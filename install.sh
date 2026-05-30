@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# install.sh — BEN device setup script
+# Usage: sudo ./install.sh <model> <hw-revision> <device-id>
+# Example: sudo ./install.sh pi0-wired rev01 ben-0042
+#
+# Must be run as root (via sudo).
+# Prerequisites:
+#   - Network connectivity
+#   - /tmp/ben-certs/ contains: device.crt, device.key, root-ca.crt
+#     (staged by operator via ben-ops provisioning scripts)
+
+set -euo pipefail
+
+REPO_URL="https://github.com/xdegenne/ben-firmware.git"
+REPO_PATH="/opt/ben/repo"
+INITIAL_TAG="pi-1.0.0"
+
+if [ $# -ne 3 ]; then
+    echo "Usage: sudo ./install.sh <model> <hw-revision> <device-id>" >&2
+    exit 1
+fi
+
+MODEL=$1
+HW_REV=$2
+DEVICE_ID=$3
+
+# --------------------------------------------------------------------------
+# 1. Validate arguments
+# --------------------------------------------------------------------------
+if [[ ! "$MODEL" =~ ^(pi0-wired|pi0-lora|pi0-lora-wired)$ ]]; then
+    echo "ERROR: MODEL must be pi0-wired, pi0-lora, or pi0-lora-wired (got: $MODEL)" >&2
+    exit 1
+fi
+if [[ ! "$HW_REV" =~ ^rev[0-9]{2}$ ]]; then
+    echo "ERROR: HW_REV must match rev[0-9]{2} (got: $HW_REV)" >&2
+    exit 1
+fi
+if [[ ! "$DEVICE_ID" =~ ^ben-[0-9]{4}$ ]]; then
+    echo "ERROR: DEVICE_ID must match ben-[0-9]{4} (got: $DEVICE_ID)" >&2
+    exit 1
+fi
+
+echo "[1/12] Arguments: $DEVICE_ID  model=$MODEL  hw=$HW_REV"
+
+# --------------------------------------------------------------------------
+# 2. Install system dependencies + locale
+# --------------------------------------------------------------------------
+apt-get update -qq
+apt-get install -y git python3 python3-pip
+timedatectl set-timezone Europe/Paris
+echo "[2/12] System dependencies installed, timezone=Europe/Paris"
+
+# --------------------------------------------------------------------------
+# 2b. Configure UART (models with wired TIC) + LED RGB boot indicator
+# --------------------------------------------------------------------------
+CONFIG_TXT="/boot/firmware/config.txt"
+[ -f /boot/config.txt ] && CONFIG_TXT="/boot/config.txt"
+
+# LED RGB — vert (GPIO13) allumé dès le firmware, avant l'OS
+grep -q "gpio=13=op,dh" "$CONFIG_TXT" || echo "gpio=13=op,dh" >> "$CONFIG_TXT"
+echo "[2b/12] LED RGB boot indicator configuré (GPIO13 vert)"
+
+if [ "$MODEL" = "pi0-wired" ] || [ "$MODEL" = "pi0-lora-wired" ]; then
+    # miniuart-bt déplace le BT sur ttyS0 et libère le PL011 (ttyAMA0) pour la TIC.
+    grep -q "dtoverlay=miniuart-bt" "$CONFIG_TXT" || echo "dtoverlay=miniuart-bt" >> "$CONFIG_TXT"
+    grep -q "enable_uart=1"         "$CONFIG_TXT" || echo "enable_uart=1"         >> "$CONFIG_TXT"
+    echo "[2b/12] UART configuré (ttyAMA0 TIC, BT sur ttyS0)"
+fi
+
+# --------------------------------------------------------------------------
+# 3. Create ben user
+# --------------------------------------------------------------------------
+if ! id -u ben &>/dev/null; then
+    useradd --system --create-home --shell /bin/bash ben
+fi
+echo "[3/12] User ben OK"
+
+# --------------------------------------------------------------------------
+# 4. Configure sudo rights
+# --------------------------------------------------------------------------
+echo "ben ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/ben-firmware
+chmod 440 /etc/sudoers.d/ben-firmware
+echo "[4/12] Sudo rights OK"
+
+# --------------------------------------------------------------------------
+# 5. Clone repo and checkout initial version
+# --------------------------------------------------------------------------
+mkdir -p /opt/ben
+git clone "$REPO_URL" "$REPO_PATH"
+git -C "$REPO_PATH" fetch --tags
+git -C "$REPO_PATH" checkout "$INITIAL_TAG"
+chown -R ben:ben /opt/ben
+echo "[5/12] Repo cloned and checked out at $INITIAL_TAG"
+
+# --------------------------------------------------------------------------
+# 6. Create directory structure
+# --------------------------------------------------------------------------
+mkdir -p /etc/ben-firmware/certs
+mkdir -p /etc/ben-firmware/gpg
+mkdir -p /var/lib/ben-firmware
+mkdir -p /var/log/ben-firmware
+chown -R ben:ben /etc/ben-firmware /var/lib/ben-firmware /var/log/ben-firmware
+echo "[6/12] Directories OK"
+
+# --------------------------------------------------------------------------
+# 7. Install certificates and HMAC key
+# --------------------------------------------------------------------------
+cp /tmp/ben-certs/device.crt  /etc/ben-firmware/certs/
+cp /tmp/ben-certs/device.key  /etc/ben-firmware/certs/
+cp /tmp/ben-certs/root-ca.crt /etc/ben-firmware/certs/
+chown -R ben:ben /etc/ben-firmware/certs
+chmod 600 /etc/ben-firmware/certs/device.key
+chmod 644 /etc/ben-firmware/certs/device.crt /etc/ben-firmware/certs/root-ca.crt
+
+cp /tmp/ben-certs/hmac.key /etc/ben-firmware/hmac.key
+chown ben:ben /etc/ben-firmware/hmac.key
+chmod 600 /etc/ben-firmware/hmac.key
+echo "[7/12] Certificates and HMAC key installed"
+
+# --------------------------------------------------------------------------
+# 8. Write device.json
+# --------------------------------------------------------------------------
+if [ "$MODEL" = "pi0-lora" ] || [ "$MODEL" = "pi0-lora-wired" ]; then
+    cat > /etc/ben-firmware/device.json <<EOF
+{
+  "deviceId": "$DEVICE_ID",
+  "model": "$MODEL",
+  "hardwareRevision": "$HW_REV",
+  "softwareVersion": "1.0.0",
+  "arduinoFirmwareVersion": "1.0.0"
+}
+EOF
+else
+    cat > /etc/ben-firmware/device.json <<EOF
+{
+  "deviceId": "$DEVICE_ID",
+  "model": "$MODEL",
+  "hardwareRevision": "$HW_REV",
+  "softwareVersion": "1.0.0"
+}
+EOF
+fi
+chown ben:ben /etc/ben-firmware/device.json
+
+# sources.json — PDL source routing (lora_address → pdl_index)
+# Arduino CLIENT_ADDRESS is always 0x1f (31) on first provisioning.
+if [ "$MODEL" = "pi0-lora" ]; then
+    cat > /etc/ben-firmware/sources.json <<'EOF'
+{
+  "sources": [
+    {"type": "lora", "lora_address": "0x1f", "index": 0}
+  ]
+}
+EOF
+elif [ "$MODEL" = "pi0-lora-wired" ]; then
+    cat > /etc/ben-firmware/sources.json <<'EOF'
+{
+  "sources": [
+    {"type": "wired", "index": 0},
+    {"type": "lora", "lora_address": "0x1f", "index": 1}
+  ]
+}
+EOF
+else
+    cat > /etc/ben-firmware/sources.json <<'EOF'
+{
+  "sources": [
+    {"type": "wired", "index": 0}
+  ]
+}
+EOF
+fi
+chown ben:ben /etc/ben-firmware/sources.json
+echo "[8/12] device.json and sources.json written"
+
+# --------------------------------------------------------------------------
+# 9. Import GPG release signing key
+# --------------------------------------------------------------------------
+# Public key ships with the repo — no secret.
+cp "$REPO_PATH/config/etc/gpg/ben-releases.pub" /etc/ben-firmware/gpg/
+chown ben:ben /etc/ben-firmware/gpg/ben-releases.pub
+sudo -u ben gpg --import /etc/ben-firmware/gpg/ben-releases.pub
+echo "[9/12] GPG key imported"
+
+# --------------------------------------------------------------------------
+# 10. Install Python dependencies
+# --------------------------------------------------------------------------
+pip3 install --break-system-packages -r "$REPO_PATH/src/pi/requirements.txt"
+echo "[10/12] Python dependencies installed"
+
+# --------------------------------------------------------------------------
+# 11. Install systemd units
+# --------------------------------------------------------------------------
+cp "$REPO_PATH/config/systemd/"*.service /etc/systemd/system/
+cp "$REPO_PATH/config/systemd/"*.timer   /etc/systemd/system/
+systemctl daemon-reload
+echo "[11/12] Systemd units installed"
+
+# --------------------------------------------------------------------------
+# 12. Enable and start services (model-dependent)
+# --------------------------------------------------------------------------
+systemctl enable ben-update.timer
+systemctl start  ben-update.timer
+
+if [ "$MODEL" = "pi0-lora" ]; then
+    systemctl enable ben-lora-receiver.service
+    systemctl start  ben-lora-receiver.service || true
+elif [ "$MODEL" = "pi0-wired" ]; then
+    systemctl enable ben-tic-reader.service
+    systemctl start  ben-tic-reader.service || true
+elif [ "$MODEL" = "pi0-lora-wired" ]; then
+    systemctl enable ben-lora-receiver.service ben-tic-reader.service
+    systemctl start  ben-lora-receiver.service || true
+    systemctl start  ben-tic-reader.service || true
+fi
+
+echo "[12/12] Services enabled"
+
+# --------------------------------------------------------------------------
+# Verify
+# --------------------------------------------------------------------------
+echo ""
+echo "--- Status ---"
+systemctl is-active ben-update.timer && echo "ben-update.timer: active"
+echo ""
+echo "BEN device $DEVICE_ID ($MODEL / $HW_REV) provisioned successfully."

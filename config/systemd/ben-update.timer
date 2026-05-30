@@ -1,0 +1,11 @@
+[Unit]
+Description=BEN Device OTA Update Timer
+Requires=network-online.target
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=24h
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

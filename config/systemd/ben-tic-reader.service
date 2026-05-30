@@ -1,0 +1,14 @@
+[Unit]
+Description=BEN TIC Reader
+After=basic.target
+
+[Service]
+Type=simple
+User=ben
+WorkingDirectory=/opt/ben/repo/src/pi/tic-reader
+ExecStart=/usr/bin/python3 /opt/ben/repo/src/pi/tic-reader/main_uart.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

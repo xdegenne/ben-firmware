@@ -1,0 +1,9 @@
+[Unit]
+Description=BEN Device OTA Update
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ben
+ExecStart=/usr/bin/python3 /opt/ben/repo/src/pi/updater/check_update.py

@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+
+# Device-specific secrets (never committed)
+*.key
+*.pem
+!config/etc/gpg/*.pub
+hmac.key
+device.json
+sources.json
+
+# Local state from running on a device
+/var/
+/etc/ben-firmware/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Arduino build artifacts
+*.hex
+*.elf
+build/

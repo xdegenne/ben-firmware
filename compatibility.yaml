@@ -1,0 +1,56 @@
+# BEN Device — Compatibility Matrix
+# Source of truth for all device models, hardware revisions,
+# software versions and update paths.
+#
+# Sections:
+#   devices  — informational only (history, release notes)
+#   updates  — machine-readable update paths consumed by check_update.py
+
+devices:
+
+  pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
+    rev01:
+      pi:
+        latest: "1.0.0"
+        history:
+          - version: "1.0.0"
+            released: "2026-05-19"
+      arduino:
+        minimum: "1.0.0"
+        latest: "1.0.0"
+        history:
+          - version: "1.0.0"
+            released: "2026-05-19"
+
+  pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
+    rev01:
+      pi:
+        latest: "1.0.0"
+        history:
+          - version: "1.0.0"
+            released: "2026-05-19"
+
+  pi0-lora-wired:       # Raspberry Pi Zero W with both direct TIC (wired) and LoRa reception
+    rev01:
+      pi:
+        latest: "1.0.0"
+        history:
+          - version: "1.0.0"
+            released: "2026-05-19"
+      arduino:
+        minimum: "1.0.0"
+        latest: "1.0.0"
+        history:
+          - version: "1.0.0"
+            released: "2026-05-19"
+
+updates:
+
+  pi0-lora:
+    []                  # no updates yet — first release
+
+  pi0-wired:
+    []                  # no updates yet — first release
+
+  pi0-lora-wired:
+    []                  # no updates yet — first release
