@@ -291,6 +291,7 @@ try:
     while True:
         cycle_success = False
         try:
+            blink_rgb(5, 5, 0, 0.05)    # jaune 5% — wake-up cycle
             ser.reset_input_buffer()
             labels = read_frame(ser)
 
@@ -336,7 +337,10 @@ try:
             log.error(f"Exception dans la boucle principale:\n{traceback.format_exc()}")
 
         if cycle_success:
+            blink_rgb(0, 5, 0, 0.1)     # vert 5% — trame TIC valide
             last_success_time = time.time()
+        else:
+            blink_rgb(5, 0, 0, 0.1)     # rouge 5% — trame KO
 
         sleep(PERIOD_S)
 

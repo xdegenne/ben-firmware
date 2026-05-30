@@ -29,7 +29,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.5"
+        latest: "0.0.6"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -46,6 +46,9 @@ devices:
           - version: "0.0.5"
             released: "2026-05-31"
             notes: "LED silence radio — plus aucun blink (for sleeping operators)"
+          - version: "0.0.6"
+            released: "2026-05-31"
+            notes: "LED 5% partout : jaune wake / vert trame OK / rouge trame KO"
 
   pi0-lora-wired:       # Raspberry Pi Zero W with both direct TIC (wired) and LoRa reception
     rev01:
@@ -83,6 +86,10 @@ updates:
       to: "0.0.5"
       tag: "pi-0.0.5"
       script: "updates/pi0-wired/0.0.4_to_0.0.5/update.sh"
+    - from: "0.0.5"
+      to: "0.0.6"
+      tag: "pi-0.0.6"
+      script: "updates/pi0-wired/0.0.5_to_0.0.6/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet
