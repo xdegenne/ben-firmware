@@ -44,9 +44,8 @@ TIC_TIMEOUT_S     = 12      # max pour lire une trame complète (~4s à 1200 bau
 
 PDL_INDEX         = 0       # source câblée — toujours index 0 par convention
 
-PERIOD_S            = 30    # intervalle entre deux cycles (aligné LoRa Arduino ~32s)
-TIC_STALE_THRESHOLD = 300   # 5 min sans trame valide → flash violet d'alerte
-WATCHDOG_THRESHOLD  = 600   # 10 min sans trame valide → relance process
+PERIOD_S           = 30     # intervalle entre deux cycles (aligné LoRa Arduino ~32s)
+WATCHDOG_THRESHOLD = 600    # 10 min sans trame valide → relance process
 
 STATE_PATH         = "/var/lib/ben-firmware/tic-state.json"
 
@@ -339,8 +338,12 @@ try:
 
         if cycle_success:
             last_success_time = time.time()
-        elif time.time() - last_success_time > TIC_STALE_THRESHOLD:
-            blink_rgb(100, 0, 100, 0.1)   # violet — TIC stale > 5 min (warning)
+        else:
+            # "bonk bonk" : 2 flashs violet rapides — cycle raté.
+            # Si ça continue 10 min, le WATCHDOG fire (arc-en-ciel restart).
+            blink_rgb(100, 0, 100, 0.1)
+            sleep(0.15)
+            blink_rgb(100, 0, 100, 0.1)
 
         sleep(PERIOD_S)
 
