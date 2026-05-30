@@ -74,12 +74,14 @@ if [ "$MODEL" = "pi0-wired" ] || [ "$MODEL" = "pi0-lora-wired" ]; then
 fi
 
 # --------------------------------------------------------------------------
-# 3. Create ben user
+# 3. Create ben user + group memberships
 # --------------------------------------------------------------------------
 if ! id -u ben &>/dev/null; then
     useradd --system --create-home --shell /bin/bash ben
 fi
-echo "[3/13] User ben OK"
+# dialout : /dev/ttyAMA0 (TIC). gpio + spi : LoRa receiver via raspi_lora + RPi.GPIO.
+usermod -aG dialout,gpio,spi ben
+echo "[3/13] User ben OK (dialout, gpio, spi)"
 
 # --------------------------------------------------------------------------
 # 4. Configure sudo rights
