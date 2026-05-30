@@ -53,8 +53,14 @@ echo "[2/13] System dependencies installed, timezone=Europe/Paris"
 # --------------------------------------------------------------------------
 # 2b. Configure UART (models with wired TIC) + LED RGB boot indicator
 # --------------------------------------------------------------------------
-CONFIG_TXT="/boot/firmware/config.txt"
-[ -f /boot/config.txt ] && CONFIG_TXT="/boot/config.txt"
+# Pi OS Bookworm/Trixie : /boot/firmware/config.txt est le vrai fichier.
+# /boot/config.txt n'est qu'un stub ("DO NOT EDIT, moved to /boot/firmware/config.txt").
+# Sur Bullseye et antérieur seul /boot/config.txt existait — fallback si firmware/ absent.
+if [ -f /boot/firmware/config.txt ]; then
+    CONFIG_TXT="/boot/firmware/config.txt"
+else
+    CONFIG_TXT="/boot/config.txt"
+fi
 
 # LED RGB — vert (GPIO13) allumé dès le firmware, avant l'OS
 grep -q "gpio=13=op,dh" "$CONFIG_TXT" || echo "gpio=13=op,dh" >> "$CONFIG_TXT"
