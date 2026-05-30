@@ -13,7 +13,7 @@ set -euo pipefail
 
 REPO_URL="https://github.com/xdegenne/ben-firmware.git"
 REPO_PATH="/opt/ben/repo"
-INITIAL_TAG="pi-1.0.0"
+INITIAL_TAG="pi-0.0.1"
 
 if [ $# -ne 3 ]; then
     echo "Usage: sudo ./install.sh <model> <hw-revision> <device-id>" >&2
@@ -126,8 +126,8 @@ if [ "$MODEL" = "pi0-lora" ] || [ "$MODEL" = "pi0-lora-wired" ]; then
   "deviceId": "$DEVICE_ID",
   "model": "$MODEL",
   "hardwareRevision": "$HW_REV",
-  "softwareVersion": "1.0.0",
-  "arduinoFirmwareVersion": "1.0.0"
+  "softwareVersion": "0.0.1",
+  "arduinoFirmwareVersion": "0.0.1"
 }
 EOF
 else
@@ -136,7 +136,7 @@ else
   "deviceId": "$DEVICE_ID",
   "model": "$MODEL",
   "hardwareRevision": "$HW_REV",
-  "softwareVersion": "1.0.0"
+  "softwareVersion": "0.0.1"
 }
 EOF
 fi

@@ -11,38 +11,38 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "1.0.0"
+        latest: "0.0.1"
         history:
-          - version: "1.0.0"
-            released: "2026-05-19"
+          - version: "0.0.1"
+            released: "2026-05-30"
       arduino:
-        minimum: "1.0.0"
-        latest: "1.0.0"
+        minimum: "0.0.1"
+        latest: "0.0.1"
         history:
-          - version: "1.0.0"
-            released: "2026-05-19"
+          - version: "0.0.1"
+            released: "2026-05-30"
 
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "1.0.0"
+        latest: "0.0.1"
         history:
-          - version: "1.0.0"
-            released: "2026-05-19"
+          - version: "0.0.1"
+            released: "2026-05-30"
 
   pi0-lora-wired:       # Raspberry Pi Zero W with both direct TIC (wired) and LoRa reception
     rev01:
       pi:
-        latest: "1.0.0"
+        latest: "0.0.1"
         history:
-          - version: "1.0.0"
-            released: "2026-05-19"
+          - version: "0.0.1"
+            released: "2026-05-30"
       arduino:
-        minimum: "1.0.0"
-        latest: "1.0.0"
+        minimum: "0.0.1"
+        latest: "0.0.1"
         history:
-          - version: "1.0.0"
-            released: "2026-05-19"
+          - version: "0.0.1"
+            released: "2026-05-30"
 
 updates:
 
