@@ -44,7 +44,7 @@ TIC_TIMEOUT_S     = 12      # max pour lire une trame complète (~4s à 1200 bau
 
 PDL_INDEX         = 0       # source câblée — toujours index 0 par convention
 
-PERIOD_S           = 60     # intervalle entre deux cycles
+PERIOD_S           = 30     # intervalle entre deux cycles (aligné LoRa Arduino ~32s)
 WATCHDOG_THRESHOLD = 300    # secondes sans succès → relance
 
 STATE_PATH         = "/var/lib/ben-firmware/tic-state.json"
