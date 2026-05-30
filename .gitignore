@@ -10,7 +10,9 @@ venv/
 # Device-specific secrets (never committed)
 *.key
 *.pem
+*.crt
 !config/etc/gpg/*.pub
+!config/etc/ca/root-ca.crt
 hmac.key
 device.json
 sources.json

@@ -105,9 +105,9 @@ echo "[6/12] Directories OK"
 # --------------------------------------------------------------------------
 # 7. Install certificates and HMAC key
 # --------------------------------------------------------------------------
-cp /tmp/ben-certs/device.crt  /etc/ben-firmware/certs/
-cp /tmp/ben-certs/device.key  /etc/ben-firmware/certs/
-cp /tmp/ben-certs/root-ca.crt /etc/ben-firmware/certs/
+cp /tmp/ben-certs/device.crt              /etc/ben-firmware/certs/
+cp /tmp/ben-certs/device.key              /etc/ben-firmware/certs/
+cp "$REPO_PATH/config/etc/ca/root-ca.crt" /etc/ben-firmware/certs/
 chown -R ben:ben /etc/ben-firmware/certs
 chmod 600 /etc/ben-firmware/certs/device.key
 chmod 644 /etc/ben-firmware/certs/device.crt /etc/ben-firmware/certs/root-ca.crt
