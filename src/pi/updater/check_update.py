@@ -18,7 +18,7 @@ from pathlib import Path
 
 import update_lib
 
-LOCK_PATH = "/var/run/ben-update.lock"
+LOCK_PATH = "/var/lib/ben-firmware/update.lock"  # /var/lib/ben-firmware/ owned ben
 DEVICE_JSON = "/etc/ben-firmware/device.json"
 REPO_PATH = "/opt/ben/repo"
 LOG_PATH = "/var/log/ben-firmware/update.log"
