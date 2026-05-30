@@ -70,7 +70,13 @@ if [ "$MODEL" = "pi0-wired" ] || [ "$MODEL" = "pi0-lora-wired" ]; then
     # miniuart-bt déplace le BT sur ttyS0 et libère le PL011 (ttyAMA0) pour la TIC.
     grep -q "dtoverlay=miniuart-bt" "$CONFIG_TXT" || echo "dtoverlay=miniuart-bt" >> "$CONFIG_TXT"
     grep -q "enable_uart=1"         "$CONFIG_TXT" || echo "enable_uart=1"         >> "$CONFIG_TXT"
-    echo "[2b/13] UART configuré (ttyAMA0 TIC, BT sur ttyS0)"
+
+    # cmdline.txt : retire la directive `console=serial0,*` (et son alias `ttyAMA0`).
+    # Sans ce patch, le kernel claim /dev/ttyAMA0 comme console série debug
+    # → crw------- root root → SerialException Permission denied côté agent.
+    CMDLINE_TXT="${CONFIG_TXT%/config.txt}/cmdline.txt"
+    sed -i 's/console=serial0,[0-9]* *//g; s/console=ttyAMA0,[0-9]* *//g' "$CMDLINE_TXT"
+    echo "[2b/13] UART configuré (ttyAMA0 TIC, BT sur ttyS0, kernel console libérée)"
 fi
 
 # --------------------------------------------------------------------------
