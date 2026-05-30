@@ -111,6 +111,9 @@ GPIO.setwarnings(False)
 
 _pwm_r = _pwm_g = _pwm_b = None
 
+# last_frame_time est initialisé depuis le state file plus bas (après load_state).
+# Cette pré-déclaration sert juste à exister comme variable module-level
+# (pour le `global` dans on_recv) — la vraie valeur vient de state.
 last_frame_time = 0
 
 def setup_led(*args):
@@ -213,10 +216,11 @@ def load_state() -> dict:
             indexes["BASE"] = int(last_base)
             log.info(f"Migration état legacy : BASE={last_base}")
     return {
-        "indexes":        indexes,
-        "last_active_id": raw.get("last_active_id"),
-        "last_boot_seq":  raw.get("last_boot_seq"),
-        "adco":           raw.get("adco", ""),
+        "indexes":         indexes,
+        "last_active_id":  raw.get("last_active_id"),
+        "last_boot_seq":   raw.get("last_boot_seq"),
+        "adco":            raw.get("adco", ""),
+        "last_frame_time": raw.get("last_frame_time", 0),
     }
 
 def save_state(state: dict) -> None:
@@ -225,6 +229,9 @@ def save_state(state: dict) -> None:
         json.dump(state, f)
 
 state = load_state()
+# Restauré depuis le state file → survit aux watchdog-restarts (process execv).
+# 0 = aucune trame jamais reçue → heartbeat YELLOW honnête + watchdog désactivé.
+last_frame_time = state.get("last_frame_time", 0)
 
 # ---------------------------------------------------------------------------
 # Détection boot_seq
@@ -348,8 +355,9 @@ def on_recv(payload) -> None:
 
         if index_value >= prev_value:
             state["indexes"][active_name] = int(index_value)
-        state["last_active_id"] = int(index_id)
-        state["last_boot_seq"]  = int(boot_seq)
+        state["last_active_id"]  = int(index_id)
+        state["last_boot_seq"]   = int(boot_seq)
+        state["last_frame_time"] = now
         save_state(state)
 
     except Exception:

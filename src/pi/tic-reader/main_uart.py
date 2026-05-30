@@ -26,6 +26,7 @@ import traceback
 from threading import Thread
 from time import sleep
 
+import RPi.GPIO as GPIO
 import serial
 
 logging.basicConfig(
@@ -47,6 +48,35 @@ PERIOD_S           = 60     # intervalle entre deux cycles
 WATCHDOG_THRESHOLD = 300    # secondes sans succès → relance
 
 STATE_PATH         = "/var/lib/ben-firmware/tic-state.json"
+
+# ---------------------------------------------------------------------------
+# LED RGB (cathode commune sur PCB rev01)
+# R=GPIO12 (HW PWM0), G=GPIO13 (HW PWM1, boot indicator via gpio=13=op,dh),
+# B=GPIO16. On pilote en digital ON/OFF — pas besoin de PWM ici.
+# ---------------------------------------------------------------------------
+RGB_R = 12
+RGB_G = 13
+RGB_B = 16
+
+def setup_led() -> None:
+    """Init pins LED + éteint le boot indicator vert (allumé par config.txt)."""
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+    for pin in (RGB_R, RGB_G, RGB_B):
+        GPIO.setup(pin, GPIO.OUT)
+        GPIO.output(pin, GPIO.LOW)
+
+def blink_rgb(r: bool, g: bool, b: bool, duration: float = 0.05) -> None:
+    try:
+        if r: GPIO.output(RGB_R, GPIO.HIGH)
+        if g: GPIO.output(RGB_G, GPIO.HIGH)
+        if b: GPIO.output(RGB_B, GPIO.HIGH)
+        sleep(duration)
+        GPIO.output(RGB_R, GPIO.LOW)
+        GPIO.output(RGB_G, GPIO.LOW)
+        GPIO.output(RGB_B, GPIO.LOW)
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # Protocole TIC (historique Linky)
@@ -233,6 +263,9 @@ def watchdog_loop() -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+setup_led()
+log.info("LED RGB initialisée (boot indicator vert éteint)")
+
 ser = serial.Serial(
     port=UART_DEV,
     baudrate=UART_BAUD,
@@ -250,6 +283,7 @@ log.info(f"Watchdog démarré (seuil={WATCHDOG_THRESHOLD}s)")
 try:
     while True:
         try:
+            blink_rgb(True, True, False, 0.05)   # jaune — cycle de lecture
             ser.reset_input_buffer()
             labels = read_frame(ser)
 
@@ -300,6 +334,7 @@ try:
             log.info(f"OK pdl_index={PDL_INDEX} PTEC={ptec} {active_name}={active_value} "
                      f"IINST={iinst} PAPP={papp} demain={demain} adps={adps} pejp={pejp}")
 
+            blink_rgb(False, True, False, 0.15)  # vert — trame TIC valide
             last_success_time = time.time()
 
         except Exception:
@@ -311,4 +346,6 @@ except KeyboardInterrupt:
     log.info("Arrêt.")
 finally:
     try: ser.close()
+    except Exception: pass
+    try: GPIO.cleanup()
     except Exception: pass
