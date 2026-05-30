@@ -291,7 +291,6 @@ try:
     while True:
         cycle_success = False
         try:
-            blink_rgb(30, 30, 0, 0.05)   # jaune dim 30% — wake-up cycle
             ser.reset_input_buffer()
             labels = read_frame(ser)
 
@@ -338,12 +337,6 @@ try:
 
         if cycle_success:
             last_success_time = time.time()
-        else:
-            # "bonk bonk" : 2 flashs violet rapides — cycle raté.
-            # Si ça continue 10 min, le WATCHDOG fire (arc-en-ciel restart).
-            blink_rgb(100, 0, 100, 0.1)
-            sleep(0.15)
-            blink_rgb(100, 0, 100, 0.1)
 
         sleep(PERIOD_S)
 
