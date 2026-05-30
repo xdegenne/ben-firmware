@@ -1,8 +1,11 @@
 """
-lora-receiver — BEN Pi LoRa receiver agent
+lora-receiver — BEN Pi LoRa receiver agent (v1: log-only)
 
 Réceptionne les trames binaires v0x02 émises par les Arduino tic-reader,
-vérifie le HMAC, route par pdl_index selon sources.json, et écrit dans InfluxDB.
+vérifie le HMAC, route par pdl_index selon sources.json, **logue** les trames.
+
+v1 : aucun sink (pas d'InfluxDB, pas de publisher cloud).
+v2 (OTA upgrade) : InfluxDB local + Grafana.
 
 Protocole binaire v0x02 — 20 octets :
   0       version       uint8  = 0x02
@@ -34,9 +37,7 @@ from threading import Thread
 from time import sleep
 
 import RPi.GPIO as GPIO
-from influxdb import InfluxDBClient
 from raspi_lora import LoRa, ModemConfig
-import socket
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -88,15 +89,6 @@ FLAG_PEJP = 0x08
 BOOT_SEQ_MOD        = 65536
 DUPLICATE_MAX_GAP_S = 10
 WATCHDOG_THRESHOLD  = 180
-
-# ---------------------------------------------------------------------------
-# InfluxDB
-# ---------------------------------------------------------------------------
-INFLUX_HOST              = "127.0.0.1"
-INFLUX_PORT              = 8086
-INFLUX_DB                = "linky"
-INFLUX_MEASUREMENT       = "linkyEvents"
-INFLUX_EVENTS_MEASUREMENT = "lora_events"
 
 RSSI_MIN_PLAUSIBLE = -130
 RSSI_MAX_PLAUSIBLE = 0
@@ -233,68 +225,6 @@ def save_state(state: dict) -> None:
         json.dump(state, f)
 
 state = load_state()
-influx_client = None
-
-# ---------------------------------------------------------------------------
-# InfluxDB
-# ---------------------------------------------------------------------------
-def test_influx_connection(host: str, port: int) -> None:
-    while True:
-        s = None
-        try:
-            log.info(f"Test InfluxDB {host}:{port}...")
-            s = socket.socket()
-            s.connect((host, port))
-            log.info("InfluxDB OK")
-            return
-        except Exception as e:
-            log.warning(f"InfluxDB indisponible ({e}), retry 10s...")
-            time.sleep(10)
-        finally:
-            if s:
-                try: s.close()
-                except Exception: pass
-
-def write_to_influx(pdl_index: int, active_name: str, active_value: int,
-                    iinst: int, papp: int, rssi: float, snr: float,
-                    boot_seq: int, demain, adps: bool, pejp: bool) -> None:
-    if influx_client is None:
-        return
-    fields = {
-        active_name: int(active_value),
-        "IINST": int(iinst),
-        "PAPP": int(papp),
-        "RSSI": float(rssi),
-        "SNR": float(snr),
-        "BOOT_SEQ": int(boot_seq),
-    }
-    tags = {
-        "pdl_index":    str(pdl_index),
-        "active_index": active_name,
-        "demain":       demain if demain is not None else "n/a",
-        "adps":         "1" if adps else "0",
-        "pejp":         "1" if pejp else "0",
-    }
-    try:
-        influx_client.write_points([{
-            "measurement": INFLUX_MEASUREMENT,
-            "tags": tags,
-            "fields": fields,
-        }])
-    except Exception:
-        log.error(f"Influx write failed:\n{traceback.format_exc()}")
-
-def write_event(event: str, **fields) -> None:
-    if influx_client is None:
-        return
-    try:
-        influx_client.write_points([{
-            "measurement": INFLUX_EVENTS_MEASUREMENT,
-            "tags": {"event": event},
-            "fields": {k: int(v) for k, v in fields.items()},
-        }])
-    except Exception:
-        log.error(f"Influx event write failed:\n{traceback.format_exc()}")
 
 # ---------------------------------------------------------------------------
 # Détection boot_seq
@@ -407,12 +337,11 @@ def on_recv(payload) -> None:
 
         event, details = detect_boot_seq_event(boot_seq, time_since_prev)
         if event:
-            write_event(event, **details)
+            log.info(f"EVENT {event} {details}")
 
         prev_value = state["indexes"].get(active_name, 0)
         if index_value < prev_value:
             log.warning(f"{active_name} en décroissance : {index_value} < {prev_value}")
-            write_event("index_decrease", prev=prev_value, new=index_value, idx_id=index_id)
             blink_rgb(30, 15, 0, 0.3)  # orange — décroissance
         else:
             blink_rgb(0, 30, 0, 0.2)   # vert — données valides
@@ -422,9 +351,6 @@ def on_recv(payload) -> None:
         state["last_active_id"] = int(index_id)
         state["last_boot_seq"]  = int(boot_seq)
         save_state(state)
-
-        write_to_influx(pdl_index, active_name, index_value,
-                        iinst, papp, rssi, snr, boot_seq, demain, adps, pejp)
 
     except Exception:
         log.error(f"Exception dans on_recv :\n{traceback.format_exc()}")
@@ -471,11 +397,6 @@ def heartbeat_loop() -> None:
 # Main
 # ---------------------------------------------------------------------------
 setup_led()
-
-test_influx_connection(INFLUX_HOST, INFLUX_PORT)
-influx_client = InfluxDBClient(host=INFLUX_HOST, port=INFLUX_PORT)
-influx_client.switch_database(INFLUX_DB)
-log.info(f"InfluxDB connecté — db={INFLUX_DB}")
 
 GPIO.setup(RFM95_RST_PIN, GPIO.OUT)
 GPIO.output(RFM95_RST_PIN, GPIO.HIGH); sleep(0.01)
@@ -525,6 +446,4 @@ except KeyboardInterrupt:
 finally:
     try:
         if lora: lora.close()
-    except Exception: pass
-    try: influx_client.close()
     except Exception: pass

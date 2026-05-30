@@ -1,15 +1,15 @@
 """
-tic-reader — BEN Pi wired TIC reader
+tic-reader — BEN Pi wired TIC reader (v1: log-only)
 
 Lit la TIC Linky via /dev/ttyS0 (mini-UART, 1200 baud 8N1, masque 0x7F),
-décode multi-tarif (BASE/HC/HP/EJP/BBR), écrit dans InfluxDB.
+décode multi-tarif (BASE/HC/HP/EJP/BBR), **logue** les trames parsées.
+
+v1 : aucun sink (pas d'InfluxDB, pas de publisher cloud).
+v2 (OTA upgrade) : InfluxDB local + Grafana.
 
 Aligné sur src/arduino/tic-reader/tic-reader.ino :
   - même mapping PTEC → index (selectActiveIndex)
   - même détection DEMAIN / ADPS / PEJP (buildFlags)
-  - même schéma InfluxDB que lora-receiver/main.py
-    (tags: pdl_index, active_index, demain, adps, pejp
-     champs: <active_name>, IINST, PAPP)
 
 Note mini-UART : ttyS0 ne supporte pas la parité. On lit en 8N1
 et on masque le bit de parité (& 0x7F) — même technique que l'original.
@@ -20,7 +20,6 @@ pdl_index : 0  (source câblée — toujours index 0 dans sources.json)
 import json
 import logging
 import os
-import socket
 import sys
 import time
 import traceback
@@ -28,7 +27,6 @@ from threading import Thread
 from time import sleep
 
 import serial
-from influxdb import InfluxDBClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,11 +42,6 @@ UART_BAUD         = 1200
 TIC_TIMEOUT_S     = 12      # max pour lire une trame complète (~4s à 1200 baud)
 
 PDL_INDEX         = 0       # source câblée — toujours index 0 par convention
-
-INFLUX_HOST        = "127.0.0.1"
-INFLUX_PORT        = 8086
-INFLUX_DB          = "linky"
-INFLUX_MEASUREMENT = "linkyEvents"
 
 PERIOD_S           = 60     # intervalle entre deux cycles
 WATCHDOG_THRESHOLD = 300    # secondes sans succès → relance
@@ -223,56 +216,6 @@ def save_state(state: dict) -> None:
 state = load_state()
 
 # ---------------------------------------------------------------------------
-# InfluxDB
-# ---------------------------------------------------------------------------
-influx_client = None
-
-
-def test_influx_connection(host: str, port: int) -> None:
-    while True:
-        s = None
-        try:
-            log.info(f"Test InfluxDB {host}:{port}...")
-            s = socket.socket()
-            s.connect((host, port))
-            log.info("InfluxDB OK")
-            return
-        except Exception as e:
-            log.warning(f"InfluxDB indisponible ({e}), retry 10s...")
-            time.sleep(10)
-        finally:
-            if s:
-                try: s.close()
-                except Exception: pass
-
-
-def write_to_influx(active_name: str, active_value: int,
-                    iinst: int, papp: int,
-                    demain, adps: bool, pejp: bool) -> None:
-    if influx_client is None:
-        return
-    fields = {
-        active_name: int(active_value),
-        "IINST":     int(iinst),
-        "PAPP":      int(papp),
-    }
-    tags = {
-        "pdl_index":    str(PDL_INDEX),
-        "active_index": active_name,
-        "demain":       demain if demain is not None else "n/a",
-        "adps":         "1" if adps else "0",
-        "pejp":         "1" if pejp else "0",
-    }
-    try:
-        influx_client.write_points([{
-            "measurement": INFLUX_MEASUREMENT,
-            "tags":        tags,
-            "fields":      fields,
-        }])
-    except Exception:
-        log.error(f"Influx write failed:\n{traceback.format_exc()}")
-
-# ---------------------------------------------------------------------------
 # Watchdog
 # ---------------------------------------------------------------------------
 last_success_time = time.time()
@@ -290,11 +233,6 @@ def watchdog_loop() -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-test_influx_connection(INFLUX_HOST, INFLUX_PORT)
-influx_client = InfluxDBClient(host=INFLUX_HOST, port=INFLUX_PORT)
-influx_client.switch_database(INFLUX_DB)
-log.info(f"InfluxDB connecté — db={INFLUX_DB}")
-
 ser = serial.Serial(
     port=UART_DEV,
     baudrate=UART_BAUD,
@@ -362,7 +300,6 @@ try:
             log.info(f"OK pdl_index={PDL_INDEX} PTEC={ptec} {active_name}={active_value} "
                      f"IINST={iinst} PAPP={papp} demain={demain} adps={adps} pejp={pejp}")
 
-            write_to_influx(active_name, active_value, iinst, papp, demain, adps, pejp)
             last_success_time = time.time()
 
         except Exception:
@@ -374,6 +311,4 @@ except KeyboardInterrupt:
     log.info("Arrêt.")
 finally:
     try: ser.close()
-    except Exception: pass
-    try: influx_client.close()
     except Exception: pass

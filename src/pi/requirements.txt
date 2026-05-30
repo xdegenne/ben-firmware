@@ -1,5 +1,4 @@
 pyyaml
 pyserial
-influxdb
 raspi_lora
 RPi.GPIO
