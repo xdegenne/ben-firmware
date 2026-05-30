@@ -44,37 +44,45 @@ TIC_TIMEOUT_S     = 12      # max pour lire une trame complète (~4s à 1200 bau
 
 PDL_INDEX         = 0       # source câblée — toujours index 0 par convention
 
-PERIOD_S           = 30     # intervalle entre deux cycles (aligné LoRa Arduino ~32s)
-WATCHDOG_THRESHOLD = 300    # secondes sans succès → relance
+PERIOD_S            = 30    # intervalle entre deux cycles (aligné LoRa Arduino ~32s)
+TIC_STALE_THRESHOLD = 300   # 5 min sans trame valide → flash violet d'alerte
+WATCHDOG_THRESHOLD  = 600   # 10 min sans trame valide → relance process
 
 STATE_PATH         = "/var/lib/ben-firmware/tic-state.json"
 
 # ---------------------------------------------------------------------------
 # LED RGB (cathode commune sur PCB rev01)
 # R=GPIO12 (HW PWM0), G=GPIO13 (HW PWM1, boot indicator via gpio=13=op,dh),
-# B=GPIO16. On pilote en digital ON/OFF — pas besoin de PWM ici.
+# B=GPIO16. Piloté en PWM software (~500 Hz) pour pouvoir varier l'intensité.
 # ---------------------------------------------------------------------------
 RGB_R = 12
 RGB_G = 13
 RGB_B = 16
 
+_pwm_r = _pwm_g = _pwm_b = None
+
 def setup_led() -> None:
-    """Init pins LED + éteint le boot indicator vert (allumé par config.txt)."""
+    """Init pins LED + PWM (~500 Hz) + éteint le boot indicator vert."""
+    global _pwm_r, _pwm_g, _pwm_b
     GPIO.setmode(GPIO.BCM)
     GPIO.setwarnings(False)
     for pin in (RGB_R, RGB_G, RGB_B):
         GPIO.setup(pin, GPIO.OUT)
         GPIO.output(pin, GPIO.LOW)
+    _pwm_r = GPIO.PWM(RGB_R, 500); _pwm_r.start(0)
+    _pwm_g = GPIO.PWM(RGB_G, 500); _pwm_g.start(0)
+    _pwm_b = GPIO.PWM(RGB_B, 500); _pwm_b.start(0)
 
-def blink_rgb(r: bool, g: bool, b: bool, duration: float = 0.05) -> None:
+def blink_rgb(r: int, g: int, b: int, duration: float = 0.05) -> None:
+    """Pulse RGB en PWM. r/g/b = duty cycle 0..100."""
     try:
-        if r: GPIO.output(RGB_R, GPIO.HIGH)
-        if g: GPIO.output(RGB_G, GPIO.HIGH)
-        if b: GPIO.output(RGB_B, GPIO.HIGH)
+        _pwm_r.ChangeDutyCycle(r)
+        _pwm_g.ChangeDutyCycle(g)
+        _pwm_b.ChangeDutyCycle(b)
         sleep(duration)
-        GPIO.output(RGB_R, GPIO.LOW)
-        GPIO.output(RGB_G, GPIO.LOW)
-        GPIO.output(RGB_B, GPIO.LOW)
+        _pwm_r.ChangeDutyCycle(0)
+        _pwm_g.ChangeDutyCycle(0)
+        _pwm_b.ChangeDutyCycle(0)
     except Exception:
         pass
 
@@ -282,63 +290,57 @@ log.info(f"Watchdog démarré (seuil={WATCHDOG_THRESHOLD}s)")
 
 try:
     while True:
+        cycle_success = False
         try:
-            blink_rgb(True, True, False, 0.05)   # jaune — cycle de lecture
+            blink_rgb(30, 30, 0, 0.05)   # jaune dim 30% — wake-up cycle
             ser.reset_input_buffer()
             labels = read_frame(ser)
 
             if labels is None:
                 log.error("Trame TIC invalide ou timeout")
-                sleep(PERIOD_S)
-                continue
+            else:
+                adco = labels.get("ADCO", "")
+                if adco:
+                    prev_adco = state.get("adco", "")
+                    if adco != prev_adco:
+                        log.info(f"NOUVEAU PDL détecté : ADCO={adco} (précédent={prev_adco or 'aucun'})")
+                        state["adco"] = adco
+                        save_state(state)
 
-            adco = labels.get("ADCO", "")
-            if adco:
-                prev_adco = state.get("adco", "")
-                if adco != prev_adco:
-                    log.info(f"NOUVEAU PDL détecté : ADCO={adco} (précédent={prev_adco or 'aucun'})")
-                    state["adco"] = adco
-                    save_state(state)
+                ptec   = labels.get("PTEC")
+                iinst  = labels.get("IINST")
+                papp   = labels.get("PAPP")
+                active_name, active_value = (None, None)
+                if ptec:
+                    active_name, active_value = select_active_index(ptec, labels)
 
-            ptec = labels.get("PTEC")
-            if not ptec:
-                log.error("PTEC absent de la trame TIC")
-                sleep(PERIOD_S)
-                continue
-
-            active_name, active_value = select_active_index(ptec, labels)
-            if active_name is None:
-                log.warning(f"PTEC inconnu : '{ptec}' — trame ignorée")
-                sleep(PERIOD_S)
-                continue
-
-            # Guard : index actif, IINST et PAPP doivent être présents dans la trame.
-            # Si une ligne a un checksum KO elle est absente du dict → valeur None/manquante.
-            if active_value is None:
-                log.warning(f"{active_name} absent de la trame TIC (checksum KO?) — trame ignorée")
-                sleep(PERIOD_S)
-                continue
-            iinst = labels.get("IINST")
-            if iinst is None:
-                log.warning("IINST absent de la trame TIC (checksum KO?) — trame ignorée")
-                sleep(PERIOD_S)
-                continue
-            papp = labels.get("PAPP")
-            if papp is None:
-                log.warning("PAPP absent de la trame TIC (checksum KO?) — trame ignorée")
-                sleep(PERIOD_S)
-                continue
-
-            demain, adps, pejp = build_flags(labels)
-
-            log.info(f"OK pdl_index={PDL_INDEX} PTEC={ptec} {active_name}={active_value} "
-                     f"IINST={iinst} PAPP={papp} demain={demain} adps={adps} pejp={pejp}")
-
-            blink_rgb(False, True, False, 0.15)  # vert — trame TIC valide
-            last_success_time = time.time()
+                if not ptec:
+                    log.error("PTEC absent de la trame TIC")
+                elif active_name is None:
+                    log.warning(f"PTEC inconnu : '{ptec}' — trame ignorée")
+                elif active_value is None:
+                    log.warning(f"{active_name} absent de la trame TIC (checksum KO?) — trame ignorée")
+                elif iinst is None:
+                    log.warning("IINST absent de la trame TIC (checksum KO?) — trame ignorée")
+                elif papp is None:
+                    log.warning("PAPP absent de la trame TIC (checksum KO?) — trame ignorée")
+                else:
+                    demain, adps, pejp = build_flags(labels)
+                    log.info(f"OK pdl_index={PDL_INDEX} PTEC={ptec} {active_name}={active_value} "
+                             f"IINST={iinst} PAPP={papp} demain={demain} adps={adps} pejp={pejp}")
+                    # LED en bonne santé = discrète. Pas de flash vert à chaque trame
+                    # (le wake-up jaune 30% suffit comme "je suis vivant"). La LED ne
+                    # s'allume "fort" QUE en cas d'anomalie : violet stale ou
+                    # arc-en-ciel watchdog-restart.
+                    cycle_success = True
 
         except Exception:
             log.error(f"Exception dans la boucle principale:\n{traceback.format_exc()}")
+
+        if cycle_success:
+            last_success_time = time.time()
+        elif time.time() - last_success_time > TIC_STALE_THRESHOLD:
+            blink_rgb(100, 0, 100, 0.1)   # violet — TIC stale > 5 min (warning)
 
         sleep(PERIOD_S)
 
