@@ -29,7 +29,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.2"
+        latest: "0.0.3"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -37,6 +37,9 @@ devices:
           - version: "0.0.2"
             released: "2026-05-30"
             notes: "log-only baseline (Influx stripped, hostname rename)"
+          - version: "0.0.3"
+            released: "2026-05-31"
+            notes: "agent LED: dim yellow wake (30%), violet stale alert (>5min); WATCHDOG 5min→10min"
 
   pi0-lora-wired:       # Raspberry Pi Zero W with both direct TIC (wired) and LoRa reception
     rev01:
@@ -59,10 +62,13 @@ devices:
 updates:
 
   pi0-lora:
-    []                  # no in-field transitions yet (pi-0.0.2 is the baseline)
+    []                  # no in-field transitions yet
 
   pi0-wired:
-    []                  # no in-field transitions yet (pi-0.0.2 is the baseline)
+    - from: "0.0.2"
+      to: "0.0.3"
+      tag: "pi-0.0.3"
+      script: "updates/pi0-wired/0.0.2_to_0.0.3/update.sh"
 
   pi0-lora-wired:
-    []                  # no in-field transitions yet (pi-0.0.2 is the baseline)
+    []                  # no in-field transitions yet
