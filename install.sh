@@ -215,6 +215,25 @@ pip3 install --break-system-packages -r "$REPO_PATH/src/pi/requirements.txt"
 echo "[10/13] Python dependencies installed"
 
 # --------------------------------------------------------------------------
+# 10b. Patch raspi_lora SNR sign-handling (modèles LoRa uniquement)
+# --------------------------------------------------------------------------
+# Bug upstream raspi_lora (lora.py:248) : `snr = _spi_read(...) / 4` ne gère
+# pas le signe du byte. Le registre 0x19 PKT_SNR_VALUE du SX1276 est signé
+# 8-bit, mais `_spi_read` retourne un unsigned 0-255. Pour SNR négatifs (signal
+# distant), la lib produit une valeur positive aberrante au lieu de négatif
+# → tout le calcul RSSI (qui dépend du signe du SNR) part en vrille.
+# Le firmware ben détecte le cas via SNR_MAX_PLAUSIBLE et logge un warning.
+# Ce patch fixe l'interprétation du byte signé.
+if [ "$MODEL" = "pi0-lora" ] || [ "$MODEL" = "pi0-lora-wired" ]; then
+    RASPI_LORA_PY=$(python3 -c "import raspi_lora, os; print(os.path.join(os.path.dirname(raspi_lora.__file__), 'lora.py'))" 2>/dev/null || true)
+    if [ -n "$RASPI_LORA_PY" ] && [ -f "$RASPI_LORA_PY" ] && ! grep -q "snr -= 256" "$RASPI_LORA_PY"; then
+        cp "$RASPI_LORA_PY" "${RASPI_LORA_PY}.bak"
+        sed -i 's|            snr = self._spi_read(REG_19_PKT_SNR_VALUE) / 4|            snr = self._spi_read(REG_19_PKT_SNR_VALUE)\n            if snr > 127:\n                snr -= 256\n            snr = snr / 4|' "$RASPI_LORA_PY"
+        echo "[10b/13] raspi_lora SNR sign-handling patché ($RASPI_LORA_PY)"
+    fi
+fi
+
+# --------------------------------------------------------------------------
 # 11. Install systemd units
 # --------------------------------------------------------------------------
 cp "$REPO_PATH/config/systemd/"*.service /etc/systemd/system/

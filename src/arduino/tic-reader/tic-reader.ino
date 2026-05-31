@@ -284,10 +284,13 @@ static void provisioningMode() {
       writeKeyToEEPROM(key);
       Serial.println(F("OK"));
       Serial.flush();
+      delay(50);  // laisse le temps au "OK\n" de partir avant le reset
 
-      // Reboot via watchdog
-      wdt_enable(WDTO_15MS);
-      while (true) {}
+      // Soft reset via saut au vecteur 0 — n'arme PAS le WDT.
+      // Le pattern wdt_enable(WDTO_15MS) + while(true) cause un bootloop avec
+      // certains Optiboot qui ne désarment pas le WDT en entrée (LED pin 13
+      // scintille à ~60 Hz, plus de fenêtre upload, user code jamais atteint).
+      asm volatile ("jmp 0");
     }
   }
 }
