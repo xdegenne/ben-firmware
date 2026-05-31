@@ -62,9 +62,14 @@ else
     CONFIG_TXT="/boot/config.txt"
 fi
 
+# Strip les gpio= R (12) et B (16) baked dans le golden pour la LED blanche du ben-zero.
+# Une fois provisionné, le device a un firmware qui pilote la LED en PWM → on garde
+# uniquement le vert (GPIO13) comme indicateur de boot, puis le service prend la main.
+sed -i '/^gpio=12=op,dh$/d; /^gpio=16=op,dh$/d' "$CONFIG_TXT"
+
 # LED RGB — vert (GPIO13) allumé dès le firmware, avant l'OS
 grep -q "gpio=13=op,dh" "$CONFIG_TXT" || echo "gpio=13=op,dh" >> "$CONFIG_TXT"
-echo "[2b/13] LED RGB boot indicator configuré (GPIO13 vert)"
+echo "[2b/13] LED RGB boot indicator configuré (GPIO13 vert, GPIO12/16 strippés)"
 
 if [ "$MODEL" = "pi0-wired" ] || [ "$MODEL" = "pi0-lora-wired" ]; then
     # miniuart-bt déplace le BT sur ttyS0 et libère le PL011 (ttyAMA0) pour la TIC.
@@ -77,6 +82,13 @@ if [ "$MODEL" = "pi0-wired" ] || [ "$MODEL" = "pi0-lora-wired" ]; then
     CMDLINE_TXT="${CONFIG_TXT%/config.txt}/cmdline.txt"
     sed -i 's/console=serial0,[0-9]* *//g; s/console=ttyAMA0,[0-9]* *//g' "$CMDLINE_TXT"
     echo "[2b/13] UART configuré (ttyAMA0 TIC, BT sur ttyS0, kernel console libérée)"
+fi
+
+if [ "$MODEL" = "pi0-lora" ] || [ "$MODEL" = "pi0-lora-wired" ]; then
+    # SPI requis pour parler à la RFM95 (module LoRa). Sans ça : /dev/spidev* absent
+    # → raspi_lora throw "Failed to add edge detection" → mode sans radio.
+    grep -q "^dtparam=spi=on" "$CONFIG_TXT" || echo "dtparam=spi=on" >> "$CONFIG_TXT"
+    echo "[2b/13] SPI activé pour LoRa (dtparam=spi=on)"
 fi
 
 # --------------------------------------------------------------------------
