@@ -1,4 +1,4 @@
 pyyaml
 pyserial
 raspi_lora
-RPi.GPIO
+rpi-lgpio

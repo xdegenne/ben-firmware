@@ -5,6 +5,11 @@ After=basic.target
 [Service]
 Type=simple
 User=ben
+# WorkingDirectory writable par `ben` requis : rpi-lgpio (drop-in replacement de
+# RPi.GPIO pour kernel Trixie 6.12+) crée un FIFO de notification `.lgd-nfy*`
+# en chemin RELATIF dans le CWD. Sans WorkingDirectory= le service hérite `/`
+# → FileNotFoundError, le service crashe en boucle.
+WorkingDirectory=/opt/ben/repo/src/pi/lora-receiver
 ExecStart=/usr/bin/python3 /opt/ben/repo/src/pi/lora-receiver/main.py
 Restart=always
 RestartSec=10
