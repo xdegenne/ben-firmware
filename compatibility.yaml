@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.12"
+        latest: "0.0.13"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -34,6 +34,9 @@ devices:
           - version: "0.0.12"
             released: "2026-05-31"
             notes: "heartbeat UX-driven : OK très court (50ms × 5/255), erreur visible (300ms × 8/255)"
+          - version: "0.0.13"
+            released: "2026-05-31"
+            notes: "flashs RX jaune + HMAC OK vert discrets 50ms × 5/255 ; heartbeat rapproché (sleep 0.5s)"
       arduino:
         minimum: "0.0.1"
         latest: "0.0.1"
@@ -102,6 +105,10 @@ updates:
       to: "0.0.12"
       tag: "pi-0.0.12"
       script: "updates/pi0-lora/0.0.11_to_0.0.12/update.sh"
+    - from: "0.0.12"
+      to: "0.0.13"
+      tag: "pi-0.0.13"
+      script: "updates/pi0-lora/0.0.12_to_0.0.13/update.sh"
 
   pi0-wired:
     - from: "0.0.2"

@@ -266,8 +266,8 @@ def on_recv(payload) -> None:
         now = time.time()
         time_since_prev = now - last_frame_time
         last_frame_time = now
-        blink_rgb(0, 0, 30)  # bleu — trame reçue
-        sleep(0.15)          # délai pour distinguer du flash suivant
+        blink_rgb(5, 5, 0, 0.05)  # jaune court & faible — trame reçue (RF only, avant validation)
+        sleep(0.4)                # délai pour distinguer du flash suivant
 
         raw = bytes(payload.message)
         rssi = payload.rssi
@@ -351,7 +351,7 @@ def on_recv(payload) -> None:
             log.warning(f"{active_name} en décroissance : {index_value} < {prev_value}")
             blink_rgb(30, 15, 0, 0.3)  # orange — décroissance
         else:
-            blink_rgb(0, 30, 0, 0.2)   # vert — données valides
+            blink_rgb(0, 5, 0, 0.05)   # vert court & faible — données valides (HMAC OK)
 
         if index_value >= prev_value:
             state["indexes"][active_name] = int(index_value)
@@ -396,7 +396,7 @@ def heartbeat_loop() -> None:
             blink_rgb(0, 5, 0, 0.05)   # vert court — WiFi up (RAS)
         else:
             blink_rgb(5, 0, 8, 0.3)    # violet long — WiFi down (alerte)
-        sleep(1.0)
+        sleep(0.5)
         elapsed = time.time() - last_frame_time
         if elapsed <= TIC_HEALTH_TIMEOUT_S:
             blink_rgb(0, 5, 0, 0.05)   # vert court — trame récente (RAS)
