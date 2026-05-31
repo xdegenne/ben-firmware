@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.9"
+        latest: "0.0.10"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -25,6 +25,9 @@ devices:
           - version: "0.0.9"
             released: "2026-05-31"
             notes: "heartbeat LED présence calme (0.4s × intensité 10/255)"
+          - version: "0.0.10"
+            released: "2026-05-31"
+            notes: "heartbeat LED encore plus discret (0.1s × intensité 5/255, séparés de 1s)"
       arduino:
         minimum: "0.0.1"
         latest: "0.0.1"
@@ -81,6 +84,10 @@ updates:
       to: "0.0.9"
       tag: "pi-0.0.9"
       script: "updates/pi0-lora/0.0.8_to_0.0.9/update.sh"
+    - from: "0.0.9"
+      to: "0.0.10"
+      tag: "pi-0.0.10"
+      script: "updates/pi0-lora/0.0.9_to_0.0.10/update.sh"
 
   pi0-wired:
     - from: "0.0.2"

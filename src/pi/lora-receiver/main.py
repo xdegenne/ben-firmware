@@ -386,20 +386,20 @@ def is_wifi_up() -> bool:
         return False
 
 def heartbeat_loop() -> None:
-    """Toutes les 15s : flash réseau (vert=WiFi OK, violet=down) puis flash LoRa (vert=récent <90s, orange=timeout).
-    Durées et intensités revues pour une présence "calme" (0.4 s × intensité 10/255 = ~4%)."""
+    """Toutes les RECEPTION_TIMEOUT_S : flash réseau (vert=WiFi OK, violet=down) puis flash LoRa (vert=récent <90s, orange=timeout).
+    Durées et intensités revues pour une présence "discrète" : 2 flashs courts (0.1 s × intensité 5/255 = ~2%) séparés de 1 s."""
     sleep(1)  # laisse le fondu se terminer
     while True:
         if is_wifi_up():
-            blink_rgb(0, 10, 0, 0.4)   # vert — WiFi up
+            blink_rgb(0, 5, 0, 0.1)    # vert — WiFi up
         else:
-            blink_rgb(7, 0, 10, 0.4)   # violet — WiFi down
-        sleep(0.5)
+            blink_rgb(3, 0, 5, 0.1)    # violet — WiFi down
+        sleep(1.0)
         elapsed = time.time() - last_frame_time
         if elapsed <= TIC_HEALTH_TIMEOUT_S:
-            blink_rgb(0, 10, 0, 0.4)   # vert — trame récente
+            blink_rgb(0, 5, 0, 0.1)    # vert — trame récente
         else:
-            blink_rgb(7, 2, 0, 0.4)    # orange foncé — timeout LoRa
+            blink_rgb(3, 1, 0, 0.1)    # orange foncé — timeout LoRa
         sleep(RECEPTION_TIMEOUT_S)
 
 # ---------------------------------------------------------------------------
