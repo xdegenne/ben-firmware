@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.2"
+        latest: "0.0.9"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -19,6 +19,12 @@ devices:
           - version: "0.0.2"
             released: "2026-05-30"
             notes: "log-only baseline (Influx stripped, hostname rename)"
+          - version: "0.0.8"
+            released: "2026-05-31"
+            notes: "fix SPI + rpi-lgpio + WorkingDirectory + RPi.GPIO transitive uninstall + raspi_lora SNR sign"
+          - version: "0.0.9"
+            released: "2026-05-31"
+            notes: "heartbeat LED présence calme (0.4s × intensité 10/255)"
       arduino:
         minimum: "0.0.1"
         latest: "0.0.1"
@@ -71,7 +77,10 @@ devices:
 updates:
 
   pi0-lora:
-    []                  # no in-field transitions yet
+    - from: "0.0.8"
+      to: "0.0.9"
+      tag: "pi-0.0.9"
+      script: "updates/pi0-lora/0.0.8_to_0.0.9/update.sh"
 
   pi0-wired:
     - from: "0.0.2"

@@ -103,7 +103,7 @@ RGB_R = 12
 RGB_G = 13
 RGB_B = 16
 
-RECEPTION_TIMEOUT_S  = 15   # intervalle heartbeat
+RECEPTION_TIMEOUT_S  = 60   # intervalle heartbeat (passé de 15s à 60s pour moins de scintillement)
 TIC_HEALTH_TIMEOUT_S = 90  # seuil sans trame TIC pour le 2e flash du heartbeat
 
 GPIO.setmode(GPIO.BCM)
@@ -386,19 +386,20 @@ def is_wifi_up() -> bool:
         return False
 
 def heartbeat_loop() -> None:
-    """Toutes les 15s : flash réseau (vert=WiFi OK, violet=down) puis flash LoRa (vert=récent <90s, orange=timeout)."""
+    """Toutes les 15s : flash réseau (vert=WiFi OK, violet=down) puis flash LoRa (vert=récent <90s, orange=timeout).
+    Durées et intensités revues pour une présence "calme" (0.4 s × intensité 10/255 = ~4%)."""
     sleep(1)  # laisse le fondu se terminer
     while True:
         if is_wifi_up():
-            blink_rgb(0, 30, 0, 0.05)   # vert — WiFi up
+            blink_rgb(0, 10, 0, 0.4)   # vert — WiFi up
         else:
-            blink_rgb(20, 0, 30, 0.05)  # violet — WiFi down
-        sleep(0.3)
+            blink_rgb(7, 0, 10, 0.4)   # violet — WiFi down
+        sleep(0.5)
         elapsed = time.time() - last_frame_time
         if elapsed <= TIC_HEALTH_TIMEOUT_S:
-            blink_rgb(0, 30, 0, 0.05)   # vert — trame récente
+            blink_rgb(0, 10, 0, 0.4)   # vert — trame récente
         else:
-            blink_rgb(20, 5, 0, 0.05)   # orange foncé — timeout LoRa
+            blink_rgb(7, 2, 0, 0.4)    # orange foncé — timeout LoRa
         sleep(RECEPTION_TIMEOUT_S)
 
 # ---------------------------------------------------------------------------
