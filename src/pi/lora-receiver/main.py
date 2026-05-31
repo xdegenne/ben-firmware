@@ -93,7 +93,7 @@ WATCHDOG_THRESHOLD  = 180
 RSSI_MIN_PLAUSIBLE = -130
 RSSI_MAX_PLAUSIBLE = 0
 SNR_MIN_PLAUSIBLE  = -25
-SNR_MAX_PLAUSIBLE  = 12
+SNR_MAX_PLAUSIBLE  = 20   # bumpé depuis 12 : SNR > 12 dB est valide en close-range (proxy émetteur)
 
 # ---------------------------------------------------------------------------
 # LED RGB (GPIO BCM) — cathode commune
