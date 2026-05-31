@@ -13,7 +13,7 @@ set -euo pipefail
 
 REPO_URL="https://github.com/xdegenne/ben-firmware.git"
 REPO_PATH="/opt/ben/repo"
-INITIAL_TAG="pi-0.0.7"
+INITIAL_TAG="pi-0.0.8"
 
 if [ $# -ne 3 ]; then
     echo "Usage: sudo ./install.sh <model> <hw-revision> <device-id>" >&2
@@ -152,7 +152,7 @@ if [ "$MODEL" = "pi0-lora" ] || [ "$MODEL" = "pi0-lora-wired" ]; then
   "deviceId": "$DEVICE_ID",
   "model": "$MODEL",
   "hardwareRevision": "$HW_REV",
-  "softwareVersion": "0.0.7",
+  "softwareVersion": "0.0.8",
   "arduinoFirmwareVersion": "0.0.1"
 }
 EOF
@@ -162,7 +162,7 @@ else
   "deviceId": "$DEVICE_ID",
   "model": "$MODEL",
   "hardwareRevision": "$HW_REV",
-  "softwareVersion": "0.0.7"
+  "softwareVersion": "0.0.8"
 }
 EOF
 fi
@@ -213,6 +213,16 @@ echo "[9/13] GPG key imported"
 # --------------------------------------------------------------------------
 pip3 install --break-system-packages -r "$REPO_PATH/src/pi/requirements.txt"
 echo "[10/13] Python dependencies installed"
+
+# Force uninstall RPi.GPIO : raspi_lora le déclare en dépendance setup.py, donc
+# pip l'installe automatiquement même si requirements.txt a rpi-lgpio. Le pip
+# RPi.GPIO finit dans /usr/local et shadow le rpi-lgpio système (apt) qui est
+# le seul compatible avec le chardev GPIO du kernel Trixie 6.12+. Sans cette
+# désinstallation, ben-lora-receiver crashe avec "Failed to add edge detection".
+if [ "$MODEL" = "pi0-lora" ] || [ "$MODEL" = "pi0-lora-wired" ]; then
+    pip3 uninstall -y --break-system-packages RPi.GPIO 2>/dev/null || true
+    echo "[10a/13] RPi.GPIO transitif uninstall (rpi-lgpio prend la main)"
+fi
 
 # --------------------------------------------------------------------------
 # 10b. Patch raspi_lora SNR sign-handling (modèles LoRa uniquement)
