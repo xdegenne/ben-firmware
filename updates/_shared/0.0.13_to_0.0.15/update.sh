@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# update.sh — pi-0.0.13 → pi-0.0.14
+# update.sh — pi-0.0.13 → pi-0.0.15
 #
 # Déploie le mode provisioning BLE + boot-time network check.
 # Compatible pi0-wired ET pi0-lora — un seul script partagé via symlink.
@@ -14,9 +14,9 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-TRANSITION="pi-0.0.13 → pi-0.0.14"
+TRANSITION="pi-0.0.13 → pi-0.0.15"
 LOG_TAG="[update $TRANSITION]"
-APT_LOG="/var/log/ben-update-0.0.14-apt.log"
+APT_LOG="/var/log/ben-update-0.0.15-apt.log"
 
 log()  { echo "$LOG_TAG $*"; }
 warn() { echo "$LOG_TAG ⚠ $*" >&2; }

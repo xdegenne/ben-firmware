@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.14"
+        latest: "0.0.15"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -39,7 +39,10 @@ devices:
             notes: "flashs RX jaune + HMAC OK vert discrets 50ms × 5/255 ; heartbeat rapproché (sleep 0.5s)"
           - version: "0.0.14"
             released: "2026-06-01"
-            notes: "BLE WiFi provisioning + boot-time network check (check_network → BLE/normal). LED violet-jaune en BLE, 5 flashs vert/rouge OK/KO. Reboot post-succès. Pairing reporté."
+            notes: "BLE WiFi provisioning + boot-time network check — NEVER DEPLOYED (tag pi-0.0.14 publié mais update.sh.sha256 manquant → check_update.py fail). Voir 0.0.15."
+          - version: "0.0.15"
+            released: "2026-06-01"
+            notes: "idem 0.0.14 + .sha256 ajoutés. Transition pi-0.0.13 → pi-0.0.15 direct (saute 0.0.14 inutilisable)."
       arduino:
         minimum: "0.0.1"
         latest: "0.0.1"
@@ -50,7 +53,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.14"
+        latest: "0.0.15"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -75,7 +78,10 @@ devices:
             notes: "alignement du numéro de version avec pi0-lora (install.sh écrivait déjà 0.0.13 partout — versions 0.0.7..0.0.12 sautées, aucun pi0-wired field n'a vécu ces versions)"
           - version: "0.0.14"
             released: "2026-06-01"
-            notes: "BLE WiFi provisioning + boot-time network check. Idem pi0-lora — script update.sh partagé via symlink (cf. updates/_shared/)"
+            notes: "NEVER DEPLOYED (cf. note pi0-lora 0.0.14)."
+          - version: "0.0.15"
+            released: "2026-06-01"
+            notes: "BLE WiFi provisioning + boot-time network check. Idem pi0-lora — script update.sh partagé via symlink (cf. updates/_shared/)."
 
   pi0-lora-wired:       # Raspberry Pi Zero W with both direct TIC (wired) and LoRa reception
     rev01:
@@ -119,9 +125,13 @@ updates:
       tag: "pi-0.0.13"
       script: "updates/pi0-lora/0.0.12_to_0.0.13/update.sh"
     - from: "0.0.13"
-      to: "0.0.14"
-      tag: "pi-0.0.14"
-      script: "updates/pi0-lora/0.0.13_to_0.0.14/update.sh"
+      to: "0.0.15"
+      tag: "pi-0.0.15"
+      script: "updates/pi0-lora/0.0.13_to_0.0.15/update.sh"
+    - from: "0.0.14"
+      to: "0.0.15"
+      tag: "pi-0.0.15"
+      script: "updates/pi0-lora/0.0.14_to_0.0.15/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -141,9 +151,13 @@ updates:
       tag: "pi-0.0.6"
       script: "updates/pi0-wired/0.0.5_to_0.0.6/update.sh"
     - from: "0.0.13"
-      to: "0.0.14"
-      tag: "pi-0.0.14"
-      script: "updates/pi0-wired/0.0.13_to_0.0.14/update.sh"
+      to: "0.0.15"
+      tag: "pi-0.0.15"
+      script: "updates/pi0-wired/0.0.13_to_0.0.15/update.sh"
+    - from: "0.0.14"
+      to: "0.0.15"
+      tag: "pi-0.0.15"
+      script: "updates/pi0-wired/0.0.14_to_0.0.15/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet
