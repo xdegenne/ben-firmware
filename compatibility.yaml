@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.17"
+        latest: "0.0.18"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -48,7 +48,10 @@ devices:
             notes: "fix update.sh : suppression du redirect bash `> /var/log/...` qui faisait fail le script tournant comme `ben`. Transitions ajoutées 0.0.15 → 0.0.16 (no-op) pour aligner ben-0003."
           - version: "0.0.17"
             released: "2026-06-01"
-            notes: "nouveau service ben-led-release.service (oneshot) ordonné Before= tous les services BEN — libère les pins GPIO 12/13/16 du firmware (boot indicator) via `pinctrl set <pin> ip` pour qu'ensuite check_network/tic-reader/lora-receiver/ble-provisioner puissent faire leur PWM setup. Le boot indicator firmware est conservé."
+            notes: "tag pi-0.0.17 PUBLIÉ avec un update.sh foireux (strip gpio=13=op,dh du config.txt + reboot, perte du boot indicator). ben-0001 a effectivement OTA'd à 0.0.17 et a perdu le boot indicator. Voir 0.0.18 pour la fix."
+          - version: "0.0.18"
+            released: "2026-06-01"
+            notes: "fix 0.0.17 : restaure gpio=13=op,dh dans config.txt si manquant + installe ben-led-release.service (oneshot Before= tous les services BEN qui libère les pins via pinctrl). Transitions 0.0.16 → 0.0.18 et 0.0.17 → 0.0.18 (saute la version 0.0.17 buggy)."
       arduino:
         minimum: "0.0.1"
         latest: "0.0.1"
@@ -59,7 +62,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.17"
+        latest: "0.0.18"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -93,7 +96,10 @@ devices:
             notes: "fix update.sh apt redirect (cf. note pi0-lora 0.0.16). Idem pi0-lora — script update.sh partagé via symlink."
           - version: "0.0.17"
             released: "2026-06-01"
-            notes: "ben-led-release.service (cf. note pi0-lora 0.0.17)."
+            notes: "tag publié buggy (cf. note pi0-lora 0.0.17). Voir 0.0.18."
+          - version: "0.0.18"
+            released: "2026-06-01"
+            notes: "fix 0.0.17 (cf. note pi0-lora 0.0.18)."
 
   pi0-lora-wired:       # Raspberry Pi Zero W with both direct TIC (wired) and LoRa reception
     rev01:
@@ -152,6 +158,10 @@ updates:
       to: "0.0.17"
       tag: "pi-0.0.17"
       script: "updates/pi0-lora/0.0.16_to_0.0.17/update.sh"
+    - from: "0.0.17"
+      to: "0.0.18"
+      tag: "pi-0.0.18"
+      script: "updates/pi0-lora/0.0.17_to_0.0.18/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -186,6 +196,10 @@ updates:
       to: "0.0.17"
       tag: "pi-0.0.17"
       script: "updates/pi0-wired/0.0.16_to_0.0.17/update.sh"
+    - from: "0.0.17"
+      to: "0.0.18"
+      tag: "pi-0.0.18"
+      script: "updates/pi0-wired/0.0.17_to_0.0.18/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet
