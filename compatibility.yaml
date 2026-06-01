@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.16"
+        latest: "0.0.17"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -46,6 +46,9 @@ devices:
           - version: "0.0.16"
             released: "2026-06-01"
             notes: "fix update.sh : suppression du redirect bash `> /var/log/...` qui faisait fail le script tournant comme `ben`. Transitions ajoutées 0.0.15 → 0.0.16 (no-op) pour aligner ben-0003."
+          - version: "0.0.17"
+            released: "2026-06-01"
+            notes: "strip `gpio=*=op,dh` du config.txt (firmware boot indicator) — empêchait ben-network-check de faire le PWM setup au boot. Reboot auto en fin de update.sh pour appliquer."
       arduino:
         minimum: "0.0.1"
         latest: "0.0.1"
@@ -56,7 +59,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.16"
+        latest: "0.0.17"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -88,6 +91,9 @@ devices:
           - version: "0.0.16"
             released: "2026-06-01"
             notes: "fix update.sh apt redirect (cf. note pi0-lora 0.0.16). Idem pi0-lora — script update.sh partagé via symlink."
+          - version: "0.0.17"
+            released: "2026-06-01"
+            notes: "strip gpio=*=op,dh du config.txt (cf. note pi0-lora 0.0.17)."
 
   pi0-lora-wired:       # Raspberry Pi Zero W with both direct TIC (wired) and LoRa reception
     rev01:
@@ -142,6 +148,10 @@ updates:
       to: "0.0.16"
       tag: "pi-0.0.16"
       script: "updates/pi0-lora/0.0.15_to_0.0.16/update.sh"
+    - from: "0.0.16"
+      to: "0.0.17"
+      tag: "pi-0.0.17"
+      script: "updates/pi0-lora/0.0.16_to_0.0.17/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -172,6 +182,10 @@ updates:
       to: "0.0.16"
       tag: "pi-0.0.16"
       script: "updates/pi0-wired/0.0.15_to_0.0.16/update.sh"
+    - from: "0.0.16"
+      to: "0.0.17"
+      tag: "pi-0.0.17"
+      script: "updates/pi0-wired/0.0.16_to_0.0.17/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet

@@ -13,7 +13,7 @@ set -euo pipefail
 
 REPO_URL="https://github.com/xdegenne/ben-firmware.git"
 REPO_PATH="/opt/ben/repo"
-INITIAL_TAG="pi-0.0.16"
+INITIAL_TAG="pi-0.0.17"
 
 if [ $# -ne 3 ]; then
     echo "Usage: sudo ./install.sh <model> <hw-revision> <device-id>" >&2
@@ -62,14 +62,13 @@ else
     CONFIG_TXT="/boot/config.txt"
 fi
 
-# Strip les gpio= R (12) et B (16) baked dans le golden pour la LED blanche du ben-zero.
-# Une fois provisionné, le device a un firmware qui pilote la LED en PWM → on garde
-# uniquement le vert (GPIO13) comme indicateur de boot, puis le service prend la main.
-sed -i '/^gpio=12=op,dh$/d; /^gpio=16=op,dh$/d' "$CONFIG_TXT"
-
-# LED RGB — vert (GPIO13) allumé dès le firmware, avant l'OS
-grep -q "gpio=13=op,dh" "$CONFIG_TXT" || echo "gpio=13=op,dh" >> "$CONFIG_TXT"
-echo "[2b/13] LED RGB boot indicator configuré (GPIO13 vert, GPIO12/16 strippés)"
+# Strip tous les gpio=*=op,dh baked dans le golden image (R=12, G=13, B=16).
+# On ne garde AUCUN boot indicator firmware : sinon le kernel tient les pins
+# au démarrage et ben-network-check.service ne peut pas faire son PWM setup
+# ("GPIO not allocated"). La LED reste éteinte ~30s au boot puis les services
+# BEN prennent la main (bleu → flash vert/rouge → routine du service actif).
+sed -i '/^gpio=12=op,dh$/d; /^gpio=13=op,dh$/d; /^gpio=16=op,dh$/d' "$CONFIG_TXT"
+echo "[2b/13] LED RGB boot indicators strippés (pins libres pour les services BEN)"
 
 if [ "$MODEL" = "pi0-wired" ] || [ "$MODEL" = "pi0-lora-wired" ]; then
     # miniuart-bt déplace le BT sur ttyS0 et libère le PL011 (ttyAMA0) pour la TIC.
@@ -152,7 +151,7 @@ if [ "$MODEL" = "pi0-lora" ] || [ "$MODEL" = "pi0-lora-wired" ]; then
   "deviceId": "$DEVICE_ID",
   "model": "$MODEL",
   "hardwareRevision": "$HW_REV",
-  "softwareVersion": "0.0.16",
+  "softwareVersion": "0.0.17",
   "arduinoFirmwareVersion": "0.0.1"
 }
 EOF
@@ -162,7 +161,7 @@ else
   "deviceId": "$DEVICE_ID",
   "model": "$MODEL",
   "hardwareRevision": "$HW_REV",
-  "softwareVersion": "0.0.16"
+  "softwareVersion": "0.0.17"
 }
 EOF
 fi
