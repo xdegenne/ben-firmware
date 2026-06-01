@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # update.sh — pi-0.0.16 → pi-0.0.17
 #
-# Strip les directives `gpio=*=op,dh` du firmware Pi (config.txt) qui tenaient
-# les pins LED RGB au boot et empêchaient ben-network-check.service de faire
-# son setup PWM ("GPIO not allocated" / "GPIO busy").
+# Installe ben-led-release.service : un oneshot qui libère les pins LED RGB
+# (12/13/16) du firmware au boot, avant que les services BEN (check_network,
+# tic-reader, lora-receiver, ble-provisioner) tentent leur PWM setup.
 #
-# Effet : la LED reste éteinte pendant ~30s de boot puis les services BEN
-# prennent la main proprement (LED bleue check_network, etc.).
-#
-# Une reboot est nécessaire pour que config.txt soit relu par le firmware.
+# Sans ça, check_network rate son setup avec "GPIO not allocated" (le pin 13
+# est tenu par le `gpio=13=op,dh` du config.txt → boot indicator firmware).
+# On garde ce boot indicator (LED verte avant l'OS) — ben-led-release prend
+# juste le relais dès que le système est levé.
 
 set -euo pipefail
 
@@ -17,33 +17,35 @@ LOG_TAG="[update $TRANSITION]"
 log()  { echo "$LOG_TAG $*"; }
 fail() { echo "$LOG_TAG ✗ ERREUR : $*" >&2; exit 1; }
 
-# Pi OS Bookworm/Trixie : /boot/firmware/config.txt. Fallback /boot/config.txt.
-if [ -f /boot/firmware/config.txt ]; then
-    CONFIG_TXT="/boot/firmware/config.txt"
-elif [ -f /boot/config.txt ]; then
-    CONFIG_TXT="/boot/config.txt"
-else
-    fail "config.txt introuvable (ni /boot/firmware/ ni /boot/)"
-fi
-log "config.txt : $CONFIG_TXT"
+REPO_PATH="${REPO_PATH:-/opt/ben/repo}"
 
-# Backup défensif
-sudo cp -p "$CONFIG_TXT" "$CONFIG_TXT.bak-0.0.16" \
-    || fail "backup de $CONFIG_TXT a échoué"
-log "backup : $CONFIG_TXT.bak-0.0.16"
+# Préflight
+log "préflight : pinctrl présent (nécessaire pour libérer les pins)"
+command -v pinctrl >/dev/null \
+    || fail "/usr/bin/pinctrl absent — apt install raspi-utils manquant ?"
 
-# Strip GPIO 12 / 13 / 16 boot indicators
-sudo sed -i '/^gpio=12=op,dh$/d; /^gpio=13=op,dh$/d; /^gpio=16=op,dh$/d' "$CONFIG_TXT" \
-    || fail "sed sur $CONFIG_TXT a échoué"
+log "préflight : unit source présente"
+SRC="$REPO_PATH/config/systemd/ben-led-release.service"
+[ -f "$SRC" ] || fail "fichier manquant : $SRC"
 
-# Vérification : aucune ligne restante
-if grep -E '^gpio=(12|13|16)=op,dh$' "$CONFIG_TXT" >/dev/null; then
-    fail "des directives gpio= persistent dans $CONFIG_TXT — strip incomplet"
-fi
-log "GPIO 12/13/16 boot indicators retirés"
+# Installation
+log "[1/3] install /etc/systemd/system/ben-led-release.service"
+sudo install -m 644 -o root -g root "$SRC" /etc/systemd/system/ben-led-release.service \
+    || fail "install de l'unit a échoué"
 
-# Reboot : config.txt n'est lu qu'au démarrage du firmware. Sans reboot la
-# correction reste latente jusqu'à la prochaine coupure manuelle.
-log "✓ update OK — reboot dans 5s pour appliquer le nouveau config.txt"
-sleep 5
-sudo systemctl reboot
+log "[2/3] systemctl daemon-reload + enable ben-led-release"
+sudo systemctl daemon-reload \
+    || fail "daemon-reload a échoué"
+sudo systemctl enable ben-led-release.service \
+    || fail "enable ben-led-release.service a échoué"
+
+# Application immédiate (sans reboot) — release des pins maintenant.
+# Pas de fail-fast ici : si pinctrl rate (pin already free, etc.), on continue.
+log "[3/3] release immédiate des pins 12/13/16 (effet sans reboot)"
+sudo pinctrl set 12 ip || log "       ⚠ pinctrl 12 (non bloquant)"
+sudo pinctrl set 13 ip || log "       ⚠ pinctrl 13 (non bloquant)"
+sudo pinctrl set 16 ip || log "       ⚠ pinctrl 16 (non bloquant)"
+
+log "✓ update OK — ben-led-release.service installé et enabled."
+log "  Effet immédiat : la LED boot indicator est éteinte. Au prochain reboot"
+log "  le service tournera automatiquement avant les autres."

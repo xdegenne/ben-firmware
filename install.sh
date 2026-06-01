@@ -62,13 +62,13 @@ else
     CONFIG_TXT="/boot/config.txt"
 fi
 
-# Strip tous les gpio=*=op,dh baked dans le golden image (R=12, G=13, B=16).
-# On ne garde AUCUN boot indicator firmware : sinon le kernel tient les pins
-# au démarrage et ben-network-check.service ne peut pas faire son PWM setup
-# ("GPIO not allocated"). La LED reste éteinte ~30s au boot puis les services
-# BEN prennent la main (bleu → flash vert/rouge → routine du service actif).
-sed -i '/^gpio=12=op,dh$/d; /^gpio=13=op,dh$/d; /^gpio=16=op,dh$/d' "$CONFIG_TXT"
-echo "[2b/13] LED RGB boot indicators strippés (pins libres pour les services BEN)"
+# Strip les gpio= R (12) et B (16) baked dans le golden pour la LED blanche du ben-zero.
+# Le vert (GPIO13) reste comme boot indicator firmware (allumé avant l'OS).
+# Le service ben-led-release.service libère ensuite ce pin du firmware → permet aux
+# services BEN (check_network, tic-reader, …) de faire leur setup PWM proprement.
+sed -i '/^gpio=12=op,dh$/d; /^gpio=16=op,dh$/d' "$CONFIG_TXT"
+grep -q "gpio=13=op,dh" "$CONFIG_TXT" || echo "gpio=13=op,dh" >> "$CONFIG_TXT"
+echo "[2b/13] LED RGB boot indicator GPIO13 conservé, GPIO12/16 strippés"
 
 if [ "$MODEL" = "pi0-wired" ] || [ "$MODEL" = "pi0-lora-wired" ]; then
     # miniuart-bt déplace le BT sur ttyS0 et libère le PL011 (ttyAMA0) pour la TIC.
@@ -263,6 +263,10 @@ echo "[12/13] Hostname renamed: $DEVICE_ID"
 # --------------------------------------------------------------------------
 systemctl enable ben-update.timer
 systemctl start  ben-update.timer
+
+# Libération des pins LED RGB (12/13/16) du firmware au boot, avant tous les
+# autres services BEN. Sans ça check_network rate son PWM setup.
+systemctl enable ben-led-release.service
 
 # Décideur boot-time : ping Internet → start ben-ble-provisioner si KO.
 # ben-ble-provisioner.service reste 'static' (démarré on-demand).

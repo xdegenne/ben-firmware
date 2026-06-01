@@ -1,0 +1,18 @@
+[Unit]
+Description=BEN LED pin release (free GPIO 12/13/16 from firmware boot indicator)
+# Aucune dépendance — ce service doit tourner le plus tôt possible et libérer
+# les pins LED RGB du firmware avant que les services BEN tentent leur PWM setup.
+After=local-fs.target
+Before=ben-network-check.service ben-tic-reader.service ben-lora-receiver.service ben-ble-provisioner.service basic.target
+
+[Service]
+Type=oneshot
+# `pinctrl set <pin> ip` remet le pin en INPUT (libère du firmware-owned).
+# 3 ExecStart pour rester explicit et tracer chaque pin dans le journal.
+ExecStart=/usr/bin/pinctrl set 12 ip
+ExecStart=/usr/bin/pinctrl set 13 ip
+ExecStart=/usr/bin/pinctrl set 16 ip
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

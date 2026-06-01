@@ -48,7 +48,7 @@ devices:
             notes: "fix update.sh : suppression du redirect bash `> /var/log/...` qui faisait fail le script tournant comme `ben`. Transitions ajoutées 0.0.15 → 0.0.16 (no-op) pour aligner ben-0003."
           - version: "0.0.17"
             released: "2026-06-01"
-            notes: "strip `gpio=*=op,dh` du config.txt (firmware boot indicator) — empêchait ben-network-check de faire le PWM setup au boot. Reboot auto en fin de update.sh pour appliquer."
+            notes: "nouveau service ben-led-release.service (oneshot) ordonné Before= tous les services BEN — libère les pins GPIO 12/13/16 du firmware (boot indicator) via `pinctrl set <pin> ip` pour qu'ensuite check_network/tic-reader/lora-receiver/ble-provisioner puissent faire leur PWM setup. Le boot indicator firmware est conservé."
       arduino:
         minimum: "0.0.1"
         latest: "0.0.1"
@@ -93,7 +93,7 @@ devices:
             notes: "fix update.sh apt redirect (cf. note pi0-lora 0.0.16). Idem pi0-lora — script update.sh partagé via symlink."
           - version: "0.0.17"
             released: "2026-06-01"
-            notes: "strip gpio=*=op,dh du config.txt (cf. note pi0-lora 0.0.17)."
+            notes: "ben-led-release.service (cf. note pi0-lora 0.0.17)."
 
   pi0-lora-wired:       # Raspberry Pi Zero W with both direct TIC (wired) and LoRa reception
     rev01:
