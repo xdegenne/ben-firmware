@@ -1,0 +1,15 @@
+[Unit]
+Description=BEN boot-time network check (decides if BLE provisioning is needed)
+After=NetworkManager.service
+Wants=NetworkManager.service
+# Ordre LED : check_network anime la LED bleue, puis libère les pins.
+# tic-reader attend pour prendre la main proprement sur la LED.
+Before=ben-tic-reader.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/ben/repo/src/pi/provisioner/check_network.py
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

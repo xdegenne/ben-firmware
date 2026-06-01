@@ -1,0 +1,22 @@
+[Unit]
+Description=BEN BLE WiFi Provisioner
+After=basic.target bluetooth.service NetworkManager.service ben-network-check.service
+Wants=bluetooth.service
+# Conflit LED + GPIO avec tic-reader → mutuellement exclusifs
+Conflicts=ben-tic-reader.service
+
+[Service]
+Type=simple
+# root requis : DBus BlueZ (advertising), nmcli (modif connexions), PWM GPIO,
+# et systemctl start ben-tic-reader.service à la sortie gracieuse.
+User=root
+WorkingDirectory=/opt/ben/repo/src/pi/provisioner
+ExecStart=/usr/bin/python3 /opt/ben/repo/src/pi/provisioner/main.py
+# Restart uniquement si le process plante / sort en exit ≠ 0.
+# Exit 0 = sortie gracieuse après succès → pas de relance.
+# Exit 1 = déconnexion BLE sans succès → systemd relance, fresh advertising.
+Restart=on-failure
+RestartSec=2
+
+# Pas d'Install : ce service n'est PAS démarré au boot directement.
+# C'est ben-network-check.service qui décide de le lancer ou non.
