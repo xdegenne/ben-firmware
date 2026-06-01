@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# update.sh — pi-0.0.13 → pi-0.0.15
+# update.sh — pi-0.0.13 → pi-0.0.16
 #
 # Déploie le mode provisioning BLE + boot-time network check.
 # Compatible pi0-wired ET pi0-lora — un seul script partagé via symlink.
@@ -14,9 +14,8 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-TRANSITION="pi-0.0.13 → pi-0.0.15"
+TRANSITION="pi-0.0.13 → pi-0.0.16"
 LOG_TAG="[update $TRANSITION]"
-APT_LOG="/var/log/ben-update-0.0.15-apt.log"
 
 log()  { echo "$LOG_TAG $*"; }
 warn() { echo "$LOG_TAG ⚠ $*" >&2; }
@@ -66,9 +65,10 @@ log "modèle détecté : $MODEL"
 # 1. Dépendances système (apt — idempotent : skip si déjà installé)
 # ---------------------------------------------------------------------------
 log "[1/5] apt install python3-dbus python3-gi"
-sudo apt-get install -y --no-install-recommends python3-dbus python3-gi \
-    >"$APT_LOG" 2>&1 \
-    || fail "apt install a échoué — voir $APT_LOG"
+# Pas de redirect bash (le script tourne comme `ben`, sudo n'élève pas le `>`).
+# La sortie part vers stdout/stderr → capturée par systemd-journal de ben-update.service.
+sudo apt-get install -y --no-install-recommends python3-dbus python3-gi 2>&1 \
+    || fail "apt install a échoué (voir journalctl -u ben-update.service)"
 log "       OK"
 
 # ---------------------------------------------------------------------------
