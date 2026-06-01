@@ -2,3 +2,4 @@ pyyaml
 pyserial
 raspi_lora
 rpi-lgpio
+bluezero

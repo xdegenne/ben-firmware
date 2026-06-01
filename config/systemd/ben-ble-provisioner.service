@@ -2,8 +2,10 @@
 Description=BEN BLE WiFi Provisioner
 After=basic.target bluetooth.service NetworkManager.service ben-network-check.service
 Wants=bluetooth.service
-# Conflit LED + GPIO avec tic-reader → mutuellement exclusifs
-Conflicts=ben-tic-reader.service
+# Conflit LED + GPIO avec les agents normaux → mutuellement exclusifs.
+# Les 2 modèles (pi0-wired = tic-reader, pi0-lora = lora-receiver) sont listés
+# pour qu'une seule unit suffise au déploiement OTA.
+Conflicts=ben-tic-reader.service ben-lora-receiver.service
 
 [Service]
 Type=simple

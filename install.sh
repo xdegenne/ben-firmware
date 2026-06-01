@@ -13,7 +13,7 @@ set -euo pipefail
 
 REPO_URL="https://github.com/xdegenne/ben-firmware.git"
 REPO_PATH="/opt/ben/repo"
-INITIAL_TAG="pi-0.0.13"
+INITIAL_TAG="pi-0.0.14"
 
 if [ $# -ne 3 ]; then
     echo "Usage: sudo ./install.sh <model> <hw-revision> <device-id>" >&2
@@ -46,9 +46,9 @@ echo "[1/13] Arguments: $DEVICE_ID  model=$MODEL  hw=$HW_REV"
 # 2. Install system dependencies + locale
 # --------------------------------------------------------------------------
 apt-get update -qq
-apt-get install -y git python3 python3-pip
+apt-get install -y git python3 python3-pip python3-dbus python3-gi
 timedatectl set-timezone Europe/Paris
-echo "[2/13] System dependencies installed, timezone=Europe/Paris"
+echo "[2/13] System dependencies installed (incl. BLE provisioning deps), timezone=Europe/Paris"
 
 # --------------------------------------------------------------------------
 # 2b. Configure UART (models with wired TIC) + LED RGB boot indicator
@@ -152,7 +152,7 @@ if [ "$MODEL" = "pi0-lora" ] || [ "$MODEL" = "pi0-lora-wired" ]; then
   "deviceId": "$DEVICE_ID",
   "model": "$MODEL",
   "hardwareRevision": "$HW_REV",
-  "softwareVersion": "0.0.13",
+  "softwareVersion": "0.0.14",
   "arduinoFirmwareVersion": "0.0.1"
 }
 EOF
@@ -162,7 +162,7 @@ else
   "deviceId": "$DEVICE_ID",
   "model": "$MODEL",
   "hardwareRevision": "$HW_REV",
-  "softwareVersion": "0.0.13"
+  "softwareVersion": "0.0.14"
 }
 EOF
 fi
@@ -264,6 +264,10 @@ echo "[12/13] Hostname renamed: $DEVICE_ID"
 # --------------------------------------------------------------------------
 systemctl enable ben-update.timer
 systemctl start  ben-update.timer
+
+# Décideur boot-time : ping Internet → start ben-ble-provisioner si KO.
+# ben-ble-provisioner.service reste 'static' (démarré on-demand).
+systemctl enable ben-network-check.service
 
 if [ "$MODEL" = "pi0-lora" ]; then
     systemctl enable ben-lora-receiver.service
