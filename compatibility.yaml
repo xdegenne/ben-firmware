@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.19"
+        latest: "0.0.20"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -55,7 +55,9 @@ devices:
           - version: "0.0.19"
             released: "2026-06-01"
             notes: "fix 0.0.18 : retire Before=basic.target de ben-led-release.service (cassait le cycle multi-user.target ↔ basic.target). Service tourne enfin au boot, LED check_network fonctionne."
-      arduino:
+          - version: "0.0.20"
+            released: "2026-06-01"
+            notes: "restaure gpio=13=op,dh dans config.txt (pi-0.0.17 l'avait stripé) → boot indicator vert revient. ben-led-release.service modifié : éteint le boot indicator puis fait un flash blanc 150ms de welcome avant de release les pins."
         minimum: "0.0.1"
         latest: "0.0.1"
         history:
@@ -65,7 +67,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.19"
+        latest: "0.0.20"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -106,6 +108,9 @@ devices:
           - version: "0.0.19"
             released: "2026-06-01"
             notes: "fix 0.0.18 ordering cycle (cf. note pi0-lora 0.0.19)."
+          - version: "0.0.20"
+            released: "2026-06-01"
+            notes: "restore boot indicator + welcome flash (cf. note pi0-lora 0.0.20)."
 
   pi0-lora-wired:       # Raspberry Pi Zero W with both direct TIC (wired) and LoRa reception
     rev01:
@@ -172,6 +177,10 @@ updates:
       to: "0.0.19"
       tag: "pi-0.0.19"
       script: "updates/pi0-lora/0.0.18_to_0.0.19/update.sh"
+    - from: "0.0.19"
+      to: "0.0.20"
+      tag: "pi-0.0.20"
+      script: "updates/pi0-lora/0.0.19_to_0.0.20/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -214,6 +223,10 @@ updates:
       to: "0.0.19"
       tag: "pi-0.0.19"
       script: "updates/pi0-wired/0.0.18_to_0.0.19/update.sh"
+    - from: "0.0.19"
+      to: "0.0.20"
+      tag: "pi-0.0.20"
+      script: "updates/pi0-wired/0.0.19_to_0.0.20/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet

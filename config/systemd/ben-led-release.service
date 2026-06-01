@@ -10,8 +10,19 @@ Before=ben-network-check.service ben-tic-reader.service ben-lora-receiver.servic
 
 [Service]
 Type=oneshot
-# `pinctrl set <pin> ip` remet le pin en INPUT (libère du firmware-owned).
-# 3 ExecStart pour rester explicit et tracer chaque pin dans le journal.
+# Petite séquence "welcome" : éteint le boot indicator (vert tenu par le
+# firmware) → flash blanc 150ms (R+G+B haut) → off → release des pins pour
+# que les services suivants puissent les claim via PWM.
+ExecStart=/usr/bin/pinctrl set 13 op dl
+ExecStart=/bin/sleep 0.3
+ExecStart=/usr/bin/pinctrl set 12 op dh
+ExecStart=/usr/bin/pinctrl set 13 op dh
+ExecStart=/usr/bin/pinctrl set 16 op dh
+ExecStart=/bin/sleep 0.15
+ExecStart=/usr/bin/pinctrl set 12 op dl
+ExecStart=/usr/bin/pinctrl set 13 op dl
+ExecStart=/usr/bin/pinctrl set 16 op dl
+ExecStart=/bin/sleep 0.15
 ExecStart=/usr/bin/pinctrl set 12 ip
 ExecStart=/usr/bin/pinctrl set 13 ip
 ExecStart=/usr/bin/pinctrl set 16 ip
