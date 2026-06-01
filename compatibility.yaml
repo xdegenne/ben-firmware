@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.18"
+        latest: "0.0.19"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -51,7 +51,10 @@ devices:
             notes: "tag pi-0.0.17 PUBLIÉ avec un update.sh foireux (strip gpio=13=op,dh du config.txt + reboot, perte du boot indicator). ben-0001 a effectivement OTA'd à 0.0.17 et a perdu le boot indicator. Voir 0.0.18 pour la fix."
           - version: "0.0.18"
             released: "2026-06-01"
-            notes: "fix 0.0.17 : restaure gpio=13=op,dh dans config.txt si manquant + installe ben-led-release.service (oneshot Before= tous les services BEN qui libère les pins via pinctrl). Transitions 0.0.16 → 0.0.18 et 0.0.17 → 0.0.18 (saute la version 0.0.17 buggy)."
+            notes: "fix 0.0.17 : installe ben-led-release.service (oneshot Before= tous les services BEN qui libère les pins via pinctrl). Transition 0.0.17 → 0.0.18. Bug latent : Before=basic.target dans l'unit crée un ordering cycle → systemd skip silencieusement le job au boot."
+          - version: "0.0.19"
+            released: "2026-06-01"
+            notes: "fix 0.0.18 : retire Before=basic.target de ben-led-release.service (cassait le cycle multi-user.target ↔ basic.target). Service tourne enfin au boot, LED check_network fonctionne."
       arduino:
         minimum: "0.0.1"
         latest: "0.0.1"
@@ -62,7 +65,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.18"
+        latest: "0.0.19"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -100,6 +103,9 @@ devices:
           - version: "0.0.18"
             released: "2026-06-01"
             notes: "fix 0.0.17 (cf. note pi0-lora 0.0.18)."
+          - version: "0.0.19"
+            released: "2026-06-01"
+            notes: "fix 0.0.18 ordering cycle (cf. note pi0-lora 0.0.19)."
 
   pi0-lora-wired:       # Raspberry Pi Zero W with both direct TIC (wired) and LoRa reception
     rev01:
@@ -162,6 +168,10 @@ updates:
       to: "0.0.18"
       tag: "pi-0.0.18"
       script: "updates/pi0-lora/0.0.17_to_0.0.18/update.sh"
+    - from: "0.0.18"
+      to: "0.0.19"
+      tag: "pi-0.0.19"
+      script: "updates/pi0-lora/0.0.18_to_0.0.19/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -200,6 +210,10 @@ updates:
       to: "0.0.18"
       tag: "pi-0.0.18"
       script: "updates/pi0-wired/0.0.17_to_0.0.18/update.sh"
+    - from: "0.0.18"
+      to: "0.0.19"
+      tag: "pi-0.0.19"
+      script: "updates/pi0-wired/0.0.18_to_0.0.19/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet

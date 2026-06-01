@@ -3,7 +3,10 @@ Description=BEN LED pin release (free GPIO 12/13/16 from firmware boot indicator
 # Aucune dépendance — ce service doit tourner le plus tôt possible et libérer
 # les pins LED RGB du firmware avant que les services BEN tentent leur PWM setup.
 After=local-fs.target
-Before=ben-network-check.service ben-tic-reader.service ben-lora-receiver.service ben-ble-provisioner.service basic.target
+# Avant les services BEN qui pilotent la LED RGB. Pas de Before=basic.target
+# car ça créerait un cycle (multi-user.target wants ben-led-release ↔
+# basic.target required by multi-user.target ↔ Before=basic.target).
+Before=ben-network-check.service ben-tic-reader.service ben-lora-receiver.service ben-ble-provisioner.service
 
 [Service]
 Type=oneshot
