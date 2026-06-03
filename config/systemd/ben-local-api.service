@@ -1,0 +1,14 @@
+[Unit]
+Description=BEN Local API (LAN, read-only consumption data for the app)
+After=basic.target
+
+[Service]
+Type=simple
+User=ben
+WorkingDirectory=/opt/ben/repo/src/pi/store
+ExecStart=/usr/bin/python3 /opt/ben/repo/src/pi/store/local_api.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

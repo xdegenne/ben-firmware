@@ -29,6 +29,11 @@ from time import sleep
 import RPi.GPIO as GPIO
 import serial
 
+# Module store partagé (src/pi/store/db.py)
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "store"))
+import db  # noqa: E402
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -287,6 +292,16 @@ log.info(f"PDL connu : {state.get('adco') or '(aucun)'}")
 Thread(target=watchdog_loop, daemon=True, name="watchdog").start()
 log.info(f"Watchdog démarré (seuil={WATCHDOG_THRESHOLD}s)")
 
+# Store SQLite local (conso + outbox cloud). Non bloquant : si la base est
+# indisponible, le reader continue (LED/logs), juste sans stockage.
+try:
+    measurements_db = db.connect()
+    log.info(f"Store SQLite ouvert : {db.DB_PATH}")
+except Exception as e:
+    measurements_db = None
+    log.error(f"Store SQLite indisponible ({e}) — on continue sans stockage")
+last_prune = time.time()
+
 try:
     while True:
         cycle_success = False
@@ -331,6 +346,11 @@ try:
                     # (le wake-up jaune 30% suffit comme "je suis vivant"). La LED ne
                     # s'allume "fort" QUE en cas d'anomalie : violet stale ou
                     # arc-en-ciel watchdog-restart.
+                    if measurements_db is not None:
+                        try:
+                            db.record_measurement(measurements_db, PDL_INDEX, labels)
+                        except Exception as e:
+                            log.warning(f"store: écriture mesure échouée: {e}")
                     cycle_success = True
 
         except Exception:
@@ -341,6 +361,14 @@ try:
             last_success_time = time.time()
         else:
             blink_rgb(5, 0, 0, 0.1)     # rouge 5% — trame KO
+
+        if measurements_db is not None and time.time() - last_prune > 3600:
+            try:
+                deleted = db.prune(measurements_db)
+                log.info(f"store purge (>{db.RETENTION_DAYS}j): {deleted}")
+            except Exception as e:
+                log.warning(f"store: purge échouée: {e}")
+            last_prune = time.time()
 
         sleep(PERIOD_S)
 

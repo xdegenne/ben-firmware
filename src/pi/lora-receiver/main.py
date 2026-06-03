@@ -39,6 +39,11 @@ from time import sleep
 import RPi.GPIO as GPIO
 from raspi_lora import LoRa, ModemConfig
 
+# Module store partagé (src/pi/store/db.py)
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "store"))
+import db  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -233,6 +238,15 @@ state = load_state()
 # 0 = aucune trame jamais reçue → heartbeat YELLOW honnête + watchdog désactivé.
 last_frame_time = state.get("last_frame_time", 0)
 
+# Store SQLite local (conso + qualité LoRa + outbox cloud). Non bloquant.
+try:
+    measurements_db = db.connect()
+    log.info(f"Store SQLite ouvert : {db.DB_PATH}")
+except Exception as e:
+    measurements_db = None
+    log.error(f"Store SQLite indisponible ({e}) — on continue sans stockage")
+last_prune = time.time()
+
 # ---------------------------------------------------------------------------
 # Détection boot_seq
 # ---------------------------------------------------------------------------
@@ -261,7 +275,7 @@ def detect_boot_seq_event(current: int, time_since_prev: float):
 # Réception
 # ---------------------------------------------------------------------------
 def on_recv(payload) -> None:
-    global last_frame_time
+    global last_frame_time, last_prune
     try:
         now = time.time()
         time_since_prev = now - last_frame_time
@@ -341,6 +355,24 @@ def on_recv(payload) -> None:
         log.info(f"OK pdl_index={pdl_index} seq={boot_seq} idx={active_name} "
                  f"val={index_value} IINST={iinst} PAPP={papp} "
                  f"demain={demain} adps={adps} pejp={pejp}")
+
+        # Store local : conso (1 index actif par trame LoRa) + qualité radio.
+        if measurements_db is not None:
+            try:
+                db.record_measurement(
+                    measurements_db, pdl_index,
+                    {active_name: index_value, "IINST": iinst, "PAPP": papp},
+                )
+                db.record_lora_link(measurements_db, pdl_index, rssi, snr)
+            except Exception as e:
+                log.warning(f"store: écriture échouée: {e}")
+            if time.time() - last_prune > 3600:
+                try:
+                    deleted = db.prune(measurements_db)
+                    log.info(f"store purge (>{db.RETENTION_DAYS}j): {deleted}")
+                except Exception as e:
+                    log.warning(f"store: purge échouée: {e}")
+                last_prune = time.time()
 
         event, details = detect_boot_seq_event(boot_seq, time_since_prev)
         if event:

@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.21"
+        latest: "0.0.22"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -61,6 +61,9 @@ devices:
           - version: "0.0.21"
             released: "2026-06-03"
             notes: "BLE provisioner remonte l'IP locale du device en suffixe du statut (connected:<ip>) → l'app peut se connecter directement sur le LAN après le provisioning (mode proto). Code provisioner uniquement, transition no-op."
+          - version: "0.0.22"
+            released: "2026-06-03"
+            notes: "Phase 1 — store local SQLite (rétention 3 mois glissants) : les readers écrivent chaque trame (conso + qualité LoRa rssi/snr dans une table à part lora_link). Nouvelle API locale read-only :8087 (ben-local-api.service) lue par l'app via l'IP du device. Colonne `sent` = outbox prête pour le futur push cloud."
         minimum: "0.0.1"
         latest: "0.0.1"
         history:
@@ -70,7 +73,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.21"
+        latest: "0.0.22"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -117,6 +120,9 @@ devices:
           - version: "0.0.21"
             released: "2026-06-03"
             notes: "BLE provisioner remonte l'IP locale (connected:<ip>) — cf. note pi0-lora 0.0.21. Transition no-op."
+          - version: "0.0.22"
+            released: "2026-06-03"
+            notes: "Phase 1 — store local SQLite + API locale :8087 (cf. note pi0-lora 0.0.22). update.sh installe ben-local-api + redémarre le reader pour charger le sink."
 
   pi0-lora-wired:       # Raspberry Pi Zero W with both direct TIC (wired) and LoRa reception
     rev01:
@@ -191,6 +197,10 @@ updates:
       to: "0.0.21"
       tag: "pi-0.0.21"
       script: "updates/pi0-lora/0.0.20_to_0.0.21/update.sh"
+    - from: "0.0.21"
+      to: "0.0.22"
+      tag: "pi-0.0.22"
+      script: "updates/pi0-lora/0.0.21_to_0.0.22/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -241,6 +251,10 @@ updates:
       to: "0.0.21"
       tag: "pi-0.0.21"
       script: "updates/pi0-wired/0.0.20_to_0.0.21/update.sh"
+    - from: "0.0.21"
+      to: "0.0.22"
+      tag: "pi-0.0.22"
+      script: "updates/pi0-wired/0.0.21_to_0.0.22/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet
