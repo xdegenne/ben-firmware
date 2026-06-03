@@ -100,13 +100,20 @@ _provisioning_succeeded = False  # passe à True dès qu'on atteint STATE_CONNEC
 
 
 def set_status(new_state: str) -> None:
-    """Met à jour l'état + pousse la notification BLE + signale visuellement via LED."""
+    """Met à jour l'état + pousse la notification BLE + signale visuellement via LED.
+
+    L'état de succès peut porter l'IP locale du device en suffixe
+    (`connected:192.168.1.74`) pour que le central puisse se connecter
+    directement sur le LAN après le provisioning. La détection de succès
+    tolère donc ce suffixe.
+    """
     global _state, _provisioning_succeeded
     _state = new_state
+    is_connected = new_state.split(":", 1)[0] == STATE_CONNECTED
     # Position du flag AVANT tout traitement long (LED flash, notification) : sinon
     # une déconnexion BLE qui survient pendant le flash 0.9s ferait croire au
     # handler on_disconnect qu'on a échoué → exit 1 → restart violet-jaune.
-    if new_state == STATE_CONNECTED:
+    if is_connected:
         _provisioning_succeeded = True
     log.info("status -> %s", new_state)
     if _status_char is not None:
@@ -117,7 +124,7 @@ def set_status(new_state: str) -> None:
 
     # Feedback LED sur les transitions terminales
     try:
-        if new_state == STATE_CONNECTED:
+        if is_connected:
             led.flash_pattern(led.VERT, n=3, flash_sec=0.15, hold_after=True)
         elif new_state.startswith("failed:"):
             led.flash_pattern(led.ROUGE, n=3, flash_sec=0.15, hold_after=False)
@@ -127,7 +134,7 @@ def set_status(new_state: str) -> None:
 
     # Sur succès : armer le shutdown gracieux (en thread, ne bloque pas).
     # Le flag _provisioning_succeeded a déjà été positionné au début de la fonction.
-    if new_state == STATE_CONNECTED:
+    if is_connected:
         threading.Thread(
             target=_graceful_shutdown_after_success,
             daemon=True,
@@ -258,7 +265,8 @@ def _apply_wifi_config(ssid: str, password: str) -> None:
     set_status(STATE_CONNECTING)
     success, message = configure_wifi(ssid, password)
     if success:
-        set_status(STATE_CONNECTED)
+        # message = IP locale → on la renvoie au central : `connected:<ip>`.
+        set_status(f"{STATE_CONNECTED}:{message}" if message else STATE_CONNECTED)
     else:
         set_status(f"failed:{message}")
 

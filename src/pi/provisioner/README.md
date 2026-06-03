@@ -14,7 +14,7 @@ Tous les UUIDs préfixés `b3e7e511-...`.
 | Caractéristique | UUID            | Flags             | Description |
 |---|---|---|---|
 | `WIFI_CONFIG`   | `…000000000001` | `write`           | JSON `{"ssid": "...", "password": "..."}` |
-| `STATUS`        | `…000000000002` | `read` + `notify` | Texte : `idle`, `configuring`, `connecting`, `connected`, `failed:<raison>` |
+| `STATUS`        | `…000000000002` | `read` + `notify` | Texte : `idle`, `configuring`, `connecting`, `connected[:<ip>]`, `failed:<raison>`. En cas de succès, l'**IP locale** du device est suffixée (`connected:192.168.1.74`) pour permettre au central de se connecter directement sur le LAN (mode proto). |
 | `WIFI_SCAN`     | `…000000000003` | `read`            | JSON `[{"ssid": "...", "signal": 60, "freq": 2462}, ...]` — réseaux 2.4 GHz visibles, cache rafraîchi toutes les 30s |
 | `DEVICE_INFO`   | `…000000000004` | `read`            | JSON `{"deviceId": "...", "model": "...", "hardwareRevision": "...", "softwareVersion": "..."}` lu depuis `/etc/ben-firmware/device.json` |
 

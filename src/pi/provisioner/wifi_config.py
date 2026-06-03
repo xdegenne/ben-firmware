@@ -151,4 +151,7 @@ def configure_wifi(ssid: str, password: str) -> tuple[bool, str]:
           "connection.id", CONNECTION_NAME])
 
     log.info("provisioning OK — IP=%s, connexion renommée %s", ip, CONNECTION_NAME)
-    return True, f"connected to {ssid} ({ip})"
+    # En cas de succès, le message EST l'IP locale du device : elle est
+    # remontée au central (suffixe `connected:<ip>`) pour permettre une
+    # connexion directe sur le LAN (mode proto : InfluxDB local, etc.).
+    return True, ip
