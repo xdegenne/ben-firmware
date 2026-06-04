@@ -61,12 +61,20 @@ CREATE INDEX IF NOT EXISTS idx_lora_sent   ON lora_link(sent);
 
 def connect(path: str = DB_PATH, *, read_only: bool = False) -> sqlite3.Connection:
     """Ouvre la base. En écriture : crée le schéma + active WAL.
-    En lecture seule (`read_only=True`, pour l'API) : ouvre en mode `ro`."""
+    En lecture seule (`read_only=True`, pour l'API) : ouvre en mode `ro`.
+
+    `check_same_thread=False` : le récepteur LoRa ouvre la connexion au démarrage
+    (thread principal) mais écrit depuis le thread RX de la radio (`on_recv`).
+    SQLite interdit sinon le partage entre threads. Un seul thread écrivain par
+    process → sûr. (Sans ce flag, le sink LoRa échouait silencieusement à chaque
+    trame : « SQLite objects created in a thread can only be used in that same
+    thread ».)"""
     if read_only:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
+        conn = sqlite3.connect(
+            f"file:{path}?mode=ro", uri=True, timeout=5.0, check_same_thread=False)
     else:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(path, timeout=5.0)
+        conn = sqlite3.connect(path, timeout=5.0, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(_SCHEMA)

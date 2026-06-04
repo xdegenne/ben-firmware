@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.23"
+        latest: "0.0.24"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -67,6 +67,10 @@ devices:
           - version: "0.0.23"
             released: "2026-06-04"
             notes: "Réglages utilisateur via l'API locale : luminosité LED par crans (led_level 0-5, 0=éteinte), mapping perceptuel gamma. settings.py (store partagé) + GET/POST /settings ; la couche LED (led.py + blink_rgb readers) applique le cran. bypass=True (décidé par l'appelant) pour erreurs + provisioning → toujours visibles même LED éteinte. Résilient à l'absence de settings.json (defaults en code). Inclut le RATTRAPAGE de l'annonce mDNS avahi _ben._tcp (avait raté la 0.0.22 publiée — commit amendé après push) : update.sh l'installe."
+          - version: "0.0.24"
+            released: "2026-06-04"
+            notes: "FIX MAJEUR sink SQLite multi-thread (db.py check_same_thread=False) : le récepteur LoRa ouvrait la connexion dans le thread principal mais écrivait depuis le thread RX → CHAQUE écriture échouait silencieusement (avalée en WARNING), le store LoRa n'avait JAMAIS écrit une ligne (constaté sur ben-0001 : frames reçues OK, /pdls /live /lora-link vides). Le wired n'était pas touché (écrit depuis son thread principal). + API locale : GET /ping → {ben:true} (zéro I/O, polling régulier / voyant app) et /health renvoie `last_tic_ts` (ts dernière trame TIC). update.sh redémarre ben-local-api + le reader, pas de reboot."
+      arduino:
         minimum: "0.0.1"
         latest: "0.0.1"
         history:
@@ -76,7 +80,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.23"
+        latest: "0.0.24"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -129,6 +133,9 @@ devices:
           - version: "0.0.23"
             released: "2026-06-04"
             notes: "Réglages LED via l'API locale (GET/POST /settings, led_level 0-5) — cf. note pi0-lora 0.0.23. update.sh redémarre l'API + le reader."
+          - version: "0.0.24"
+            released: "2026-06-04"
+            notes: "FIX sink SQLite multi-thread (db.py check_same_thread=False) — cf. note pi0-lora 0.0.24 (le wired n'était pas impacté mais hérite du fix). + /ping (zéro I/O) + last_tic_ts dans /health. update.sh redémarre ben-local-api + le reader."
 
   pi0-lora-wired:       # Raspberry Pi Zero W with both direct TIC (wired) and LoRa reception
     rev01:
@@ -211,6 +218,10 @@ updates:
       to: "0.0.23"
       tag: "pi-0.0.23"
       script: "updates/pi0-lora/0.0.22_to_0.0.23/update.sh"
+    - from: "0.0.23"
+      to: "0.0.24"
+      tag: "pi-0.0.24"
+      script: "updates/pi0-lora/0.0.23_to_0.0.24/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -269,6 +280,10 @@ updates:
       to: "0.0.23"
       tag: "pi-0.0.23"
       script: "updates/pi0-wired/0.0.22_to_0.0.23/update.sh"
+    - from: "0.0.23"
+      to: "0.0.24"
+      tag: "pi-0.0.24"
+      script: "updates/pi0-wired/0.0.23_to_0.0.24/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet

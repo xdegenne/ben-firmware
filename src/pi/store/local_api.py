@@ -7,8 +7,12 @@ L'app récupère l'IP du device au provisioning (statut `connected:<ip>`) puis
 tape cette API sur le port 8087.
 
 Endpoints :
+  GET /ping
+      → {"ben":true} — sonde de présence ultra-light, AUCUNE lecture
+        (ni fichier ni base) ; pensée pour du polling régulier
   GET /health
-      → {"deviceId","model","softwareVersion","db":true}
+      → {"deviceId","model","softwareVersion","db":true,
+         "last_tic_ts":<ts dernière trame TIC ou null>,"now":...}
   GET /pdls
       → [{"pdl_index":0,"last_ts":...}, ...]
   GET /live[?pdl_index=N]
@@ -78,6 +82,8 @@ class Handler(BaseHTTPRequestHandler):
         path = url.path.rstrip("/") or "/"
         qs = parse_qs(url.query)
         try:
+            if path == "/ping":
+                return self._ping()
             if path == "/health":
                 return self._health()
             if path == "/pdls":
@@ -116,14 +122,23 @@ class Handler(BaseHTTPRequestHandler):
             return self._send({"error": "internal", "detail": str(e)}, 500)
 
     # --- handlers -----------------------------------------------------------
+    def _ping(self):
+        # Présence ultra-light : AUCUNE lecture (ni fichier ni base). Pensé pour
+        # du polling régulier (voyant de joignabilité, heartbeat de l'app).
+        self._send({"ben": True})
+
     def _health(self):
         info = _device_info()
         db_ok = True
+        last_tic = None
         try:
-            db.connect(read_only=True).close()
+            with db.connect(read_only=True) as conn:
+                row = conn.execute("SELECT MAX(ts) FROM measurements").fetchone()
+                last_tic = row[0] if row else None
         except sqlite3.OperationalError:
             db_ok = False
-        self._send({**info, "db": db_ok, "now": int(time.time())})
+        self._send({**info, "db": db_ok, "last_tic_ts": last_tic,
+                    "now": int(time.time())})
 
     def _pdls(self):
         with db.connect(read_only=True) as conn:
