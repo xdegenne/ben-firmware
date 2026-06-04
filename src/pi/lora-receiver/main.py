@@ -43,6 +43,7 @@ from raspi_lora import LoRa, ModemConfig
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "store"))
 import db  # noqa: E402
+import settings  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -155,11 +156,15 @@ def setup_led(*args):
     _pwm_g.ChangeDutyCycle(0)
     _pwm_b.ChangeDutyCycle(0)
 
-def blink_rgb(r, g, b, duration=0.05):
+def blink_rgb(r, g, b, duration=0.05, bypass=False):
+    # La luminosité réglée (led_level) est appliquée ; l'appelant passe
+    # bypass=True pour les états critiques (erreur/alerte), visibles même LED
+    # baissée/éteinte.
     try:
-        _pwm_r.ChangeDutyCycle(r)
-        _pwm_g.ChangeDutyCycle(g)
-        _pwm_b.ChangeDutyCycle(b)
+        f = settings.led_factor(bypass)
+        _pwm_r.ChangeDutyCycle(max(0, min(100, round(r * f))))
+        _pwm_g.ChangeDutyCycle(max(0, min(100, round(g * f))))
+        _pwm_b.ChangeDutyCycle(max(0, min(100, round(b * f))))
         sleep(duration)
         _pwm_r.ChangeDutyCycle(0)
         _pwm_g.ChangeDutyCycle(0)
@@ -298,12 +303,12 @@ def on_recv(payload) -> None:
         pdl_index = get_pdl_index(sender_addr)
         if pdl_index is None:
             log.warning(f"Adresse émetteur inconnue 0x{sender_addr:02x} — ignorée (non dans sources.json)")
-            blink_rgb(30, 15, 0, 0.3)  # orange — source inconnue
+            blink_rgb(30, 15, 0, 0.3, bypass=True)  # orange — source inconnue
             return
 
         if len(raw) != PAYLOAD_LEN:
             log.error(f"Longueur incorrecte : {len(raw)} octets, {PAYLOAD_LEN} attendus")
-            blink_rgb(30, 0, 0, 0.3)  # rouge — erreur proto
+            blink_rgb(30, 0, 0, 0.3, bypass=True)  # rouge — erreur proto
             return
 
         version = raw[0]
@@ -325,7 +330,7 @@ def on_recv(payload) -> None:
 
         if version != PROTOCOL_VERSION:
             log.error(f"Version inconnue : 0x{version:02x}")
-            blink_rgb(30, 0, 0, 0.3)  # rouge — erreur proto
+            blink_rgb(30, 0, 0, 0.3, bypass=True)  # rouge — erreur proto
             return
 
         signed       = raw[:HMAC_OFFSET]
@@ -333,7 +338,7 @@ def on_recv(payload) -> None:
         mac_expected = hmaclib.new(HMAC_KEY, signed, hashlib.sha256).digest()[:HMAC_LEN]
         if not hmaclib.compare_digest(mac_received, mac_expected):
             log.error(f"HMAC invalide — reçu={mac_received.hex()} attendu={mac_expected.hex()}")
-            blink_rgb(30, 0, 0, 0.3)  # rouge — HMAC
+            blink_rgb(30, 0, 0, 0.3, bypass=True)  # rouge — HMAC
             return
 
         (_ver, flags, boot_seq, index_id,
@@ -345,7 +350,7 @@ def on_recv(payload) -> None:
                 log.warning("index_id=0xFF (PTEC inconnu côté Arduino), trame ignorée")
             else:
                 log.error(f"index_id inconnu : 0x{index_id:02x}")
-            blink_rgb(30, 0, 0, 0.3)
+            blink_rgb(30, 0, 0, 0.3, bypass=True)
             return
 
         demain = DEMAIN_NAMES[flags & 0x03]
@@ -381,7 +386,7 @@ def on_recv(payload) -> None:
         prev_value = state["indexes"].get(active_name, 0)
         if index_value < prev_value:
             log.warning(f"{active_name} en décroissance : {index_value} < {prev_value}")
-            blink_rgb(30, 15, 0, 0.3)  # orange — décroissance
+            blink_rgb(30, 15, 0, 0.3, bypass=True)  # orange — décroissance
         else:
             blink_rgb(0, 5, 0, 0.05)   # vert court & faible — données valides (HMAC OK)
 
@@ -394,7 +399,7 @@ def on_recv(payload) -> None:
 
     except Exception:
         log.error(f"Exception dans on_recv :\n{traceback.format_exc()}")
-        blink_rgb(30, 0, 0, 0.5)  # rouge — exception
+        blink_rgb(30, 0, 0, 0.5, bypass=True)  # rouge — exception
 
 # ---------------------------------------------------------------------------
 # Watchdog + Heartbeat
@@ -427,13 +432,13 @@ def heartbeat_loop() -> None:
         if is_wifi_up():
             blink_rgb(0, 5, 0, 0.05)   # vert court — WiFi up (RAS)
         else:
-            blink_rgb(5, 0, 8, 0.3)    # violet long — WiFi down (alerte)
+            blink_rgb(5, 0, 8, 0.3, bypass=True)  # violet long — WiFi down (alerte)
         sleep(0.5)
         elapsed = time.time() - last_frame_time
         if elapsed <= TIC_HEALTH_TIMEOUT_S:
             blink_rgb(0, 5, 0, 0.05)   # vert court — trame récente (RAS)
         else:
-            blink_rgb(8, 2, 0, 0.3)    # orange long — timeout LoRa (alerte)
+            blink_rgb(8, 2, 0, 0.3, bypass=True)  # orange long — timeout LoRa (alerte)
         sleep(RECEPTION_TIMEOUT_S)
 
 # ---------------------------------------------------------------------------
@@ -470,7 +475,7 @@ try:
 except Exception as e:
     log.error(f"LoRa init FAILED : {e} — mode sans radio")
     for _ in range(3):
-        blink_rgb(30, 0, 0, 0.5)
+        blink_rgb(30, 0, 0, 0.5, bypass=True)
         sleep(0.3)
     sleep(0.5)
 log.info(f"PDL connu : {state.get('adco') or '(aucun)'}")

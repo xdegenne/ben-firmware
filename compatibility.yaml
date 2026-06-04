@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.22"
+        latest: "0.0.23"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -64,6 +64,9 @@ devices:
           - version: "0.0.22"
             released: "2026-06-03"
             notes: "Phase 1 — store local SQLite (rétention 3 mois glissants) : les readers écrivent chaque trame (conso + qualité LoRa rssi/snr dans une table à part lora_link). Nouvelle API locale read-only :8087 (ben-local-api.service) lue par l'app via l'IP du device. Colonne `sent` = outbox prête pour le futur push cloud."
+          - version: "0.0.23"
+            released: "2026-06-04"
+            notes: "Réglages utilisateur via l'API locale : luminosité LED par crans (led_level 0-5, 0=éteinte), mapping perceptuel gamma. settings.py (store partagé) + GET/POST /settings ; la couche LED (led.py + blink_rgb readers) applique le cran. bypass=True (décidé par l'appelant) pour erreurs + provisioning → toujours visibles même LED éteinte. Résilient à l'absence de settings.json (defaults en code). Inclut le RATTRAPAGE de l'annonce mDNS avahi _ben._tcp (avait raté la 0.0.22 publiée — commit amendé après push) : update.sh l'installe."
         minimum: "0.0.1"
         latest: "0.0.1"
         history:
@@ -73,7 +76,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.22"
+        latest: "0.0.23"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -123,6 +126,9 @@ devices:
           - version: "0.0.22"
             released: "2026-06-03"
             notes: "Phase 1 — store local SQLite + API locale :8087 (cf. note pi0-lora 0.0.22). update.sh installe ben-local-api + redémarre le reader pour charger le sink."
+          - version: "0.0.23"
+            released: "2026-06-04"
+            notes: "Réglages LED via l'API locale (GET/POST /settings, led_level 0-5) — cf. note pi0-lora 0.0.23. update.sh redémarre l'API + le reader."
 
   pi0-lora-wired:       # Raspberry Pi Zero W with both direct TIC (wired) and LoRa reception
     rev01:
@@ -201,6 +207,10 @@ updates:
       to: "0.0.22"
       tag: "pi-0.0.22"
       script: "updates/pi0-lora/0.0.21_to_0.0.22/update.sh"
+    - from: "0.0.22"
+      to: "0.0.23"
+      tag: "pi-0.0.23"
+      script: "updates/pi0-lora/0.0.22_to_0.0.23/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -255,6 +265,10 @@ updates:
       to: "0.0.22"
       tag: "pi-0.0.22"
       script: "updates/pi0-wired/0.0.21_to_0.0.22/update.sh"
+    - from: "0.0.22"
+      to: "0.0.23"
+      tag: "pi-0.0.23"
+      script: "updates/pi0-wired/0.0.22_to_0.0.23/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet

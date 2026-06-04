@@ -30,6 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import db
+import settings
 
 HOST = "0.0.0.0"
 PORT = 8087
@@ -87,10 +88,30 @@ class Handler(BaseHTTPRequestHandler):
                 return self._measurements(qs)
             if path == "/lora-link":
                 return self._lora_link(qs)
+            if path == "/settings":
+                return self._send(settings.load())
             return self._send({"error": "not_found"}, 404)
         except sqlite3.OperationalError:
             # base pas encore créée (aucune trame écrite) → réponse dégradée
             return self._send({"error": "db_unavailable"}, 503)
+        except Exception as e:  # noqa: BLE001
+            return self._send({"error": "internal", "detail": str(e)}, 500)
+
+    def do_POST(self):
+        url = urlparse(self.path)
+        path = url.path.rstrip("/") or "/"
+        if path != "/settings":
+            return self._send({"error": "not_found"}, 404)
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            raw = self.rfile.read(length) if length else b"{}"
+            body = json.loads(raw.decode("utf-8") or "{}")
+            if not isinstance(body, dict):
+                return self._send({"error": "invalid_body"}, 400)
+            # settings.save valide/clamp (ex. led_level 0..5) et persiste.
+            return self._send(settings.save(body))
+        except (ValueError, json.JSONDecodeError):
+            return self._send({"error": "invalid_json"}, 400)
         except Exception as e:  # noqa: BLE001
             return self._send({"error": "internal", "detail": str(e)}, 500)
 

@@ -125,10 +125,12 @@ def set_status(new_state: str) -> None:
     # Feedback LED sur les transitions terminales
     try:
         if is_connected:
-            led.flash_pattern(led.VERT, n=3, flash_sec=0.15, hold_after=True)
+            led.flash_pattern(led.VERT, n=3, flash_sec=0.15, hold_after=True,
+                              bypass=True)
         elif new_state.startswith("failed:"):
-            led.flash_pattern(led.ROUGE, n=3, flash_sec=0.15, hold_after=False)
-            led.start_blink(led.VIOLET, led.JAUNE, period_sec=1.2)
+            led.flash_pattern(led.ROUGE, n=3, flash_sec=0.15, hold_after=False,
+                              bypass=True)
+            led.start_blink(led.VIOLET, led.JAUNE, period_sec=1.2, bypass=True)
     except Exception as e:
         log.warning("LED feedback failed: %s", e)
 
@@ -362,7 +364,7 @@ def main() -> int:
     # LED : signale visuellement qu'on est en mode provisioning BLE
     try:
         led.setup()
-        led.start_blink(led.VIOLET, led.JAUNE, period_sec=1.2)
+        led.start_blink(led.VIOLET, led.JAUNE, period_sec=1.2, bypass=True)
     except Exception as e:
         log.warning("init LED impossible (%s) — on continue sans LED", e)
 

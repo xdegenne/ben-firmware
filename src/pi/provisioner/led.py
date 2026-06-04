@@ -13,10 +13,16 @@ Fournit un clignotement bicolore en thread daemon pour signaler visuellement
 """
 
 import logging
+import sys
 import threading
 import time
+from pathlib import Path
 
 import RPi.GPIO as GPIO
+
+# Module store partagé (réglages utilisateur — luminosité LED)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "store"))
+import settings  # noqa: E402
 
 log = logging.getLogger("ble-provisioner.led")
 
@@ -45,13 +51,19 @@ def setup() -> None:
     log.info("LED RGB initialisée")
 
 
-def set_color(r: int, g: int, b: int) -> None:
-    """Couleur instantanée (0..100 par canal — duty cycle PWM)."""
+def set_color(r: int, g: int, b: int, bypass: bool = False) -> None:
+    """Couleur instantanée (0..100 par canal — duty cycle PWM).
+
+    La luminosité réglée par l'utilisateur (`led_level`) est appliquée ICI, au
+    plus bas niveau, donc héritée par tous les blinks. `bypass=True` (décidé par
+    l'appelant) l'ignore et garantit un plancher de visibilité — pour les
+    erreurs et le mode provisioning, lisibles même LED « éteinte »."""
     if _pwm_r is None:
         return
-    _pwm_r.ChangeDutyCycle(max(0, min(100, r)))
-    _pwm_g.ChangeDutyCycle(max(0, min(100, g)))
-    _pwm_b.ChangeDutyCycle(max(0, min(100, b)))
+    f = settings.led_factor(bypass)
+    _pwm_r.ChangeDutyCycle(max(0, min(100, round(r * f))))
+    _pwm_g.ChangeDutyCycle(max(0, min(100, round(g * f))))
+    _pwm_b.ChangeDutyCycle(max(0, min(100, round(b * f))))
 
 
 def off() -> None:
@@ -63,13 +75,14 @@ def off() -> None:
 # ---------------------------------------------------------------------------
 def _blink_loop(color_a: tuple[int, int, int],
                 color_b: tuple[int, int, int],
-                period_sec: float) -> None:
+                period_sec: float,
+                bypass: bool) -> None:
     half = period_sec / 2.0
     while not _stop_evt.is_set():
-        set_color(*color_a)
+        set_color(*color_a, bypass=bypass)
         if _stop_evt.wait(half):
             break
-        set_color(*color_b)
+        set_color(*color_b, bypass=bypass)
         if _stop_evt.wait(half):
             break
     off()
@@ -77,14 +90,16 @@ def _blink_loop(color_a: tuple[int, int, int],
 
 def start_blink(color_a: tuple[int, int, int],
                 color_b: tuple[int, int, int],
-                period_sec: float = 1.2) -> None:
-    """Démarre un clignotement bicolore en background. Idempotent."""
+                period_sec: float = 1.2,
+                bypass: bool = False) -> None:
+    """Démarre un clignotement bicolore en background. Idempotent.
+    bypass=True → ignore la luminosité réglée (provisioning)."""
     global _blink_thread
     stop_blink()
     _stop_evt.clear()
     _blink_thread = threading.Thread(
         target=_blink_loop,
-        args=(color_a, color_b, period_sec),
+        args=(color_a, color_b, period_sec, bypass),
         daemon=True,
     )
     _blink_thread.start()
@@ -112,16 +127,18 @@ def cleanup() -> None:
 def flash_pattern(color: tuple[int, int, int],
                   n: int = 3,
                   flash_sec: float = 0.15,
-                  hold_after: bool = True) -> None:
-    """Stoppe le blink en cours, fait N flashs de `color`, puis maintient (ou éteint)."""
+                  hold_after: bool = True,
+                  bypass: bool = False) -> None:
+    """Stoppe le blink en cours, fait N flashs de `color`, puis maintient (ou éteint).
+    bypass=True → ignore la luminosité réglée (erreur / provisioning)."""
     stop_blink()
     for _ in range(n):
         off()
         time.sleep(flash_sec)
-        set_color(*color)
+        set_color(*color, bypass=bypass)
         time.sleep(flash_sec)
     if hold_after:
-        set_color(*color)
+        set_color(*color, bypass=bypass)
     else:
         off()
 

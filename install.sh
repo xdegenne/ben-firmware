@@ -248,7 +248,10 @@ fi
 cp "$REPO_PATH/config/systemd/"*.service /etc/systemd/system/
 cp "$REPO_PATH/config/systemd/"*.timer   /etc/systemd/system/
 systemctl daemon-reload
-echo "[11/13] Systemd units installed"
+# Annonce mDNS du boîtier (_ben._tcp :8087) → découverte par l'app sur le LAN.
+mkdir -p /etc/avahi/services
+cp "$REPO_PATH/config/avahi/ben.service" /etc/avahi/services/ben.service
+echo "[11/13] Systemd units + mDNS service installed"
 
 # --------------------------------------------------------------------------
 # 12. Rename hostname to match deviceId
@@ -271,6 +274,10 @@ systemctl enable ben-led-release.service
 # Décideur boot-time : ping Internet → start ben-ble-provisioner si KO.
 # ben-ble-provisioner.service reste 'static' (démarré on-demand).
 systemctl enable ben-network-check.service
+
+# API locale read-only (:8087) lue par l'app — tous modèles.
+systemctl enable ben-local-api.service
+systemctl start  ben-local-api.service || true
 
 if [ "$MODEL" = "pi0-lora" ]; then
     systemctl enable ben-lora-receiver.service

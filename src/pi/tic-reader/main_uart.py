@@ -33,6 +33,7 @@ import serial
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "store"))
 import db  # noqa: E402
+import settings  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,12 +78,18 @@ def setup_led() -> None:
     _pwm_g = GPIO.PWM(RGB_G, 500); _pwm_g.start(0)
     _pwm_b = GPIO.PWM(RGB_B, 500); _pwm_b.start(0)
 
-def blink_rgb(r: int, g: int, b: int, duration: float = 0.05) -> None:
-    """Pulse RGB en PWM. r/g/b = duty cycle 0..100."""
+def blink_rgb(r: int, g: int, b: int, duration: float = 0.05,
+              bypass: bool = False) -> None:
+    """Pulse RGB en PWM. r/g/b = duty cycle 0..100.
+
+    La luminosité réglée par l'utilisateur (led_level) est appliquée ; l'appelant
+    passe bypass=True pour les états critiques (erreur) → visibles même LED
+    baissée/éteinte."""
     try:
-        _pwm_r.ChangeDutyCycle(r)
-        _pwm_g.ChangeDutyCycle(g)
-        _pwm_b.ChangeDutyCycle(b)
+        f = settings.led_factor(bypass)
+        _pwm_r.ChangeDutyCycle(max(0, min(100, round(r * f))))
+        _pwm_g.ChangeDutyCycle(max(0, min(100, round(g * f))))
+        _pwm_b.ChangeDutyCycle(max(0, min(100, round(b * f))))
         sleep(duration)
         _pwm_r.ChangeDutyCycle(0)
         _pwm_g.ChangeDutyCycle(0)
@@ -360,7 +367,7 @@ try:
             blink_rgb(0, 5, 0, 0.1)     # vert 5% — trame TIC valide
             last_success_time = time.time()
         else:
-            blink_rgb(5, 0, 0, 0.1)     # rouge 5% — trame KO
+            blink_rgb(5, 0, 0, 0.1, bypass=True)  # rouge — trame KO (erreur, toujours visible)
 
         if measurements_db is not None and time.time() - last_prune > 3600:
             try:

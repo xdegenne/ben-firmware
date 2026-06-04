@@ -1,0 +1,22 @@
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<!--
+  Annonce mDNS du boîtier BEN.
+
+  Permet à l'app Flutter de DÉCOUVRIR les boîtiers présents sur le LAN
+  (browse du type `_ben._tcp`) sans connaître le deviceId à l'avance, puis de
+  se connecter à l'API locale read-only (:8087, cf. ben-local-api.service).
+
+  `%h` est remplacé par le hostname = deviceId → nom de service "BEN ben-0003",
+  et l'hôte résolu est `<deviceId>.local`. avahi-daemon recharge ce fichier
+  automatiquement quand il apparaît dans /etc/avahi/services/.
+-->
+<service-group>
+  <name replace-wildcards="yes">BEN %h</name>
+  <service>
+    <type>_ben._tcp</type>
+    <port>8087</port>
+    <txt-record>api=v1</txt-record>
+    <txt-record>health=/health</txt-record>
+  </service>
+</service-group>
