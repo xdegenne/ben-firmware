@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS measurements (
     hchp        INTEGER,
     papp        INTEGER,
     iinst       INTEGER,
+    tariff      INTEGER,
     sent        INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_meas_pdl_ts ON measurements(pdl_index, ts);
@@ -88,9 +89,47 @@ def connect(path: str = DB_PATH, *, read_only: bool = False) -> sqlite3.Connecti
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(_SCHEMA)
+        # Migration idempotente : colonne `tariff` (index tarifaire actif),
+        # ajoutée en 0.0.26. CREATE IF NOT EXISTS ne l'ajoute pas à une table
+        # existante → ALTER conditionnel.
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(measurements)")]
+        if "tariff" not in cols:
+            conn.execute("ALTER TABLE measurements ADD COLUMN tariff INTEGER")
         conn.commit()
     conn.row_factory = sqlite3.Row
     return conn
+
+
+# Index tarifaire actif (mêmes ids que l'Arduino LoRa : 0=BASE, 1=HC, 2=HP, …).
+def tariff_from_ptec(ptec: str | None) -> int | None:
+    """PTEC (TIC wired) → index tarifaire actif. None si inconnu/absent."""
+    if not ptec:
+        return None
+    p = ptec.strip()
+    if p.startswith("TH"):
+        return 0  # BASE
+    if p.startswith("HC"):
+        return 1  # Heures Creuses
+    if p.startswith("HP"):
+        return 2  # Heures Pleines
+    if p.startswith("HN"):
+        return 3  # EJP Heures Normales
+    if p.startswith("PM"):
+        return 4  # EJP Pointe Mobile
+    return None
+
+
+def _tariff_from_labels(labels: dict) -> int | None:
+    """Index tarifaire actif depuis les labels : PTEC (wired, tous les index
+    présents) sinon l'unique étiquette d'index présente (LoRa = 1 index actif
+    par trame)."""
+    t = tariff_from_ptec(labels.get("PTEC"))
+    if t is not None:
+        return t
+    for name, tid in (("BASE", 0), ("HCHC", 1), ("HCHP", 2)):
+        if labels.get(name) is not None:
+            return tid
+    return None
 
 
 def record_measurement(
@@ -101,12 +140,13 @@ def record_measurement(
     ts: int | None = None,
 ) -> None:
     """Insère une mesure de conso depuis le dict de labels TIC parsés
-    (BASE/HCHC/HCHP/PAPP/IINST). Les labels absents → NULL."""
+    (BASE/HCHC/HCHP/PAPP/IINST). Les labels absents → NULL. `tariff` = index
+    tarifaire actif (PTEC wired / index LoRa)."""
     ts = int(ts if ts is not None else time.time())
     conn.execute(
         "INSERT INTO measurements "
-        "(ts, pdl_index, base, hchc, hchp, papp, iinst) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "(ts, pdl_index, base, hchc, hchp, papp, iinst, tariff) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             ts,
             pdl_index,
@@ -115,6 +155,7 @@ def record_measurement(
             labels.get("HCHP"),
             labels.get("PAPP"),
             labels.get("IINST"),
+            _tariff_from_labels(labels),
         ),
     )
     conn.commit()

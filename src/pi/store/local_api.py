@@ -157,7 +157,7 @@ class Handler(BaseHTTPRequestHandler):
             if pdl is not None:
                 rows = _rows(
                     conn,
-                    "SELECT ts, pdl_index, base, hchc, hchp, papp, iinst "
+                    "SELECT ts, pdl_index, base, hchc, hchp, papp, iinst, tariff "
                     "FROM measurements WHERE pdl_index=? ORDER BY ts DESC LIMIT 1",
                     (pdl,),
                 )
@@ -165,7 +165,8 @@ class Handler(BaseHTTPRequestHandler):
                 # Dernière mesure par PDL.
                 rows = _rows(
                     conn,
-                    "SELECT m.ts, m.pdl_index, m.base, m.hchc, m.hchp, m.papp, m.iinst "
+                    "SELECT m.ts, m.pdl_index, m.base, m.hchc, m.hchp, m.papp, "
+                    "m.iinst, m.tariff "
                     "FROM measurements m "
                     "JOIN (SELECT pdl_index, MAX(ts) mx FROM measurements "
                     "      GROUP BY pdl_index) g "
@@ -192,7 +193,7 @@ class Handler(BaseHTTPRequestHandler):
         with db.connect(read_only=True) as conn:
             rows = _rows(
                 conn,
-                "SELECT ts, base, hchc, hchp, papp, iinst FROM measurements "
+                "SELECT ts, base, hchc, hchp, papp, iinst, tariff FROM measurements "
                 "WHERE pdl_index=? AND ts>=? AND ts<=? ORDER BY ts ASC LIMIT ?",
                 (pdl, since, until, limit),
             )

@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.25"
+        latest: "0.0.26"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -73,6 +73,9 @@ devices:
           - version: "0.0.25"
             released: "2026-06-05"
             notes: "Niveau de consommation 1..4 exposé par /live (visuel app). Nouveau module store/levels.py : percentiles PAPP du foyer (P30/P70/P90 sur 7 j glissants) → niveau 1..4, lissé sur 2 min + hystérésis ; défaut 2 en cold-start (< 2 j d'historique). Table level_profile (auto-créée par db.connect). Service planifié ben-level-profiler.{service,timer} : recalcul des seuils 1×/jour (SoC : seul ce job écrit, l'API reste read-only). update.sh installe les 2 units + redémarre ben-local-api + arme le timer & 1er calcul ; pas de reboot."
+          - version: "0.0.26"
+            released: "2026-06-05"
+            notes: "Tarif HC/HP exposé par l'API. Colonne `tariff` sur measurements (index tarifaire actif : 0=BASE, 1=HC, 2=HP, 3+=EJP/Tempo ; migration ALTER auto au prochain connect écriture) remplie par record_measurement (PTEC côté wired, index actif de la trame côté LoRa). /live et /measurements ajoutent `tariff`. L'app affiche HC/HP : chip sous la jauge (🌙 indigo / ☀️ orange) + zones de fond pastel dans la courbe avec pointillé aux transitions. update.sh redémarre ben-local-api + le reader ; pas de reboot."
       arduino:
         minimum: "0.0.1"
         latest: "0.0.1"
@@ -83,7 +86,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.25"
+        latest: "0.0.26"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -142,6 +145,9 @@ devices:
           - version: "0.0.25"
             released: "2026-06-05"
             notes: "Niveau de consommation 1..4 exposé par /live (visuel app) — cf. note pi0-lora 0.0.25. Nouveau store/levels.py (percentiles PAPP du foyer P30/P70/P90 sur 7 j, lissage 2 min + hystérésis, défaut 2 en cold-start), table level_profile, service ben-level-profiler.{service,timer} (recalcul 1×/jour, SoC : seul ce job écrit). update.sh installe les units + redémarre ben-local-api + arme le timer ; pas de reboot."
+          - version: "0.0.26"
+            released: "2026-06-05"
+            notes: "Tarif HC/HP exposé par l'API — cf. note pi0-lora 0.0.26. Colonne `tariff` sur measurements (PTEC wired → index actif), /live et /measurements l'ajoutent. L'app affiche HC/HP (chip + zones de courbe). update.sh redémarre ben-local-api + le reader ; pas de reboot."
 
   pi0-lora-wired:       # Raspberry Pi Zero W with both direct TIC (wired) and LoRa reception
     rev01:
@@ -232,6 +238,10 @@ updates:
       to: "0.0.25"
       tag: "pi-0.0.25"
       script: "updates/pi0-lora/0.0.24_to_0.0.25/update.sh"
+    - from: "0.0.25"
+      to: "0.0.26"
+      tag: "pi-0.0.26"
+      script: "updates/pi0-lora/0.0.25_to_0.0.26/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -298,6 +308,10 @@ updates:
       to: "0.0.25"
       tag: "pi-0.0.25"
       script: "updates/pi0-wired/0.0.24_to_0.0.25/update.sh"
+    - from: "0.0.25"
+      to: "0.0.26"
+      tag: "pi-0.0.26"
+      script: "updates/pi0-wired/0.0.25_to_0.0.26/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet
