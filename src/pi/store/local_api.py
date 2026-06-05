@@ -34,6 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import db
+import levels
 import settings
 
 HOST = "0.0.0.0"
@@ -172,6 +173,12 @@ class Handler(BaseHTTPRequestHandler):
                     "ORDER BY m.pdl_index",
                     (),
                 )
+            # Niveau de conso 1..4 (visuel app), seuils pré-calculés par
+            # ben-level-profiler ; ici lecture seule (cf. levels.py).
+            now = int(time.time())
+            for row in rows:
+                row["level"] = levels.level_for(
+                    conn, row["pdl_index"], row.get("papp"), now)
         self._send(rows)
 
     def _measurements(self, qs):

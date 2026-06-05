@@ -279,6 +279,10 @@ systemctl enable ben-network-check.service
 systemctl enable ben-local-api.service
 systemctl start  ben-local-api.service || true
 
+# Profileur du niveau de conso (percentiles PAPP → table level_profile), 1×/jour.
+systemctl enable ben-level-profiler.timer
+systemctl start  ben-level-profiler.timer || true
+
 if [ "$MODEL" = "pi0-lora" ]; then
     systemctl enable ben-lora-receiver.service
     systemctl start  ben-lora-receiver.service || true

@@ -56,6 +56,16 @@ CREATE TABLE IF NOT EXISTS lora_link (
 );
 CREATE INDEX IF NOT EXISTS idx_lora_pdl_ts ON lora_link(pdl_index, ts);
 CREATE INDEX IF NOT EXISTS idx_lora_sent   ON lora_link(sent);
+
+CREATE TABLE IF NOT EXISTS level_profile (
+    pdl_index   INTEGER PRIMARY KEY,
+    computed_ts INTEGER NOT NULL,
+    p_low       INTEGER,
+    p_mid       INTEGER,
+    p_high      INTEGER,
+    n_samples   INTEGER NOT NULL DEFAULT 0,
+    span_sec    INTEGER NOT NULL DEFAULT 0
+);
 """
 
 

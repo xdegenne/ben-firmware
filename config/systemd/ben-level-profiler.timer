@@ -1,0 +1,12 @@
+[Unit]
+Description=BEN level profiler — recompute consumption-level thresholds daily
+
+[Timer]
+# Peu après le boot (le temps que NTP + données soient là), puis 1×/jour.
+OnBootSec=10min
+OnUnitActiveSec=1d
+AccuracyMin=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
