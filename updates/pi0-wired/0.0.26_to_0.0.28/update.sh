@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# update.sh — pi-0.0.26 → pi-0.0.27
+# update.sh — pi-0.0.26 → pi-0.0.28
 #
 # Vérification couleur au provisioning BLE (anti-association au mauvais boîtier).
 #   - led.py  : palette daltonien (B/J/Blanc/Rouge, sans vert) + start_sequence
@@ -19,7 +19,7 @@
 
 set -euo pipefail
 
-TR="pi-0.0.26 → pi-0.0.27"
+TR="pi-0.0.26 → pi-0.0.28"
 log()  { echo "[update $TR] $*"; }
 fail() { echo "[update $TR] ✗ ERREUR : $*" >&2; exit 1; }
 
