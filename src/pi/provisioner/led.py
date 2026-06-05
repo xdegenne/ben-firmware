@@ -144,9 +144,72 @@ def flash_pattern(color: tuple[int, int, int],
 
 
 # ---------------------------------------------------------------------------
+# Séquence de couleurs (vérification visuelle au provisioning)
+# ---------------------------------------------------------------------------
+def _sequence_loop(colors: list[tuple[int, int, int]],
+                   on_sec: float,
+                   gap_sec: float,
+                   loop_gap_sec: float,
+                   bypass: bool) -> None:
+    """Boucle l'affichage d'une séquence de couleurs.
+
+    Deux niveaux de noir, indispensables à la lisibilité :
+      - `gap_sec` (court) entre chaque couleur → distingue deux couleurs
+        identiques qui se suivent et rend les transitions nettes ;
+      - `loop_gap_sec` (long) avant chaque répétition → marque le DÉBUT du code
+        (sinon on ne sait pas où la séquence commence).
+    La LED reste éteinte pendant tous les gaps.
+    """
+    while not _stop_evt.is_set():
+        for c in colors:
+            if _stop_evt.is_set():
+                break
+            set_color(*c, bypass=bypass)
+            if _stop_evt.wait(on_sec):
+                break
+            off()
+            if _stop_evt.wait(gap_sec):
+                break
+        # noir long = délimiteur de séquence
+        if _stop_evt.wait(loop_gap_sec):
+            break
+    off()
+
+
+def start_sequence(colors: list[tuple[int, int, int]],
+                   on_sec: float = 0.7,
+                   gap_sec: float = 0.3,
+                   loop_gap_sec: float = 1.5,
+                   bypass: bool = True) -> None:
+    """Démarre l'affichage en boucle d'une séquence de couleurs (background).
+    Idempotent (stoppe la séquence/blink en cours). bypass=True par défaut :
+    une vérification doit rester visible même LED « éteinte » par l'utilisateur."""
+    global _blink_thread
+    stop_blink()
+    _stop_evt.clear()
+    _blink_thread = threading.Thread(
+        target=_sequence_loop,
+        args=(colors, on_sec, gap_sec, loop_gap_sec, bypass),
+        daemon=True,
+    )
+    _blink_thread.start()
+
+
+# ---------------------------------------------------------------------------
 # Palettes pré-définies (duty cycle 0..100)
 # ---------------------------------------------------------------------------
 VIOLET = (20, 0, 40)   # plus de bleu que de rouge pour un violet franc
 JAUNE  = (35, 20, 0)   # vert tiré pour rester chaud sans virer vert
 VERT   = (0, 30, 0)
 ROUGE  = (40, 0, 0)
+
+# Palette de vérification (lisible daltonien) : JAMAIS rouge ET vert ensemble
+# → on supprime le vert (confusion deutan/protan, ~8 % des hommes). Duties poussés
+# (séquence affichée en bypass, donc plein contraste) ; à calibrer sur device réel
+# pour que BLANC/JAUNE ne virent pas verdâtre (canal vert perceptuellement vif).
+VERIFY_PALETTE = {
+    "B": (0, 0, 100),     # Bleu
+    "Y": (80, 70, 0),     # Jaune (warm, pas de bleu)
+    "W": (70, 70, 80),    # Blanc
+    "R": (100, 0, 0),     # Rouge (poussé : les protans le voient sombre)
+}
