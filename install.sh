@@ -13,7 +13,7 @@ set -euo pipefail
 
 REPO_URL="https://github.com/xdegenne/ben-firmware.git"
 REPO_PATH="/opt/ben/repo"
-INITIAL_TAG="pi-0.0.28"
+INITIAL_TAG="pi-0.0.29"
 # Version écrite dans device.json — DOIT correspondre au tag checkout, sinon
 # l'OTA re-grimpe depuis une version périmée. Dérivée de INITIAL_TAG pour
 # qu'elles ne puissent jamais diverger (ex. pi-0.0.28 → 0.0.28).
@@ -287,19 +287,14 @@ systemctl start  ben-local-api.service || true
 systemctl enable ben-level-profiler.timer
 systemctl start  ben-level-profiler.timer || true
 
-if [ "$MODEL" = "pi0-lora" ]; then
-    systemctl enable ben-lora-receiver.service
-    systemctl start  ben-lora-receiver.service || true
-elif [ "$MODEL" = "pi0-wired" ]; then
-    systemctl enable ben-tic-reader.service
-    systemctl start  ben-tic-reader.service || true
-elif [ "$MODEL" = "pi0-lora-wired" ]; then
-    systemctl enable ben-lora-receiver.service ben-tic-reader.service
-    systemctl start  ben-lora-receiver.service || true
-    systemctl start  ben-tic-reader.service || true
-fi
+# Les agents de mesure (tic-reader / lora-receiver) ne sont PAS enable :
+# pas de WantedBy → pas d'autostart au boot. C'est ben-network-check.service
+# (check_network.py) qui les démarre, et seulement si le réseau est up. Sinon
+# ils tournaient au boot en doublon et tuaient ben-ble-provisioner (Conflicts)
+# → bug "code couleur en boucle". Après ce provisioning, le device reboot puis
+# part en BLE (jamais provisionné → pas de connexion ben-provisioned).
 
-echo "[13/13] Services enabled"
+echo "[13/13] Services enabled (readers gérés par check_network, pas d'autostart)"
 
 # --------------------------------------------------------------------------
 # Verify

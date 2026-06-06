@@ -13,12 +13,29 @@ Aucune décision n'est prise sur la base de l'état nmcli seul : un wlan0
 mode provisioning.
 """
 
+import json
 import logging
 import subprocess
 import sys
 import time
 
 import led
+
+DEVICE_JSON = "/etc/ben-firmware/device.json"
+
+# Nom de la connexion WiFi créée par le provisioning BLE (= marqueur "déjà
+# unboxé"). DOIT rester aligné avec wifi_config.CONNECTION_NAME.
+CONNECTION_NAME = "ben-provisioned"
+
+# Agents "normaux" à démarrer selon le modèle quand le réseau est up.
+# Ils n'ont PLUS d'autostart systemd (pas de WantedBy) : c'est ici, et
+# seulement ici, qu'ils sont lancés — sinon ils démarrent au boot en doublon
+# et tuent ben-ble-provisioner via Conflicts (bug "code couleur en boucle").
+READERS_BY_MODEL = {
+    "pi0-wired": ["ben-tic-reader.service"],
+    "pi0-lora": ["ben-lora-receiver.service"],
+    "pi0-lora-wired": ["ben-lora-receiver.service", "ben-tic-reader.service"],
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,15 +72,57 @@ def has_internet() -> bool:
     return False
 
 
-def _start_service(name: str) -> None:
+def _start(name: str) -> None:
     log.info("systemctl start %s", name)
-    r = subprocess.run(["systemctl", "start", name], capture_output=True, text=True)
-    if r.returncode != 0:
-        log.error("start %s échec: %s", name, (r.stderr or r.stdout).strip())
+    subprocess.run(["systemctl", "start", "--no-block", name], capture_output=True)
+
+
+def _start_provisioning() -> None:
+    """Mode BLE provisioning."""
+    _start("ben-ble-provisioner.service")
+
+
+def _start_readers() -> None:
+    """Démarre les agents normaux selon le modèle (device provisionné + réseau up).
+    Ces services n'ont pas d'autostart : ils ne tournent QUE par cet appel."""
+    model = ""
+    try:
+        with open(DEVICE_JSON) as f:
+            model = json.load(f).get("model", "")
+    except Exception as e:
+        log.warning("lecture %s: %s", DEVICE_JSON, e)
+    services = READERS_BY_MODEL.get(model)
+    if not services:
+        log.warning("modèle inconnu (%r) → démarrage tic-reader + lora-receiver par défaut", model)
+        services = ["ben-tic-reader.service", "ben-lora-receiver.service"]
+    for s in services:
+        _start(s)
+
+
+def _has_been_provisioned() -> bool:
+    """Vrai si une connexion WiFi `ben-provisioned` existe (= déjà unboxé).
+
+    Premier boot d'un device jamais provisionné → pas de connexion → on sait
+    d'avance qu'il n'y a pas de réseau, inutile de pinguer 30s : on va direct
+    en BLE. Une fois provisionné, la connexion existe et on teste le réseau
+    (qui peut être temporairement down → fallback BLE de récupération)."""
+    r = subprocess.run(
+        ["nmcli", "-t", "-f", "NAME", "connection", "show"],
+        capture_output=True, text=True,
+    )
+    return any(line.strip() == CONNECTION_NAME for line in r.stdout.splitlines())
 
 
 def main() -> int:
-    log.info("vérification connectivité Internet (timeout %ds)", TOTAL_TIMEOUT_SEC)
+    # Premier boot (jamais unboxé) : on ne teste même pas le réseau.
+    if not _has_been_provisioned():
+        log.info("aucune connexion '%s' → device jamais provisionné → BLE direct "
+                 "(pas de test réseau)", CONNECTION_NAME)
+        _start_provisioning()
+        return 0
+
+    log.info("device déjà provisionné — vérification connectivité (timeout %ds)",
+             TOTAL_TIMEOUT_SEC)
 
     # LED : signale visuellement le check en cours (bleu clignotant)
     led_ok = False
@@ -85,21 +144,18 @@ def main() -> int:
         log.warning("LED flash final: %s", e)
     finally:
         # IMPORTANT : libère les pins GPIO pour le service suivant
-        # (tic-reader si online, ble-provisioner sinon).
+        # (reader si online, ble-provisioner sinon).
         try:
             led.cleanup()
         except Exception:
             pass
 
     if online:
-        log.info("réseau OK — rien à faire (ben-tic-reader et compagnie démarrent "
-                 "en parallèle au boot, ils n'ont pas besoin d'Internet)")
+        log.info("réseau OK → démarrage des agents normaux")
+        _start_readers()
     else:
-        log.info("pas de réseau → démarrage mode provisioning BLE")
-        subprocess.run(
-            ["systemctl", "start", "--no-block", "ben-ble-provisioner.service"],
-            capture_output=True,
-        )
+        log.info("provisionné mais réseau KO → mode provisioning BLE (récupération)")
+        _start_provisioning()
     return 0
 
 

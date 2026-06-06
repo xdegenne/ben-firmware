@@ -14,5 +14,5 @@ ExecStart=/usr/bin/python3 /opt/ben/repo/src/pi/lora-receiver/main.py
 Restart=always
 RestartSec=10
 
-[Install]
-WantedBy=multi-user.target
+# PAS d'[Install]/WantedBy : démarré uniquement par ben-network-check.service
+# quand le réseau est up. Voir l'explication dans ben-tic-reader.service.

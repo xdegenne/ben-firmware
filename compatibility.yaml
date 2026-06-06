@@ -86,7 +86,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.28"
+        latest: "0.0.29"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -151,8 +151,9 @@ devices:
           - version: "0.0.28"
             released: "2026-06-05"
             notes: "Vérification couleur au provisioning BLE (confirme le bon boîtier). led.py : palette daltonien (B/J/Blanc/Rouge, sans vert) + start_sequence. main.py : GATT VERIFY/VERIFY_STATUS, hook on_connect qui génère un code couleur affiché sur la LED, WIFI_CONFIG refusé tant que non vérifié. ⚠ CASSANT : nécessite l'app avec l'étape VERIFY pour provisionner ; n'impacte QUE le provisioning BLE (un device en service en mode normal n'est pas affecté). Code en place via checkout ; aucun service à redémarrer. Cf. docs/ble-color-verification.md. (NB : pi-0.0.27 avait été taggé sans son update.sh.sha256 → OTA en échec, jamais appliqué ; 0.0.28 = même contenu + checksum, transition directe 0.0.26→0.0.28.)"
-
-  pi0-lora-wired:       # Raspberry Pi Zero W with both direct TIC (wired) and LoRa reception
+          - version: "0.0.29"
+            released: "2026-06-07"
+            notes: "Fix race de services au provisioning. ben-tic-reader / ben-lora-receiver perdent leur autostart (WantedBy retiré) : ils sont désormais lancés UNIQUEMENT par check_network.py quand le réseau est up. Avant, ils démarraient au boot en doublon et tuaient ben-ble-provisioner via Conflicts → bug 'code couleur affiché puis ré-écoute BLE en boucle', provisioning impossible (vu en démo sans Linky). De plus check_network détecte 'jamais provisionné' (absence de connexion ben-provisioned) → bascule BLE directe sans pinguer 30s au premier boot. Migration : réinstalle les units + systemctl disable des readers. N'impacte pas un device en service (le reader tourne jusqu'au prochain reboot où check_network le relance)."
     rev01:
       pi:
         latest: "0.0.2"
@@ -319,6 +320,10 @@ updates:
       to: "0.0.28"
       tag: "pi-0.0.28"
       script: "updates/pi0-wired/0.0.26_to_0.0.28/update.sh"
+    - from: "0.0.28"
+      to: "0.0.29"
+      tag: "pi-0.0.29"
+      script: "updates/pi0-wired/0.0.28_to_0.0.29/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet

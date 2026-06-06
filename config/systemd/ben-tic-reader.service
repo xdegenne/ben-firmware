@@ -10,5 +10,8 @@ ExecStart=/usr/bin/python3 /opt/ben/repo/src/pi/tic-reader/main_uart.py
 Restart=always
 RestartSec=10
 
-[Install]
-WantedBy=multi-user.target
+# PAS d'[Install]/WantedBy : ce service ne démarre JAMAIS tout seul au boot.
+# C'est ben-network-check.service (check_network.py) qui le lance, et seulement
+# si le réseau est up (= device provisionné). Sinon ben-ble-provisioner tourne ;
+# le Conflicts entre les deux faisait que tic-reader démarré en doublon au boot
+# tuait le provisioner → bug "code couleur puis ré-écoute BLE en boucle".
