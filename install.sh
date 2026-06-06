@@ -13,7 +13,7 @@ set -euo pipefail
 
 REPO_URL="https://github.com/xdegenne/ben-firmware.git"
 REPO_PATH="/opt/ben/repo"
-INITIAL_TAG="pi-0.0.20"
+INITIAL_TAG="pi-0.0.28"
 
 if [ $# -ne 3 ]; then
     echo "Usage: sudo ./install.sh <model> <hw-revision> <device-id>" >&2
