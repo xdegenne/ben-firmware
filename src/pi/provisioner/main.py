@@ -193,7 +193,8 @@ def set_status(new_state: str) -> None:
     # Feedback LED sur les transitions terminales
     try:
         if is_connected:
-            led.flash_pattern(led.VERT, n=3, flash_sec=0.15, hold_after=True,
+            # Succès connexion réseau : 2 flashs verts rapides (pas de vert tenu).
+            led.flash_pattern(led.VERT, n=2, flash_sec=0.08, hold_after=False,
                               bypass=True)
         elif new_state.startswith("failed:"):
             led.flash_pattern(led.ROUGE, n=3, flash_sec=0.15, hold_after=False,
