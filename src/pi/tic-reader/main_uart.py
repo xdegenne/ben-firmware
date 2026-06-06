@@ -50,7 +50,7 @@ TIC_TIMEOUT_S     = 12      # max pour lire une trame complète (~4s à 1200 bau
 
 PDL_INDEX         = 0       # source câblée — toujours index 0 par convention
 
-PERIOD_S           = 30     # intervalle entre deux cycles (aligné LoRa Arduino ~32s)
+PERIOD_S           = 15     # intervalle entre deux cycles de lecture TIC (wired)
 WATCHDOG_THRESHOLD = 600    # 10 min sans trame valide → relance process
 
 STATE_PATH         = "/var/lib/ben-firmware/tic-state.json"
@@ -313,7 +313,7 @@ try:
     while True:
         cycle_success = False
         try:
-            blink_rgb(5, 5, 0, 0.05)    # jaune 5% — wake-up cycle
+            blink_rgb(0, 0, 5, 0.05)    # bleu 5% — wake-up cycle
             ser.reset_input_buffer()
             labels = read_frame(ser)
 
