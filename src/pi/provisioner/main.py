@@ -491,11 +491,18 @@ def main() -> int:
         global _verified, _verify_attempts
         _verified = False
         _verify_attempts = 0
-        log.info("BLE connecté — code de vérification couleur dans %ds", VERIFY_DISPLAY_DELAY_SEC)
+        log.info("BLE connecté — 2 flashs verts puis code couleur dans %ds", VERIFY_DISPLAY_DELAY_SEC)
         set_verify_status(VS_PENDING)
-        # Ne pas afficher le code tout de suite : délai (le temps que l'app ouvre
-        # son écran de vérif). Le blink violet/jaune d'attente reste visible
-        # pendant ce délai, puis _new_verify_code prend la main sur la LED.
+        # À la connexion BLE : on ARRÊTE le blink d'attente violet/jaune et on
+        # fait 2 flashs verts rapides (= connecté). flash_pattern() appelle
+        # stop_blink() en interne, donc le blink s'arrête tout seul. En thread :
+        # ne pas bloquer le callback GATT pendant les flashs.
+        threading.Thread(
+            target=led.flash_pattern, args=(led.VERT,),
+            kwargs={"n": 2, "flash_sec": 0.08, "hold_after": False, "bypass": True},
+            daemon=True,
+        ).start()
+        # Puis, après le délai, le code couleur prend la main (LED éteinte entre-temps).
         threading.Timer(VERIFY_DISPLAY_DELAY_SEC, _new_verify_code).start()
     ben.on_connect = _on_connect
 
