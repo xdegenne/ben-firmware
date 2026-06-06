@@ -13,19 +13,16 @@ Type=oneshot
 # Petite séquence "welcome" : éteint le boot indicator (vert tenu par le
 # firmware) → flash blanc 150ms (R+G+B haut) → off → release des pins pour
 # que les services suivants puissent les claim via PWM.
+# IMPORTANT : les 3 canaux R/G/B sont commutés EN UNE SEULE commande pinctrl
+# (liste 12,13,16). Sinon (3 commandes séparées) le délai inter-process fait
+# voir un balayage rouge→jaune→blanc→cyan→bleu au lieu d'un blanc net.
 ExecStart=/usr/bin/pinctrl set 13 op dl
 ExecStart=/bin/sleep 0.3
-ExecStart=/usr/bin/pinctrl set 12 op dh
-ExecStart=/usr/bin/pinctrl set 13 op dh
-ExecStart=/usr/bin/pinctrl set 16 op dh
+ExecStart=/usr/bin/pinctrl set 12,13,16 op dh
 ExecStart=/bin/sleep 0.15
-ExecStart=/usr/bin/pinctrl set 12 op dl
-ExecStart=/usr/bin/pinctrl set 13 op dl
-ExecStart=/usr/bin/pinctrl set 16 op dl
+ExecStart=/usr/bin/pinctrl set 12,13,16 op dl
 ExecStart=/bin/sleep 0.15
-ExecStart=/usr/bin/pinctrl set 12 ip
-ExecStart=/usr/bin/pinctrl set 13 ip
-ExecStart=/usr/bin/pinctrl set 16 ip
+ExecStart=/usr/bin/pinctrl set 12,13,16 ip
 RemainAfterExit=yes
 
 [Install]

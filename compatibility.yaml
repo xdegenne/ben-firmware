@@ -86,7 +86,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.30"
+        latest: "0.0.31"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -157,6 +157,9 @@ devices:
           - version: "0.0.30"
             released: "2026-06-07"
             notes: "tic-reader (wired) : wake-up LED jaune → bleu (cosmétique) ; PERIOD_S 30s → 15s (lecture TIC toutes les 15s). Migration : try-restart ben-tic-reader (applique le nouveau code s'il tourne, no-op sinon → safe en mode provisioning)."
+          - version: "0.0.31"
+            released: "2026-06-07"
+            notes: "Provisioner BLE — UX vérif couleur : code correct → 3 blinks verts rapides (au lieu du vert fixe permanent) ; délai de 10s avant d'afficher le code couleur à la connexion (blink violet/jaune d'attente pendant le délai, puis le code se répète au rythme normal ~1,5s). + ben-led-release.service : flash blanc 'welcome' rendu atomique (3 canaux R/G/B en une seule commande pinctrl) — avant, 3 commandes séparées faisaient voir un balayage rouge→jaune→blanc→cyan→bleu au boot. Migration : réinstalle ben-led-release.service + daemon-reload (effet au prochain boot) ; provisioner on-demand donc rien d'autre à redémarrer."
     rev01:
       pi:
         latest: "0.0.2"
@@ -331,6 +334,10 @@ updates:
       to: "0.0.30"
       tag: "pi-0.0.30"
       script: "updates/pi0-wired/0.0.29_to_0.0.30/update.sh"
+    - from: "0.0.30"
+      to: "0.0.31"
+      tag: "pi-0.0.31"
+      script: "updates/pi0-wired/0.0.30_to_0.0.31/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet
