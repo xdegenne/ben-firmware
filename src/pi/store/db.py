@@ -45,8 +45,9 @@ CREATE TABLE IF NOT EXISTS measurements (
     tariff      INTEGER,
     sent        INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_meas_pdl_ts ON measurements(pdl_index, ts);
-CREATE INDEX IF NOT EXISTS idx_meas_sent   ON measurements(sent);
+CREATE INDEX IF NOT EXISTS idx_meas_pdl_ts   ON measurements(pdl_index, ts);
+CREATE INDEX IF NOT EXISTS idx_meas_pdl_papp ON measurements(pdl_index, papp);
+CREATE INDEX IF NOT EXISTS idx_meas_sent     ON measurements(sent);
 
 CREATE TABLE IF NOT EXISTS lora_link (
     ts          INTEGER NOT NULL,
@@ -59,13 +60,15 @@ CREATE INDEX IF NOT EXISTS idx_lora_pdl_ts ON lora_link(pdl_index, ts);
 CREATE INDEX IF NOT EXISTS idx_lora_sent   ON lora_link(sent);
 
 CREATE TABLE IF NOT EXISTS level_profile (
-    pdl_index   INTEGER PRIMARY KEY,
-    computed_ts INTEGER NOT NULL,
-    p_low       INTEGER,
-    p_mid       INTEGER,
-    p_high      INTEGER,
-    n_samples   INTEGER NOT NULL DEFAULT 0,
-    span_sec    INTEGER NOT NULL DEFAULT 0
+    pdl_index        INTEGER PRIMARY KEY,
+    computed_ts      INTEGER NOT NULL,
+    p_low            INTEGER,
+    p_mid            INTEGER,
+    p_high           INTEGER,
+    talon            INTEGER,
+    papp_max_alltime INTEGER,
+    n_samples        INTEGER NOT NULL DEFAULT 0,
+    span_sec         INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -95,6 +98,15 @@ def connect(path: str = DB_PATH, *, read_only: bool = False) -> sqlite3.Connecti
         cols = [r[1] for r in conn.execute("PRAGMA table_info(measurements)")]
         if "tariff" not in cols:
             conn.execute("ALTER TABLE measurements ADD COLUMN tariff INTEGER")
+        # Migration 0.0.34 : modèle de niveau « course [talon, plafond] ».
+        # talon = ancrage bas (percentile bas) ; papp_max_alltime = high-water
+        # mark monotone (jamais décrémenté, survit au prune → vrai plafond foyer).
+        lvl_cols = [r[1] for r in conn.execute("PRAGMA table_info(level_profile)")]
+        if "talon" not in lvl_cols:
+            conn.execute("ALTER TABLE level_profile ADD COLUMN talon INTEGER")
+        if "papp_max_alltime" not in lvl_cols:
+            conn.execute(
+                "ALTER TABLE level_profile ADD COLUMN papp_max_alltime INTEGER")
         conn.commit()
     conn.row_factory = sqlite3.Row
     return conn
@@ -143,6 +155,7 @@ def record_measurement(
     (BASE/HCHC/HCHP/PAPP/IINST). Les labels absents → NULL. `tariff` = index
     tarifaire actif (PTEC wired / index LoRa)."""
     ts = int(ts if ts is not None else time.time())
+    papp = labels.get("PAPP")
     conn.execute(
         "INSERT INTO measurements "
         "(ts, pdl_index, base, hchc, hchp, papp, iinst, tariff) "
@@ -153,11 +166,23 @@ def record_measurement(
             labels.get("BASE"),
             labels.get("HCHC"),
             labels.get("HCHP"),
-            labels.get("PAPP"),
+            papp,
             labels.get("IINST"),
             _tariff_from_labels(labels),
         ),
     )
+    # High-water mark monotone de la PAPP (plafond du modèle de niveau). Mis à
+    # jour ICI (au fil de l'eau) et JAMAIS via un SELECT MAX sur measurements,
+    # qui sont prunées à 3 mois → on perdrait les vieux pics. SoC : le reader ne
+    # touche QUE cette colonne ; le profiler (refresh) possède talon/percentiles.
+    if papp is not None:
+        conn.execute(
+            "INSERT INTO level_profile (pdl_index, computed_ts, papp_max_alltime) "
+            "VALUES (?, 0, ?) "
+            "ON CONFLICT(pdl_index) DO UPDATE SET "
+            "papp_max_alltime = MAX(COALESCE(papp_max_alltime, 0), excluded.papp_max_alltime)",
+            (pdl_index, papp),
+        )
     conn.commit()
 
 

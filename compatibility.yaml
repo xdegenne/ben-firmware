@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.33"
+        latest: "0.0.34"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -96,6 +96,9 @@ devices:
           - version: "0.0.33"
             released: "2026-06-07"
             notes: "cf. note pi0-wired 0.0.33 — feedback succès WiFi (2 flashs verts)."
+          - version: "0.0.34"
+            released: "2026-06-08"
+            notes: "cf. note pi0-wired 0.0.34 — modèle de niveau « course [talon, plafond] »."
       arduino:
         minimum: "0.0.1"
         latest: "0.0.1"
@@ -106,7 +109,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.33"
+        latest: "0.0.34"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -186,6 +189,9 @@ devices:
           - version: "0.0.33"
             released: "2026-06-07"
             notes: "Provisioner BLE — feedback succès connexion réseau : sur succès WiFi, 2 flashs verts rapides au lieu de 3 flashs + vert tenu permanent (cohérence UX, plus de vert fixe). N'impacte que le provisioning BLE ; rien à redémarrer (provisioner on-demand)."
+          - version: "0.0.34"
+            released: "2026-06-08"
+            notes: "Modèle de niveau « course [talon, plafond] » (remplace les percentiles P30/P70/P90, qui dégénéraient sur les foyers à faible base : un frigo seul ~150 W était sur-noté niveau 3, vu en prod sur ben-0003/Neuville). niveau = position de la PAPP entre le talon (P15, ancrage bas) et le plafond = papp_max_alltime (high-water mark MONOTONE de la PAPP, jamais décrémenté, survit au prune 3 mois ; « si c'est arrivé ça arrivera encore »). ratio=(PAPP−talon)/(plafond−talon), bandes 0,10/0,40/0,70. db.py : colonnes level_profile.talon + .papp_max_alltime (maintenu par record_measurement) + index idx_meas_pdl_papp (ALTER/index auto). levels.py : talon en SQL, cold-start (ou plafond<=talon) → niveau 2. Plus aucun seuil absolu en watts : bornes tirées des données du foyer → adaptatif ET non-dégénéré. update.sh : backfill one-shot du plafond depuis l'historique + restart ben-local-api + reader + recalcul talon ; pas de reboot. Firmware only (l'app lit déjà reading.level)."
     rev01:
       pi:
         latest: "0.0.2"
@@ -305,6 +311,10 @@ updates:
       to: "0.0.33"
       tag: "pi-0.0.33"
       script: "updates/_shared/0.0.32_to_0.0.33/update.sh"
+    - from: "0.0.33"
+      to: "0.0.34"
+      tag: "pi-0.0.34"
+      script: "updates/_shared/0.0.33_to_0.0.34/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -399,6 +409,10 @@ updates:
       to: "0.0.33"
       tag: "pi-0.0.33"
       script: "updates/pi0-wired/0.0.32_to_0.0.33/update.sh"
+    - from: "0.0.33"
+      to: "0.0.34"
+      tag: "pi-0.0.34"
+      script: "updates/_shared/0.0.33_to_0.0.34/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet
