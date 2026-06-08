@@ -150,7 +150,9 @@ def _sequence_loop(colors: list[tuple[int, int, int]],
                    on_sec: float,
                    gap_sec: float,
                    loop_gap_sec: float,
-                   bypass: bool) -> None:
+                   bypass: bool,
+                   tokens=None,
+                   on_show=None) -> None:
     """Boucle l'affichage d'une séquence de couleurs.
 
     Deux niveaux de noir, indispensables à la lisibilité :
@@ -159,37 +161,52 @@ def _sequence_loop(colors: list[tuple[int, int, int]],
       - `loop_gap_sec` (long) avant chaque répétition → marque le DÉBUT du code
         (sinon on ne sait pas où la séquence commence).
     La LED reste éteinte pendant tous les gaps.
+
+    Si `tokens` (liste parallèle à `colors`) et `on_show` sont fournis, on appelle
+    `on_show(token)` à l'allumage de chaque couleur et `on_show(None)` à l'extinction
+    → permet à l'app de se synchroniser (phase d'apprentissage des couleurs).
     """
     while not _stop_evt.is_set():
-        for c in colors:
+        for i, c in enumerate(colors):
             if _stop_evt.is_set():
                 break
             set_color(*c, bypass=bypass)
+            if on_show is not None and tokens is not None:
+                on_show(tokens[i])
             if _stop_evt.wait(on_sec):
                 break
             off()
+            if on_show is not None:
+                on_show(None)
             if _stop_evt.wait(gap_sec):
                 break
         # noir long = délimiteur de séquence
         if _stop_evt.wait(loop_gap_sec):
             break
     off()
+    if on_show is not None:
+        on_show(None)
 
 
 def start_sequence(colors: list[tuple[int, int, int]],
                    on_sec: float = 0.7,
                    gap_sec: float = 0.3,
                    loop_gap_sec: float = 1.5,
-                   bypass: bool = True) -> None:
+                   bypass: bool = True,
+                   tokens=None,
+                   on_show=None) -> None:
     """Démarre l'affichage en boucle d'une séquence de couleurs (background).
     Idempotent (stoppe la séquence/blink en cours). bypass=True par défaut :
-    une vérification doit rester visible même LED « éteinte » par l'utilisateur."""
+    une vérification doit rester visible même LED « éteinte » par l'utilisateur.
+
+    `tokens` + `on_show` : callback synchro (cf. _sequence_loop), pour la phase
+    d'apprentissage où l'app surligne la couleur affichée en temps réel."""
     global _blink_thread
     stop_blink()
     _stop_evt.clear()
     _blink_thread = threading.Thread(
         target=_sequence_loop,
-        args=(colors, on_sec, gap_sec, loop_gap_sec, bypass),
+        args=(colors, on_sec, gap_sec, loop_gap_sec, bypass, tokens, on_show),
         daemon=True,
     )
     _blink_thread.start()

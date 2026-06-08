@@ -70,16 +70,35 @@ Service `b3e7e511-0001-4bea-9b15-000000000000` (inchangé), deux caractéristiqu
 |---|---|---|---|
 | `VERIFY` | `…0005` | write | code deviné, 3 lettres ASCII parmi `BYWR` |
 | `VERIFY_STATUS` | `…0006` | read · notify | `pending \| verified \| wrong \| locked` |
+| `PREVIEW_CMD` | `…0007` | write | `"1"` = jouer les 4 couleurs en boucle (apprentissage), `"0"` = stop → test |
+| `PREVIEW_COLOR` | `…0008` | read · notify | couleur affichée pendant l'apprentissage : `B \| Y \| W \| R \| -` (`-` = noir) |
 
 `WIFI_CONFIG` (`…0001`) renvoie désormais `failed:not_verified` via `STATUS` si écrit
 avant `verified`.
 
+## Apprentissage des couleurs (avant le test) — depuis 0.0.38
+
+Pour garantir que l'utilisateur a **vu et su distinguer les 4 couleurs au moins une
+fois** avant de devoir lire le code (sinon il devine au hasard), une phase
+d'apprentissage précède le test :
+
+1. L'app écrit `PREVIEW_CMD = "1"` → le device joue les 4 couleurs dans un **ordre fixe**
+   `B → Y → W → R` en boucle (~1,3 s chacune, noir court entre), et **notifie** la couleur
+   courante via `PREVIEW_COLOR` (`-` pendant le noir).
+2. L'app affiche les 4 pastilles et **surligne en temps réel** celle qui correspond à la
+   couleur notifiée (synchro). « Voyez-vous les 4 couleurs s'allumer sur le boîtier ? »
+3. Sur **Suivant**, l'app écrit `PREVIEW_CMD = "0"` → le device arrête la boucle et lance
+   l'affichage du **code de test** ; on passe à l'écran de vérification.
+
+Repli : si l'app ne pilote pas `PREVIEW` (vieille app), le code de test s'affiche tout seul
+après `VERIFY_DISPLAY_DELAY_SEC` comme avant — comportement inchangé.
+
 ## Place dans le flux app
 
-`scan → connexion BLE → **vérification couleur** → WiFi → progression`
+`scan → connexion BLE → **apprentissage couleurs** → **vérification couleur** → WiFi → progression`
 
-L'écran de vérification s'insère entre la connexion et le formulaire WiFi. Tant que
-`verified` n'est pas reçu, on ne propose pas la saisie WiFi.
+L'écran d'apprentissage puis celui de vérification s'insèrent entre la connexion et le
+formulaire WiFi. Tant que `verified` n'est pas reçu, on ne propose pas la saisie WiFi.
 
 Déclenchement côté firmware : hook **`on_connect`** (bluezero, symétrique de
 `on_disconnect`). Au connect → génère un code frais + lance la séquence. Au disconnect sans

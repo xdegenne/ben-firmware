@@ -12,6 +12,8 @@ Service GATT (UUIDs custom BEN — préfixe `b3e7e511-...`)
   DEVICE_INFO   …004  read           JSON {deviceId, model, hardwareRevision, softwareVersion}
   VERIFY        …005  write          code couleur deviné (3 lettres parmi BYWR)
   VERIFY_STATUS …006  read|notify    texte: pending|verified|wrong|locked
+  PREVIEW_CMD   …007  write          "1" = jouer les 4 couleurs en boucle (apprentissage), "0" = stop → test
+  PREVIEW_COLOR …008  read|notify    couleur affichée pendant l'apprentissage: B|Y|W|R|- (- = noir)
 
 Vérification couleur (association) : à la connexion BLE, le device affiche un code de 3
 couleurs sur sa LED ; l'app le renvoie via VERIFY ; tant que VERIFY_STATUS != verified,
@@ -93,6 +95,8 @@ WIFI_SCAN_UUID   = "b3e7e511-0001-4bea-9b15-000000000003"
 DEVICE_INFO_UUID = "b3e7e511-0001-4bea-9b15-000000000004"
 VERIFY_UUID         = "b3e7e511-0001-4bea-9b15-000000000005"
 VERIFY_STATUS_UUID  = "b3e7e511-0001-4bea-9b15-000000000006"
+PREVIEW_CMD_UUID    = "b3e7e511-0001-4bea-9b15-000000000007"
+PREVIEW_COLOR_UUID  = "b3e7e511-0001-4bea-9b15-000000000008"
 
 # ---------------------------------------------------------------------------
 # State machine
@@ -117,6 +121,19 @@ VERIFY_CODE_LEN     = 3
 VERIFY_MAX_ATTEMPTS = 5
 VERIFY_COOLDOWN_SEC = 30
 VERIFY_DISPLAY_DELAY_SEC = 10   # délai avant d'afficher le code couleur à la connexion BLE
+# Durée d'affichage de chaque couleur du CODE de test (allongée pour laisser le
+# temps de lire ; séparées par un noir court).
+VERIFY_ON_SEC       = 1.3
+
+# Phase d'apprentissage des couleurs (avant le test) : on joue les 4 couleurs
+# dans un ORDRE FIXE, en boucle, et on notifie la couleur courante (synchro app).
+PREVIEW_ORDER       = "BYWR"
+PREVIEW_ON_SEC      = 1.3
+PREVIEW_GAP_SEC     = 0.45
+PREVIEW_LOOP_GAP_SEC = 0.9
+_preview_color_char = None  # set after publish()
+_preview_active = False
+_test_displayed = False   # le code de test est-il déjà à l'écran ? (anti-double)
 
 VS_PENDING  = "pending"
 VS_VERIFIED = "verified"
@@ -132,14 +149,62 @@ _verify_status_char = None  # set after publish()
 
 def _new_verify_code() -> None:
     """Génère un nouveau code couleur et lance son affichage LED en boucle."""
-    global _verify_code
+    global _verify_code, _test_displayed
     _verify_code = "".join(secrets.choice(VERIFY_TOKENS) for _ in range(VERIFY_CODE_LEN))
     log.info("code couleur: %s", _verify_code)
+    _test_displayed = True
     try:
         colors = [led.VERIFY_PALETTE[t] for t in _verify_code]
-        led.start_sequence(colors)
+        led.start_sequence(colors, on_sec=VERIFY_ON_SEC)
     except Exception as e:
         log.warning("affichage séquence LED impossible: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Apprentissage des couleurs (phase avant le test) — joue les 4 couleurs dans un
+# ordre fixe en boucle, et notifie la couleur courante pour synchroniser l'app.
+# ---------------------------------------------------------------------------
+def _notify_preview_color(token) -> None:
+    """Appelé par led._sequence_loop : pousse la couleur affichée (B|Y|W|R) ou
+    '-' (noir) sur PREVIEW_COLOR → l'app surligne la pastille correspondante."""
+    if _preview_color_char is None:
+        return
+    value = token if token else "-"
+    try:
+        _preview_color_char.set_value(value.encode("utf-8"))
+    except Exception as e:
+        log.warning("notify preview color failed: %s", e)
+
+
+def on_preview_color_read() -> bytes:
+    return b"-"
+
+
+def on_preview_cmd_write(value, options):
+    """PREVIEW_CMD : '1' = apprentissage (4 couleurs en boucle, synchro), '0' =
+    fin → affiche le code de test."""
+    global _preview_active
+    try:
+        cmd = bytes(value).decode("utf-8", "ignore").strip()
+    except Exception:
+        return
+    if cmd == "1":
+        _preview_active = True
+        log.info("apprentissage couleurs: démarrage (ordre %s)", PREVIEW_ORDER)
+        try:
+            colors = [led.VERIFY_PALETTE[t] for t in PREVIEW_ORDER]
+            led.start_sequence(
+                colors,
+                on_sec=PREVIEW_ON_SEC, gap_sec=PREVIEW_GAP_SEC,
+                loop_gap_sec=PREVIEW_LOOP_GAP_SEC,
+                tokens=list(PREVIEW_ORDER), on_show=_notify_preview_color)
+        except Exception as e:
+            log.warning("apprentissage couleurs impossible: %s", e)
+    elif cmd == "0":
+        if _preview_active:
+            log.info("apprentissage couleurs: fin → code de test")
+        _preview_active = False
+        _new_verify_code()
 
 
 def set_verify_status(new_status: str) -> None:
@@ -470,6 +535,18 @@ def main() -> int:
         flags=["read", "notify"],
         read_callback=on_verify_status_read,
     )
+    ben.add_characteristic(
+        srv_id=1, chr_id=7, uuid=PREVIEW_CMD_UUID,
+        value=[], notifying=False,
+        flags=["write"],
+        write_callback=on_preview_cmd_write,
+    )
+    ben.add_characteristic(
+        srv_id=1, chr_id=8, uuid=PREVIEW_COLOR_UUID,
+        value=list(b"-"), notifying=False,
+        flags=["read", "notify"],
+        read_callback=on_preview_color_read,
+    )
 
     # Gestion de la déconnexion BLE :
     #   - Si on a déjà réussi → on reste vivant pour la grace period
@@ -489,9 +566,11 @@ def main() -> int:
     # Au connect d'un central : on génère un code couleur frais et on l'affiche.
     # C'est le moment où la vérification visuelle a un sens (un téléphone est là).
     def _on_connect(*_args, **_kwargs):
-        global _verified, _verify_attempts
+        global _verified, _verify_attempts, _preview_active, _test_displayed
         _verified = False
         _verify_attempts = 0
+        _preview_active = False
+        _test_displayed = False
         log.info("BLE connecté — 2 flashs verts puis code couleur dans %ds", VERIFY_DISPLAY_DELAY_SEC)
         set_verify_status(VS_PENDING)
         # À la connexion BLE : on ARRÊTE le blink d'attente violet/jaune et on
@@ -503,13 +582,20 @@ def main() -> int:
             kwargs={"n": 2, "flash_sec": 0.08, "hold_after": False, "bypass": True},
             daemon=True,
         ).start()
-        # Puis, après le délai, le code couleur prend la main (LED éteinte entre-temps).
-        threading.Timer(VERIFY_DISPLAY_DELAY_SEC, _new_verify_code).start()
+        # Repli : si l'app ne pilote PAS la phase d'apprentissage (PREVIEW_CMD),
+        # on affiche quand même le code de test après le délai. Avec une app à
+        # jour, c'est le « Suivant » (PREVIEW_CMD="0") qui déclenche l'affichage,
+        # et ce repli ne fait rien (preview actif ou code déjà affiché).
+        def _fallback_show_code():
+            if not _preview_active and not _test_displayed:
+                _new_verify_code()
+        threading.Timer(VERIFY_DISPLAY_DELAY_SEC, _fallback_show_code).start()
     ben.on_connect = _on_connect
 
-    global _status_char, _verify_status_char
-    _status_char = ben.characteristics[1]         # la 2e ajoutée
-    _verify_status_char = ben.characteristics[5]  # la 6e ajoutée
+    global _status_char, _verify_status_char, _preview_color_char
+    _status_char = ben.characteristics[1]          # la 2e ajoutée
+    _verify_status_char = ben.characteristics[5]   # la 6e ajoutée
+    _preview_color_char = ben.characteristics[7]   # la 8e ajoutée
 
     log.info("advertising sous le nom: %s", device_id)
     log.info("service UUID: %s", SERVICE_UUID)
