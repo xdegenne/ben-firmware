@@ -28,6 +28,7 @@ durcissement (cert device / token) prévu plus tard.
 """
 
 import json
+import os
 import sqlite3
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -48,9 +49,17 @@ def _device_info() -> dict:
     try:
         with open(DEVICE_JSON) as f:
             d = json.load(f)
-        return {k: d.get(k) for k in ("deviceId", "model", "softwareVersion")}
+        info = {k: d.get(k) for k in ("deviceId", "model", "softwareVersion")}
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"deviceId": None, "model": None, "softwareVersion": None}
+        info = {"deviceId": None, "model": None, "softwareVersion": None}
+    # Date de la dernière MAJ firmware (epoch s) = mtime de device.json : ce
+    # fichier n'est réécrit qu'à un changement de version (OTA) ou au
+    # provisioning. Pas de champ stocké, on lit la métadonnée filesystem.
+    try:
+        info["lastUpdateTs"] = int(os.path.getmtime(DEVICE_JSON))
+    except OSError:
+        info["lastUpdateTs"] = None
+    return info
 
 
 def _rows(conn, sql, params) -> list:

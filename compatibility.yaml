@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.34"
+        latest: "0.0.35"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -99,6 +99,9 @@ devices:
           - version: "0.0.34"
             released: "2026-06-08"
             notes: "cf. note pi0-wired 0.0.34 — modèle de niveau « course [talon, plafond] »."
+          - version: "0.0.35"
+            released: "2026-06-08"
+            notes: "cf. note pi0-wired 0.0.35 — /health expose lastUpdateTs (mtime device.json)."
       arduino:
         minimum: "0.0.1"
         latest: "0.0.1"
@@ -109,7 +112,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.34"
+        latest: "0.0.35"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -192,22 +195,9 @@ devices:
           - version: "0.0.34"
             released: "2026-06-08"
             notes: "Modèle de niveau « course [talon, plafond] » (remplace les percentiles P30/P70/P90, qui dégénéraient sur les foyers à faible base : un frigo seul ~150 W était sur-noté niveau 3, vu en prod sur ben-0003/Neuville). niveau = position de la PAPP entre le talon (P15, ancrage bas) et le plafond = papp_max_alltime (high-water mark MONOTONE de la PAPP, jamais décrémenté, survit au prune 3 mois ; « si c'est arrivé ça arrivera encore »). ratio=(PAPP−talon)/(plafond−talon), bandes 0,10/0,40/0,70. db.py : colonnes level_profile.talon + .papp_max_alltime (maintenu par record_measurement) + index idx_meas_pdl_papp (ALTER/index auto). levels.py : talon en SQL, cold-start (ou plafond<=talon) → niveau 2. Plus aucun seuil absolu en watts : bornes tirées des données du foyer → adaptatif ET non-dégénéré. update.sh : backfill one-shot du plafond depuis l'historique + restart ben-local-api + reader + recalcul talon ; pas de reboot. Firmware only (l'app lit déjà reading.level)."
-    rev01:
-      pi:
-        latest: "0.0.2"
-        history:
-          - version: "0.0.1"
-            released: "2026-05-30"
-            notes: "first dev release (published, no devices in field)"
-          - version: "0.0.2"
-            released: "2026-05-30"
-            notes: "log-only baseline (Influx stripped, hostname rename)"
-      arduino:
-        minimum: "0.0.1"
-        latest: "0.0.1"
-        history:
-          - version: "0.0.1"
-            released: "2026-05-30"
+          - version: "0.0.35"
+            released: "2026-06-08"
+            notes: "/health expose lastUpdateTs (epoch s) = date de la dernière MAJ firmware, lue via la mtime de device.json (réécrit seulement à un changement de version OTA ou au provisioning). local_api.py : _device_info() ajoute le champ. Pas de champ stocké, pas de migration, aucun reader touché. update.sh : restart ben-local-api ; pas de reboot. Permet à l'app d'afficher « Mis à jour le … » et de repérer un device en retard."
 
 updates:
 
@@ -315,6 +305,10 @@ updates:
       to: "0.0.34"
       tag: "pi-0.0.34"
       script: "updates/_shared/0.0.33_to_0.0.34/update.sh"
+    - from: "0.0.34"
+      to: "0.0.35"
+      tag: "pi-0.0.35"
+      script: "updates/_shared/0.0.34_to_0.0.35/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -413,6 +407,10 @@ updates:
       to: "0.0.34"
       tag: "pi-0.0.34"
       script: "updates/_shared/0.0.33_to_0.0.34/update.sh"
+    - from: "0.0.34"
+      to: "0.0.35"
+      tag: "pi-0.0.35"
+      script: "updates/_shared/0.0.34_to_0.0.35/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet
