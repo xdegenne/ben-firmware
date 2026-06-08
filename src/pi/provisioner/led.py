@@ -204,12 +204,16 @@ VERT   = (0, 30, 0)
 ROUGE  = (40, 0, 0)
 
 # Palette de vérification (lisible daltonien) : JAMAIS rouge ET vert ensemble
-# → on supprime le vert (confusion deutan/protan, ~8 % des hommes). Duties poussés
-# (séquence affichée en bypass, donc plein contraste) ; à calibrer sur device réel
-# pour que BLANC/JAUNE ne virent pas verdâtre (canal vert perceptuellement vif).
+# → on supprime le vert (confusion deutan/protan, ~8 % des hommes). On joue sur
+# l'axe bleu↔jaune (perçu par les dichromates) + la luminosité (blanc clair /
+# rouge sombre). Duties poussés (séquence en bypass, plein contraste).
+# IMPORTANT — le BLANC : la LED bleue est perceptuellement plus vive, donc à
+# canaux égaux le « blanc » vire au bleu (confusion blanc/bleu constatée). On
+# fait un BLANC CHAUD en écrasant le bleu (B ≈ 0,25-0,35 × R). À ré-ajuster sur
+# device réel si besoin.
 VERIFY_PALETTE = {
-    "B": (0, 0, 100),     # Bleu
-    "Y": (80, 70, 0),     # Jaune (warm, pas de bleu)
-    "W": (70, 70, 80),    # Blanc
-    "R": (100, 0, 0),     # Rouge (poussé : les protans le voient sombre)
+    "B": (0,   0,   100),  # Bleu  — pur
+    "Y": (100, 80,  0),    # Jaune — vif, zéro bleu
+    "W": (100, 85,  25),   # Blanc CHAUD — bleu écrasé pour ne plus virer bleu
+    "R": (100, 0,   0),    # Rouge — poussé (les protans le voient sombre)
 }

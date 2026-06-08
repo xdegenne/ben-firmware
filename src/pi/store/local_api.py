@@ -30,6 +30,8 @@ durcissement (cert device / token) prévu plus tard.
 import json
 import os
 import sqlite3
+import subprocess
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -116,6 +118,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         url = urlparse(self.path)
         path = url.path.rstrip("/") or "/"
+        if path == "/unprovision":
+            return self._unprovision(parse_qs(url.query))
         if path != "/settings":
             return self._send({"error": "not_found"}, 404)
         try:
@@ -149,6 +153,29 @@ class Handler(BaseHTTPRequestHandler):
             db_ok = False
         self._send({**info, "db": db_ok, "last_tic_ts": last_tic,
                     "now": int(time.time())})
+
+    def _unprovision(self, qs):
+        """Désappaire le boîtier : supprime la connexion WiFi (→ provisioning BLE
+        au reboot), efface optionnellement les données (`?wipe=1`), puis reboot.
+        Raccourci assumé (pas en prod) : AUCUNE auth — l'API est sur le LAN, la
+        confirmation se fait côté app. Garde l'identité (certs, deviceId)."""
+        wipe = (qs.get("wipe", ["0"])[0]).lower() in ("1", "true", "yes")
+        # 1. supprime la connexion WiFi → repart en provisioning BLE au boot.
+        subprocess.run(
+            ["sudo", "nmcli", "connection", "delete", "ben-provisioned"],
+            capture_output=True)
+        # 2. wipe optionnel des données locales (db recréée au prochain démarrage).
+        if wipe:
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.remove(db.DB_PATH + suffix)
+                except OSError:
+                    pass
+        # 3. on répond AVANT de rebooter (laisse le HTTP flush).
+        self._send({"ok": True, "wipe": wipe, "rebooting": True})
+        threading.Timer(
+            1.5, lambda: subprocess.Popen(["sudo", "systemctl", "reboot"])
+        ).start()
 
     def _pdls(self):
         with db.connect(read_only=True) as conn:
