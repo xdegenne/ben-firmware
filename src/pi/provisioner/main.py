@@ -262,9 +262,14 @@ def set_status(new_state: str) -> None:
             led.flash_pattern(led.VERT, n=2, flash_sec=0.08, hold_after=False,
                               bypass=True)
         elif new_state.startswith("failed:"):
+            # Échec WiFi (ex. mauvais mot de passe) : le BLE reste connecté,
+            # l'utilisateur peut re-saisir. On signale l'échec par 3 flashs
+            # rouges puis on ÉTEINT — surtout PAS le violet/jaune « à configurer »
+            # (aucun téléphone connecté), qui laisserait croire à un reset alors
+            # qu'on est toujours lié et prêt pour un nouvel essai.
             led.flash_pattern(led.ROUGE, n=3, flash_sec=0.15, hold_after=False,
                               bypass=True)
-            led.start_blink(led.VIOLET, led.JAUNE, period_sec=1.2, bypass=True)
+            led.off()
     except Exception as e:
         log.warning("LED feedback failed: %s", e)
 
