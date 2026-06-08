@@ -121,6 +121,10 @@ VERIFY_CODE_LEN     = 3
 VERIFY_MAX_ATTEMPTS = 5
 VERIFY_COOLDOWN_SEC = 30
 VERIFY_DISPLAY_DELAY_SEC = 10   # délai avant d'afficher le code couleur à la connexion BLE
+# Délai (LED éteinte) entre la fin de l'apprentissage (« Suivant ») et le
+# démarrage du code de test → laisse le temps d'arriver sur l'écran de test et
+# de ne pas rater le début de la séquence.
+VERIFY_AFTER_PREVIEW_SEC = 3.0
 # Durée d'affichage de chaque couleur du CODE de test (allongée pour laisser le
 # temps de lire ; séparées par un noir court).
 VERIFY_ON_SEC       = 1.3
@@ -202,9 +206,17 @@ def on_preview_cmd_write(value, options):
             log.warning("apprentissage couleurs impossible: %s", e)
     elif cmd == "0":
         if _preview_active:
-            log.info("apprentissage couleurs: fin → code de test")
+            log.info("apprentissage couleurs: fin → code de test dans %.1fs",
+                     VERIFY_AFTER_PREVIEW_SEC)
         _preview_active = False
-        _new_verify_code()
+        # Arrête la boucle d'apprentissage et éteint, PUIS lance le code de test
+        # après un délai (le temps d'arriver sur l'écran de test).
+        try:
+            led.stop_blink()
+            led.off()
+        except Exception:
+            pass
+        threading.Timer(VERIFY_AFTER_PREVIEW_SEC, _new_verify_code).start()
 
 
 def set_verify_status(new_status: str) -> None:
