@@ -155,27 +155,45 @@ class Handler(BaseHTTPRequestHandler):
                     "now": int(time.time())})
 
     def _unprovision(self, qs):
-        """Désappaire le boîtier : supprime la connexion WiFi (→ provisioning BLE
-        au reboot), efface optionnellement les données (`?wipe=1`), puis reboot.
-        Raccourci assumé (pas en prod) : AUCUNE auth — l'API est sur le LAN, la
-        confirmation se fait côté app. Garde l'identité (certs, deviceId)."""
+        """Désappaire le boîtier : oublie le WiFi (→ provisioning BLE au reboot),
+        efface optionnellement les données (`?wipe=1`), puis reboot.
+
+        ORDRE CRITIQUE : on répond AVANT de couper le réseau, puis on fait le
+        désappairage + reboot en ASYNCHRONE. Sinon supprimer la connexion WiFi
+        tue le lien TCP et l'app ne reçoit jamais la réponse.
+        Raccourci assumé (pas en prod) : AUCUNE auth. Garde l'identité (certs)."""
         wipe = (qs.get("wipe", ["0"])[0]).lower() in ("1", "true", "yes")
-        # 1. supprime la connexion WiFi → repart en provisioning BLE au boot.
-        subprocess.run(
-            ["sudo", "nmcli", "connection", "delete", "ben-provisioned"],
-            capture_output=True)
-        # 2. wipe optionnel des données locales (db recréée au prochain démarrage).
-        if wipe:
-            for suffix in ("", "-wal", "-shm"):
-                try:
-                    os.remove(db.DB_PATH + suffix)
-                except OSError:
-                    pass
-        # 3. on répond AVANT de rebooter (laisse le HTTP flush).
+        print(f"[unprovision] requête reçue (wipe={wipe})", flush=True)
+        # 1. Réponse immédiate — le réseau est encore là, l'app reçoit l'ack.
         self._send({"ok": True, "wipe": wipe, "rebooting": True})
-        threading.Timer(
-            1.5, lambda: subprocess.Popen(["sudo", "systemctl", "reboot"])
-        ).start()
+
+        # 2. Désappairage + reboot DIFFÉRÉS (laisse la réponse HTTP partir).
+        def _teardown():
+            # Oublie TOUTES les connexions WiFi (ben-provisioned + éventuel profil
+            # opérateur du golden) → repart en provisioning BLE au prochain boot.
+            listing = subprocess.run(
+                ["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"],
+                capture_output=True, text=True)
+            for line in listing.stdout.splitlines():
+                name, _, ctype = line.partition(":")
+                if ctype == "802-11-wireless" and name:
+                    r = subprocess.run(
+                        ["sudo", "nmcli", "connection", "delete", name],
+                        capture_output=True, text=True)
+                    print(f"[unprovision] delete '{name}' rc={r.returncode} "
+                          f"{r.stderr.strip()}", flush=True)
+            if wipe:
+                for suffix in ("", "-wal", "-shm"):
+                    try:
+                        os.remove(db.DB_PATH + suffix)
+                        print(f"[unprovision] wipe {db.DB_PATH}{suffix}",
+                              flush=True)
+                    except OSError:
+                        pass
+            print("[unprovision] reboot", flush=True)
+            subprocess.Popen(["sudo", "systemctl", "reboot"])
+
+        threading.Timer(2.0, _teardown).start()
 
     def _pdls(self):
         with db.connect(read_only=True) as conn:

@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.36"
+        latest: "0.0.37"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -105,6 +105,9 @@ devices:
           - version: "0.0.36"
             released: "2026-06-08"
             notes: "cf. note pi0-wired 0.0.36 — palette LED de vérif recalibrée (blanc chaud) + POST /unprovision (désappairage)."
+          - version: "0.0.37"
+            released: "2026-06-08"
+            notes: "cf. note pi0-wired 0.0.37 — /unprovision corrigé (ack avant coupure réseau, reboot async, oubli WiFi complet) + logs."
       arduino:
         minimum: "0.0.1"
         latest: "0.0.1"
@@ -115,7 +118,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.36"
+        latest: "0.0.37"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -204,6 +207,9 @@ devices:
           - version: "0.0.36"
             released: "2026-06-08"
             notes: "(1) Palette LED de vérif BLE recalibrée (led.py) : BLANC CHAUD (canal bleu écrasé, B≈0,25×R) car la LED bleue est perceptuellement plus vive → le blanc virait au bleu (confusion blanc/bleu constatée au provisioning). Palette daltonien conservée (axe bleu↔jaune + luminosité, sans vert). Provisioner on-demand → pris au prochain provisioning. (2) API locale : POST /unprovision (désappairage) — supprime la connexion WiFi `ben-provisioned` (→ provisioning BLE au reboot), efface optionnellement les données (?wipe=1), puis reboot ; garde l'identité (certs, deviceId). SANS auth (raccourci assumé : LAN + confirmation app). update.sh : restart ben-local-api ; pas de reboot. L'app ajoute une carte « Désappairer » (Avancé) avec option wipe."
+          - version: "0.0.37"
+            released: "2026-06-08"
+            notes: "API locale : POST /unprovision corrigé. Bug : on supprimait la connexion WiFi AVANT de répondre → couper `ben-provisioned` tue le lien TCP, l'app ne recevait jamais l'ack (et le diagnostic était aveugle car l'API silence log_message par défaut). Fix : on répond d'abord, PUIS désappairage + reboot en ASYNCHRONE (threading.Timer 2 s) ; on oublie TOUTES les connexions WiFi (ben-provisioned + éventuel profil opérateur `wifi` du golden, qui sinon reconnectait en autoconnect) ; ajout de logs « [unprovision] … ». update.sh : restart ben-local-api ; pas de reboot."
 
 updates:
 
@@ -319,6 +325,10 @@ updates:
       to: "0.0.36"
       tag: "pi-0.0.36"
       script: "updates/_shared/0.0.35_to_0.0.36/update.sh"
+    - from: "0.0.36"
+      to: "0.0.37"
+      tag: "pi-0.0.37"
+      script: "updates/_shared/0.0.36_to_0.0.37/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -425,6 +435,10 @@ updates:
       to: "0.0.36"
       tag: "pi-0.0.36"
       script: "updates/_shared/0.0.35_to_0.0.36/update.sh"
+    - from: "0.0.36"
+      to: "0.0.37"
+      tag: "pi-0.0.37"
+      script: "updates/_shared/0.0.36_to_0.0.37/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet
