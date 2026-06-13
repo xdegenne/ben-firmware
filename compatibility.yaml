@@ -124,7 +124,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.39"
+        latest: "0.0.40"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -222,6 +222,9 @@ devices:
           - version: "0.0.39"
             released: "2026-06-08"
             notes: "Provisioning BLE — 2 corrections UX de la LED. (1) Échec WiFi (ex. mauvais mot de passe) : le BLE reste connecté et l'utilisateur peut re-saisir → set_status() ne rejoue PLUS le blink violet/jaune (« aucun téléphone, à configurer ») qui laissait croire à un reset ; on garde les 3 flashs rouges (échec) puis on ÉTEINT (état « connecté, en attente de saisie »). (2) Fin de l'apprentissage des couleurs (PREVIEW_CMD='0') : on arrête la boucle + éteint, puis on attend VERIFY_AFTER_PREVIEW_SEC (3 s) avant de démarrer le code de test, le temps d'arriver sur l'écran de test sans rater le début. Provisioner on-demand → rien à redémarrer, pas de reboot."
+          - version: "0.0.40"
+            released: "2026-06-13"
+            notes: "Courbe temps réel (pi-wired). Lecture TIC AU FIL DE L'EAU (suppression du sleep 15s, event-driven sur la trame → courbe fine ~1,5s au lieu de 1/15s) + écritures BDD BATCHÉES (1 commit/15s via executemany → ménage la SD malgré ~7× plus de points). API : nouvel endpoint /curve (agrégé min/max/avg, bucketing ABSOLU + quantifié pour stabilité au pan, centroïde temporel, index porté) ; /measurements degrade-safe (agrège au lieu de tronquer) ; /pdls expose first_ts. db.py/local_api.py partagés mais ADDITIFS (pas de changement de schéma, reader LoRa intact) → seuls les wired bumpent. AUCUNE migration. update.sh = restart ben-tic-reader + ben-local-api."
 
 updates:
 
@@ -467,6 +470,10 @@ updates:
       to: "0.0.39"
       tag: "pi-0.0.39"
       script: "updates/_shared/0.0.38_to_0.0.39/update.sh"
+    - from: "0.0.39"
+      to: "0.0.40"
+      tag: "pi-0.0.40"
+      script: "updates/pi0-wired/0.0.39_to_0.0.40/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet
