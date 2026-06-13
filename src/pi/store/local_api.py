@@ -18,7 +18,12 @@ Endpoints :
   GET /live[?pdl_index=N]
       → dernière mesure (≤ ~30 s) par PDL (ou pour un PDL donné)
   GET /measurements?pdl_index=N[&since=ts&until=ts&limit=N]
-      → points de conso ordonnés par ts croissant (since défaut = -24 h)
+      → points de conso ordonnés par ts croissant (since défaut = -24 h).
+        Degrade-safe : si > limit points fins → agrégé à ~limit buckets
+        (min/max/avg) au lieu d'être tronqué. `downsampled` indique le cas.
+  GET /curve?pdl_index=N[&since=ts&until=ts&buckets=K]
+      → courbe agrégée par bucket (min/max/avg, pics préservés). `buckets` =
+        résolution voulue par l'app (défaut 500, max 2000). Endpoint riche.
   GET /lora-link?pdl_index=N[&since=ts&limit=N]
       → qualité de réception LoRa (rssi/snr) — modèles pi0-lora
 
@@ -45,6 +50,8 @@ PORT = 8087
 DEVICE_JSON = "/etc/ben-firmware/device.json"
 DEFAULT_WINDOW_SEC = 24 * 3600
 MAX_LIMIT = 10000
+DEFAULT_CURVE_BUCKETS = 500   # points servis par défaut (≈ largeur écran)
+MAX_CURVE_BUCKETS = 2000      # plafond : au-delà, inutile (densité > pixels)
 
 
 def _device_info() -> dict:
@@ -104,6 +111,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._live(qs)
             if path == "/measurements":
                 return self._measurements(qs)
+            if path == "/curve":
+                return self._curve(qs)
             if path == "/lora-link":
                 return self._lora_link(qs)
             if path == "/settings":
@@ -199,7 +208,11 @@ class Handler(BaseHTTPRequestHandler):
         with db.connect(read_only=True) as conn:
             rows = _rows(
                 conn,
-                "SELECT pdl_index, MAX(ts) AS last_ts, COUNT(*) AS points "
+                # first_ts = 1re mesure du PDL → l'app en déduit l'âge
+                # d'apprentissage (now - first_ts) pour dimensionner sa fenêtre de
+                # lissage anti-Hawthorne (volet D, présentation côté app).
+                "SELECT pdl_index, MIN(ts) AS first_ts, MAX(ts) AS last_ts, "
+                "COUNT(*) AS points "
                 "FROM measurements GROUP BY pdl_index ORDER BY pdl_index",
                 (),
             )
@@ -245,14 +258,52 @@ class Handler(BaseHTTPRequestHandler):
         until = _int(qs, "until", now)
         limit = min(_int(qs, "limit", MAX_LIMIT) or MAX_LIMIT, MAX_LIMIT)
         with db.connect(read_only=True) as conn:
-            rows = _rows(
-                conn,
-                "SELECT ts, base, hchc, hchp, papp, iinst, tariff FROM measurements "
-                "WHERE pdl_index=? AND ts>=? AND ts<=? ORDER BY ts ASC LIMIT ?",
-                (pdl, since, until, limit),
-            )
+            # Degrade-safe : la lecture au fil de l'eau densifie la courbe (~7×).
+            # Si la plage contient plus de `limit` points fins, on AGRÈGE à ~limit
+            # buckets (min/max/avg) au lieu de tronquer aux plus VIEUX via
+            # `ORDER BY ts ASC LIMIT` — qui affichait un bord périmé. Une app pas
+            # à jour reçoit ainsi une courbe complète et allégée, sans rien changer
+            # côté app (cf. chantier-courbe-temps-reel.md, compat).
+            total = conn.execute(
+                "SELECT COUNT(*) AS c FROM measurements "
+                "WHERE pdl_index=? AND ts>=? AND ts<=? AND papp IS NOT NULL",
+                (pdl, since, until),
+            ).fetchone()["c"]
+            if total > limit and until > since:
+                bucket_sec = max(1, (until - since) // limit)
+                rows = db.curve_buckets(conn, pdl, since, until, bucket_sec)
+                downsampled = True
+            else:
+                rows = _rows(
+                    conn,
+                    "SELECT ts, base, hchc, hchp, papp, iinst, tariff FROM measurements "
+                    "WHERE pdl_index=? AND ts>=? AND ts<=? ORDER BY ts ASC LIMIT ?",
+                    (pdl, since, until, limit),
+                )
+                downsampled = False
         self._send({"pdl_index": pdl, "since": since, "until": until,
-                    "count": len(rows), "points": rows})
+                    "count": len(rows), "downsampled": downsampled, "points": rows})
+
+    def _curve(self, qs):
+        """Courbe agrégée par bucket — endpoint riche pour l'app à jour. L'app
+        pilote la résolution (`buckets` = largeur de son viewport) ; le firmware
+        agrège (min/max/avg, pics préservés). Le lissage anti-Hawthorne est
+        appliqué PAR L'APP par-dessus (présentation pure, volet D)."""
+        pdl = _int(qs, "pdl_index")
+        if pdl is None:
+            return self._send({"error": "pdl_index_required"}, 400)
+        now = int(time.time())
+        since = _int(qs, "since", now - DEFAULT_WINDOW_SEC)
+        until = _int(qs, "until", now)
+        if until <= since:
+            return self._send({"error": "bad_range"}, 400)
+        buckets = _int(qs, "buckets", DEFAULT_CURVE_BUCKETS) or DEFAULT_CURVE_BUCKETS
+        buckets = max(1, min(buckets, MAX_CURVE_BUCKETS))
+        bucket_sec = max(1, (until - since) // buckets)
+        with db.connect(read_only=True) as conn:
+            pts = db.curve_buckets(conn, pdl, since, until, bucket_sec)
+        self._send({"pdl_index": pdl, "since": since, "until": until,
+                    "bucket_sec": bucket_sec, "count": len(pts), "points": pts})
 
     def _lora_link(self, qs):
         pdl = _int(qs, "pdl_index")

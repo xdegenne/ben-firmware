@@ -186,6 +186,57 @@ def record_measurement(
     conn.commit()
 
 
+def record_measurements_batch(
+    conn: sqlite3.Connection,
+    rows: list[tuple[int, dict, int]],
+) -> int:
+    """Insère un LOT de mesures en UNE seule transaction (executemany) + met à
+    jour le high-water mark `papp_max_alltime` par PDL — un seul `commit()` pour
+    tout le lot, au lieu d'un par mesure.
+
+    `rows` = liste de `(pdl_index, labels, ts)`. Sert la lecture UART au fil de
+    l'eau (cadence ~2 s) sans matraquer la SD d'un fsync par trame
+    (cf. chantier-courbe-temps-reel.md, volet B : « granularité de perte = le
+    batch »). Le LoRa garde `record_measurement` (cadence ~1/32 s, batch inutile).
+    Renvoie le nombre de lignes insérées. Lot vide → no-op."""
+    if not rows:
+        return 0
+    params = []
+    maxima: dict[int, int] = {}  # pdl_index -> max PAPP du lot
+    for pdl_index, labels, ts in rows:
+        papp = labels.get("PAPP")
+        params.append((
+            int(ts),
+            pdl_index,
+            labels.get("BASE"),
+            labels.get("HCHC"),
+            labels.get("HCHP"),
+            papp,
+            labels.get("IINST"),
+            _tariff_from_labels(labels),
+        ))
+        if papp is not None and papp > maxima.get(pdl_index, -1):
+            maxima[pdl_index] = papp
+    conn.executemany(
+        "INSERT INTO measurements "
+        "(ts, pdl_index, base, hchc, hchp, papp, iinst, tariff) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        params,
+    )
+    # High-water mark par PDL : même logique monotone que record_measurement,
+    # mais une fois par PDL pour tout le lot (le max du lot suffit).
+    for pdl_index, papp in maxima.items():
+        conn.execute(
+            "INSERT INTO level_profile (pdl_index, computed_ts, papp_max_alltime) "
+            "VALUES (?, 0, ?) "
+            "ON CONFLICT(pdl_index) DO UPDATE SET "
+            "papp_max_alltime = MAX(COALESCE(papp_max_alltime, 0), excluded.papp_max_alltime)",
+            (pdl_index, papp),
+        )
+    conn.commit()
+    return len(params)
+
+
 def record_lora_link(
     conn: sqlite3.Connection,
     pdl_index: int,
@@ -201,6 +252,86 @@ def record_lora_link(
         (ts, pdl_index, rssi, snr),
     )
     conn.commit()
+
+
+# Échelle de bucket QUANTIFIÉE : on snappe `bucket_sec` sur des paliers fixes pour
+# que la résolution soit stable d'un fetch à l'autre. Couplé au bucketing ABSOLU
+# (`CAST(ts/bucket_sec)`), une même zone donne TOUJOURS les mêmes buckets → en panant,
+# le re-fetch ne fait pas « sauter » la courbe (les zones recouvrantes sont identiques).
+_BUCKET_LADDER = (1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200,
+                  10800, 21600, 43200, 86400)
+
+
+def _snap_bucket_sec(sec: int) -> int:
+    """Arrondit `sec` au palier ≥ le plus proche (résolution stable entre fetches)."""
+    sec = max(1, int(sec))
+    for b in _BUCKET_LADDER:
+        if b >= sec:
+            return b
+    return 86400 * ((sec + 86399) // 86400)  # au-delà d'un jour : multiples de 86400
+
+
+def curve_buckets(
+    conn: sqlite3.Connection,
+    pdl_index: int,
+    since: int,
+    until: int,
+    bucket_sec: int,
+    *,
+    with_minmax: bool = True,
+) -> list[dict]:
+    """Courbe de PAPP **agrégée par bucket temporel** de `bucket_sec` secondes sur
+    `[since, until]`. Sert l'app (`/curve`, `/measurements` degrade-safe) : on
+    stocke fin, on sert grossier (cf. chantier-courbe-temps-reel.md, volet C).
+
+    Chaque point : `{ts, papp_avg, n[, papp_min, papp_max]}`, ordonné par ts.
+    L'agrégation **préserve les pics** via min/max — JAMAIS de décimation naïve
+    (« 1 point sur N ») qui tuerait les transitoires (signatures NILM). `tariff`
+    = celui du dernier échantillon du bucket (pour les marqueurs de zones tarifaires
+    de l'app). `with_minmax=False` → moyenne seule.
+
+    Le bucketing par `CAST((ts - since) / bucket_sec AS INT)` s'appuie sur l'index
+    `(pdl_index, ts)` → pas de transfert des lignes fines hors SQL."""
+    bucket_sec = _snap_bucket_sec(bucket_sec)
+    # CTE `agg` : bucket sur GRILLE ABSOLUE (`ts / bucket_sec`, pas `(ts - since)`) →
+    # frontières fixes, stables au pan. tariff/index = ceux de l'échantillon au ts_max
+    # du bucket (via JOIN sur valeur concrète ; SQLite refuse MAX() dans une corrélée).
+    rows = conn.execute(
+        "WITH agg AS ("
+        "  SELECT CAST(ts / ? AS INT) AS bucket, "
+        # ts du point = CENTROÏDE temporel du bucket (AVG), pas le bord gauche
+        # (MIN) : sinon un bucket large ancre sa moyenne à gauche → la courbe
+        # grossière paraît décalée, et passe à droite quand le fin arrive (« saut
+        # dans le temps »). Le centroïde aligne grossier et fin.
+        "         CAST(AVG(ts) AS INT) AS ts, MAX(ts) AS ts_max, "
+        "         AVG(papp) AS papp_avg, MIN(papp) AS papp_min, "
+        "         MAX(papp) AS papp_max, COUNT(*) AS n "
+        "  FROM measurements "
+        "  WHERE pdl_index=? AND ts>=? AND ts<=? AND papp IS NOT NULL "
+        "  GROUP BY bucket"
+        ") "
+        # tariff ET index d'énergie (base/hchc/hchp) = ceux du dernier échantillon
+        # du bucket (à ts_max). L'index est INDISPENSABLE : l'app calcule la conso/
+        # le coût d'une période par DIFFÉRENCE d'index (cf. _indexAt) → sans lui,
+        # pas de coût sur les vues agrégées. GROUP BY a.bucket dédoublonne un ts_max
+        # éventuellement partagé.
+        "SELECT a.ts AS ts, a.papp_avg, a.papp_min, a.papp_max, a.n, "
+        "       l.tariff AS tariff, l.base AS base, l.hchc AS hchc, l.hchp AS hchp "
+        "FROM agg a "
+        "LEFT JOIN measurements l ON l.pdl_index=? AND l.ts=a.ts_max "
+        "GROUP BY a.bucket ORDER BY a.bucket",
+        (bucket_sec, pdl_index, since, until, pdl_index),
+    ).fetchall()
+    out = []
+    for r in rows:
+        pt = {"ts": r["ts"], "papp": int(round(r["papp_avg"])),
+              "tariff": r["tariff"], "base": r["base"], "hchc": r["hchc"],
+              "hchp": r["hchp"], "n": r["n"]}
+        if with_minmax:
+            pt["papp_min"] = r["papp_min"]
+            pt["papp_max"] = r["papp_max"]
+        out.append(pt)
+    return out
 
 
 def prune(conn: sqlite3.Connection, retention_days: int = RETENTION_DAYS) -> dict:

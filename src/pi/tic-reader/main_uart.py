@@ -20,6 +20,7 @@ pdl_index : 0  (source câblée — toujours index 0 dans sources.json)
 import json
 import logging
 import os
+import signal
 import sys
 import time
 import traceback
@@ -50,8 +51,14 @@ TIC_TIMEOUT_S     = 12      # max pour lire une trame complète (~4s à 1200 bau
 
 PDL_INDEX         = 0       # source câblée — toujours index 0 par convention
 
-PERIOD_S           = 15     # intervalle entre deux cycles de lecture TIC (wired)
+# Lecture au fil de l'eau (volet A) : plus de PERIOD_S — on suit la cadence des
+# trames du compteur (~1,7 s historique, ~1 s standard).
 WATCHDOG_THRESHOLD = 600    # 10 min sans trame valide → relance process
+
+# Écritures BDD batchées (volet B) : un commit par LOT, pas par trame.
+BATCH_MAX_AGE_S    = 15     # flush au plus tard toutes les 15 s (= cadence d'hier)
+BATCH_MAX_SIZE     = 60     # plafond de sécurité (anti-emballement RAM)
+HEARTBEAT_S        = 20     # cadence max du flash LED vert « vivant » (≠ par trame)
 
 STATE_PATH         = "/var/lib/ben-firmware/tic-state.json"
 
@@ -309,16 +316,51 @@ except Exception as e:
     log.error(f"Store SQLite indisponible ({e}) — on continue sans stockage")
 last_prune = time.time()
 
+# --- Batch d'écriture (volet B) ---------------------------------------------
+# La lecture au fil de l'eau densifie les trames (~7×). Pour ne pas faire un fsync
+# par trame, on accumule et on flush en UN commit (executemany) toutes les
+# BATCH_MAX_AGE_S (ou BATCH_MAX_SIZE). Granularité de perte = le batch (crash → au
+# pire les ~15 dernières s ; courbe append-only, non critique à la seconde).
+batch: list = []          # (pdl_index, labels, ts)
+last_flush = time.time()
+last_heartbeat = 0.0
+
+
+def flush_batch() -> None:
+    global batch, last_flush
+    last_flush = time.time()
+    if not batch or measurements_db is None:
+        batch = []
+        return
+    try:
+        n = db.record_measurements_batch(measurements_db, batch)
+        log.debug(f"store: batch flush {n} mesures")
+    except Exception as e:
+        log.warning(f"store: flush batch échoué ({len(batch)} pts perdus): {e}")
+    finally:
+        batch = []
+
+
+def _on_sigterm(signum, frame):
+    # systemd stop → flush le batch courant avant de mourir (pas de perte évitable).
+    log.info("SIGTERM — flush batch puis arrêt")
+    flush_batch()
+    raise SystemExit(0)
+
+
+signal.signal(signal.SIGTERM, _on_sigterm)
+
 try:
     while True:
-        cycle_success = False
+        frame_ok = False
         try:
-            blink_rgb(0, 0, 5, 0.05)    # bleu 5% — wake-up cycle
-            ser.reset_input_buffer()
+            # Au fil de l'eau : read_frame se cale sur la cadence du compteur.
+            # PAS de reset_input_buffer (on lit le flux en continu) ni de sleep
+            # (la trame suivante nous attend déjà dans le port).
             labels = read_frame(ser)
 
             if labels is None:
-                log.error("Trame TIC invalide ou timeout")
+                log.warning("Trame TIC invalide ou timeout")
             else:
                 adco = labels.get("ADCO", "")
                 if adco:
@@ -347,29 +389,35 @@ try:
                     log.warning("PAPP absent de la trame TIC (checksum KO?) — trame ignorée")
                 else:
                     demain, adps, pejp = build_flags(labels)
-                    log.info(f"OK pdl_index={PDL_INDEX} PTEC={ptec} {active_name}={active_value} "
-                             f"IINST={iinst} PAPP={papp} demain={demain} adps={adps} pejp={pejp}")
-                    # LED en bonne santé = discrète. Pas de flash vert à chaque trame
-                    # (le wake-up jaune 30% suffit comme "je suis vivant"). La LED ne
-                    # s'allume "fort" QUE en cas d'anomalie : violet stale ou
-                    # arc-en-ciel watchdog-restart.
+                    log.debug(f"OK pdl_index={PDL_INDEX} PTEC={ptec} {active_name}={active_value} "
+                              f"IINST={iinst} PAPP={papp} demain={demain} adps={adps} pejp={pejp}")
+                    # On EMPILE dans le batch ; l'écriture BDD se fait par lot
+                    # (flush plus bas, volet B). Log en DEBUG : à ~1,7 s/trame, un
+                    # INFO par trame noierait journald (cf. preshipping).
                     if measurements_db is not None:
-                        try:
-                            db.record_measurement(measurements_db, PDL_INDEX, labels)
-                        except Exception as e:
-                            log.warning(f"store: écriture mesure échouée: {e}")
-                    cycle_success = True
+                        batch.append((PDL_INDEX, labels, int(time.time())))
+                    frame_ok = True
 
         except Exception:
             log.error(f"Exception dans la boucle principale:\n{traceback.format_exc()}")
 
-        if cycle_success:
-            blink_rgb(0, 5, 0, 0.1)     # vert 5% — trame TIC valide
-            last_success_time = time.time()
+        now = time.time()
+        if frame_ok:
+            last_success_time = now
+            # Heartbeat vert DISCRET, throttlé (≠ un flash par trame ~1,7 s) — la
+            # LED en bonne santé reste calme (cf. note d'origine).
+            if now - last_heartbeat >= HEARTBEAT_S:
+                blink_rgb(0, 5, 0, 0.1)
+                last_heartbeat = now
         else:
-            blink_rgb(5, 0, 0, 0.1, bypass=True)  # rouge — trame KO (erreur, toujours visible)
+            blink_rgb(5, 0, 0, 0.1, bypass=True)  # rouge immédiat (erreur, visible)
 
-        if measurements_db is not None and time.time() - last_prune > 3600:
+        # Flush du batch si âge ou taille atteinte (volet B).
+        if batch and (len(batch) >= BATCH_MAX_SIZE
+                      or now - last_flush >= BATCH_MAX_AGE_S):
+            flush_batch()
+
+        if measurements_db is not None and now - last_prune > 3600:
             try:
                 deleted = db.prune(measurements_db)
                 log.info(f"store purge (>{db.RETENTION_DAYS}j): {deleted}")
@@ -377,11 +425,10 @@ try:
                 log.warning(f"store: purge échouée: {e}")
             last_prune = time.time()
 
-        sleep(PERIOD_S)
-
-except KeyboardInterrupt:
+except (KeyboardInterrupt, SystemExit):
     log.info("Arrêt.")
 finally:
+    flush_batch()   # ne pas perdre le batch courant à l'arrêt
     try: ser.close()
     except Exception: pass
     try: GPIO.cleanup()
