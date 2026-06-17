@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="robots" content="index, follow" />
+  <title>BEN — Politique de confidentialité</title>
+  <style>
+    :root { --green: #2e7d32; --ink: #1b1b1b; --muted: #5a5a5a; --bg: #ffffff; }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      color: var(--ink); background: var(--bg); line-height: 1.65;
+      max-width: 760px; margin: 0 auto; padding: 32px 20px 80px;
+    }
+    h1 { color: var(--green); font-size: 1.8rem; margin-bottom: 4px; }
+    h2 { color: var(--green); font-size: 1.2rem; margin-top: 36px; }
+    .updated { color: var(--muted); font-size: 0.9rem; margin-top: 0; }
+    a { color: var(--green); }
+    code { background: #f0f0f0; padding: 1px 5px; border-radius: 4px; font-size: 0.9em; }
+    ul { padding-left: 1.3rem; }
+    li { margin: 6px 0; }
+    .note { background: #f3f8f3; border-left: 4px solid var(--green); padding: 12px 16px; border-radius: 6px; margin: 20px 0; }
+    footer { margin-top: 48px; color: var(--muted); font-size: 0.85rem; border-top: 1px solid #eee; padding-top: 16px; }
+  </style>
+</head>
+<body>
+  <h1>Politique de confidentialité — BEN</h1>
+  <p class="updated">Dernière mise à jour : 17 juin 2026</p>
+
+  <p>
+    BEN est une application qui vous aide à comprendre et maîtriser la consommation
+    électrique de votre logement, à partir d'un boîtier branché sur votre compteur
+    Linky. Nous attachons une importance forte à la protection de vos données
+    personnelles. Cette politique explique quelles données sont traitées, pourquoi,
+    et quels sont vos droits.
+  </p>
+
+  <div class="note">
+    <strong>Principe fondateur :</strong> votre identifiant de compteur (PDL) et vos
+    données de consommation ne sont <strong>jamais transmis en clair</strong>. Dans la
+    version actuelle de l'application, vos données de consommation restent
+    <strong>locales</strong> : elles sont stockées sur votre boîtier et lues par votre
+    téléphone sur votre réseau domestique, sans être envoyées vers nos serveurs.
+  </div>
+
+  <h2>1. Responsable du traitement</h2>
+  <p>
+    Le responsable du traitement est Xavier Degenne, éditeur de l'application BEN.
+    Pour toute question relative à vos données :
+    <a href="mailto:xavier.degenne@gmail.com">xavier.degenne@gmail.com</a>.
+  </p>
+
+  <h2>2. Données que nous traitons</h2>
+  <ul>
+    <li>
+      <strong>Identité de connexion.</strong> Lorsque vous vous connectez avec
+      « Se connecter avec Apple » ou « Se connecter avec Google », nous recevons un
+      identifiant de compte unique, votre adresse e-mail et, le cas échéant, votre nom.
+      L'authentification est gérée par <strong>Firebase Authentication</strong> (Google).
+    </li>
+    <li>
+      <strong>Inventaire des boîtiers.</strong> Pour assurer le suivi et les mises à
+      jour du parc, nous enregistrons des informations <em>techniques</em> sur votre
+      boîtier (identifiant matériel du boîtier, modèle, version du firmware) et le lien
+      entre votre compte et votre/vos boîtier(s). Ces informations ne contiennent
+      <strong>aucune donnée de consommation ni aucun PDL</strong>.
+    </li>
+    <li>
+      <strong>Données de consommation électrique.</strong> Elles sont traitées
+      <strong>localement</strong> (sur le boîtier et sur votre téléphone) et ne sont
+      pas collectées par nos serveurs dans la version actuelle de l'application.
+    </li>
+  </ul>
+  <p>
+    Nous ne collectons pas de données de localisation, ne diffusons pas de publicité
+    et ne revendons aucune donnée.
+  </p>
+
+  <h2>3. Finalités</h2>
+  <ul>
+    <li>Vous authentifier et sécuriser l'accès à l'application.</li>
+    <li>Associer vos boîtiers à votre compte et permettre leur configuration.</li>
+    <li>Maintenir un inventaire technique du parc pour assurer les mises à jour logicielles.</li>
+  </ul>
+
+  <h2>4. Autorisations de l'appareil</h2>
+  <ul>
+    <li>
+      <strong>Bluetooth.</strong> Utilisé uniquement lors de la mise en service, pour
+      détecter votre boîtier à proximité et lui transmettre vos identifiants WiFi. Ces
+      identifiants sont envoyés au boîtier et ne sont pas conservés par nos services.
+    </li>
+    <li>
+      <strong>Réseau local.</strong> Utilisé pour retrouver automatiquement votre
+      boîtier sur votre réseau (découverte mDNS). Aucune donnée ne quitte votre réseau
+      de ce fait.
+    </li>
+  </ul>
+
+  <h2>5. Sous-traitants et hébergement</h2>
+  <p>
+    L'authentification et l'inventaire technique des boîtiers s'appuient sur les services
+    <strong>Firebase</strong> (Google). Le futur backend de BEN, lorsqu'il traitera des
+    données personnelles, sera hébergé en France (Scaleway, Paris), conformément à notre
+    engagement de souveraineté des données.
+  </p>
+
+  <h2>6. Durée de conservation</h2>
+  <p>
+    Les données de compte sont conservées tant que votre compte existe. Vous pouvez
+    demander la suppression de votre compte et des données associées à tout moment (voir
+    ci-dessous).
+  </p>
+
+  <h2>7. Vos droits</h2>
+  <p>
+    Conformément au RGPD, vous disposez d'un droit d'accès, de rectification,
+    d'effacement, de limitation et de portabilité de vos données. Pour exercer ces droits
+    ou supprimer votre compte, écrivez à
+    <a href="mailto:xavier.degenne@gmail.com">xavier.degenne@gmail.com</a>. Vous pouvez
+    également introduire une réclamation auprès de la CNIL (www.cnil.fr).
+  </p>
+
+  <h2>8. Modifications</h2>
+  <p>
+    Cette politique peut être mise à jour. La date de dernière mise à jour figure en
+    haut de page.
+  </p>
+
+  <footer>
+    BEN — assistant de gestion énergétique domestique. Contact :
+    <a href="mailto:xavier.degenne@gmail.com">xavier.degenne@gmail.com</a>.
+  </footer>
+</body>
+</html>
