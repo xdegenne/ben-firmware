@@ -1,18 +1,39 @@
 /*
   tic-reader — BEN Arduino emitter
   =================================
-  Lit la TIC du compteur Linky et transmet les données en LoRa
-  vers le Pi Zero récepteur (ben-device).
+  Lit la TIC du compteur Linky et transmet la COURBE de charge (PAPP fin)
+  en LoRa vers le Pi Zero récepteur (ben-device).
 
-  Protocole binaire v0x02 — 20 octets :
-    0       version       uint8  = 0x02
-    1       flags         bit0-1 DEMAIN, bit2 ADPS, bit3 PEJP
-    2-3     boot_seq      uint16 LE — RAM, reset au boot, +1/trame
-    4       index_id      uint8  BASE=0x00 HCHC=0x01 HCHP=0x02 EJP/BBR=0x03..0x0A
-    5-8     index_value   uint32 LE — Wh
-    9       IINST         uint8  — A, saturé à 255
-    10-11   PAPP          uint16 LE — VA
-    12-19   HMAC          HMAC-SHA256(key, octets 0..11) tronqué 8 octets
+  ── Trame v0x04 — courbe PAPP batchée (delta + keyframe), longueur variable ──
+  Remplace l'ancienne v0x02 (1 index / 32 s, trop grossier pour le NILM). On lit
+  TOUTES les trames TIC (~1,7 s en historique), on n'envoie que les DELTAS de PAPP
+  par rapport à un keyframe embarqué, et on flush un batch toutes les ~60 s. Le
+  keyframe porte aussi l'index actif → l'index cumulatif passe dans chaque batch
+  (plus besoin de v0x02). Spec complète : rasperry/LORA_PROTOCOL.md §17.
+
+    0       version      uint8  = 0x04
+    1       flags        bit0-1 DEMAIN, bit2 ADPS, bit3 PEJP,
+                         bit4 ts_valid, bit5 src_standard, bit6 has_ext (=0 en histo)
+    2-3     batch_seq    uint16 LE — RAM, reset au boot, +1/batch
+    4       index_id     uint8  BASE=0x00 HCHC=0x01 HCHP=0x02 EJP/BBR=0x03..0x0A
+    5-8     index_value  uint32 LE — index absolu au 1er échantillon (Wh)
+    9-10    papp_ref     uint16 LE — PAPP du 1er échantillon (VA)
+    11      N            uint8  — nb d'échantillons du batch
+    12      period_ds    uint8  — période nominale en 1/10 s (20 = 2,0 s, historique)
+    13      ts_season    'E'/'H'/0x00 (absent en historique)
+    14-19   ts           YY MM DD hh mm ss (0 en historique ; champ DATE en standard)
+    20..    deltas       (N-1) deltas PAPP, varint zig-zag (1-3 o)
+    len-8   HMAC         HMAC-SHA256(key, octets 0..len-9) tronqué 8 octets
+
+  Un CHANGEMENT D'INDEX (PTEC) pendant un batch → flush immédiat + nouveau keyframe
+  → chaque batch est homogène en index_id (cf. §17.3). Mode STANDARD (9600 bd,
+  URMS/IRMS/SINSTI, horodate absolue, bloc extension) : différé, bits réservés.
+
+  Trame d'identité v0x01 (boot/discovery, 20 o) : version=0x01 + ADCO(12) — inchangée.
+
+  Énergie : la capture continue (pas de deep-sleep, MCU ~5 mA + TX) reste ~6 mA
+  moyen côté ligne, très en deçà de la borne A du Linky (~50-100 mA, cf. §8.3). Un
+  futur device SANS borne A (batterie) imposerait une capture fenêtrée — hors v1.
 
   Clé HMAC : 32 octets stockés en EEPROM (adresses 0x00–0x1F).
   Mode provisioning : si l'EEPROM est vierge (0xFF), l'Arduino attend
@@ -31,7 +52,6 @@
 #include <SPI.h>
 #include <RH_RF95.h>
 #include <RHReliableDatagram.h>
-#include "LowPower.h"
 #include <Crypto.h>
 #include <SHA256.h>
 #include <EEPROM.h>
@@ -60,10 +80,19 @@
 // ---------------------------------------------------------------------------
 // Protocole
 // ---------------------------------------------------------------------------
-#define PROTOCOL_VERSION 0x02
-#define PAYLOAD_LEN      20
-#define HMAC_LEN          8
-#define HMAC_OFFSET      12
+#define PROTOCOL_VERSION_BOOT  0x01   // trame d'identité (ADCO)
+#define PROTOCOL_VERSION_CURVE 0x04   // trame courbe batchée
+#define BOOT_PAYLOAD_LEN       20     // v0x01 : version + ADCO(12), padding
+#define HMAC_LEN                8
+
+// Courbe v0x04
+// CURVE_BUF_LEN dimensionné pour l'HISTORIQUE v1 (flush ~60 s ≈ 30 éch. ≈ ~110 o).
+// 160 o tient un batch de 60 s pire-cas (deltas 2-3 o) avec marge, et économise ~80 o
+// de SRAM sur le 328P. Le mode STANDARD (1 Hz, batch ~3 min, ~175 éch.) demandera ~240.
+#define CURVE_BUF_LEN     160         // < RH_RF95_MAX_MESSAGE_LEN (251)
+#define CURVE_MAX_SAMPLES 130         // garde secondaire (buffer-full domine en pratique)
+#define SAMPLE_PERIOD_DS  20          // période nominale = 2,0 s (cadence TIC historique)
+#define CURVE_FLUSH_MS    60000UL     // flush périodique → fraîcheur /live ~60 s
 
 // ---------------------------------------------------------------------------
 // Index IDs
@@ -90,6 +119,10 @@
 #define FLAG_DEMAIN_NA   0x03
 #define FLAG_ADPS        0x04
 #define FLAG_PEJP        0x08
+// Bits v0x04 (réservés ; tous à 0 en historique). Posés en standard (différé).
+#define FLAG_TS_VALID    0x10
+#define FLAG_SRC_STANDARD 0x20
+#define FLAG_HAS_EXT     0x40
 
 // ---------------------------------------------------------------------------
 // EEPROM
@@ -110,9 +143,21 @@ RH_RF95 driver(RFM95_CS, RFM95_INT);
 RHReliableDatagram manager(driver, CLIENT_ADDRESS);
 SHA256 sha256;
 static bool loraOk = false;
-static uint16_t boot_seq = 0;
 static bool firstFrame = true;
 static uint8_t hmac_key[HMAC_KEY_LEN];
+
+// --- État courbe v0x04 ---
+// curveBuf est fichier-scope (PAS pile) pour ne pas entrer en collision avec le heap
+// String de la TIC pendant le parsing. Encodage AU FIL DE L'EAU (curveAdd) : on
+// n'archive jamais la courbe brute, seulement les deltas dans curveBuf.
+static uint8_t  curveBuf[CURVE_BUF_LEN];
+static uint16_t curvePos     = 0;     // curseur d'écriture
+static uint16_t papp_prev    = 0;     // dernière PAPP encodée
+static uint8_t  curveN       = 0;     // échantillons dans le batch courant
+static bool     curveActive  = false;
+static uint8_t  curveIndexId = IDX_UNKNOWN;  // index_id du batch courant (homogène)
+static uint16_t batch_seq    = 0;     // RAM, reset au boot, +1/batch
+static unsigned long curveT0 = 0;     // millis() du début de batch (flush périodique)
 
 // ---------------------------------------------------------------------------
 // TIC values
@@ -310,99 +355,83 @@ bool verifyTICChecksum(const char *line, size_t len) {
   return line[len - 1] == (char)((sum & 0x3F) + 0x20);
 }
 
-String readTIC() {
+// Parse UNE ligne TIC (déjà validée checksum) directement dans v, EN PLACE,
+// sans String (char* only) → pas de heap, robuste sur AVR.
+static void parseTICLine(char* line, uint8_t len, TICValues& v) {
+  int fs = -1, ls = -1;
+  for (uint8_t i = 0; i < len; i++) if (line[i] == ' ') { if (fs < 0) fs = i; ls = i; }
+  if (fs < 1 || ls <= fs) return;
+  line[fs] = 0;                  // termine le nom
+  line[ls] = 0;                  // termine la valeur (au dernier espace)
+  const char* name = line;
+  const char* val  = line + fs + 1;
+  if      (!strcmp(name, "ADCO"))    strncpy(v.adco,    val, sizeof(v.adco)    - 1);
+  else if (!strcmp(name, "OPTARIF")) strncpy(v.optarif, val, sizeof(v.optarif) - 1);
+  else if (!strcmp(name, "PTEC"))    strncpy(v.ptec,    val, sizeof(v.ptec)    - 1);
+  else if (!strcmp(name, "DEMAIN"))  strncpy(v.demain,  val, sizeof(v.demain)  - 1);
+  else if (!strcmp(name, "BASE"))    { v.base   = strtoul(val, 0, 10);           v.fields_seen |= TIC_SEEN_BASE;   }
+  else if (!strcmp(name, "HCHC"))    { v.hchc   = strtoul(val, 0, 10);           v.fields_seen |= TIC_SEEN_HCHC;   }
+  else if (!strcmp(name, "HCHP"))    { v.hchp   = strtoul(val, 0, 10);           v.fields_seen |= TIC_SEEN_HCHP;   }
+  else if (!strcmp(name, "EJPHN"))   { v.ejphn  = strtoul(val, 0, 10);           v.fields_seen |= TIC_SEEN_EJPHN;  }
+  else if (!strcmp(name, "EJPHPM"))  { v.ejphpm = strtoul(val, 0, 10);           v.fields_seen |= TIC_SEEN_EJPHPM; }
+  else if (!strcmp(name, "BBRHCJB")) { v.bbr[0] = strtoul(val, 0, 10);           v.fields_seen |= TIC_SEEN_BBR0;   }
+  else if (!strcmp(name, "BBRHPJB")) { v.bbr[1] = strtoul(val, 0, 10);           v.fields_seen |= TIC_SEEN_BBR1;   }
+  else if (!strcmp(name, "BBRHCJW")) { v.bbr[2] = strtoul(val, 0, 10);           v.fields_seen |= TIC_SEEN_BBR2;   }
+  else if (!strcmp(name, "BBRHPJW")) { v.bbr[3] = strtoul(val, 0, 10);           v.fields_seen |= TIC_SEEN_BBR3;   }
+  else if (!strcmp(name, "BBRHCJR")) { v.bbr[4] = strtoul(val, 0, 10);           v.fields_seen |= TIC_SEEN_BBR4;   }
+  else if (!strcmp(name, "BBRHPJR")) { v.bbr[5] = strtoul(val, 0, 10);           v.fields_seen |= TIC_SEEN_BBR5;   }
+  else if (!strcmp(name, "IINST"))   { v.iinst  = (uint16_t)strtoul(val, 0, 10); v.fields_seen |= TIC_SEEN_IINST;  }
+  else if (!strcmp(name, "PAPP"))    { v.papp   = (uint16_t)strtoul(val, 0, 10); v.fields_seen |= TIC_SEEN_PAPP;   }
+  else if (!strcmp(name, "ADPS"))    v.adps_present = true;
+  else if (!strcmp(name, "PEJP"))    v.pejp_present = true;
+}
+
+// Lit UNE trame TIC (STX..ETX) et la parse directement dans v. Char-based, SANS
+// String → plus de corruption de heap. Retourne true si ≥1 ligne lue.
+bool readAndParseTIC(TICValues& v) {
+  memset(&v, 0, sizeof(v));
   digitalWrite(TIC_OUT, HIGH);
   Serial.begin(1200, SERIAL_7E1);
 
   const char STX = 0x02, ETX = 0x03, LF = 0x0A, CR = 0x0D;
-
   unsigned long t0 = millis();
   char c = 0;
-  String frame = "", line = "";
-  bool inLine = false;
+  char line[40]; uint8_t li = 0; bool inLine = false;
   uint8_t kept = 0, dropped = 0;
 
   while (c != STX) {
     wdt_reset();
-    if (Serial.available()) {
-      c = Serial.read();
-    } else if (millis() - t0 > TIC_TIMEOUT_MS) {
-      Serial.flush(); Serial.end();
-      digitalWrite(TIC_OUT, LOW);
-      return "";
+    if (Serial.available()) c = Serial.read();
+    else if (millis() - t0 > TIC_TIMEOUT_MS) {
+      Serial.flush(); Serial.end(); digitalWrite(TIC_OUT, LOW); return false;
     }
   }
 
+  t0 = millis();  // budget propre pour la lecture STX->ETX
   while (c != ETX) {
     wdt_reset();
     if (Serial.available()) {
       c = Serial.read();
-      if (c == LF) { line = ""; inLine = true; }
+      if (c == LF) { li = 0; inLine = true; }
       else if (c == CR) {
-        if (inLine && line.length() > 0) {
-          if (verifyTICChecksum(line.c_str(), line.length())) {
-            frame += line; frame += '\n'; kept++;
-          } else { dropped++; }
+        if (inLine && li > 0) {
+          line[li] = 0;
+          if (verifyTICChecksum(line, li)) { parseTICLine(line, li, v); kept++; }
+          else dropped++;
         }
         inLine = false;
-      } else if (inLine) { line += c; }
-    } else if (millis() - t0 > TIC_TIMEOUT_MS) { break; }
+      } else if (inLine && li < sizeof(line) - 1) { line[li++] = c; }
+    } else if (millis() - t0 > TIC_TIMEOUT_MS) break;
   }
 
   Serial.flush(); Serial.end();
   digitalWrite(TIC_OUT, LOW);
-
-  Serial.begin(9600);
-  Serial.print(F("TIC ok=")); Serial.print(kept);
-  Serial.print(F(" drop=")); Serial.println(dropped);
-  Serial.flush(); Serial.end();
-
-  return frame;
-}
-
-static void copyField(char *dst, size_t sz, const String& s) {
-  size_t n = s.length();
-  if (n >= sz) n = sz - 1;
-  memcpy(dst, s.c_str(), n);
-  dst[n] = 0;
-}
-
-TICValues parseTICFrame(const String& frame) {
-  TICValues v;
-  memset(&v, 0, sizeof(v));
-  String rem = frame;
-  int pos = rem.indexOf('\n');
-  while (pos > -1) {
-    String line = rem.substring(0, pos);
-    rem = rem.substring(pos + 1);
-    pos = rem.indexOf('\n');
-    int fs = line.indexOf(' '), ls = line.lastIndexOf(' ');
-    if (fs < 1 || ls <= fs) continue;
-    String name = line.substring(0, fs);
-    String val  = line.substring(fs + 1, ls);
-    if      (name == "ADCO")    copyField(v.adco,    sizeof(v.adco),    val);
-    else if (name == "OPTARIF") copyField(v.optarif, sizeof(v.optarif), val);
-    else if (name == "PTEC")    copyField(v.ptec,    sizeof(v.ptec),    val);
-    else if (name == "DEMAIN")  copyField(v.demain,  sizeof(v.demain),  val);
-    else if (name == "BASE")    { v.base   = (uint32_t)val.toInt(); v.fields_seen |= TIC_SEEN_BASE;   }
-    else if (name == "HCHC")    { v.hchc   = (uint32_t)val.toInt(); v.fields_seen |= TIC_SEEN_HCHC;   }
-    else if (name == "HCHP")    { v.hchp   = (uint32_t)val.toInt(); v.fields_seen |= TIC_SEEN_HCHP;   }
-    else if (name == "EJPHN")   { v.ejphn  = (uint32_t)val.toInt(); v.fields_seen |= TIC_SEEN_EJPHN;  }
-    else if (name == "EJPHPM")  { v.ejphpm = (uint32_t)val.toInt(); v.fields_seen |= TIC_SEEN_EJPHPM; }
-    else if (name == "BBRHCJB") { v.bbr[0] = (uint32_t)val.toInt(); v.fields_seen |= TIC_SEEN_BBR0;   }
-    else if (name == "BBRHPJB") { v.bbr[1] = (uint32_t)val.toInt(); v.fields_seen |= TIC_SEEN_BBR1;   }
-    else if (name == "BBRHCJW") { v.bbr[2] = (uint32_t)val.toInt(); v.fields_seen |= TIC_SEEN_BBR2;   }
-    else if (name == "BBRHPJW") { v.bbr[3] = (uint32_t)val.toInt(); v.fields_seen |= TIC_SEEN_BBR3;   }
-    else if (name == "BBRHCJR") { v.bbr[4] = (uint32_t)val.toInt(); v.fields_seen |= TIC_SEEN_BBR4;   }
-    else if (name == "BBRHPJR") { v.bbr[5] = (uint32_t)val.toInt(); v.fields_seen |= TIC_SEEN_BBR5;   }
-    else if (name == "IINST")   { v.iinst  = (uint16_t)val.toInt(); v.fields_seen |= TIC_SEEN_IINST;  }
-    else if (name == "PAPP")    { v.papp   = (uint16_t)val.toInt(); v.fields_seen |= TIC_SEEN_PAPP;   }
-    else if (name == "ADPS")    v.adps_present = true;
-    else if (name == "PEJP")    v.pejp_present = true;
-  }
   v.valid = (v.ptec[0] != 0);
-  return v;
+  (void)dropped;
+  return (kept > 0);
 }
+
+// (readTIC/parseTICFrame String-based supprimés → readAndParseTIC char-based ci-dessus)
 
 void selectActiveIndex(const TICValues& v, uint8_t& id, uint32_t& value) {
   if      (strncmp(v.ptec, "TH",   2) == 0) { id = IDX_BASE;    value = v.base;   }
@@ -446,80 +475,89 @@ bool isVoltageSufficient() {
 // ---------------------------------------------------------------------------
 // LoRa
 // ---------------------------------------------------------------------------
-void buildPayload(uint8_t *buf, const TICValues& v) {
-  uint8_t id; uint32_t val;
-  selectActiveIndex(v, id, val);
-  buf[0] = PROTOCOL_VERSION;
-  buf[1] = buildFlags(v);
-  memcpy(buf + 2, &boot_seq, 2);
-  buf[4] = id;
-  memcpy(buf + 5, &val, 4);
-  buf[9] = (v.iinst > 255) ? 255 : (uint8_t)v.iinst;
-  memcpy(buf + 10, &v.papp, 2);
-
-  uint8_t mac[32];
-  sha256.resetHMAC(hmac_key, HMAC_KEY_LEN);
-  sha256.update(buf, HMAC_OFFSET);
-  sha256.finalizeHMAC(hmac_key, HMAC_KEY_LEN, mac, 32);
-  memcpy(buf + HMAC_OFFSET, mac, HMAC_LEN);
-}
-
 // Trame boot (version=0x01) : ADCO en clair dans les octets 1-12.
 // Chiffrement PDL : sujet separe, a traiter ulterieurement.
 void sendBootFrame(const char* adco) {
-  uint8_t buf[PAYLOAD_LEN];
-  memset(buf, 0, PAYLOAD_LEN);
-  buf[0] = 0x01;
+  uint8_t buf[BOOT_PAYLOAD_LEN];
+  memset(buf, 0, BOOT_PAYLOAD_LEN);
+  buf[0] = PROTOCOL_VERSION_BOOT;
   memcpy(buf + 1, adco, 12);
 
   if (loraOk) {
     driver.setModeIdle();
-    manager.sendtoWait(buf, PAYLOAD_LEN, SERVER_ADDRESS);
+    manager.sendtoWait(buf, BOOT_PAYLOAD_LEN, SERVER_ADDRESS);
     blinkRGB(0, 0, 255);  // bleu = boot frame envoyee
     driver.sleep();
   }
 }
 
-void sendBinary(const TICValues& v) {
-  uint8_t id; uint32_t val;
-  selectActiveIndex(v, id, val);
-  if (id == IDX_UNKNOWN) {
-    Serial.print(F("PTEC inconnu (")); Serial.print(v.ptec); Serial.println(')');
-    blinkErr(4);
-    return;
-  }
+// ---------------------------------------------------------------------------
+// Courbe v0x04 — keyframe + deltas (codec inspiré I-frame/P-frame, cf. §17)
+// ---------------------------------------------------------------------------
+void curveFlush();  // prototype (curveAdd l'appelle quand le buffer est plein)
 
-  // Guard : index actif + IINST + PAPP doivent avoir ete vus dans la trame.
-  // Si une de ces lignes a eu un checksum KO, on skipe plutot que d'emettre 0.
-  uint16_t required = TIC_SEEN_IINST | TIC_SEEN_PAPP;
-  if (id < sizeof(INDEX_ID_TO_SEEN) / sizeof(INDEX_ID_TO_SEEN[0]))
-    required |= INDEX_ID_TO_SEEN[id];
-  if ((v.fields_seen & required) != required) {
-    Serial.println(F("TIC partielle (champs manquants), trame ignoree"));
-    blinkErr(2);
-    return;
-  }
+// Démarre un batch : le keyframe EST le 1er échantillon (index actif + PAPP absolue).
+void curveStart(const TICValues& v, uint8_t id, uint32_t value) {
+  curveBuf[0] = PROTOCOL_VERSION_CURVE;
+  curveBuf[1] = buildFlags(v);              // bits 0-3 ; bits 4/5/6 = 0 en historique
+  memcpy(curveBuf + 2, &batch_seq, 2);
+  curveBuf[4] = id;
+  memcpy(curveBuf + 5, &value, 4);
+  memcpy(curveBuf + 9, &v.papp, 2);         // papp_ref = PAPP du 1er échantillon
+  // buf[11]=N et buf[12]=period_ds : écrits à l'envoi (curveFlush).
+  curveBuf[13] = 0x00;                      // ts_season absent (historique)
+  memset(curveBuf + 14, 0, 6);              // ts absent (historique)
+  curvePos     = 20;
+  papp_prev    = v.papp;
+  curveN       = 1;
+  curveActive  = true;
+  curveIndexId = id;
+  curveT0      = millis();
+}
 
-  uint8_t buf[PAYLOAD_LEN];
-  buildPayload(buf, v);
+// Append d'un échantillon = delta zig-zag varint de PAPP vs le précédent.
+void curveAdd(uint16_t papp) {
+  int32_t  d  = (int32_t)papp - (int32_t)papp_prev;
+  uint32_t zz = ((uint32_t)d << 1) ^ (uint32_t)(d >> 31);   // zig-zag
+  while (zz >= 0x80) { curveBuf[curvePos++] = (zz & 0x7F) | 0x80; zz >>= 7; }
+  curveBuf[curvePos++] = (uint8_t)zz;
+  papp_prev = papp;
+  curveN++;
+  // -3 = marge d'un varint 3 o au pire ; -HMAC_LEN = réserve la signature finale.
+  if (curvePos >= CURVE_BUF_LEN - HMAC_LEN - 3 || curveN >= CURVE_MAX_SAMPLES)
+    curveFlush();
+}
 
-  Serial.print(F("seq=")); Serial.print(boot_seq);
-  Serial.print(F(" ptec=")); Serial.print(v.ptec);
-  Serial.print(F(" idx=0x")); Serial.print(id, HEX);
-  Serial.print(F(" val=")); Serial.print(val);
-  Serial.print(F(" IINST=")); Serial.print(v.iinst);
-  Serial.print(F(" PAPP=")); Serial.println(v.papp);
+// Finalise (N, period, HMAC) et émet le batch. Auto-suffisant : keyframe par trame
+// (§17.3), aucun delta inter-batch.
+void curveFlush() {
+  if (!curveActive || curveN == 0) { curveActive = false; return; }
+  curveBuf[11] = curveN;
+  curveBuf[12] = SAMPLE_PERIOD_DS;
+
+  uint8_t mac[32];
+  sha256.resetHMAC(hmac_key, HMAC_KEY_LEN);
+  sha256.update(curveBuf, curvePos);                          // signe octets 0..pos-1
+  sha256.finalizeHMAC(hmac_key, HMAC_KEY_LEN, mac, 32);
+  memcpy(curveBuf + curvePos, mac, HMAC_LEN);
+  uint16_t len = curvePos + HMAC_LEN;
+
+  Serial.begin(9600);
+  Serial.print(F("v04 seq=")); Serial.print(batch_seq);
+  Serial.print(F(" n="));      Serial.print(curveN);
+  Serial.print(F(" idx=0x"));  Serial.print(curveIndexId, HEX);
+  Serial.print(F(" len="));    Serial.println(len);
+  Serial.flush(); Serial.end();
 
   if (loraOk) {
     driver.setModeIdle();
-    bool ok = manager.sendtoWait(buf, PAYLOAD_LEN, SERVER_ADDRESS);
-    Serial.println(ok ? F("ACK OK") : F("No ACK"));
-    blinkRGB(0, 255, 0);
-    if (ok) { delay(120); blinkRGB(0, 255, 0); }
+    manager.sendtoWait(curveBuf, len, SERVER_ADDRESS);
+    blinkRGB(0, 255, 255);    // cyan = batch courbe envoyé
     driver.sleep();
   }
 
-  boot_seq++;
+  batch_seq++;                // prochain batch = nouveau keyframe
+  curveActive = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -574,49 +612,64 @@ void setup() {
 // ---------------------------------------------------------------------------
 // Loop
 // ---------------------------------------------------------------------------
+// Capture CONTINUE : pas de deep-sleep. readTIC() bloque jusqu'à la prochaine trame
+// TIC (~1,7 s en historique) → c'est lui qui cadence la boucle (= period_ds nominal).
+// On lit TOUTES les trames et on accumule la courbe ; flush par batch (§17).
 void loop() {
-  // Sleep ~32s
-  for (uint8_t i = 0; i < 4; i++) {
-    LowPower.powerDown(SLEEP_8S, ADC_OFF, BOD_OFF);
-  }
-  wdt_enable(WDTO_8S);  // LowPower desactive le WDT pendant le sleep
+  wdt_enable(WDTO_8S);  // ré-armé chaque tour ; readTIC() fait wdt_reset() pendant la lecture
 
   Serial.begin(9600);
-  blinkRGB(255, 255, 255);  // heartbeat
-
-  if (!isVoltageSufficient()) {
-    Serial.flush(); Serial.end();
+  bool vok = isVoltageSufficient();   // imprime "Vcc: x"
+  Serial.flush(); Serial.end();
+  if (!vok) {
+    if (curveActive) curveFlush();    // brownout imminent : ne pas perdre le batch en cours
     blinkErr(1);
     return;
   }
 
-  Serial.flush(); Serial.end();
-  String frame = readTIC();
-  Serial.begin(9600);
+  TICValues v;
+  if (!readAndParseTIC(v)) { blinkErr(2); return; }   // pas de trame (timeout STX)
 
-  if (frame == "") {
-    blinkErr(2);
-  } else {
-    TICValues v = parseTICFrame(frame);
-    if (firstFrame) {
-      blinkRGB(255, 80, 0);  // orange : premiere trame / discovery
-      if (v.adco[0] != 0) {
-        Serial.print(F("Discovery ADCO="));
-        Serial.println(v.adco);
-        Serial.flush(); Serial.end();
-        sendBootFrame(v.adco);
-        Serial.begin(9600);
-      }
-      firstFrame = false;
-    } else if (!v.valid) {
-      blinkErr(3);
-    } else {
-      blinkRGB(0, 0, 255);  // TIC valide
-      Serial.flush(); Serial.end();
-      sendBinary(v);
-      Serial.begin(9600);
-    }
+  if (firstFrame) {
+    blinkRGB(255, 80, 0);             // orange : premiere trame / discovery
+    if (v.adco[0] != 0) sendBootFrame(v.adco);
+    firstFrame = false;
+    return;
+  }
+  if (!v.valid) { blinkErr(3); return; }
+
+  uint8_t id; uint32_t value;
+  selectActiveIndex(v, id, value);
+  if (id == IDX_UNKNOWN) {
+    Serial.begin(9600);
+    Serial.print(F("PTEC inconnu (")); Serial.print(v.ptec); Serial.println(')');
+    Serial.flush(); Serial.end();
+    blinkErr(4);
+    return;
   }
 
-  Serial.flush(); Serial.end();
+  // Garde : l'index actif + PAPP doivent avoir été vus (checksum OK) dans la trame.
+  // (IINST n'est plus requis : non porté par v0x04 historique — cf. bloc extension différé.)
+  uint16_t required = TIC_SEEN_PAPP;
+  if (id < sizeof(INDEX_ID_TO_SEEN) / sizeof(INDEX_ID_TO_SEEN[0]))
+    required |= INDEX_ID_TO_SEEN[id];
+  if ((v.fields_seen & required) != required) {
+    blinkErr(2);                      // trame partielle → on saute (papp_prev inchangé)
+    return;
+  }
+
+  // Accumulation courbe. Changement d'index actif (PTEC) → coupe le batch courant
+  // et repart sur un keyframe du nouvel index → batch homogène (décision §17.3).
+  if (!curveActive || id != curveIndexId) {
+    if (curveActive && curveN > 1) curveFlush();
+    curveStart(v, id, value);
+  } else {
+    curveAdd(v.papp);                 // peut auto-flush si le buffer est plein
+  }
+
+  // Flush périodique → fraîcheur /live ~60 s (sinon un batch traînerait jusqu'à plein).
+  if (curveActive && curveN > 1 && (millis() - curveT0) >= CURVE_FLUSH_MS)
+    curveFlush();
+
+  blinkRGB(0, 12, 0, 4);              // tick vert discret = échantillon capté
 }
