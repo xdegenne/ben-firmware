@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS level_profile (
     p_high           INTEGER,
     talon            INTEGER,
     papp_max_alltime INTEGER,
+    isousc           INTEGER,
     n_samples        INTEGER NOT NULL DEFAULT 0,
     span_sec         INTEGER NOT NULL DEFAULT 0
 );
@@ -107,6 +108,11 @@ def connect(path: str = DB_PATH, *, read_only: bool = False) -> sqlite3.Connecti
         if "papp_max_alltime" not in lvl_cols:
             conn.execute(
                 "ALTER TABLE level_profile ADD COLUMN papp_max_alltime INTEGER")
+        # Chantier ISOUSC : intensité souscrite (A) par PDL, sert à l'étalonnage
+        # de la jauge (maxVa = isousc×230) + borne du plafond. Statique → écrite
+        # sur changement uniquement (cf. record_isousc).
+        if "isousc" not in lvl_cols:
+            conn.execute("ALTER TABLE level_profile ADD COLUMN isousc INTEGER")
         conn.commit()
     conn.row_factory = sqlite3.Row
     return conn
@@ -252,6 +258,55 @@ def record_lora_link(
         (ts, pdl_index, rssi, snr),
     )
     conn.commit()
+
+
+def record_isousc(
+    conn: sqlite3.Connection,
+    pdl_index: int,
+    isousc: int | None,
+) -> bool:
+    """Enregistre l'intensité souscrite (ISOUSC, en ampères) d'un PDL dans
+    `level_profile`. Donnée STATIQUE (l'abonnement ne change quasiment jamais) →
+    **écriture SUR CHANGEMENT uniquement** : si la valeur stockée est déjà
+    identique, no-op (on ne matraque pas la SD à chaque trame). `isousc` None ou 0
+    = absent → ignoré. Renvoie True si une écriture a eu lieu.
+
+    Wired : appelé à chaque trame (ISOUSC présent partout) mais n'écrit qu'au
+    1er passage / sur changement réel. LoRa : appelé à réception de la trame
+    d'identité v0x01. La valeur PERSISTE → survit au redémarrage du Pi (résout la
+    robustesse LoRa où ISOUSC n'arrive qu'au boot de l'Arduino)."""
+    if not isousc:  # None ou 0 → absent
+        return False
+    row = conn.execute(
+        "SELECT isousc FROM level_profile WHERE pdl_index=?", (pdl_index,)
+    ).fetchone()
+    if row is not None and row["isousc"] == isousc:
+        return False  # inchangé → aucune écriture
+    conn.execute(
+        "INSERT INTO level_profile (pdl_index, computed_ts, isousc) "
+        "VALUES (?, 0, ?) "
+        "ON CONFLICT(pdl_index) DO UPDATE SET isousc = excluded.isousc",
+        (pdl_index, isousc),
+    )
+    conn.commit()
+    return True
+
+
+def get_isousc(conn: sqlite3.Connection, pdl_index: int) -> int | None:
+    """Intensité souscrite (A) d'un PDL depuis level_profile, ou None si absente.
+    Sert l'API (/live → maxVa=isousc×230 + réglages app).
+
+    Défensif : juste après l'upgrade, l'API (read-only) peut interroger avant que
+    le 1er connect en écriture ait exécuté la migration ALTER → la colonne
+    `isousc` n'existe pas encore. On traite ce cas comme « absente » (None) au
+    lieu de planter le /live."""
+    try:
+        row = conn.execute(
+            "SELECT isousc FROM level_profile WHERE pdl_index=?", (pdl_index,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return row["isousc"] if row and row["isousc"] else None
 
 
 # Échelle de bucket QUANTIFIÉE : on snappe `bucket_sec` sur des paliers fixes pour

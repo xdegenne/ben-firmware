@@ -156,6 +156,7 @@ static uint16_t papp_prev    = 0;     // dernière PAPP encodée
 static uint8_t  curveN       = 0;     // échantillons dans le batch courant
 static bool     curveActive  = false;
 static uint8_t  curveIndexId = IDX_UNKNOWN;  // index_id du batch courant (homogène)
+static uint8_t  lastSentIsousc = 0;          // dernier ISOUSC émis (v0x01) → ré-émet sur changement
 static uint16_t batch_seq    = 0;     // RAM, reset au boot, +1/batch
 static unsigned long curveT0 = 0;     // millis() du début de batch (flush périodique)
 
@@ -195,6 +196,7 @@ struct TICValues {
   bool pejp_present;
   uint16_t iinst;
   uint16_t papp;
+  uint8_t  isousc;        // intensité souscrite (A) — chantier ISOUSC (statique)
   uint16_t fields_seen;
 };
 
@@ -382,6 +384,7 @@ static void parseTICLine(char* line, uint8_t len, TICValues& v) {
   else if (!strcmp(name, "BBRHPJR")) { v.bbr[5] = strtoul(val, 0, 10);           v.fields_seen |= TIC_SEEN_BBR5;   }
   else if (!strcmp(name, "IINST"))   { v.iinst  = (uint16_t)strtoul(val, 0, 10); v.fields_seen |= TIC_SEEN_IINST;  }
   else if (!strcmp(name, "PAPP"))    { v.papp   = (uint16_t)strtoul(val, 0, 10); v.fields_seen |= TIC_SEEN_PAPP;   }
+  else if (!strcmp(name, "ISOUSC"))  v.isousc = (uint8_t)strtoul(val, 0, 10);   // abonnement (A)
   else if (!strcmp(name, "ADPS"))    v.adps_present = true;
   else if (!strcmp(name, "PEJP"))    v.pejp_present = true;
 }
@@ -475,13 +478,14 @@ bool isVoltageSufficient() {
 // ---------------------------------------------------------------------------
 // LoRa
 // ---------------------------------------------------------------------------
-// Trame boot (version=0x01) : ADCO en clair dans les octets 1-12.
+// Trame boot (version=0x01) : ADCO en clair octets 1-12, ISOUSC (A) octet 13.
 // Chiffrement PDL : sujet separe, a traiter ulterieurement.
-void sendBootFrame(const char* adco) {
+void sendBootFrame(const char* adco, uint8_t isousc) {
   uint8_t buf[BOOT_PAYLOAD_LEN];
   memset(buf, 0, BOOT_PAYLOAD_LEN);
   buf[0] = PROTOCOL_VERSION_BOOT;
   memcpy(buf + 1, adco, 12);
+  buf[13] = isousc;          // octet 13 = ISOUSC (A) ; 0 = absent (chantier ISOUSC)
 
   if (loraOk) {
     driver.setModeIdle();
@@ -632,10 +636,19 @@ void loop() {
 
   if (firstFrame) {
     blinkRGB(255, 80, 0);             // orange : premiere trame / discovery
-    if (v.adco[0] != 0) sendBootFrame(v.adco);
+    if (v.adco[0] != 0) sendBootFrame(v.adco, v.isousc);
+    lastSentIsousc = v.isousc;
     firstFrame = false;
     return;
   }
+
+  // ISOUSC : si l'abonnement change (rare), ré-émettre la trame d'identité v0x01
+  // (boot + on-change). Indépendant de la validité PTEC/PAPP ; nécessite ADCO+ISOUSC.
+  if (v.isousc != 0 && v.isousc != lastSentIsousc && v.adco[0] != 0) {
+    sendBootFrame(v.adco, v.isousc);
+    lastSentIsousc = v.isousc;
+  }
+
   if (!v.valid) { blinkErr(3); return; }
 
   uint8_t id; uint32_t value;

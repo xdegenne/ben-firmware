@@ -361,6 +361,18 @@ def on_recv(payload) -> None:
                 save_state(state)
             else:
                 log.info(f"BOOT FRAME addr=0x{sender_addr:02x} pdl_index={pdl_index} ADCO={adco} (PDL connu)")
+            # ISOUSC (abonnement) : octet 13 de la trame d'identité = intensité
+            # souscrite en A (0 = absent, ex. émetteur < 0.0.2 → rétro-compat).
+            # Chantier ISOUSC. record_isousc fait sa garde (écrit seulement sur
+            # changement) ; le boot frame est rare → pas de garde RAM nécessaire.
+            isousc = raw[13]
+            if isousc and measurements_db is not None:
+                try:
+                    if db.record_isousc(measurements_db, pdl_index, isousc):
+                        log.info(f"ISOUSC={isousc} A enregistré "
+                                 f"(maxVa≈{isousc * 230} VA) pdl_index={pdl_index}")
+                except Exception as e:
+                    log.warning(f"store: record_isousc échoué: {e}")
             blink_rgb(30, 30, 30, 2.0)   # blanc long = discovery
             return
 

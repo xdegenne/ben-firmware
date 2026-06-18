@@ -247,6 +247,12 @@ class Handler(BaseHTTPRequestHandler):
             for row in rows:
                 row["level"] = levels.level_for(
                     conn, row["pdl_index"], row.get("papp"), now)
+                # ISOUSC (abonnement souscrit) : exposé pour les réglages app
+                # + l'étalonnage de la jauge (maxVa = ISOUSC×230). None tant que
+                # pas reçu (LoRa : avant le 1er boot frame de l'émetteur ≥ 0.0.3).
+                isousc = db.get_isousc(conn, row["pdl_index"])
+                row["isousc"] = isousc
+                row["maxVa"] = isousc * 230 if isousc else None
         self._send(rows)
 
     def _measurements(self, qs):

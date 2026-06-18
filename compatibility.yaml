@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.41"
+        latest: "0.0.42"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -117,20 +117,26 @@ devices:
           - version: "0.0.41"
             released: "2026-06-18"
             notes: "Courbe LoRa v0x04 : le récepteur décode la trame v0x04 (courbe PAPP batchée ~2 s, keyframe + deltas varint, HMAC-8) en plus de v0x02/v0x01. Réutilise db.py/local_api.py de 0.0.40 (curve_buckets + /curve agrégé) → /curve et /measurements identiques au wired. Saut 0.0.39→0.0.41 (0.0.40 = tag wired). Transition = restart ben-local-api + ben-lora-receiver, AUCUNE migration BDD. ⚠️ déployer le Pi AVANT de reflasher l'Arduino en 0.0.2 (un Pi 0.0.39 rejette le v0x04)."
+          - version: "0.0.42"
+            released: "2026-06-18"
+            notes: "Chantier ISOUSC : le récepteur (wired ET lora) lit l'intensité souscrite et la stocke par PDL (level_profile.isousc, write-on-change). LoRa : ISOUSC dans la trame d'identité v0x01 (octet 13). /live expose isousc + maxVa (=ISOUSC×230) pour les réglages app + l'étalonnage de la jauge. Migration BDD = ALTER conditionnel (colonne isousc), idempotent. Transition = restart ben-local-api + ben-lora-receiver."
       arduino:
         minimum: "0.0.1"
-        latest: "0.0.2"
+        latest: "0.0.3"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
           - version: "0.0.2"
             released: "2026-06-18"
             notes: "Émetteur v0x04 : courbe PAPP fine batchée (capture continue, flush 60 s, LowPower retiré). Parseur TIC réécrit char-based (corrige une corruption de heap String qui rendait PTEC vide → trames courbe jamais émises). Remplace v0x02 (l'émetteur n'émet plus de v0x02). minimum reste 0.0.1 : les anciens émetteurs v0x02 restent décodés par le Pi 0.0.41 (rétro-compat récepteur)."
+          - version: "0.0.3"
+            released: "2026-06-18"
+            notes: "Chantier ISOUSC : l'émetteur parse ISOUSC et le place dans la trame d'identité v0x01 (octet 13). Ré-émet le boot frame au démarrage ET sur changement d'abonnement. Rétro-compatible (octet de padding réservé). minimum reste 0.0.1."
 
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.40"
+        latest: "0.0.42"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -231,6 +237,9 @@ devices:
           - version: "0.0.40"
             released: "2026-06-13"
             notes: "Courbe temps réel (pi-wired). Lecture TIC AU FIL DE L'EAU (suppression du sleep 15s, event-driven sur la trame → courbe fine ~1,5s au lieu de 1/15s) + écritures BDD BATCHÉES (1 commit/15s via executemany → ménage la SD malgré ~7× plus de points). API : nouvel endpoint /curve (agrégé min/max/avg, bucketing ABSOLU + quantifié pour stabilité au pan, centroïde temporel, index porté) ; /measurements degrade-safe (agrège au lieu de tronquer) ; /pdls expose first_ts. db.py/local_api.py partagés mais ADDITIFS (pas de changement de schéma, reader LoRa intact) → seuls les wired bumpent. AUCUNE migration. update.sh = restart ben-tic-reader + ben-local-api."
+          - version: "0.0.42"
+            released: "2026-06-18"
+            notes: "Chantier ISOUSC : lecture + stockage de l'intensité souscrite par PDL (level_profile.isousc, write-on-change) ; le wired la lit dans chaque trame TIC (étiquette ISOUSC). /live expose isousc + maxVa (=ISOUSC×230) pour les réglages app + l'étalonnage de la jauge. Migration BDD = ALTER conditionnel (colonne isousc), idempotent. Transition = restart ben-tic-reader + ben-local-api."
 
 updates:
 
@@ -362,6 +371,10 @@ updates:
       to: "0.0.41"
       tag: "pi-0.0.41"
       script: "updates/pi0-lora/0.0.39_to_0.0.41/update.sh"
+    - from: "0.0.41"
+      to: "0.0.42"
+      tag: "pi-0.0.42"
+      script: "updates/pi0-lora/0.0.41_to_0.0.42/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -484,6 +497,10 @@ updates:
       to: "0.0.40"
       tag: "pi-0.0.40"
       script: "updates/pi0-wired/0.0.39_to_0.0.40/update.sh"
+    - from: "0.0.40"
+      to: "0.0.42"
+      tag: "pi-0.0.42"
+      script: "updates/pi0-wired/0.0.40_to_0.0.42/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet

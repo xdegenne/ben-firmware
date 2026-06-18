@@ -173,6 +173,13 @@ def _parse_label(line: str, out: dict) -> None:
             out["PAPP"] = int(value)
         except ValueError:
             pass
+    elif name == "ISOUSC":
+        # Intensité souscrite (abonnement, A) — statique. Chantier ISOUSC :
+        # sert à l'étalonnage de la jauge (maxVa = ISOUSC×230).
+        try:
+            out["ISOUSC"] = int(value)
+        except ValueError:
+            pass
     elif name == "ADCO":
         out["ADCO"] = value.strip()
     elif name in ("ADPS", "PEJP"):
@@ -324,6 +331,7 @@ last_prune = time.time()
 batch: list = []          # (pdl_index, labels, ts)
 last_flush = time.time()
 last_heartbeat = 0.0
+last_isousc: int | None = None  # garde RAM : record_isousc seulement sur changement
 
 
 def flush_batch() -> None:
@@ -369,6 +377,16 @@ try:
                         log.info(f"NOUVEAU PDL détecté : ADCO={adco} (précédent={prev_adco or 'aucun'})")
                         state["adco"] = adco
                         save_state(state)
+
+                # ISOUSC (abonnement) — écrit SUR CHANGEMENT seulement (garde RAM
+                # + record_isousc fait aussi sa garde DB). Indépendant de la
+                # validité PTEC/PAPP de la trame.
+                isousc = labels.get("ISOUSC")
+                if (isousc is not None and isousc != last_isousc
+                        and measurements_db is not None):
+                    if db.record_isousc(measurements_db, PDL_INDEX, isousc):
+                        log.info(f"ISOUSC={isousc} A enregistré (maxVa≈{isousc * 230} VA)")
+                    last_isousc = isousc
 
                 ptec   = labels.get("PTEC")
                 iinst  = labels.get("IINST")
