@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.44"
+        latest: "0.0.45"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -126,6 +126,9 @@ devices:
           - version: "0.0.44"
             released: "2026-06-23"
             notes: "LED de boot : remplace la séquence arc-en-ciel « disco » (~5 s, 9 couleurs) par 3 flashs bleus brefs au démarrage (aligné avec le wired). Cosmétique pur, AUCUNE migration. Transition = restart ben-local-api + ben-lora-receiver."
+          - version: "0.0.45"
+            released: "2026-06-23"
+            notes: "Unpair « supprimer les données » (POST /unprovision?wipe=1) : on STOPPE le reader avant le rm de la base (wipe propre, plus de base ouverte en WAL) puis on ÉTEINT le boîtier (poweroff) au lieu de reboot → prépa livraison béta (part hors tension, rallumé par le testeur pour provisionner via l'app). Unpair simple (sans suppression) → reboot (re-pairing BLE) inchangé. Modif local_api.py. AUCUNE migration. Transition = restart ben-local-api + ben-lora-receiver."
       arduino:
         minimum: "0.0.1"
         latest: "0.0.5"
@@ -148,7 +151,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.44"
+        latest: "0.0.45"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -258,6 +261,9 @@ devices:
           - version: "0.0.44"
             released: "2026-06-23"
             notes: "LED de boot : 3 flashs bleus brefs au démarrage (aligné avec le récepteur LoRa). Cosmétique pur, AUCUNE migration. Transition = restart ben-tic-reader + ben-local-api."
+          - version: "0.0.45"
+            released: "2026-06-23"
+            notes: "Unpair « supprimer les données » (POST /unprovision?wipe=1) : on STOPPE le reader avant le rm de la base (wipe propre) puis on ÉTEINT le boîtier (poweroff) au lieu de reboot → prépa livraison béta (part hors tension). Unpair simple → reboot (re-pairing BLE) inchangé. Modif local_api.py. AUCUNE migration. Transition = restart ben-tic-reader + ben-local-api."
 
 updates:
 
@@ -401,6 +407,10 @@ updates:
       to: "0.0.44"
       tag: "pi-0.0.44"
       script: "updates/pi0-lora/0.0.43_to_0.0.44/update.sh"
+    - from: "0.0.44"
+      to: "0.0.45"
+      tag: "pi-0.0.45"
+      script: "updates/pi0-lora/0.0.44_to_0.0.45/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -535,6 +545,10 @@ updates:
       to: "0.0.44"
       tag: "pi-0.0.44"
       script: "updates/pi0-wired/0.0.43_to_0.0.44/update.sh"
+    - from: "0.0.44"
+      to: "0.0.45"
+      tag: "pi-0.0.45"
+      script: "updates/pi0-wired/0.0.44_to_0.0.45/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet

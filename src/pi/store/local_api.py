@@ -192,6 +192,12 @@ class Handler(BaseHTTPRequestHandler):
                     print(f"[unprovision] delete '{name}' rc={r.returncode} "
                           f"{r.stderr.strip()}", flush=True)
             if wipe:
+                # Stop le(s) reader(s) AVANT le rm : la base n'est alors plus ouverte (WAL)
+                # → wipe propre (pas d'écriture dans un inode supprimé, pas de -wal recréé).
+                # On NE touche PAS ben-local-api : c'est lui qui exécute _teardown.
+                subprocess.run(
+                    ["sudo", "systemctl", "stop", "ben-tic-reader", "ben-lora-receiver"],
+                    stderr=subprocess.DEVNULL)  # le service absent selon le modèle → ignoré
                 for suffix in ("", "-wal", "-shm"):
                     try:
                         os.remove(db.DB_PATH + suffix)
@@ -199,8 +205,16 @@ class Handler(BaseHTTPRequestHandler):
                               flush=True)
                     except OSError:
                         pass
-            print("[unprovision] reboot", flush=True)
-            subprocess.Popen(["sudo", "systemctl", "reboot"])
+                # « Supprimer les données » = prépa livraison → on ÉTEINT (poweroff/halt),
+                # PAS reboot : le boîtier part HORS TENSION chez le béta-testeur, qui le
+                # rallumera pour provisionner via l'app (BLE).
+                print("[unprovision] poweroff (wipe)", flush=True)
+                subprocess.Popen(["sudo", "systemctl", "poweroff"])
+            else:
+                # Unpair simple (sans suppression) → reboot en provisioning BLE (re-pairing
+                # immédiat sur un autre réseau).
+                print("[unprovision] reboot", flush=True)
+                subprocess.Popen(["sudo", "systemctl", "reboot"])
 
         threading.Timer(2.0, _teardown).start()
 
