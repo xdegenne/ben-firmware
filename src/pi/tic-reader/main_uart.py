@@ -102,7 +102,7 @@ RGB_B = 16
 _pwm_r = _pwm_g = _pwm_b = None
 
 def setup_led() -> None:
-    """Init pins LED + PWM (~500 Hz) + éteint le boot indicator vert."""
+    """Init pins LED + PWM (~500 Hz) + 3 flashs bleus de boot (signe « démarré »)."""
     global _pwm_r, _pwm_g, _pwm_b
     GPIO.setmode(GPIO.BCM)
     GPIO.setwarnings(False)
@@ -112,6 +112,10 @@ def setup_led() -> None:
     _pwm_r = GPIO.PWM(RGB_R, 500); _pwm_r.start(0)
     _pwm_g = GPIO.PWM(RGB_G, 500); _pwm_g.start(0)
     _pwm_b = GPIO.PWM(RGB_B, 500); _pwm_b.start(0)
+    # Blink de boot : 3 flashs bleus brefs (idem récepteur LoRa, modèles alignés).
+    for _ in range(3):
+        _pwm_b.ChangeDutyCycle(20); time.sleep(0.12)
+        _pwm_b.ChangeDutyCycle(0);  time.sleep(0.12)
 
 def blink_rgb(r: int, g: int, b: int, duration: float = 0.05,
               bypass: bool = False) -> None:

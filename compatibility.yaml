@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.43"
+        latest: "0.0.44"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -123,9 +123,12 @@ devices:
           - version: "0.0.43"
             released: "2026-06-23"
             notes: "Mode TIC STANDARD (Enedis-NOI-CPT_54E) bout-en-bout + dorsale stockage index bi-mode. Récepteur LoRa décode le v0x04 standard (papp NET SIGNÉ via src_standard, − = injection ; bloc ext EAIT ; horodate compteur → meter_ts, immunisée au délai radio) ; NTARF standard non mappé sur INDEX_NAMES (opaque) → clé générique (src_standard, index_id, index_value). Suppression du watchdog restart-sur-silence (inutile côté récepteur ; fraîcheur via heartbeat). MIGRATION BDD : ALTER ×5 (src_standard/index_id/index_value/inject_total/meter_ts), idempotente, NON bloquante, double-écriture base/hchc/hchp. /live expose tic_mode (standard/historique). Transition = restart ben-local-api + ben-lora-receiver. ⚠️ déployer le Pi AVANT de flasher l'Arduino standard (arduino 0.0.4)."
+          - version: "0.0.44"
+            released: "2026-06-23"
+            notes: "LED de boot : remplace la séquence arc-en-ciel « disco » (~5 s, 9 couleurs) par 3 flashs bleus brefs au démarrage (aligné avec le wired). Cosmétique pur, AUCUNE migration. Transition = restart ben-local-api + ben-lora-receiver."
       arduino:
         minimum: "0.0.1"
-        latest: "0.0.4"
+        latest: "0.0.5"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -138,11 +141,14 @@ devices:
           - version: "0.0.4"
             released: "2026-06-23"
             notes: "Mode TIC STANDARD : décodage 9600 + auto-détection historique↔standard (mode persisté EEPROM 0x20, re-discovery sur échec prolongé) + parseur standard (séparateur HT, checksum HT-de-queue inclus). Trame v0x04 standard : papp NET SIGNÉ (SINSTS + / SINSTI − ; flag src_standard), horodate compteur DATE → ts (flag ts_valid), EAIT → bloc extension (flag has_ext). Identité v0x01 inchangée (ADCO ← ADSC ; ISOUSC=0 en standard, calibrage PREF différé). minimum reste 0.0.1. ⚠️ flasher APRÈS avoir déployé le Pi récepteur en pi-0.0.43 (un récepteur < 0.0.43 misread le papp signé)."
+          - version: "0.0.5"
+            released: "2026-06-23"
+            notes: "Echo de la version firmware au boot (Serial : « tic-reader boot v0.0.5 ») pour confirmer au debug quelle version est flashée. Aucun changement fonctionnel (FW_VERSION + 1 println). minimum reste 0.0.1."
 
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.43"
+        latest: "0.0.44"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -249,6 +255,9 @@ devices:
           - version: "0.0.43"
             released: "2026-06-23"
             notes: "Mode TIC STANDARD (Enedis-NOI-CPT_54E) bout-en-bout + dorsale stockage index bi-mode. main_uart.py BI-MODE : auto-détection historique↔standard au boot (sonde 1200/9600, mode persisté tic-state.json, re-détection sur silence via watchdog) ; parseur standard (séparateur HT, checksum HT-de-queue inclus, horodate DATE→meter_ts) ; papp = SINSTS net signé. Stockage GÉNÉRIQUE (src_standard, index_id=NTARF, index_value=EASF[NTARF]) + inject_total (EAIT) + meter_ts. MIGRATION BDD : ALTER ×5 (src_standard/index_id/index_value/inject_total/meter_ts), idempotente, NON bloquante, double-écriture base/hchc/hchp. /live expose tic_mode. Transition = restart ben-tic-reader + ben-local-api."
+          - version: "0.0.44"
+            released: "2026-06-23"
+            notes: "LED de boot : 3 flashs bleus brefs au démarrage (aligné avec le récepteur LoRa). Cosmétique pur, AUCUNE migration. Transition = restart ben-tic-reader + ben-local-api."
 
 updates:
 
@@ -388,6 +397,10 @@ updates:
       to: "0.0.43"
       tag: "pi-0.0.43"
       script: "updates/pi0-lora/0.0.42_to_0.0.43/update.sh"
+    - from: "0.0.43"
+      to: "0.0.44"
+      tag: "pi-0.0.44"
+      script: "updates/pi0-lora/0.0.43_to_0.0.44/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -518,6 +531,10 @@ updates:
       to: "0.0.43"
       tag: "pi-0.0.43"
       script: "updates/pi0-wired/0.0.42_to_0.0.43/update.sh"
+    - from: "0.0.43"
+      to: "0.0.44"
+      tag: "pi-0.0.44"
+      script: "updates/pi0-wired/0.0.43_to_0.0.44/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet

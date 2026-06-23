@@ -133,30 +133,12 @@ def setup_led(*args):
     _pwm_g = GPIO.PWM(RGB_G, 500)
     _pwm_b = GPIO.PWM(RGB_B, 500)
     _pwm_r.start(0); _pwm_g.start(0); _pwm_b.start(0)
+    # Blink de boot : 3 flashs bleus brefs (remplace l'ancienne séquence arc-en-ciel
+    # ~5 s "disco" ; aligné avec le wired).
     import time as _t
-    colors = [
-        (28, 0,  0),   # rouge
-        (28, 14, 0),   # orange
-        (28, 28, 0),   # jaune
-        (0,  28, 0),   # vert
-        (0,  28, 28),  # cyan
-        (0,  0,  28),  # bleu
-        (20, 0,  28),  # violet
-        (28, 0,  10),  # rose
-        (28, 28, 28),  # blanc
-    ]
-    for r, g, b in colors:
-        _pwm_r.ChangeDutyCycle(r)
-        _pwm_g.ChangeDutyCycle(g)
-        _pwm_b.ChangeDutyCycle(b)
-        _t.sleep(0.5)
-        _pwm_r.ChangeDutyCycle(0)
-        _pwm_g.ChangeDutyCycle(0)
-        _pwm_b.ChangeDutyCycle(0)
-        _t.sleep(0.06)
-    _pwm_r.ChangeDutyCycle(0)
-    _pwm_g.ChangeDutyCycle(0)
-    _pwm_b.ChangeDutyCycle(0)
+    for _ in range(3):
+        _pwm_b.ChangeDutyCycle(20); _t.sleep(0.12)
+        _pwm_b.ChangeDutyCycle(0);  _t.sleep(0.12)
 
 def blink_rgb(r, g, b, duration=0.05, bypass=False):
     # La luminosité réglée (led_level) est appliquée ; l'appelant passe

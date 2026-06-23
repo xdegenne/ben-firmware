@@ -84,6 +84,7 @@
 // ---------------------------------------------------------------------------
 #define PROTOCOL_VERSION_BOOT  0x01   // trame d'identité (ADCO)
 #define PROTOCOL_VERSION_CURVE 0x04   // trame courbe batchée
+#define FW_VERSION             "0.0.5"  // version firmware, échoée au boot (debug / confirmation flash)
 #define BOOT_PAYLOAD_LEN       20     // v0x01 : version + ADCO(12), padding
 #define HMAC_LEN                8
 
@@ -733,7 +734,7 @@ void setup() {
   }
 
   Serial.begin(9600);
-  Serial.println(F("tic-reader boot"));
+  Serial.println(F("tic-reader boot v" FW_VERSION));
   Serial.flush(); Serial.end();
 
   // Init RFM95
