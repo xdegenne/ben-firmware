@@ -12,22 +12,24 @@
   (plus besoin de v0x02). Spec complète : rasperry/LORA_PROTOCOL.md §17.
 
     0       version      uint8  = 0x04
-    1       flags        bit0-1 DEMAIN, bit2 ADPS, bit3 PEJP,
-                         bit4 ts_valid, bit5 src_standard, bit6 has_ext (=0 en histo)
+    1       flags        bit0-1 DEMAIN, bit2 ADPS, bit3 PEJP, bit4 ts_valid,
+                         bit5 src_standard, bit6 has_ext  (bits 0-3 = 0 en standard)
     2-3     batch_seq    uint16 LE — RAM, reset au boot, +1/batch
-    4       index_id     uint8  BASE=0x00 HCHC=0x01 HCHP=0x02 EJP/BBR=0x03..0x0A
-    5-8     index_value  uint32 LE — index absolu au 1er échantillon (Wh)
-    9-10    papp_ref     uint16 LE — PAPP du 1er échantillon (VA)
+    4       index_id     uint8  histo: PTEC 0x00..0x0A ; standard: NTARF 1..10
+    5-8     index_value  uint32 LE — index absolu au 1er échantillon (Wh ; EASF[NTARF] en std)
+    9-10    papp_ref     int16/uint16 LE — PAPP 1er éch. ; SIGNÉ si src_standard (− = injection)
     11      N            uint8  — nb d'échantillons du batch
-    12      period_ds    uint8  — période nominale en 1/10 s (20 = 2,0 s, historique)
-    13      ts_season    'E'/'H'/0x00 (absent en historique)
-    14-19   ts           YY MM DD hh mm ss (0 en historique ; champ DATE en standard)
-    20..    deltas       (N-1) deltas PAPP, varint zig-zag (1-3 o)
+    12      period_ds    uint8  — période nominale 1/10 s (20=2,0 s histo ; 10=1,0 s std)
+    13      ts_season    'E'/'H' si ts_valid, sinon 0x00 (horodate compteur fiable)
+    14-19   ts           YY MM DD hh mm ss (binaire ; 0 si !ts_valid ; champ DATE en std)
+    20..    deltas       (N-1) deltas PAPP, varint zig-zag signé (1-3 o)
+    [ext]   EAIT         uint32 LE (Wh) si has_ext — énergie injectée totale (producteur std)
     len-8   HMAC         HMAC-SHA256(key, octets 0..len-9) tronqué 8 octets
 
-  Un CHANGEMENT D'INDEX (PTEC) pendant un batch → flush immédiat + nouveau keyframe
-  → chaque batch est homogène en index_id (cf. §17.3). Mode STANDARD (9600 bd,
-  URMS/IRMS/SINSTI, horodate absolue, bloc extension) : différé, bits réservés.
+  Un CHANGEMENT D'INDEX (PTEC histo / NTARF std) pendant un batch → flush immédiat +
+  nouveau keyframe → batch homogène en index_id (cf. §17.3). MODE STANDARD (9600 bd,
+  Enedis-NOI-CPT_54E) : implémenté — auto-détection histo↔standard au boot (+EEPROM,
+  +re-discovery), SINSTS/SINSTI → papp signé (net), horodate DATE → ts, EAIT → bloc ext.
 
   Trame d'identité v0x01 (boot/discovery, 20 o) : version=0x01 + ADCO(12) — inchangée.
 
@@ -119,16 +121,33 @@
 #define FLAG_DEMAIN_NA   0x03
 #define FLAG_ADPS        0x04
 #define FLAG_PEJP        0x08
-// Bits v0x04 (réservés ; tous à 0 en historique). Posés en standard (différé).
-#define FLAG_TS_VALID    0x10
-#define FLAG_SRC_STANDARD 0x20
-#define FLAG_HAS_EXT     0x40
+// Bits v0x04. Posés en STANDARD (implémenté) ; tous à 0 en historique.
+#define FLAG_TS_VALID    0x10   // octets 13-19 (horodate compteur) valides
+#define FLAG_SRC_STANDARD 0x20  // 0=historique, 1=standard ; dit aussi de lire papp en int16 signé
+#define FLAG_HAS_EXT     0x40   // bloc extension présent (EAIT injecté, 4 o)
+
+// ---------------------------------------------------------------------------
+// Modes TIC (Enedis-NOI-CPT_54E) + auto-détection
+// ---------------------------------------------------------------------------
+#define MODE_HISTO     0
+#define MODE_STANDARD  1
+#define TIC_BAUD_HISTO 1200
+#define TIC_BAUD_STD   9600
+// Période nominale de l'échantillonnage (1/10 s) — porte le pas de temps au récepteur.
+#define SAMPLE_PERIOD_DS_HISTO 20   // ~2,0 s/trame en historique
+#define SAMPLE_PERIOD_DS_STD   10   // ~1,0 s/trame en standard
+// Bloc extension : énergie active injectée totale EAIT (uint32 Wh).
+#define EXT_INJECT_LEN  4
+// Re-discovery : si N lectures consécutives échouent (Enedis a peut-être rebasculé
+// le mode), on re-sonde les deux débits.
+#define REDISCOVER_FAILS 5
 
 // ---------------------------------------------------------------------------
 // EEPROM
 // ---------------------------------------------------------------------------
 #define HMAC_KEY_ADDR 0x00
 #define HMAC_KEY_LEN  32
+#define MODE_ADDR     0x20   // mode TIC auto-détecté persisté (reboot rapide)
 
 // ---------------------------------------------------------------------------
 // TIC
@@ -152,13 +171,19 @@ static uint8_t hmac_key[HMAC_KEY_LEN];
 // n'archive jamais la courbe brute, seulement les deltas dans curveBuf.
 static uint8_t  curveBuf[CURVE_BUF_LEN];
 static uint16_t curvePos     = 0;     // curseur d'écriture
-static uint16_t papp_prev    = 0;     // dernière PAPP encodée
+static int32_t  papp_prev    = 0;     // dernière PAPP encodée (signée : net en standard)
 static uint8_t  curveN       = 0;     // échantillons dans le batch courant
 static bool     curveActive  = false;
 static uint8_t  curveIndexId = IDX_UNKNOWN;  // index_id du batch courant (homogène)
+static bool     curveHasInject = false;      // batch standard producteur → bloc ext EAIT
+static uint32_t curveEait     = 0;           // EAIT au keyframe (Wh) — écrit dans le bloc ext
 static uint8_t  lastSentIsousc = 0;          // dernier ISOUSC émis (v0x01) → ré-émet sur changement
 static uint16_t batch_seq    = 0;     // RAM, reset au boot, +1/batch
 static unsigned long curveT0 = 0;     // millis() du début de batch (flush périodique)
+
+// Mode TIC courant (auto-détecté) + compteur d'échecs consécutifs pour re-discovery.
+static uint8_t  ticMode      = MODE_HISTO;
+static uint8_t  consecFail   = 0;
 
 // ---------------------------------------------------------------------------
 // TIC values
@@ -198,6 +223,14 @@ struct TICValues {
   uint16_t papp;
   uint8_t  isousc;        // intensité souscrite (A) — chantier ISOUSC (statique)
   uint16_t fields_seen;
+  // --- Champs MODE STANDARD (Enedis-NOI-CPT_54E §6.2) -----------------------
+  int16_t  papp_net;      // net signé : soutiré (SINSTS) + / injection (SINSTI) -
+  uint8_t  ntarf;         // n° index tarifaire actif (1..10)
+  uint32_t easf[10];      // index fournisseur EASF01..10 (Wh) — l'actif = easf[ntarf-1]
+  uint16_t easf_seen;     // bit i = EASF(i+1) vu (checksum OK) — garde keyframe
+  uint32_t eait;          // énergie active injectée totale (Wh) — producteur
+  bool     has_inject;    // EAIT présent (foyer producteur)
+  char     ts[14];        // horodate DATE "SAAMMJJhhmmss" (saison + 12 chiffres)
 };
 
 // ---------------------------------------------------------------------------
@@ -389,12 +422,59 @@ static void parseTICLine(char* line, uint8_t len, TICValues& v) {
   else if (!strcmp(name, "PEJP"))    v.pejp_present = true;
 }
 
+// ---- MODE STANDARD (Enedis-NOI-CPT_54E §5.3.6) ----------------------------
+// Séparateur HT (0x09, ≠ SP en historique) ; checksum sur étiquette → HT de queue
+// INCLUS (≠ historique où le SP de queue est exclu). `line` = contenu entre LF et
+// CR : "ETIQ<HT>[HORODATE<HT>]DONNEE<HT>CK".
+bool verifyTICChecksumStd(const char *line, size_t len) {
+  if (len < 4) return false;
+  if (line[len - 2] != '\t') return false;        // dernier séparateur = HT
+  uint8_t sum = 0;
+  for (size_t i = 0; i < len - 1; i++) sum += (uint8_t)line[i];  // HT de queue inclus
+  return line[len - 1] == (char)((sum & 0x3F) + 0x20);
+}
+
+// Parse UNE ligne standard validée. Split sur HT : [étiquette, (horodate,) donnée,
+// checksum]. La donnée est l'avant-dernier champ ; l'horodate (si 9 parties) le 2e.
+// On déduit l'horodatage du nombre de HT — rien à coder en dur. On n'extrait que
+// l'utile à BEN (SINSTS/SINSTI/EASF/NTARF/EAIT/ADSC/DATE).
+static void parseTICLineStd(char* line, uint8_t len, TICValues& v) {
+  uint8_t ht[4]; uint8_t n = 0;
+  for (uint8_t i = 0; i < len && n < 4; i++) if (line[i] == '\t') ht[n++] = i;
+  if (n < 2) return;                              // besoin d'au moins ETIQ<HT>DON<HT>CK
+  line[ht[0]] = 0;                                // termine l'étiquette
+  const char* name = line;
+  uint8_t dStart = ht[n - 2] + 1;                 // donnée = champ avant le checksum
+  line[ht[n - 1]] = 0;                            // termine la donnée
+  const char* val = line + dStart;
+
+  if      (!strcmp(name, "ADSC")) strncpy(v.adco, val, sizeof(v.adco) - 1);  // ≈ ADCO
+  else if (!strcmp(name, "SINSTS")) {            // puiss. soutirée (VA) → net positif
+    v.papp_net = (int16_t)strtol(val, 0, 10);
+    v.fields_seen |= TIC_SEEN_PAPP;
+  }
+  else if (!strcmp(name, "SINSTI")) {            // puiss. injectée (VA) → net négatif
+    long s = strtol(val, 0, 10);                 // un seul des deux est non nul à la fois
+    if (s > 0) { v.papp_net = (int16_t)(-s); v.fields_seen |= TIC_SEEN_PAPP; }
+  }
+  else if (!strcmp(name, "NTARF")) v.ntarf = (uint8_t)strtoul(val, 0, 10);  // n° tarif actif
+  else if (!strncmp(name, "EASF", 4) && name[4] >= '0' && name[5] != 0) {
+    uint8_t idx = (uint8_t)strtoul(name + 4, 0, 10);   // EASF01..10 → 1..10
+    if (idx >= 1 && idx <= 10) { v.easf[idx - 1] = strtoul(val, 0, 10); v.easf_seen |= (1 << (idx - 1)); }
+  }
+  else if (!strcmp(name, "EAIT")) { v.eait = strtoul(val, 0, 10); v.has_inject = true; }
+  else if (!strcmp(name, "DATE")) {              // horodatée, donnée vide → horodate = champ 2
+    if (n >= 3) { line[ht[1]] = 0; strncpy(v.ts, line + ht[0] + 1, sizeof(v.ts) - 1); }
+  }
+}
+
 // Lit UNE trame TIC (STX..ETX) et la parse directement dans v. Char-based, SANS
-// String → plus de corruption de heap. Retourne true si ≥1 ligne lue.
-bool readAndParseTIC(TICValues& v) {
+// String → plus de corruption de heap. `mode` = MODE_HISTO (1200, SP) ou
+// MODE_STANDARD (9600, HT). Retourne true si ≥1 ligne valide lue.
+bool readAndParseTIC(TICValues& v, uint8_t mode) {
   memset(&v, 0, sizeof(v));
   digitalWrite(TIC_OUT, HIGH);
-  Serial.begin(1200, SERIAL_7E1);
+  Serial.begin(mode == MODE_STANDARD ? TIC_BAUD_STD : TIC_BAUD_HISTO, SERIAL_7E1);
 
   const char STX = 0x02, ETX = 0x03, LF = 0x0A, CR = 0x0D;
   unsigned long t0 = millis();
@@ -419,8 +499,14 @@ bool readAndParseTIC(TICValues& v) {
       else if (c == CR) {
         if (inLine && li > 0) {
           line[li] = 0;
-          if (verifyTICChecksum(line, li)) { parseTICLine(line, li, v); kept++; }
-          else dropped++;
+          bool ok = (mode == MODE_STANDARD)
+                      ? verifyTICChecksumStd(line, li)
+                      : verifyTICChecksum(line, li);
+          if (ok) {
+            if (mode == MODE_STANDARD) parseTICLineStd(line, li, v);
+            else                       parseTICLine(line, li, v);
+            kept++;
+          } else dropped++;
         }
         inLine = false;
       } else if (inLine && li < sizeof(line) - 1) { line[li++] = c; }
@@ -429,9 +515,37 @@ bool readAndParseTIC(TICValues& v) {
 
   Serial.flush(); Serial.end();
   digitalWrite(TIC_OUT, LOW);
-  v.valid = (v.ptec[0] != 0);
+  // Validité : historique = PTEC vu ; standard = tarif actif (NTARF 1..10) + PAPP vus.
+  if (mode == MODE_STANDARD)
+    v.valid = (v.ntarf >= 1 && v.ntarf <= 10 && (v.fields_seen & TIC_SEEN_PAPP));
+  else
+    v.valid = (v.ptec[0] != 0);
   (void)dropped;
   return (kept > 0);
+}
+
+// Sélection de l'index actif en STANDARD : index_id = NTARF (1..10), value = EASF[NTARF].
+// (Namespace distinct de l'historique 0x00..0x0A, désambiguïsé par FLAG_SRC_STANDARD.)
+void selectActiveIndexStd(const TICValues& v, uint8_t& id, uint32_t& value) {
+  if (v.ntarf >= 1 && v.ntarf <= 10) { id = v.ntarf; value = v.easf[v.ntarf - 1]; }
+  else                               { id = IDX_UNKNOWN; value = 0; }
+}
+
+// Auto-détection du mode TIC : on sonde un débit en lisant une trame ; si elle est
+// VALIDE → c'est le bon mode (au mauvais débit, pas de STX propre → timeout/garbage).
+// Mode persisté (EEPROM) sondé en premier (reboot rapide). 0xFF = aucun (compteur muet).
+uint8_t discoverMode() {
+  uint8_t persisted = EEPROM.read(MODE_ADDR);
+  uint8_t first  = (persisted == MODE_STANDARD) ? MODE_STANDARD : MODE_HISTO;
+  uint8_t second = (first == MODE_HISTO) ? MODE_STANDARD : MODE_HISTO;
+  TICValues t;
+  if (readAndParseTIC(t, first)  && t.valid) return first;
+  if (readAndParseTIC(t, second) && t.valid) return second;
+  return 0xFF;
+}
+
+static void persistMode(uint8_t mode) {
+  if (EEPROM.read(MODE_ADDR) != mode) EEPROM.update(MODE_ADDR, mode);
 }
 
 // (readTIC/parseTICFrame String-based supprimés → readAndParseTIC char-based ci-dessus)
@@ -500,48 +614,84 @@ void sendBootFrame(const char* adco, uint8_t isousc) {
 // ---------------------------------------------------------------------------
 void curveFlush();  // prototype (curveAdd l'appelle quand le buffer est plein)
 
+// Valeur PAPP à encoder : net SIGNÉ en standard (SINSTS + / SINSTI −), PAPP uint16 en
+// historique. Le récepteur la relit signée/non-signée selon FLAG_SRC_STANDARD.
+static inline int32_t pappValue(const TICValues& v) {
+  return (ticMode == MODE_STANDARD) ? (int32_t)v.papp_net : (int32_t)v.papp;
+}
+
 // Démarre un batch : le keyframe EST le 1er échantillon (index actif + PAPP absolue).
 void curveStart(const TICValues& v, uint8_t id, uint32_t value) {
+  int32_t papp = pappValue(v);
   curveBuf[0] = PROTOCOL_VERSION_CURVE;
-  curveBuf[1] = buildFlags(v);              // bits 0-3 ; bits 4/5/6 = 0 en historique
+
+  uint8_t flags;
+  bool tsValid = false;
+  if (ticMode == MODE_STANDARD) {
+    flags = FLAG_SRC_STANDARD;
+    tsValid = (v.ts[0] == 'E' || v.ts[0] == 'H');   // saison MAJUSCULE = horloge fiable (≠ dégradé)
+    if (tsValid)      flags |= FLAG_TS_VALID;
+    if (v.has_inject) flags |= FLAG_HAS_EXT;
+  } else {
+    flags = buildFlags(v);                  // bits 0-3 ; bits 4/5/6 = 0 en historique
+  }
+  curveBuf[1] = flags;
+
   memcpy(curveBuf + 2, &batch_seq, 2);
   curveBuf[4] = id;
   memcpy(curveBuf + 5, &value, 4);
-  memcpy(curveBuf + 9, &v.papp, 2);         // papp_ref = PAPP du 1er échantillon
+  uint16_t papp16 = (uint16_t)papp;         // int16 signé (standard) / uint16 (histo), mêmes 2 o LE
+  memcpy(curveBuf + 9, &papp16, 2);
   // buf[11]=N et buf[12]=period_ds : écrits à l'envoi (curveFlush).
-  curveBuf[13] = 0x00;                      // ts_season absent (historique)
-  memset(curveBuf + 14, 0, 6);              // ts absent (historique)
-  curvePos     = 20;
-  papp_prev    = v.papp;
-  curveN       = 1;
-  curveActive  = true;
-  curveIndexId = id;
-  curveT0      = millis();
+  if (tsValid) {                            // horodate compteur : season + YY MM DD hh mm ss (binaire)
+    curveBuf[13] = (uint8_t)v.ts[0];
+    for (uint8_t i = 0; i < 6; i++)
+      curveBuf[14 + i] = (uint8_t)((v.ts[1 + i * 2] - '0') * 10 + (v.ts[2 + i * 2] - '0'));
+  } else {
+    curveBuf[13] = 0x00;
+    memset(curveBuf + 14, 0, 6);
+  }
+  curvePos       = 20;
+  papp_prev      = papp;
+  curveN         = 1;
+  curveActive    = true;
+  curveIndexId   = id;
+  curveHasInject = (ticMode == MODE_STANDARD && v.has_inject);
+  curveEait      = v.eait;
+  curveT0        = millis();
 }
 
-// Append d'un échantillon = delta zig-zag varint de PAPP vs le précédent.
-void curveAdd(uint16_t papp) {
-  int32_t  d  = (int32_t)papp - (int32_t)papp_prev;
-  uint32_t zz = ((uint32_t)d << 1) ^ (uint32_t)(d >> 31);   // zig-zag
+// Append d'un échantillon = delta zig-zag varint de PAPP vs le précédent (signé).
+void curveAdd(int32_t papp) {
+  int32_t  d  = papp - papp_prev;
+  uint32_t zz = ((uint32_t)d << 1) ^ (uint32_t)(d >> 31);   // zig-zag (gère le signe → injection)
   while (zz >= 0x80) { curveBuf[curvePos++] = (zz & 0x7F) | 0x80; zz >>= 7; }
   curveBuf[curvePos++] = (uint8_t)zz;
   papp_prev = papp;
   curveN++;
-  // -3 = marge d'un varint 3 o au pire ; -HMAC_LEN = réserve la signature finale.
-  if (curvePos >= CURVE_BUF_LEN - HMAC_LEN - 3 || curveN >= CURVE_MAX_SAMPLES)
+  // -3 = marge d'un varint 3 o au pire ; -HMAC_LEN = signature ; -ext = bloc EAIT si producteur.
+  uint8_t extReserve = curveHasInject ? EXT_INJECT_LEN : 0;
+  if (curvePos >= CURVE_BUF_LEN - HMAC_LEN - extReserve - 3 || curveN >= CURVE_MAX_SAMPLES)
     curveFlush();
 }
 
-// Finalise (N, period, HMAC) et émet le batch. Auto-suffisant : keyframe par trame
-// (§17.3), aucun delta inter-batch.
+// Finalise (N, period, [ext], HMAC) et émet le batch. Auto-suffisant : keyframe par
+// trame (§17.3), aucun delta inter-batch.
 void curveFlush() {
   if (!curveActive || curveN == 0) { curveActive = false; return; }
   curveBuf[11] = curveN;
-  curveBuf[12] = SAMPLE_PERIOD_DS;
+  curveBuf[12] = (ticMode == MODE_STANDARD) ? SAMPLE_PERIOD_DS_STD : SAMPLE_PERIOD_DS_HISTO;
+
+  // Bloc extension (entre les deltas et le HMAC) : EAIT injecté (uint32 LE, Wh).
+  // Posé seulement si FLAG_HAS_EXT (producteur standard) ; signé par le HMAC.
+  if (curveHasInject) {
+    memcpy(curveBuf + curvePos, &curveEait, EXT_INJECT_LEN);
+    curvePos += EXT_INJECT_LEN;
+  }
 
   uint8_t mac[32];
   sha256.resetHMAC(hmac_key, HMAC_KEY_LEN);
-  sha256.update(curveBuf, curvePos);                          // signe octets 0..pos-1
+  sha256.update(curveBuf, curvePos);                          // signe octets 0..pos-1 (ext inclus)
   sha256.finalizeHMAC(hmac_key, HMAC_KEY_LEN, mac, 32);
   memcpy(curveBuf + curvePos, mac, HMAC_LEN);
   uint16_t len = curvePos + HMAC_LEN;
@@ -631,19 +781,39 @@ void loop() {
     return;
   }
 
-  TICValues v;
-  if (!readAndParseTIC(v)) { blinkErr(2); return; }   // pas de trame (timeout STX)
-
+  // Discovery au boot (1re itération) : sonde histo↔standard, fixe et persiste le mode.
   if (firstFrame) {
-    blinkRGB(255, 80, 0);             // orange : premiere trame / discovery
-    if (v.adco[0] != 0) sendBootFrame(v.adco, v.isousc);
-    lastSentIsousc = v.isousc;
+    blinkRGB(255, 80, 0);             // orange : discovery
+    uint8_t m = discoverMode();
+    if (m == 0xFF) { blinkErr(2); return; }   // compteur muet : on retentera au tour suivant
+    ticMode = m;
+    persistMode(ticMode);
+    TICValues v0;                     // une trame du bon mode pour l'identité (ADCO/ADSC + ISOUSC)
+    if (readAndParseTIC(v0, ticMode) && v0.adco[0] != 0) {
+      sendBootFrame(v0.adco, v0.isousc);
+      lastSentIsousc = v0.isousc;
+    }
     firstFrame = false;
     return;
   }
 
-  // ISOUSC : si l'abonnement change (rare), ré-émettre la trame d'identité v0x01
-  // (boot + on-change). Indépendant de la validité PTEC/PAPP ; nécessite ADCO+ISOUSC.
+  TICValues v;
+  if (!readAndParseTIC(v, ticMode)) {
+    // Échec lecture : Enedis a peut-être rebasculé le mode → re-discovery après N échecs.
+    if (++consecFail >= REDISCOVER_FAILS) {
+      if (curveActive) curveFlush();
+      uint8_t m = discoverMode();
+      if (m != 0xFF) { ticMode = m; persistMode(ticMode); }
+      consecFail = 0;
+    }
+    blinkErr(2);
+    return;
+  }
+  consecFail = 0;
+
+  // ISOUSC : si l'abonnement change (rare), ré-émettre la trame d'identité v0x01.
+  // (Standard : PREF en kVA non mappé ici → v.isousc=0, identité émise au boot seulement —
+  //  calibrage jauge depuis PREF = chantier ISOUSC standard.)
   if (v.isousc != 0 && v.isousc != lastSentIsousc && v.adco[0] != 0) {
     sendBootFrame(v.adco, v.isousc);
     lastSentIsousc = v.isousc;
@@ -652,32 +822,38 @@ void loop() {
   if (!v.valid) { blinkErr(3); return; }
 
   uint8_t id; uint32_t value;
-  selectActiveIndex(v, id, value);
+  bool ok;
+  if (ticMode == MODE_STANDARD) {
+    selectActiveIndexStd(v, id, value);
+    // Garde standard : PAPP (SINSTS/SINSTI) vu + index actif EASF[NTARF] vu (checksum OK).
+    ok = (id != IDX_UNKNOWN) && (v.fields_seen & TIC_SEEN_PAPP)
+         && (v.easf_seen & (1 << (v.ntarf - 1)));
+  } else {
+    selectActiveIndex(v, id, value);
+    // Garde historique : PAPP + l'index actif vus.
+    uint16_t required = TIC_SEEN_PAPP;
+    if (id != IDX_UNKNOWN && id < sizeof(INDEX_ID_TO_SEEN) / sizeof(INDEX_ID_TO_SEEN[0]))
+      required |= INDEX_ID_TO_SEEN[id];
+    ok = (id != IDX_UNKNOWN) && ((v.fields_seen & required) == required);
+  }
   if (id == IDX_UNKNOWN) {
     Serial.begin(9600);
-    Serial.print(F("PTEC inconnu (")); Serial.print(v.ptec); Serial.println(')');
+    Serial.print(F("index inconnu (PTEC=")); Serial.print(v.ptec);
+    Serial.print(F(" NTARF=")); Serial.print(v.ntarf); Serial.println(')');
     Serial.flush(); Serial.end();
     blinkErr(4);
     return;
   }
+  if (!ok) { blinkErr(2); return; }   // trame partielle → on saute (papp_prev inchangé)
 
-  // Garde : l'index actif + PAPP doivent avoir été vus (checksum OK) dans la trame.
-  // (IINST n'est plus requis : non porté par v0x04 historique — cf. bloc extension différé.)
-  uint16_t required = TIC_SEEN_PAPP;
-  if (id < sizeof(INDEX_ID_TO_SEEN) / sizeof(INDEX_ID_TO_SEEN[0]))
-    required |= INDEX_ID_TO_SEEN[id];
-  if ((v.fields_seen & required) != required) {
-    blinkErr(2);                      // trame partielle → on saute (papp_prev inchangé)
-    return;
-  }
-
-  // Accumulation courbe. Changement d'index actif (PTEC) → coupe le batch courant
-  // et repart sur un keyframe du nouvel index → batch homogène (décision §17.3).
+  // Accumulation courbe. Changement d'index actif → coupe le batch et repart sur un
+  // keyframe du nouvel index → batch homogène (décision §17.3). En standard, une
+  // bascule soutiré↔injection n'a PAS besoin de flush : le delta zig-zag est signé.
   if (!curveActive || id != curveIndexId) {
     if (curveActive && curveN > 1) curveFlush();
     curveStart(v, id, value);
   } else {
-    curveAdd(v.papp);                 // peut auto-flush si le buffer est plein
+    curveAdd(pappValue(v));           // signé en standard ; peut auto-flush si buffer plein
   }
 
   // Flush périodique → fraîcheur /live ~60 s (sinon un batch traînerait jusqu'à plein).

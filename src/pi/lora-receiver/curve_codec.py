@@ -93,10 +93,17 @@ def decode_v04(payload: bytes, key: bytes) -> dict:
         raise CurveDecodeError(f"version {version:#04x} ≠ 0x04")
     if n < 1:
         raise CurveDecodeError("N = 0")
-    if not (0 <= papp_ref <= PAPP_MAX):
+
+    src_standard = bool(flags & FLAG_SRC_STANDARD)
+    # En STANDARD, papp est le NET SIGNÉ (int16 : soutiré + / injection −). En historique,
+    # uint16 (soutiré seul). L'émetteur stocke les 2 mêmes octets ; on les relit selon le flag.
+    if src_standard and papp_ref >= 0x8000:
+        papp_ref -= 0x10000
+    lo, hi = (-0x8000, 0x7FFF) if src_standard else (0, PAPP_MAX)
+    if not (lo <= papp_ref <= hi):
         raise CurveDecodeError(f"papp_ref hors bornes : {papp_ref}")
 
-    # 3) Reconstruire la courbe PAPP par intégration des deltas (varint zig-zag).
+    # 3) Reconstruire la courbe PAPP par intégration des deltas (varint zig-zag SIGNÉ).
     papp = [papp_ref]
     pos = KEYFRAME_LEN
     for _ in range(n - 1):
@@ -104,13 +111,17 @@ def decode_v04(payload: bytes, key: bytes) -> dict:
             raise CurveDecodeError("deltas tronqués (N incohérent avec la longueur)")
         u, pos = _read_varint(signed, pos)
         v = papp[-1] + _unzigzag(u)
-        if not (0 <= v <= PAPP_MAX):
+        if not (lo <= v <= hi):   # standard : v peut être négatif (injection) — pas de clamp à 0
             raise CurveDecodeError(f"PAPP reconstruite hors bornes : {v}")
         papp.append(v)
 
-    # Le bloc extension (has_ext=1) est positionné en signed[pos:] ; non lu en v1
-    # (historique → has_ext=0). main.py logue un avertissement si présent. Le mode
-    # standard le parsera ici plus tard (URMS/IRMS/SINSTI).
+    # 4) Bloc extension (has_ext=1) en signed[pos:] : énergie injectée totale EAIT (uint32 LE).
+    inject_total = None
+    if flags & FLAG_HAS_EXT:
+        if pos + 4 > len(signed):
+            raise CurveDecodeError("bloc extension tronqué (has_ext mais < 4 octets)")
+        inject_total = struct.unpack_from("<I", signed, pos)[0]
+        pos += 4
 
     return {
         "version": version,
@@ -122,27 +133,60 @@ def decode_v04(payload: bytes, key: bytes) -> dict:
         "n": n,
         "period_ds": period_ds,
         "ts_valid": bool(flags & FLAG_TS_VALID),
-        "src_standard": bool(flags & FLAG_SRC_STANDARD),
+        "src_standard": src_standard,
         "has_ext": bool(flags & FLAG_HAS_EXT),
         "ts_season": ts_season,
         "ts_raw": ts_raw,
+        "inject_total": inject_total,   # Wh injectés (standard producteur) ou None
         "papp": papp,
     }
 
 
+def meter_epoch(decoded: dict) -> int | None:
+    """Convertit l'horodate compteur (champ DATE de la TIC standard, portée par la trame)
+    en epoch UTC, ou None si absente/non fiable.
+
+    `ts_raw` = 6 octets binaires YY MM DD hh mm ss ; `ts_season` = 'E' (été, UTC+2) ou
+    'H' (hiver, UTC+1). Le compteur DIT la saison → conversion locale→UTC sans base de
+    fuseaux. Saison minuscule (mode dégradé) ou ts_valid=0 → None (pas fiable)."""
+    if not decoded.get("ts_valid"):
+        return None
+    season = chr(decoded["ts_season"]) if isinstance(decoded["ts_season"], int) else decoded["ts_season"]
+    if season not in ("E", "H"):          # minuscule = horloge compteur dégradée → on n'y fait pas foi
+        return None
+    yy, mo, da, hh, mi, se = decoded["ts_raw"][0:6]
+    offset = 2 if season == "E" else 1    # été UTC+2 / hiver UTC+1
+    import calendar
+    try:
+        return calendar.timegm((2000 + yy, mo, da, hh, mi, se, 0, 0, 0)) - offset * 3600
+    except (ValueError, OverflowError):
+        return None
+
+
 def anchor_timestamps(decoded: dict, t_rx: float) -> list[int]:
-    """Horodate les N échantillons d'un batch décodé.
+    """Horodate SYSTÈME des N échantillons (timeline horloge du Pi/NTP).
 
-    Historique (ts_valid=0, §17.8) : le DERNIER échantillon est ancré à l'instant de
-    réception `t_rx` (le Pi a le NTP), les précédents espacés en arrière de `period_ds`.
-    `period_ds` reste nominal (jitter de la cadence TIC) — bon pour l'ordre/espacement,
-    pas pour de l'horodatage légal.
-
-    Mode standard (ts_valid=1) : à brancher ultérieurement (horodate compteur absolue
-    via le champ DATE de la TIC) ; en attendant on retombe sur l'ancrage réception.
+    Le DERNIER échantillon est ancré à l'instant de réception `t_rx`, les précédents
+    espacés en arrière de `period_ds`. `period_ds` reste nominal (jitter de la cadence
+    TIC) — bon pour l'ordre/espacement. ⚠ Approximatif en LoRa : le batch est transmis
+    APRÈS accumulation (+ délai duty-cycle) → `t_rx` ≠ instant réel du dernier échantillon.
+    En standard, préférer `meter_timestamps()` (horodate compteur, immunisée au délai).
     """
     n = decoded["n"]
     period_s = decoded["period_ds"] / 10.0
-    # TODO(standard) : si decoded["ts_valid"], t0 = linky_horodate_to_epoch(ts_raw,
-    # ts_season) puis t[i] = t0 + i*period_s. Non implémenté en v1 (historique).
     return [int(t_rx - (n - 1 - i) * period_s) for i in range(n)]
+
+
+def meter_timestamps(decoded: dict) -> list[int] | None:
+    """Horodate COMPTEUR par échantillon (epoch UTC), ou None si indispo/dégradé.
+
+    L'horodate de la trame est celle du 1er échantillon (keyframe = champ DATE de la TIC
+    standard) → ancrage AVANT : t[i] = t0 + i*period_s. Contrairement à l'ancrage
+    réception, c'est **immunisé au délai de transmission LoRa** (l'heure voyage avec la
+    mesure) → c'est le `meter_ts` fiable à stocker pour le standard."""
+    t0 = meter_epoch(decoded)
+    if t0 is None:
+        return None
+    period_s = decoded["period_ds"] / 10.0
+    n = decoded["n"]
+    return [int(t0 + i * period_s) for i in range(n)]

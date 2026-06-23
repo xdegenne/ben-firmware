@@ -247,6 +247,9 @@ class Handler(BaseHTTPRequestHandler):
             for row in rows:
                 row["level"] = levels.level_for(
                     conn, row["pdl_index"], row.get("papp"), now)
+                # Mode TIC du PDL ('standard'/'historique'/null) — affiché par l'app.
+                # En standard, `papp` est le NET SIGNÉ (>0 soutiré, <0 surplus injecté).
+                row["tic_mode"] = db.tic_mode(conn, row["pdl_index"])
                 # ISOUSC (abonnement souscrit) : exposé pour les réglages app
                 # + l'étalonnage de la jauge (maxVa = ISOUSC×230). None tant que
                 # pas reçu (LoRa : avant le 1er boot frame de l'émetteur ≥ 0.0.3).

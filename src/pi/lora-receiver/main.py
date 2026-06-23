@@ -97,7 +97,6 @@ FLAG_PEJP = 0x08
 
 BOOT_SEQ_MOD        = 65536
 DUPLICATE_MAX_GAP_S = 10
-WATCHDOG_THRESHOLD  = 180
 
 RSSI_MIN_PLAUSIBLE = -130
 RSSI_MAX_PLAUSIBLE = 0
@@ -474,50 +473,75 @@ def on_recv_curve(raw, rssi, snr, pdl_index, now, time_since_prev) -> None:
         return
 
     index_id = decoded["index_id"]
-    active_name = INDEX_NAMES.get(index_id)
-    if active_name is None:
-        if index_id == INDEX_UNKNOWN:
-            log.warning("v0x04 index_id=0xFF (PTEC inconnu côté Arduino), batch ignoré")
-        else:
-            log.error(f"v0x04 index_id inconnu : 0x{index_id:02x}")
-        blink_rgb(30, 0, 0, 0.3, bypass=True)
-        return
+    src_standard = decoded["src_standard"]
 
-    if decoded["has_ext"]:
-        # v1 historique n'émet jamais d'extension ; le mode standard la branchera ici.
-        log.warning("v0x04 has_ext=1 — bloc extension ignoré (non géré en v1)")
+    # Index actif : histo → nom canonique (INDEX_NAMES) écrit dans base/hchc/hchp ;
+    # standard → index_id = NTARF (1..10), OPAQUE (nom = LTARF fournisseur, pas de table
+    # en dur) → pas de mapping base/hchc/hchp, seules les colonnes génériques le portent.
+    if src_standard:
+        if not (1 <= index_id <= 10):
+            log.warning(f"v0x04 standard : NTARF hors plage ({index_id}), batch ignoré")
+            blink_rgb(30, 0, 0, 0.3, bypass=True)
+            return
+        active_name = None
+    else:
+        active_name = INDEX_NAMES.get(index_id)
+        if active_name is None:
+            if index_id == INDEX_UNKNOWN:
+                log.warning("v0x04 index_id=0xFF (PTEC inconnu côté Arduino), batch ignoré")
+            else:
+                log.error(f"v0x04 index_id inconnu : 0x{index_id:02x}")
+            blink_rgb(30, 0, 0, 0.3, bypass=True)
+            return
 
     papp = decoded["papp"]
-    ts_list = curve_codec.anchor_timestamps(decoded, now)
+    ts_list = curve_codec.anchor_timestamps(decoded, now)         # ts SYSTÈME (Pi/NTP, approx LoRa)
+    meter_ts_list = curve_codec.meter_timestamps(decoded)         # meter_ts COMPTEUR (standard) ou None
     flags = decoded["flags"]
     demain = DEMAIN_NAMES[flags & 0x03]
     adps = bool(flags & FLAG_ADPS)
     pejp = bool(flags & FLAG_PEJP)
     batch_seq = decoded["batch_seq"]
     index_value = decoded["index_value"]
+    inject_total = decoded["inject_total"]
 
-    log.info(f"v0x04 OK pdl_index={pdl_index} batch_seq={batch_seq} idx={active_name} "
+    mode = "std" if src_standard else "histo"
+    idlbl = f"NTARF={index_id}" if src_standard else active_name
+    extra = (f" inject_total={inject_total}" if src_standard
+             else f" demain={demain} adps={adps} pejp={pejp}")
+    log.info(f"v0x04 OK [{mode}] pdl_index={pdl_index} batch_seq={batch_seq} {idlbl} "
              f"index={index_value} n={decoded['n']} period_ds={decoded['period_ds']} "
-             f"papp[0]={papp[0]} papp[-1]={papp[-1]} demain={demain} adps={adps} pejp={pejp}")
+             f"papp[0]={papp[0]} papp[-1]={papp[-1]}" + extra)
 
     # Chaque batch s'auto-ancre (§17.3) → on logue les trous, sans correction.
     event, details = detect_batch_seq_event(batch_seq, time_since_prev)
     if event:
         log.info(f"EVENT {event} {details}")
 
-    # Stockage : un row par échantillon. L'index actif est CONSTANT sur le batch
-    # (l'Arduino coupe au changement d'index) → on l'estampille sur CHAQUE row, donc
-    # curve_buckets() (JOIN sur ts_max) ne renvoie jamais d'index NULL. IINST absent
-    # en v0x04 historique → colonne NULL (cf. doc, régression mineure assumée).
+    # Stockage : un row par échantillon. L'index actif est CONSTANT sur le batch (l'Arduino
+    # coupe au changement d'index) → estampillé sur CHAQUE row (curve_buckets JOIN ts_max →
+    # jamais d'index NULL). Colonnes GÉNÉRIQUES (_src_standard/_index_id/_index_value) +
+    # meter_ts (horodate compteur, standard) ; base/hchc/hchp en double-écriture (histo).
     if measurements_db is not None:
         try:
-            rows = [
-                (pdl_index, {active_name: index_value, "PAPP": papp[i]}, ts_list[i])
-                for i in range(len(papp))
-            ]
+            rows = []
+            for i in range(len(papp)):
+                labels = {
+                    "PAPP": papp[i],                       # net signé en standard (− = injection)
+                    "_src_standard": 1 if src_standard else 0,
+                    "_index_id": index_id,
+                    "_index_value": index_value,
+                }
+                if active_name is not None:                # double-écriture histo
+                    labels[active_name] = index_value
+                if inject_total is not None:
+                    labels["_inject_total"] = inject_total
+                if meter_ts_list is not None:
+                    labels["_meter_ts"] = meter_ts_list[i]
+                rows.append((pdl_index, labels, ts_list[i]))
             n_ins = db.record_measurements_batch(measurements_db, rows)
             db.record_lora_link(measurements_db, pdl_index, rssi, snr)
-            log.debug(f"store: v0x04 batch {n_ins} mesures + 1 lora_link")
+            log.debug(f"store: v0x04 [{mode}] batch {n_ins} mesures + 1 lora_link")
         except Exception as e:
             log.warning(f"store: écriture v0x04 échouée: {e}")
         _maybe_prune()
@@ -539,16 +563,13 @@ def on_recv_curve(raw, rssi, snr, pdl_index, now, time_since_prev) -> None:
 # ---------------------------------------------------------------------------
 # Watchdog + Heartbeat
 # ---------------------------------------------------------------------------
-def watchdog_loop() -> None:
-    while True:
-        sleep(30)
-        if not lora_ok or last_frame_time == 0:
-            continue
-        elapsed = time.time() - last_frame_time
-        if elapsed > WATCHDOG_THRESHOLD:
-            log.critical(f"WATCHDOG : {int(elapsed)}s sans trame — relance")
-            sleep(1)
-            os.execv(sys.executable, [sys.executable] + sys.argv)
+# Pas de watchdog « relance si pas de trame » côté récepteur LoRa : contrairement au
+# wired (où l'absence de TIC peut signaler un port série bloqué qu'un restart resynchronise),
+# ici « pas de trame » est NORMAL (émetteur éteint, hors portée, supercap en recharge). Un
+# restart ne reçoit pas plus et perd l'état (indexes/seq). La fraîcheur LoRa reste signalée
+# par le heartbeat (flash orange si rien depuis >90 s) — informatif, sans relance.
+# (Si un jour la radio se fige vraiment, ajouter un vrai self-test radio plutôt qu'un
+#  timeout sur l'absence de trafic, qui confond « radio HS » et « rien à recevoir ».)
 
 def is_wifi_up() -> bool:
     try:
@@ -617,9 +638,8 @@ log.info(f"PDL connu : {state.get('adco') or '(aucun)'}")
 log.info(f"Index connus : {state['indexes']}")
 log.info(f"Last boot_seq : {state.get('last_boot_seq')}")
 
-Thread(target=watchdog_loop, daemon=True, name="watchdog").start()
 Thread(target=heartbeat_loop, daemon=True, name="heartbeat").start()
-log.info(f"Watchdog démarré (seuil={WATCHDOG_THRESHOLD}s), heartbeat={RECEPTION_TIMEOUT_S}s")
+log.info(f"Heartbeat démarré ({RECEPTION_TIMEOUT_S}s) — pas de watchdog restart-sur-silence")
 
 try:
     while True:

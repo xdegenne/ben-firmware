@@ -35,15 +35,20 @@ RETENTION_DAYS = 90  # 3 mois glissants
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS measurements (
-    ts          INTEGER NOT NULL,
-    pdl_index   INTEGER NOT NULL,
-    base        INTEGER,
-    hchc        INTEGER,
-    hchp        INTEGER,
-    papp        INTEGER,
-    iinst       INTEGER,
-    tariff      INTEGER,
-    sent        INTEGER NOT NULL DEFAULT 0
+    ts            INTEGER NOT NULL,
+    pdl_index     INTEGER NOT NULL,
+    base          INTEGER,
+    hchc          INTEGER,
+    hchp          INTEGER,
+    papp          INTEGER,
+    iinst         INTEGER,
+    tariff        INTEGER,
+    src_standard  INTEGER NOT NULL DEFAULT 0,
+    index_id      INTEGER,
+    index_value   INTEGER,
+    inject_total  INTEGER,
+    meter_ts      INTEGER,
+    sent          INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_meas_pdl_ts   ON measurements(pdl_index, ts);
 CREATE INDEX IF NOT EXISTS idx_meas_pdl_papp ON measurements(pdl_index, papp);
@@ -99,6 +104,22 @@ def connect(path: str = DB_PATH, *, read_only: bool = False) -> sqlite3.Connecti
         cols = [r[1] for r in conn.execute("PRAGMA table_info(measurements)")]
         if "tariff" not in cols:
             conn.execute("ALTER TABLE measurements ADD COLUMN tariff INTEGER")
+        # Chantier index bi-mode : stockage GÉNÉRIQUE des index d'énergie (histo+standard)
+        # + horodate compteur. Migration idempotente ; double-écriture transitoire avec
+        # base/hchc/hchp (cf. docs/chantier-index-energie-bimode.md).
+        #   src_standard : 0=histo (index_id=rang PTEC 0..0x0A), 1=standard (index_id=NTARF 1..10)
+        #   index_value  : Wh du registre actif (carry-forward) ; inject_total : EAIT (Wh, producteur)
+        #   meter_ts     : horodate compteur (epoch UTC), NULL si indispo (provenance du temps)
+        if "src_standard" not in cols:
+            conn.execute("ALTER TABLE measurements ADD COLUMN src_standard INTEGER NOT NULL DEFAULT 0")
+        if "index_id" not in cols:
+            conn.execute("ALTER TABLE measurements ADD COLUMN index_id INTEGER")
+        if "index_value" not in cols:
+            conn.execute("ALTER TABLE measurements ADD COLUMN index_value INTEGER")
+        if "inject_total" not in cols:
+            conn.execute("ALTER TABLE measurements ADD COLUMN inject_total INTEGER")
+        if "meter_ts" not in cols:
+            conn.execute("ALTER TABLE measurements ADD COLUMN meter_ts INTEGER")
         # Migration 0.0.34 : modèle de niveau « course [talon, plafond] ».
         # talon = ancrage bas (percentile bas) ; papp_max_alltime = high-water
         # mark monotone (jamais décrémenté, survit au prune → vrai plafond foyer).
@@ -150,6 +171,20 @@ def _tariff_from_labels(labels: dict) -> int | None:
     return None
 
 
+def _generic_cols(labels: dict) -> tuple:
+    """Colonnes GÉNÉRIQUES d'index (chantier bi-mode) depuis les clés réservées du dict
+    de labels, posées par le reader wired ou le récepteur LoRa. Absentes → NULL/0.
+      _src_standard (0/1) · _index_id · _index_value · _inject_total · _meter_ts
+    Cohabite avec base/hchc/hchp (double-écriture transitoire)."""
+    return (
+        int(labels.get("_src_standard", 0) or 0),
+        labels.get("_index_id"),
+        labels.get("_index_value"),
+        labels.get("_inject_total"),
+        labels.get("_meter_ts"),
+    )
+
+
 def record_measurement(
     conn: sqlite3.Connection,
     pdl_index: int,
@@ -158,14 +193,15 @@ def record_measurement(
     ts: int | None = None,
 ) -> None:
     """Insère une mesure de conso depuis le dict de labels TIC parsés
-    (BASE/HCHC/HCHP/PAPP/IINST). Les labels absents → NULL. `tariff` = index
-    tarifaire actif (PTEC wired / index LoRa)."""
+    (BASE/HCHC/HCHP/PAPP/IINST + clés génériques _index_*). Les labels absents → NULL.
+    `tariff` = index tarifaire actif (PTEC wired / index LoRa)."""
     ts = int(ts if ts is not None else time.time())
     papp = labels.get("PAPP")
     conn.execute(
         "INSERT INTO measurements "
-        "(ts, pdl_index, base, hchc, hchp, papp, iinst, tariff) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "(ts, pdl_index, base, hchc, hchp, papp, iinst, tariff, "
+        " src_standard, index_id, index_value, inject_total, meter_ts) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             ts,
             pdl_index,
@@ -175,6 +211,7 @@ def record_measurement(
             papp,
             labels.get("IINST"),
             _tariff_from_labels(labels),
+            *_generic_cols(labels),
         ),
     )
     # High-water mark monotone de la PAPP (plafond du modèle de niveau). Mis à
@@ -220,13 +257,15 @@ def record_measurements_batch(
             papp,
             labels.get("IINST"),
             _tariff_from_labels(labels),
+            *_generic_cols(labels),
         ))
         if papp is not None and papp > maxima.get(pdl_index, -1):
             maxima[pdl_index] = papp
     conn.executemany(
         "INSERT INTO measurements "
-        "(ts, pdl_index, base, hchc, hchp, papp, iinst, tariff) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "(ts, pdl_index, base, hchc, hchp, papp, iinst, tariff, "
+        " src_standard, index_id, index_value, inject_total, meter_ts) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params,
     )
     # High-water mark par PDL : même logique monotone que record_measurement,
@@ -290,6 +329,25 @@ def record_isousc(
     )
     conn.commit()
     return True
+
+
+def tic_mode(conn: sqlite3.Connection, pdl_index: int) -> str | None:
+    """Mode TIC courant d'un PDL — 'standard' / 'historique' — depuis le `src_standard`
+    de la dernière mesure, ou None si inconnu. Sert l'API (/live → affichage app).
+
+    Défensif (comme get_isousc) : si la colonne `src_standard` n'existe pas encore
+    (API read-only interrogée juste après l'upgrade, avant que le reader ait exécuté la
+    migration ALTER) → None au lieu de planter le /live."""
+    try:
+        row = conn.execute(
+            "SELECT src_standard FROM measurements WHERE pdl_index=? "
+            "ORDER BY ts DESC LIMIT 1", (pdl_index,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None or row["src_standard"] is None:
+        return None
+    return "standard" if row["src_standard"] else "historique"
 
 
 def get_isousc(conn: sqlite3.Connection, pdl_index: int) -> int | None:
