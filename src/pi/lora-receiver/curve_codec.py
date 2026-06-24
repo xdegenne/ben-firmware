@@ -1,14 +1,14 @@
 """
-curve_codec.py — Décodage de la trame LoRa v0x04 (courbe PAPP batchée, delta + keyframe).
+curve_codec.py — Décodage de la trame LoRa v0x05 (courbe PAPP batchée, delta + dt par point).
 
 Module **pur** : aucune dépendance GPIO / raspi_lora → importable et testable hors device
 (le récepteur main.py importe RPi.GPIO + raspi_lora, qui échouent à l'import sur une machine
-de dev). Toute la logique de décodage v0x04 vit ici pour être couverte par un test round-trip.
+de dev). Toute la logique de décodage v0x05 vit ici pour être couverte par un test round-trip.
 
 Spec complète : rasperry/LORA_PROTOCOL.md §17. Layout (longueur variable) :
 
     Offset  Taille  Champ        Rôle
-    0       1       version      uint8 = 0x04
+    0       1       version      uint8 = 0x05
     1       1       flags        bits 0-3 DEMAIN/ADPS/PEJP (idem v0x02 §12.5)
                                  bit4 ts_valid · bit5 src_standard · bit6 has_ext
     2-3     2       batch_seq    uint16 LE — +1 par batch (détection de trous)
@@ -16,11 +16,12 @@ Spec complète : rasperry/LORA_PROTOCOL.md §17. Layout (longueur variable) :
     5-8     4       index_value  uint32 LE — index absolu au 1er échantillon (Wh)
     9-10    2       papp_ref     uint16 LE — PAPP du 1er échantillon (VA)
     11      1       N            uint8 — nb total d'échantillons (≥ 1)
-    12      1       period_ds    uint8 — période nominale, en dixièmes de s (20 = 2,0 s)
+    12      1       period_ds    uint8 — moyenne/hint du batch en 1/10 s (le timing vient des dt)
     13      1       ts_season    'E'=été · 'H'=hiver · 0x00 = absent (historique)
     14-19   6       ts           YY MM DD hh mm ss (uint8) — historique : tout à 0
-    20..    var     deltas       (N-1) deltas PAPP, varint zig-zag (1-3 o chacun)
-    [ext]   var     extension    bloc optionnel (has_ext=1) — différé (mode standard)
+    20..    var     points       (N-1) paires [dt, delta PAPP] : dt = écart au point précédent
+                                 en SECONDES (varint) ; delta PAPP varint zig-zag (1-3 o)
+    [ext]   var     extension    bloc optionnel (has_ext=1) — EAIT injecté (mode standard)
     len-8   8       HMAC         HMAC-SHA256(clé, octets 0..len-9) tronqué 8 octets
 
 Le keyframe porte UN seul index actif (l'émetteur coupe le batch au changement d'index,
@@ -31,8 +32,8 @@ import hashlib
 import hmac as _hmac
 import struct
 
-PROTOCOL_VERSION_CURVE = 0x04
-KEYFRAME_LEN = 20
+PROTOCOL_VERSION_CURVE = 0x05            # un seul émetteur LoRa en service → pas de compat v0x04
+KEYFRAME_LEN = 20                        # period_ds conservé (offsets inchangés) = moyenne/hint du batch
 HMAC_LEN = 8
 MIN_FRAME_LEN = KEYFRAME_LEN + HMAC_LEN  # 28 octets : keyframe (N=1, 0 delta) + HMAC
 
@@ -90,7 +91,7 @@ def decode_v04(payload: bytes, key: bytes) -> dict:
     (version, flags, batch_seq, index_id, index_value, papp_ref,
      n, period_ds, ts_season, ts_raw) = struct.unpack_from(_KEYFRAME_FMT, signed, 0)
     if version != PROTOCOL_VERSION_CURVE:
-        raise CurveDecodeError(f"version {version:#04x} ≠ 0x04")
+        raise CurveDecodeError(f"version {version:#04x} ≠ 0x05")
     if n < 1:
         raise CurveDecodeError("N = 0")
 
@@ -103,12 +104,17 @@ def decode_v04(payload: bytes, key: bytes) -> dict:
     if not (lo <= papp_ref <= hi):
         raise CurveDecodeError(f"papp_ref hors bornes : {papp_ref}")
 
-    # 3) Reconstruire la courbe PAPP par intégration des deltas (varint zig-zag SIGNÉ).
+    # 3) Reconstruire la courbe. Chaque point = (dt en SECONDES, delta PAPP zig-zag signé).
     papp = [papp_ref]
+    sample_dt_s = [0.0]              # point 0 (keyframe) : dt nul
     pos = KEYFRAME_LEN
     for _ in range(n - 1):
         if pos >= len(signed):
-            raise CurveDecodeError("deltas tronqués (N incohérent avec la longueur)")
+            raise CurveDecodeError("points tronqués (N incohérent avec la longueur)")
+        dt, pos = _read_varint(signed, pos)             # dt depuis le point précédent, en secondes
+        sample_dt_s.append(float(dt))
+        if pos >= len(signed):
+            raise CurveDecodeError("points tronqués (dt sans delta PAPP)")
         u, pos = _read_varint(signed, pos)
         v = papp[-1] + _unzigzag(u)
         if not (lo <= v <= hi):   # standard : v peut être négatif (injection) — pas de clamp à 0
@@ -139,6 +145,7 @@ def decode_v04(payload: bytes, key: bytes) -> dict:
         "ts_raw": ts_raw,
         "inject_total": inject_total,   # Wh injectés (standard producteur) ou None
         "papp": papp,
+        "sample_dt_s": sample_dt_s,     # dt par point en s (v0x05 réel ; v0x04 = period_ds/10 uniforme)
     }
 
 
@@ -163,30 +170,38 @@ def meter_epoch(decoded: dict) -> int | None:
         return None
 
 
-def anchor_timestamps(decoded: dict, t_rx: float) -> list[int]:
-    """Horodate SYSTÈME des N échantillons (timeline horloge du Pi/NTP).
+def _cumulative_offsets_s(decoded: dict) -> list[float]:
+    """Décalage cumulé (s) de chaque point vs le 1er, depuis les dt par point (`sample_dt_s`,
+    en secondes ; dt[0]=0). v0x05 : dt RÉELS mesurés (horodate compteur en std, millis en
+    histo) → espacement fidèle même cadence non uniforme. v0x04 : period_ds/10 uniforme."""
+    off, acc = [], 0.0
+    for dt in decoded["sample_dt_s"]:
+        acc += dt
+        off.append(acc)
+    return off
 
-    Le DERNIER échantillon est ancré à l'instant de réception `t_rx`, les précédents
-    espacés en arrière de `period_ds`. `period_ds` reste nominal (jitter de la cadence
-    TIC) — bon pour l'ordre/espacement. ⚠ Approximatif en LoRa : le batch est transmis
-    APRÈS accumulation (+ délai duty-cycle) → `t_rx` ≠ instant réel du dernier échantillon.
-    En standard, préférer `meter_timestamps()` (horodate compteur, immunisée au délai).
-    """
-    n = decoded["n"]
-    period_s = decoded["period_ds"] / 10.0
-    return [int(t_rx - (n - 1 - i) * period_s) for i in range(n)]
+
+def anchor_timestamps(decoded: dict, t_rx: float) -> list[int]:
+    """Horodate SYSTÈME des N points (timeline horloge du Pi/NTP), en secondes entières.
+
+    Le DERNIER point est ancré à l'instant de réception `t_rx`, les précédents reculés par
+    les dt cumulés (`sample_dt_s`). ⚠ Approximatif en LoRa : la trame arrive APRÈS l'airtime
+    → `t_rx` ≠ instant réel du dernier point (décalé de l'airtime, ~1-3 s). En standard,
+    préférer `meter_timestamps()` (horodate compteur, immunisée au délai)."""
+    off = _cumulative_offsets_s(decoded)
+    total = off[-1] if off else 0.0
+    return [round(t_rx - (total - o)) for o in off]
 
 
 def meter_timestamps(decoded: dict) -> list[int] | None:
-    """Horodate COMPTEUR par échantillon (epoch UTC), ou None si indispo/dégradé.
+    """Horodate COMPTEUR par point (epoch UTC entier), ou None si indispo/dégradé.
 
-    L'horodate de la trame est celle du 1er échantillon (keyframe = champ DATE de la TIC
-    standard) → ancrage AVANT : t[i] = t0 + i*period_s. Contrairement à l'ancrage
-    réception, c'est **immunisé au délai de transmission LoRa** (l'heure voyage avec la
-    mesure) → c'est le `meter_ts` fiable à stocker pour le standard."""
+    t0 = horodate du keyframe (champ DATE de la TIC standard) ; points espacés par les dt
+    cumulés (`sample_dt_s`). En standard les dt VIENNENT de l'horodate compteur → on retombe
+    EXACTEMENT sur les horodates de chaque mesure. **Immunisé au délai de transmission LoRa**
+    (l'heure voyage avec la mesure) → c'est le `meter_ts` fiable à stocker pour le standard."""
     t0 = meter_epoch(decoded)
     if t0 is None:
         return None
-    period_s = decoded["period_ds"] / 10.0
-    n = decoded["n"]
-    return [int(t0 + i * period_s) for i in range(n)]
+    off = _cumulative_offsets_s(decoded)
+    return [int(round(t0 + o)) for o in off]

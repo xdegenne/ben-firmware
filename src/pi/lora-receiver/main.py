@@ -45,7 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "store"))
 import db  # noqa: E402
 import settings  # noqa: E402
 
-# Décodeur courbe v0x04 (module pur, même dossier — testable hors device).
+# Décodeur courbe v0x05 (module pur, même dossier — testable hors device).
 import curve_codec  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -213,7 +213,7 @@ def load_state() -> dict:
         "indexes":         indexes,
         "last_active_id":  raw.get("last_active_id"),
         "last_boot_seq":   raw.get("last_boot_seq"),   # v0x02
-        "last_batch_seq":  raw.get("last_batch_seq"),  # v0x04
+        "last_batch_seq":  raw.get("last_batch_seq"),  # v0x05
         "adco":            raw.get("adco", ""),
         "last_frame_time": raw.get("last_frame_time", 0),
     }
@@ -263,7 +263,7 @@ def detect_boot_seq_event(current: int, time_since_prev: float):
 
 
 def detect_batch_seq_event(current: int, time_since_prev: float):
-    """Idem detect_boot_seq_event mais pour batch_seq (v0x04). Chaque batch v0x04
+    """Idem detect_boot_seq_event mais pour batch_seq (v0x05). Chaque batch v0x05
     s'auto-ancre (keyframe par trame, §17.3) → un trou se LOGUE seulement, aucune
     correction n'est nécessaire. batch_seq est RAM côté Arduino → reset au boot."""
     last = state.get("last_batch_seq")
@@ -318,8 +318,8 @@ def on_recv(payload) -> None:
 
         version = raw[0]
 
-        # v0x04 = trame courbe batchée (longueur VARIABLE) → branche dédiée, AVANT
-        # le contrôle de longueur fixe (sinon toute trame v0x04 serait rejetée ici).
+        # v0x05 = trame courbe batchée (longueur VARIABLE) → branche dédiée, AVANT
+        # le contrôle de longueur fixe (sinon toute trame v0x05 serait rejetée ici).
         if version == curve_codec.PROTOCOL_VERSION_CURVE:
             on_recv_curve(raw, rssi, snr, pdl_index, now, time_since_prev)
             return
@@ -432,7 +432,7 @@ def on_recv(payload) -> None:
 
 
 def _maybe_prune() -> None:
-    """Purge la rétention au plus une fois/heure (commun v0x02/v0x04)."""
+    """Purge la rétention au plus une fois/heure (commun v0x02/v0x05)."""
     global last_prune
     if measurements_db is not None and time.time() - last_prune > 3600:
         try:
@@ -444,13 +444,13 @@ def _maybe_prune() -> None:
 
 
 def on_recv_curve(raw, rssi, snr, pdl_index, now, time_since_prev) -> None:
-    """Trame courbe v0x04 : HMAC vérifié + courbe PAPP reconstruite par curve_codec,
+    """Trame courbe v0x05 : HMAC vérifié + courbe PAPP reconstruite par curve_codec,
     horodatée (ancrage réception en historique), puis insérée EN BATCH dans la même
     table `measurements` que le wired → /curve et /measurements à l'identique."""
     try:
         decoded = curve_codec.decode_v04(raw, HMAC_KEY)
     except curve_codec.CurveDecodeError as e:
-        log.error(f"v0x04 rejetée : {e}")
+        log.error(f"v0x05 rejetée : {e}")
         blink_rgb(30, 0, 0, 0.3, bypass=True)  # rouge — HMAC / proto
         return
 
@@ -462,7 +462,7 @@ def on_recv_curve(raw, rssi, snr, pdl_index, now, time_since_prev) -> None:
     # en dur) → pas de mapping base/hchc/hchp, seules les colonnes génériques le portent.
     if src_standard:
         if not (1 <= index_id <= 10):
-            log.warning(f"v0x04 standard : NTARF hors plage ({index_id}), batch ignoré")
+            log.warning(f"v0x05 standard : NTARF hors plage ({index_id}), batch ignoré")
             blink_rgb(30, 0, 0, 0.3, bypass=True)
             return
         active_name = None
@@ -470,9 +470,9 @@ def on_recv_curve(raw, rssi, snr, pdl_index, now, time_since_prev) -> None:
         active_name = INDEX_NAMES.get(index_id)
         if active_name is None:
             if index_id == INDEX_UNKNOWN:
-                log.warning("v0x04 index_id=0xFF (PTEC inconnu côté Arduino), batch ignoré")
+                log.warning("v0x05 index_id=0xFF (PTEC inconnu côté Arduino), batch ignoré")
             else:
-                log.error(f"v0x04 index_id inconnu : 0x{index_id:02x}")
+                log.error(f"v0x05 index_id inconnu : 0x{index_id:02x}")
             blink_rgb(30, 0, 0, 0.3, bypass=True)
             return
 
@@ -491,7 +491,7 @@ def on_recv_curve(raw, rssi, snr, pdl_index, now, time_since_prev) -> None:
     idlbl = f"NTARF={index_id}" if src_standard else active_name
     extra = (f" inject_total={inject_total}" if src_standard
              else f" demain={demain} adps={adps} pejp={pejp}")
-    log.info(f"v0x04 OK [{mode}] pdl_index={pdl_index} batch_seq={batch_seq} {idlbl} "
+    log.info(f"v0x05 OK [{mode}] pdl_index={pdl_index} batch_seq={batch_seq} {idlbl} "
              f"index={index_value} n={decoded['n']} period_ds={decoded['period_ds']} "
              f"papp[0]={papp[0]} papp[-1]={papp[-1]}" + extra)
 
@@ -523,9 +523,9 @@ def on_recv_curve(raw, rssi, snr, pdl_index, now, time_since_prev) -> None:
                 rows.append((pdl_index, labels, ts_list[i]))
             n_ins = db.record_measurements_batch(measurements_db, rows)
             db.record_lora_link(measurements_db, pdl_index, rssi, snr)
-            log.debug(f"store: v0x04 [{mode}] batch {n_ins} mesures + 1 lora_link")
+            log.debug(f"store: v0x05 [{mode}] batch {n_ins} mesures + 1 lora_link")
         except Exception as e:
-            log.warning(f"store: écriture v0x04 échouée: {e}")
+            log.warning(f"store: écriture v0x05 échouée: {e}")
         _maybe_prune()
 
     # Anti-rollback de l'index (sur le keyframe = absolu du 1er échantillon).

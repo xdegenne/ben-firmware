@@ -4,14 +4,14 @@
   Lit la TIC du compteur Linky et transmet la COURBE de charge (PAPP fin)
   en LoRa vers le Pi Zero récepteur (ben-device).
 
-  ── Trame v0x04 — courbe PAPP batchée (delta + keyframe), longueur variable ──
+  ── Trame v0x05 — courbe PAPP batchée (delta + dt par point + keyframe), longueur variable ──
   Remplace l'ancienne v0x02 (1 index / 32 s, trop grossier pour le NILM). On lit
   TOUTES les trames TIC (~1,7 s en historique), on n'envoie que les DELTAS de PAPP
   par rapport à un keyframe embarqué, et on flush un batch toutes les ~60 s. Le
   keyframe porte aussi l'index actif → l'index cumulatif passe dans chaque batch
   (plus besoin de v0x02). Spec complète : rasperry/LORA_PROTOCOL.md §17.
 
-    0       version      uint8  = 0x04
+    0       version      uint8  = 0x05
     1       flags        bit0-1 DEMAIN, bit2 ADPS, bit3 PEJP, bit4 ts_valid,
                          bit5 src_standard, bit6 has_ext  (bits 0-3 = 0 en standard)
     2-3     batch_seq    uint16 LE — RAM, reset au boot, +1/batch
@@ -19,10 +19,13 @@
     5-8     index_value  uint32 LE — index absolu au 1er échantillon (Wh ; EASF[NTARF] en std)
     9-10    papp_ref     int16/uint16 LE — PAPP 1er éch. ; SIGNÉ si src_standard (− = injection)
     11      N            uint8  — nb d'échantillons du batch
-    12      period_ds    uint8  — période nominale 1/10 s (20=2,0 s histo ; 10=1,0 s std)
+    12      period_ds    uint8  — moyenne du batch en 1/10 s (SYNTHÈSE/hint ; le timing réel
+                         vient des dt par point ci-dessous, pas de ce champ)
     13      ts_season    'E'/'H' si ts_valid, sinon 0x00 (horodate compteur fiable)
     14-19   ts           YY MM DD hh mm ss (binaire ; 0 si !ts_valid ; champ DATE en std)
-    20..    deltas       (N-1) deltas PAPP, varint zig-zag signé (1-3 o)
+    20..    points       (N-1) paires [dt, delta PAPP] : dt = écart au point précédent en
+                         SECONDES (varint) — standard: écart d'horodate compteur ; histo:
+                         écart millis() ; delta PAPP = varint zig-zag signé (1-3 o)
     [ext]   EAIT         uint32 LE (Wh) si has_ext — énergie injectée totale (producteur std)
     len-8   HMAC         HMAC-SHA256(key, octets 0..len-9) tronqué 8 octets
 
@@ -83,8 +86,8 @@
 // Protocole
 // ---------------------------------------------------------------------------
 #define PROTOCOL_VERSION_BOOT  0x01   // trame d'identité (ADCO)
-#define PROTOCOL_VERSION_CURVE 0x04   // trame courbe batchée
-#define FW_VERSION             "0.0.5"  // version firmware, échoée au boot (debug / confirmation flash)
+#define PROTOCOL_VERSION_CURVE 0x05   // trame courbe batchée (v0x05 : dt par point)
+#define FW_VERSION             "0.0.6"  // version firmware, échoée au boot (debug / confirmation flash)
 #define BOOT_PAYLOAD_LEN       20     // v0x01 : version + ADCO(12), padding
 #define HMAC_LEN                8
 
@@ -181,10 +184,14 @@ static uint32_t curveEait     = 0;           // EAIT au keyframe (Wh) — écrit
 static uint8_t  lastSentIsousc = 0;          // dernier ISOUSC émis (v0x01) → ré-émet sur changement
 static uint16_t batch_seq    = 0;     // RAM, reset au boot, +1/batch
 static unsigned long curveT0 = 0;     // millis() du début de batch (flush périodique)
+static uint32_t curveLastOffSec = 0;  // histo : offset cumulé (s) du dernier point vs curveT0 (dt v0x05)
+static int32_t  curveLastTod    = 0;  // standard : time-of-day (s) du dernier point (dt = écart d'horodate)
 
 // Mode TIC courant (auto-détecté) + compteur d'échecs consécutifs pour re-discovery.
 static uint8_t  ticMode      = MODE_HISTO;
 static uint8_t  consecFail   = 0;
+static uint32_t lastStdIndex = 0;     // standard : dernier EASF[NTARF] vu (carry-forward)
+static uint8_t  lastNtarf    = 0;     // standard : dernier NTARF vu (carry-forward)
 
 // ---------------------------------------------------------------------------
 // TIC values
@@ -469,13 +476,24 @@ static void parseTICLineStd(char* line, uint8_t len, TICValues& v) {
   }
 }
 
+// UART TIC ouvert EN CONTINU (begin-once) : plus de Serial.begin()/end() par trame — ça
+// créait une fenêtre aveugle où l'on ratait une trame sur deux. On (re)configure le
+// débit/format SEULEMENT au changement de mode. serialTicMode = mode courant (0xFF = fermé).
+static uint8_t serialTicMode = 0xFF;
+static void ticSerialBegin(uint8_t mode) {
+  if (serialTicMode == mode) return;
+  Serial.end();
+  Serial.begin(mode == MODE_STANDARD ? TIC_BAUD_STD : TIC_BAUD_HISTO, SERIAL_7E1);
+  serialTicMode = mode;
+}
+
 // Lit UNE trame TIC (STX..ETX) et la parse directement dans v. Char-based, SANS
 // String → plus de corruption de heap. `mode` = MODE_HISTO (1200, SP) ou
 // MODE_STANDARD (9600, HT). Retourne true si ≥1 ligne valide lue.
 bool readAndParseTIC(TICValues& v, uint8_t mode) {
   memset(&v, 0, sizeof(v));
   digitalWrite(TIC_OUT, HIGH);
-  Serial.begin(mode == MODE_STANDARD ? TIC_BAUD_STD : TIC_BAUD_HISTO, SERIAL_7E1);
+  ticSerialBegin(mode);
 
   const char STX = 0x02, ETX = 0x03, LF = 0x0A, CR = 0x0D;
   unsigned long t0 = millis();
@@ -487,7 +505,7 @@ bool readAndParseTIC(TICValues& v, uint8_t mode) {
     wdt_reset();
     if (Serial.available()) c = Serial.read();
     else if (millis() - t0 > TIC_TIMEOUT_MS) {
-      Serial.flush(); Serial.end(); digitalWrite(TIC_OUT, LOW); return false;
+      digitalWrite(TIC_OUT, LOW); return false;   // UART laissé ouvert (begin-once)
     }
   }
 
@@ -514,22 +532,14 @@ bool readAndParseTIC(TICValues& v, uint8_t mode) {
     } else if (millis() - t0 > TIC_TIMEOUT_MS) break;
   }
 
-  Serial.flush(); Serial.end();
-  digitalWrite(TIC_OUT, LOW);
-  // Validité : historique = PTEC vu ; standard = tarif actif (NTARF 1..10) + PAPP vus.
+  digitalWrite(TIC_OUT, LOW);   // UART laissé ouvert (begin-once)
+  // Validité : historique = PTEC vu ; standard = PAPP vu (NTARF/horodate gérés dans la garde).
   if (mode == MODE_STANDARD)
-    v.valid = (v.ntarf >= 1 && v.ntarf <= 10 && (v.fields_seen & TIC_SEEN_PAPP));
+    v.valid = (v.fields_seen & TIC_SEEN_PAPP) != 0;   // PAPP requis ; NTARF/horodate gérés dans la garde
   else
     v.valid = (v.ptec[0] != 0);
   (void)dropped;
   return (kept > 0);
-}
-
-// Sélection de l'index actif en STANDARD : index_id = NTARF (1..10), value = EASF[NTARF].
-// (Namespace distinct de l'historique 0x00..0x0A, désambiguïsé par FLAG_SRC_STANDARD.)
-void selectActiveIndexStd(const TICValues& v, uint8_t& id, uint32_t& value) {
-  if (v.ntarf >= 1 && v.ntarf <= 10) { id = v.ntarf; value = v.easf[v.ntarf - 1]; }
-  else                               { id = IDX_UNKNOWN; value = 0; }
 }
 
 // Auto-détection du mode TIC : on sonde un débit en lisant une trame ; si elle est
@@ -586,7 +596,6 @@ bool isVoltageSufficient() {
   ADCSRA |= (1 << ADEN) | (1 << ADSC);
   while (ADCSRA & (1 << ADSC));
   float vcc = (1023.0 * 1.1) / (float)(ADCL | (ADCH << 8));
-  Serial.print(F("Vcc: ")); Serial.println(vcc, 2);
   return vcc >= VCC_MIN;
 }
 
@@ -659,20 +668,51 @@ void curveStart(const TICValues& v, uint8_t id, uint32_t value) {
   curveIndexId   = id;
   curveHasInject = (ticMode == MODE_STANDARD && v.has_inject);
   curveEait      = v.eait;
-  curveT0        = millis();
+  curveT0         = millis();
+  curveLastOffSec = 0;                                                 // histo : origine des dt (millis)
+  curveLastTod    = (ticMode == MODE_STANDARD) ? todSeconds(v.ts) : 0; // standard : tod du keyframe (point 0)
 }
 
-// Append d'un échantillon = delta zig-zag varint de PAPP vs le précédent (signé).
-void curveAdd(int32_t papp) {
+// Time-of-day (s depuis minuit) depuis l'horodate standard v.ts = "SAAMMJJhhmmss" :
+// hh@[7][8], mm@[9][10], ss@[11][12]. Base du dt par point en standard (écart d'horodate).
+static int32_t todSeconds(const char* ts) {
+  int hh = (ts[7]  - '0') * 10 + (ts[8]  - '0');
+  int mm = (ts[9]  - '0') * 10 + (ts[10] - '0');
+  int ss = (ts[11] - '0') * 10 + (ts[12] - '0');
+  return (int32_t)hh * 3600 + mm * 60 + ss;
+}
+
+// Append d'un échantillon (v0x05) = paire [dt, delta PAPP], dt en SECONDES (varint) :
+//  - standard    : dt = écart d'HORODATE compteur (instant de MESURE, autoritaire, sans dérive).
+//                  La garde amont garantit une horodate valide → pas de garbage ici.
+//  - historique  : dt = écart millis() arrondi (pas d'horodate dispo), sans dérive cumulative
+//                  (différence d'offsets arrondis vs curveT0 → Σdt = durée totale arrondie).
+//  - delta PAPP  : varint zig-zag signé vs le précédent (gère l'injection en standard).
+void curveAdd(int32_t papp, const TICValues& v) {
+  uint32_t dt;
+  if (ticMode == MODE_STANDARD) {
+    int32_t tod = todSeconds(v.ts);
+    int32_t d = tod - curveLastTod;
+    if (d < 0) d += 86400L;                                  // passage minuit
+    dt = (uint32_t)d;
+    curveLastTod = tod;
+  } else {
+    uint32_t offSec = (uint32_t)((millis() - curveT0 + 500UL) / 1000UL);  // ms → s arrondi
+    dt = offSec - curveLastOffSec;
+    curveLastOffSec = offSec;
+  }
+  while (dt >= 0x80) { curveBuf[curvePos++] = (dt & 0x7F) | 0x80; dt >>= 7; }
+  curveBuf[curvePos++] = (uint8_t)dt;
+
   int32_t  d  = papp - papp_prev;
-  uint32_t zz = ((uint32_t)d << 1) ^ (uint32_t)(d >> 31);   // zig-zag (gère le signe → injection)
+  uint32_t zz = ((uint32_t)d << 1) ^ (uint32_t)(d >> 31);    // zig-zag (gère le signe → injection)
   while (zz >= 0x80) { curveBuf[curvePos++] = (zz & 0x7F) | 0x80; zz >>= 7; }
   curveBuf[curvePos++] = (uint8_t)zz;
   papp_prev = papp;
   curveN++;
-  // -3 = marge d'un varint 3 o au pire ; -HMAC_LEN = signature ; -ext = bloc EAIT si producteur.
+  // marge worst-case = 2 varints de 3 o (dt + delta) = 6 ; -HMAC_LEN = signature ; -ext = bloc EAIT.
   uint8_t extReserve = curveHasInject ? EXT_INJECT_LEN : 0;
-  if (curvePos >= CURVE_BUF_LEN - HMAC_LEN - extReserve - 3 || curveN >= CURVE_MAX_SAMPLES)
+  if (curvePos >= CURVE_BUF_LEN - HMAC_LEN - extReserve - 6 || curveN >= CURVE_MAX_SAMPLES)
     curveFlush();
 }
 
@@ -681,7 +721,17 @@ void curveAdd(int32_t papp) {
 void curveFlush() {
   if (!curveActive || curveN == 0) { curveActive = false; return; }
   curveBuf[11] = curveN;
-  curveBuf[12] = (ticMode == MODE_STANDARD) ? SAMPLE_PERIOD_DS_STD : SAMPLE_PERIOD_DS_HISTO;
+  // period_ds = période RÉELLE mesurée (millis), en 1/10 s, pas le nominal théorique :
+  // (durée du batch) / (N-1 intervalles) → le récepteur espace les points au vrai
+  // rythme observé, donc horodatage juste quel que soit le débit. Borné 1..255.
+  {
+    uint8_t pds = (ticMode == MODE_STANDARD) ? SAMPLE_PERIOD_DS_STD : SAMPLE_PERIOD_DS_HISTO;
+    if (curveN >= 2) {
+      uint32_t per_ds = (millis() - curveT0) / (uint32_t)(curveN - 1) / 100UL;  // ms → 1/10 s
+      pds = (per_ds < 1) ? 1 : (per_ds > 255 ? 255 : (uint8_t)per_ds);
+    }
+    curveBuf[12] = pds;   // N==1 (keyframe seul) → garde le nominal (période sans objet)
+  }
 
   // Bloc extension (entre les deltas et le HMAC) : EAIT injecté (uint32 LE, Wh).
   // Posé seulement si FLAG_HAS_EXT (producteur standard) ; signé par le HMAC.
@@ -697,17 +747,11 @@ void curveFlush() {
   memcpy(curveBuf + curvePos, mac, HMAC_LEN);
   uint16_t len = curvePos + HMAC_LEN;
 
-  Serial.begin(9600);
-  Serial.print(F("v04 seq=")); Serial.print(batch_seq);
-  Serial.print(F(" n="));      Serial.print(curveN);
-  Serial.print(F(" idx=0x"));  Serial.print(curveIndexId, HEX);
-  Serial.print(F(" len="));    Serial.println(len);
-  Serial.flush(); Serial.end();
-
   if (loraOk) {
     driver.setModeIdle();
-    manager.sendtoWait(curveBuf, len, SERVER_ADDRESS);
-    blinkRGB(0, 255, 255);    // cyan = batch courbe envoyé
+    bool acked = manager.sendtoWait(curveBuf, len, SERVER_ADDRESS);
+    blinkRGB(40, 40, 40, 30);          // blanc bref = batch courbe ÉMIS en LoRa
+    if (acked) blinkRGB(0, 60, 0, 40); // vert = ACK reçu du récepteur
     driver.sleep();
   }
 
@@ -773,9 +817,7 @@ void setup() {
 void loop() {
   wdt_enable(WDTO_8S);  // ré-armé chaque tour ; readTIC() fait wdt_reset() pendant la lecture
 
-  Serial.begin(9600);
-  bool vok = isVoltageSufficient();   // imprime "Vcc: x"
-  Serial.flush(); Serial.end();
+  bool vok = isVoltageSufficient();   // ADC seul, plus d'impression (UART TIC laissé ouvert)
   if (!vok) {
     if (curveActive) curveFlush();    // brownout imminent : ne pas perdre le batch en cours
     blinkErr(1);
@@ -807,59 +849,56 @@ void loop() {
       if (m != 0xFF) { ticMode = m; persistMode(ticMode); }
       consecFail = 0;
     }
-    blinkErr(2);
+    blinkErr(2);                       // rouge 2× = pas de TIC
     return;
   }
   consecFail = 0;
+  blinkRGB(0, 0, 40, 8);               // bleu bref = trame TIC lue (heartbeat lecture)
 
   // ISOUSC : si l'abonnement change (rare), ré-émettre la trame d'identité v0x01.
-  // (Standard : PREF en kVA non mappé ici → v.isousc=0, identité émise au boot seulement —
-  //  calibrage jauge depuis PREF = chantier ISOUSC standard.)
+  // (Standard : PREF en kVA non mappé → v.isousc=0, identité au boot — chantier ISOUSC.)
   if (v.isousc != 0 && v.isousc != lastSentIsousc && v.adco[0] != 0) {
     sendBootFrame(v.adco, v.isousc);
     lastSentIsousc = v.isousc;
   }
 
-  if (!v.valid) { blinkErr(3); return; }
-
+  // --- Sélection index + garde, par mode -----------------------------------------------
   uint8_t id; uint32_t value;
-  bool ok;
   if (ticMode == MODE_STANDARD) {
-    selectActiveIndexStd(v, id, value);
-    // Garde standard : PAPP (SINSTS/SINSTI) vu + index actif EASF[NTARF] vu (checksum OK).
-    ok = (id != IDX_UNKNOWN) && (v.fields_seen & TIC_SEEN_PAPP)
-         && (v.easf_seen & (1 << (v.ntarf - 1)));
+    // Standard : on capte le point si PAPP (la courbe) ET une horodate valide (pour le dater)
+    // sont présents. NTARF/EASF en CARRY-FORWARD (index cumulatif quasi-statique) → un drop
+    // de ligne ne jette PAS le point et ne clignote PAS rouge : on saute SILENCIEUSEMENT si
+    // PAPP/horodate manquent, ou si NTARF n'a jamais été vu (boot).
+    bool tsOk = (v.ts[0] == 'E' || v.ts[0] == 'H' || v.ts[0] == 'e' || v.ts[0] == 'h');
+    if (!(v.fields_seen & TIC_SEEN_PAPP) || !tsOk) return;         // skip silencieux (pas de rouge)
+    if (v.ntarf >= 1 && v.ntarf <= 10) {
+      lastNtarf = v.ntarf;                                         // maj carry-forward NTARF
+      if (v.easf_seen & (1 << (v.ntarf - 1))) lastStdIndex = v.easf[v.ntarf - 1];  // maj carry-forward EASF
+    }
+    if (lastNtarf < 1 || lastNtarf > 10) return;                  // NTARF jamais vu → skip silencieux
+    id = lastNtarf;
+    value = lastStdIndex;
   } else {
+    if (!v.valid) { blinkErr(3); return; }                        // histo : trame invalide
     selectActiveIndex(v, id, value);
-    // Garde historique : PAPP + l'index actif vus.
-    uint16_t required = TIC_SEEN_PAPP;
-    if (id != IDX_UNKNOWN && id < sizeof(INDEX_ID_TO_SEEN) / sizeof(INDEX_ID_TO_SEEN[0]))
+    if (id == IDX_UNKNOWN) { blinkErr(4); return; }               // histo : PTEC inconnu
+    uint16_t required = TIC_SEEN_PAPP;                            // garde histo : PAPP + index actif
+    if (id < sizeof(INDEX_ID_TO_SEEN) / sizeof(INDEX_ID_TO_SEEN[0]))
       required |= INDEX_ID_TO_SEEN[id];
-    ok = (id != IDX_UNKNOWN) && ((v.fields_seen & required) == required);
+    if ((v.fields_seen & required) != required) { blinkErr(2); return; }   // trame partielle
   }
-  if (id == IDX_UNKNOWN) {
-    Serial.begin(9600);
-    Serial.print(F("index inconnu (PTEC=")); Serial.print(v.ptec);
-    Serial.print(F(" NTARF=")); Serial.print(v.ntarf); Serial.println(')');
-    Serial.flush(); Serial.end();
-    blinkErr(4);
-    return;
-  }
-  if (!ok) { blinkErr(2); return; }   // trame partielle → on saute (papp_prev inchangé)
 
-  // Accumulation courbe. Changement d'index actif → coupe le batch et repart sur un
-  // keyframe du nouvel index → batch homogène (décision §17.3). En standard, une
-  // bascule soutiré↔injection n'a PAS besoin de flush : le delta zig-zag est signé.
+  // Accumulation courbe. Changement d'index actif → coupe le batch et repart sur un keyframe
+  // du nouvel index → batch homogène (§17.3). En standard, bascule soutiré↔injection sans
+  // flush : le delta zig-zag est signé.
   if (!curveActive || id != curveIndexId) {
     if (curveActive && curveN > 1) curveFlush();
     curveStart(v, id, value);
   } else {
-    curveAdd(pappValue(v));           // signé en standard ; peut auto-flush si buffer plein
+    curveAdd(pappValue(v), v);         // signé en standard ; dt par point ; peut auto-flush
   }
 
   // Flush périodique → fraîcheur /live ~60 s (sinon un batch traînerait jusqu'à plein).
   if (curveActive && curveN > 1 && (millis() - curveT0) >= CURVE_FLUSH_MS)
     curveFlush();
-
-  blinkRGB(0, 12, 0, 4);              // tick vert discret = échantillon capté
 }

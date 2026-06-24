@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.45"
+        latest: "0.0.46"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -129,9 +129,12 @@ devices:
           - version: "0.0.45"
             released: "2026-06-23"
             notes: "Unpair « supprimer les données » (POST /unprovision?wipe=1) : on STOPPE le reader avant le rm de la base (wipe propre, plus de base ouverte en WAL) puis on ÉTEINT le boîtier (poweroff) au lieu de reboot → prépa livraison béta (part hors tension, rallumé par le testeur pour provisionner via l'app). Unpair simple (sans suppression) → reboot (re-pairing BLE) inchangé. Modif local_api.py. AUCUNE migration. Transition = restart ben-local-api + ben-lora-receiver."
+          - version: "0.0.46"
+            released: "2026-06-24"
+            notes: "Trame courbe LoRa v0x05 : HORODATAGE PAR POINT. Chaque point porte son intervalle réel (dt en secondes, varint) depuis le précédent au lieu d'un period_ds uniforme supposé → le récepteur reconstruit t[i] = t0 + Σdt (courbe fidèle quelle que soit la cadence, trames ratées incluses). En standard le dt vient de l'horodate compteur (instant de mesure, sans dérive) → meter_ts exact ; en historique de millis(). Décodeur curve_codec.py expose sample_dt_s ; anchor_timestamps/meter_timestamps cumulent les dt. period_ds conservé comme moyenne/hint. Compat v0x04 RETIRÉE (un seul émetteur en service). AUCUNE migration BDD (ts/meter_ts déjà présents). Transition = restart ben-local-api + ben-lora-receiver. ⚠️ déployer le Pi AVANT de flasher l'Arduino 0.0.6 (un récepteur < 0.0.46 rejette le v0x05 → « 20 attendus »)."
       arduino:
         minimum: "0.0.1"
-        latest: "0.0.5"
+        latest: "0.0.6"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -147,11 +150,14 @@ devices:
           - version: "0.0.5"
             released: "2026-06-23"
             notes: "Echo de la version firmware au boot (Serial : « tic-reader boot v0.0.5 ») pour confirmer au debug quelle version est flashée. Aucun changement fonctionnel (FW_VERSION + 1 println). minimum reste 0.0.1."
+          - version: "0.0.6"
+            released: "2026-06-24"
+            notes: "Émetteur v0x05 : horodatage PAR POINT. curveAdd envoie un dt (secondes, varint) par échantillon — en standard l'écart d'horodate compteur (todSeconds), en historique l'écart millis() sans dérive cumulative. period_ds devient la moyenne réelle du batch (hint). FIX DÉBIT : UART TIC ouvert en continu (ticSerialBegin begin-once) au lieu de Serial.begin/end par trame → fini la fenêtre aveugle, ~1 trame/s (n≈58/batch au lieu de ~30). Carry-forward NTARF+EASF (index quasi-statique → un drop de ligne ne jette plus le point). Garde standard = PAPP + horodate valide ; drop de ligne = skip SILENCIEUX (plus de rouge). LED : bleu=lecture trame, blanc=émission LoRa, vert=ACK, rouge réservé Vcc(1×)/pas-de-TIC(2×). Debug Serial par trame retiré. minimum reste 0.0.1. ⚠️ flasher APRÈS avoir déployé le Pi en pi-0.0.46 (un récepteur < 0.0.46 rejette le v0x05)."
 
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.45"
+        latest: "0.0.46"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -264,6 +270,9 @@ devices:
           - version: "0.0.45"
             released: "2026-06-23"
             notes: "Unpair « supprimer les données » (POST /unprovision?wipe=1) : on STOPPE le reader avant le rm de la base (wipe propre) puis on ÉTEINT le boîtier (poweroff) au lieu de reboot → prépa livraison béta (part hors tension). Unpair simple → reboot (re-pairing BLE) inchangé. Modif local_api.py. AUCUNE migration. Transition = restart ben-tic-reader + ben-local-api."
+          - version: "0.0.46"
+            released: "2026-06-24"
+            notes: "Alignement no-op avec pi0-lora 0.0.46 (trame courbe LoRa v0x05). curve_codec.py n'est utilisé QUE par le récepteur LoRa → AUCUN impact sur le wired (lecture TIC directe, pas de trame LoRa). Bump pour garder les deux modèles + INITIAL_TAG alignés. AUCUNE migration. Transition = restart ben-tic-reader + ben-local-api."
 
 updates:
 
