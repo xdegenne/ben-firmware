@@ -87,7 +87,7 @@
 // ---------------------------------------------------------------------------
 #define PROTOCOL_VERSION_BOOT  0x01   // trame d'identité (ADCO)
 #define PROTOCOL_VERSION_CURVE 0x05   // trame courbe batchée (v0x05 : dt par point)
-#define FW_VERSION             "0.0.6"  // version firmware, échoée au boot (debug / confirmation flash)
+#define FW_VERSION             "0.0.7"  // version firmware, échoée au boot (debug / confirmation flash)
 #define BOOT_PAYLOAD_LEN       20     // v0x01 : version + ADCO(12), padding
 #define HMAC_LEN                8
 
