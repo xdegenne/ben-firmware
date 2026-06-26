@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.47"
+        latest: "0.0.48"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -135,9 +135,12 @@ devices:
           - version: "0.0.47"
             released: "2026-06-25"
             notes: "Désappairage : POST /unprovision ÉTEINT TOUJOURS le boîtier (poweroff), avec ou sans wipe (avant : reboot quand pas de wipe). Au prochain allumage, sans WiFi → mode configuration (BLE). Signal d'extinction uniforme. Modif local_api.py. AUCUNE migration. Transition = restart ben-local-api + ben-lora-receiver."
+          - version: "0.0.48"
+            released: "2026-06-26"
+            notes: "Chantier ISOUSC STANDARD : calibrage de la jauge en mode standard via PREF (puiss. de réf., kVA — le standard ne fournit pas ISOUSC en A). db.py : colonne level_profile.pref (ALTER conditionnel idempotent) + record_pref/get_pref. lora-receiver : lit l'octet 14 de la trame boot v0x01 → record_pref (émetteur ≥ arduino 0.0.7 ; < 0.0.7 → octet 14 = 0, ignoré, rétro-compat). local_api : /live arbitre maxVa = standard ? pref×1000 : isousc×230 (+ expose pref). MIGRATION = ALTER pref (idempotente, non bloquante). Transition = restart ben-local-api + ben-lora-receiver. ⚠️ jauge LoRa standard nécessite AUSSI arduino 0.0.7."
       arduino:
         minimum: "0.0.1"
-        latest: "0.0.6"
+        latest: "0.0.7"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -156,11 +159,14 @@ devices:
           - version: "0.0.6"
             released: "2026-06-24"
             notes: "Émetteur v0x05 : horodatage PAR POINT. curveAdd envoie un dt (secondes, varint) par échantillon — en standard l'écart d'horodate compteur (todSeconds), en historique l'écart millis() sans dérive cumulative. period_ds devient la moyenne réelle du batch (hint). FIX DÉBIT : UART TIC ouvert en continu (ticSerialBegin begin-once) au lieu de Serial.begin/end par trame → fini la fenêtre aveugle, ~1 trame/s (n≈58/batch au lieu de ~30). Carry-forward NTARF+EASF (index quasi-statique → un drop de ligne ne jette plus le point). Garde standard = PAPP + horodate valide ; drop de ligne = skip SILENCIEUX (plus de rouge). LED : bleu=lecture trame, blanc=émission LoRa, vert=ACK, rouge réservé Vcc(1×)/pas-de-TIC(2×). Debug Serial par trame retiré. minimum reste 0.0.1. ⚠️ flasher APRÈS avoir déployé le Pi en pi-0.0.46 (un récepteur < 0.0.46 rejette le v0x05)."
+          - version: "0.0.7"
+            released: "2026-06-26"
+            notes: "Chantier ISOUSC standard : l'émetteur parse PREF (puiss. de réf., kVA, mode standard) et le place dans la trame d'identité v0x01 (octet 14 ; octet 13 reste ISOUSC histo). Ré-émet le boot frame au démarrage ET sur changement d'abonnement (ISOUSC ou PREF). Rétro-compatible (octet de padding réservé ; récepteur < pi-0.0.48 ignore l'octet 14). minimum reste 0.0.1. À flasher avec le Pi en pi-0.0.48 (qui lit l'octet 14)."
 
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.47"
+        latest: "0.0.48"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -279,6 +285,9 @@ devices:
           - version: "0.0.47"
             released: "2026-06-25"
             notes: "Désappairage : POST /unprovision ÉTEINT TOUJOURS le boîtier (poweroff), avec ou sans wipe (avant : reboot quand pas de wipe). Au prochain allumage, sans WiFi → mode configuration (BLE). Signal d'extinction uniforme. Modif local_api.py. AUCUNE migration. Transition = restart ben-tic-reader + ben-local-api."
+          - version: "0.0.48"
+            released: "2026-06-26"
+            notes: "Chantier ISOUSC STANDARD : calibrage de la jauge en mode standard via PREF (puiss. de réf., kVA — le standard ne fournit pas ISOUSC en A). db.py : colonne level_profile.pref (ALTER conditionnel idempotent) + record_pref/get_pref. main_uart.py (wired) : record_pref on-change (PREF déjà parsé). local_api : /live arbitre maxVa = standard ? pref×1000 : isousc×230 (+ expose pref). MIGRATION = ALTER pref (idempotente, non bloquante). Transition = restart ben-tic-reader + ben-local-api."
 
 updates:
 
@@ -434,6 +443,10 @@ updates:
       to: "0.0.47"
       tag: "pi-0.0.47"
       script: "updates/pi0-lora/0.0.46_to_0.0.47/update.sh"
+    - from: "0.0.47"
+      to: "0.0.48"
+      tag: "pi-0.0.48"
+      script: "updates/pi0-lora/0.0.47_to_0.0.48/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -580,6 +593,10 @@ updates:
       to: "0.0.47"
       tag: "pi-0.0.47"
       script: "updates/pi0-wired/0.0.46_to_0.0.47/update.sh"
+    - from: "0.0.47"
+      to: "0.0.48"
+      tag: "pi-0.0.48"
+      script: "updates/pi0-wired/0.0.47_to_0.0.48/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet

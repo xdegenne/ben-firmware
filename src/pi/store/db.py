@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS level_profile (
     talon            INTEGER,
     papp_max_alltime INTEGER,
     isousc           INTEGER,
+    pref             INTEGER,
     n_samples        INTEGER NOT NULL DEFAULT 0,
     span_sec         INTEGER NOT NULL DEFAULT 0
 );
@@ -134,6 +135,10 @@ def connect(path: str = DB_PATH, *, read_only: bool = False) -> sqlite3.Connecti
         # sur changement uniquement (cf. record_isousc).
         if "isousc" not in lvl_cols:
             conn.execute("ALTER TABLE level_profile ADD COLUMN isousc INTEGER")
+        # Chantier ISOUSC standard : PREF (puiss. de réf., kVA) par PDL → maxVa = pref×1000.
+        # Le standard ne fournit pas ISOUSC (A) mais PREF (kVA) ; on stocke brut, /live arbitre.
+        if "pref" not in lvl_cols:
+            conn.execute("ALTER TABLE level_profile ADD COLUMN pref INTEGER")
         conn.commit()
     conn.row_factory = sqlite3.Row
     return conn
@@ -331,6 +336,35 @@ def record_isousc(
     return True
 
 
+def record_pref(
+    conn: sqlite3.Connection,
+    pdl_index: int,
+    pref: int | None,
+) -> bool:
+    """Enregistre la puissance de référence (PREF, en kVA) d'un PDL dans
+    `level_profile` — l'abonnement en mode STANDARD (le standard ne fournit pas
+    ISOUSC mais PREF). Même logique que `record_isousc` : STATIQUE, écriture SUR
+    CHANGEMENT uniquement, None/0 = absent → ignoré. Renvoie True si écrit.
+
+    Wired : PREF dans chaque trame standard. LoRa : octet 14 de la trame d'identité
+    v0x01. La conversion en jauge (maxVa = pref×1000) se fait à la lecture (/live)."""
+    if not pref:  # None ou 0 → absent
+        return False
+    row = conn.execute(
+        "SELECT pref FROM level_profile WHERE pdl_index=?", (pdl_index,)
+    ).fetchone()
+    if row is not None and row["pref"] == pref:
+        return False  # inchangé → aucune écriture
+    conn.execute(
+        "INSERT INTO level_profile (pdl_index, computed_ts, pref) "
+        "VALUES (?, 0, ?) "
+        "ON CONFLICT(pdl_index) DO UPDATE SET pref = excluded.pref",
+        (pdl_index, pref),
+    )
+    conn.commit()
+    return True
+
+
 def tic_mode(conn: sqlite3.Connection, pdl_index: int) -> str | None:
     """Mode TIC courant d'un PDL — 'standard' / 'historique' — depuis le `src_standard`
     de la dernière mesure, ou None si inconnu. Sert l'API (/live → affichage app).
@@ -365,6 +399,19 @@ def get_isousc(conn: sqlite3.Connection, pdl_index: int) -> int | None:
     except sqlite3.OperationalError:
         return None
     return row["isousc"] if row and row["isousc"] else None
+
+
+def get_pref(conn: sqlite3.Connection, pdl_index: int) -> int | None:
+    """Puissance de référence (PREF, kVA) d'un PDL depuis level_profile, ou None.
+    Sert l'API (/live → maxVa=pref×1000 en mode standard). Même garde défensive
+    que get_isousc (colonne absente juste après upgrade → None, pas de crash)."""
+    try:
+        row = conn.execute(
+            "SELECT pref FROM level_profile WHERE pdl_index=?", (pdl_index,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return row["pref"] if row and row["pref"] else None
 
 
 # Échelle de bucket QUANTIFIÉE : on snappe `bucket_sec` sur des paliers fixes pour

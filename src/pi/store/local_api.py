@@ -263,13 +263,23 @@ class Handler(BaseHTTPRequestHandler):
                     conn, row["pdl_index"], row.get("papp"), now)
                 # Mode TIC du PDL ('standard'/'historique'/null) — affiché par l'app.
                 # En standard, `papp` est le NET SIGNÉ (>0 soutiré, <0 surplus injecté).
-                row["tic_mode"] = db.tic_mode(conn, row["pdl_index"])
-                # ISOUSC (abonnement souscrit) : exposé pour les réglages app
-                # + l'étalonnage de la jauge (maxVa = ISOUSC×230). None tant que
-                # pas reçu (LoRa : avant le 1er boot frame de l'émetteur ≥ 0.0.3).
+                mode = db.tic_mode(conn, row["pdl_index"])
+                row["tic_mode"] = mode
+                # Abonnement souscrit (réglages app + étalonnage jauge), exposé brut
+                # dans son unité d'origine : ISOUSC (A) en histo, PREF (kVA) en standard.
+                # Étalonnage maxVa : on prend la source du MODE COURANT (standard→PREF×1000,
+                # histo→ISOUSC×230), avec repli sur l'autre si la valeur du mode manque encore
+                # (transition / cold-start). None tant que rien n'est reçu.
                 isousc = db.get_isousc(conn, row["pdl_index"])
+                pref = db.get_pref(conn, row["pdl_index"])
                 row["isousc"] = isousc
-                row["maxVa"] = isousc * 230 if isousc else None
+                row["pref"] = pref
+                from_isousc = isousc * 230 if isousc else None
+                from_pref = pref * 1000 if pref else None
+                if mode == "standard":
+                    row["maxVa"] = from_pref or from_isousc
+                else:
+                    row["maxVa"] = from_isousc or from_pref
         self._send(rows)
 
     def _measurements(self, qs):

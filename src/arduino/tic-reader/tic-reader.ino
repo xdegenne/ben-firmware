@@ -182,6 +182,7 @@ static uint8_t  curveIndexId = IDX_UNKNOWN;  // index_id du batch courant (homog
 static bool     curveHasInject = false;      // batch standard producteur → bloc ext EAIT
 static uint32_t curveEait     = 0;           // EAIT au keyframe (Wh) — écrit dans le bloc ext
 static uint8_t  lastSentIsousc = 0;          // dernier ISOUSC émis (v0x01) → ré-émet sur changement
+static uint8_t  lastSentPref   = 0;          // dernier PREF émis (v0x01, standard) → ré-émet sur changement
 static uint16_t batch_seq    = 0;     // RAM, reset au boot, +1/batch
 static unsigned long curveT0 = 0;     // millis() du début de batch (flush périodique)
 static uint32_t curveLastOffSec = 0;  // histo : offset cumulé (s) du dernier point vs curveT0 (dt v0x05)
@@ -229,7 +230,8 @@ struct TICValues {
   bool pejp_present;
   uint16_t iinst;
   uint16_t papp;
-  uint8_t  isousc;        // intensité souscrite (A) — chantier ISOUSC (statique)
+  uint8_t  isousc;        // intensité souscrite (A) — abonnement HISTO (statique)
+  uint8_t  pref;          // puiss. de réf. (kVA) — abonnement STANDARD (statique, chantier ISOUSC)
   uint16_t fields_seen;
   // --- Champs MODE STANDARD (Enedis-NOI-CPT_54E §6.2) -----------------------
   int16_t  papp_net;      // net signé : soutiré (SINSTS) + / injection (SINSTI) -
@@ -471,6 +473,7 @@ static void parseTICLineStd(char* line, uint8_t len, TICValues& v) {
     if (idx >= 1 && idx <= 10) { v.easf[idx - 1] = strtoul(val, 0, 10); v.easf_seen |= (1 << (idx - 1)); }
   }
   else if (!strcmp(name, "EAIT")) { v.eait = strtoul(val, 0, 10); v.has_inject = true; }
+  else if (!strcmp(name, "PREF")) v.pref = (uint8_t)strtoul(val, 0, 10);  // abonnement std (kVA)
   else if (!strcmp(name, "DATE")) {              // horodatée, donnée vide → horodate = champ 2
     if (n >= 3) { line[ht[1]] = 0; strncpy(v.ts, line + ht[0] + 1, sizeof(v.ts) - 1); }
   }
@@ -602,14 +605,15 @@ bool isVoltageSufficient() {
 // ---------------------------------------------------------------------------
 // LoRa
 // ---------------------------------------------------------------------------
-// Trame boot (version=0x01) : ADCO en clair octets 1-12, ISOUSC (A) octet 13.
+// Trame boot (version=0x01) : ADCO octets 1-12, ISOUSC (A, histo) octet 13, PREF (kVA, std) octet 14.
 // Chiffrement PDL : sujet separe, a traiter ulterieurement.
-void sendBootFrame(const char* adco, uint8_t isousc) {
+void sendBootFrame(const char* adco, uint8_t isousc, uint8_t pref) {
   uint8_t buf[BOOT_PAYLOAD_LEN];
   memset(buf, 0, BOOT_PAYLOAD_LEN);
   buf[0] = PROTOCOL_VERSION_BOOT;
   memcpy(buf + 1, adco, 12);
-  buf[13] = isousc;          // octet 13 = ISOUSC (A) ; 0 = absent (chantier ISOUSC)
+  buf[13] = isousc;          // octet 13 = ISOUSC (A, histo)     ; 0 = absent
+  buf[14] = pref;            // octet 14 = PREF   (kVA, standard) ; 0 = absent (chantier ISOUSC std)
 
   if (loraOk) {
     driver.setModeIdle();
@@ -833,8 +837,9 @@ void loop() {
     persistMode(ticMode);
     TICValues v0;                     // une trame du bon mode pour l'identité (ADCO/ADSC + ISOUSC)
     if (readAndParseTIC(v0, ticMode) && v0.adco[0] != 0) {
-      sendBootFrame(v0.adco, v0.isousc);
+      sendBootFrame(v0.adco, v0.isousc, v0.pref);
       lastSentIsousc = v0.isousc;
+      lastSentPref = v0.pref;
     }
     firstFrame = false;
     return;
@@ -855,11 +860,14 @@ void loop() {
   consecFail = 0;
   blinkRGB(0, 0, 40, 8);               // bleu bref = trame TIC lue (heartbeat lecture)
 
-  // ISOUSC : si l'abonnement change (rare), ré-émettre la trame d'identité v0x01.
-  // (Standard : PREF en kVA non mappé → v.isousc=0, identité au boot — chantier ISOUSC.)
-  if (v.isousc != 0 && v.isousc != lastSentIsousc && v.adco[0] != 0) {
-    sendBootFrame(v.adco, v.isousc);
+  // Abonnement (statique) : si ISOUSC (histo, A) OU PREF (standard, kVA) change, ré-émettre
+  // la trame d'identité v0x01 (octet 13 = ISOUSC, octet 14 = PREF ; 0 = absent dans le mode courant).
+  if (v.adco[0] != 0 &&
+      ((v.isousc != 0 && v.isousc != lastSentIsousc) ||
+       (v.pref   != 0 && v.pref   != lastSentPref))) {
+    sendBootFrame(v.adco, v.isousc, v.pref);
     lastSentIsousc = v.isousc;
+    lastSentPref = v.pref;
   }
 
   // --- Sélection index + garde, par mode -----------------------------------------------

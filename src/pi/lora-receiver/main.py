@@ -354,6 +354,16 @@ def on_recv(payload) -> None:
                                  f"(maxVa≈{isousc * 230} VA) pdl_index={pdl_index}")
                 except Exception as e:
                     log.warning(f"store: record_isousc échoué: {e}")
+            # PREF (abonnement en mode STANDARD, kVA) : octet 14 (0 = absent, ex. émetteur
+            # < 0.0.7 → rétro-compat). Le standard ne porte pas ISOUSC ; PREF×1000 calibre la jauge.
+            pref = raw[14] if len(raw) > 14 else 0
+            if pref and measurements_db is not None:
+                try:
+                    if db.record_pref(measurements_db, pdl_index, pref):
+                        log.info(f"PREF={pref} kVA enregistré "
+                                 f"(maxVa≈{pref * 1000} VA) pdl_index={pdl_index}")
+                except Exception as e:
+                    log.warning(f"store: record_pref échoué: {e}")
             blink_rgb(30, 30, 30, 2.0)   # blanc long = discovery
             return
 

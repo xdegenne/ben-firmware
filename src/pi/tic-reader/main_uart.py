@@ -549,6 +549,7 @@ batch: list = []          # (pdl_index, labels, ts)
 last_flush = time.time()
 last_heartbeat = 0.0
 last_isousc: int | None = None  # garde RAM : record_isousc seulement sur changement
+last_pref: int | None = None    # garde RAM : record_pref (abonnement standard, kVA) sur changement
 
 
 def flush_batch() -> None:
@@ -609,6 +610,15 @@ try:
                     if db.record_isousc(measurements_db, PDL_INDEX, isousc):
                         log.info(f"ISOUSC={isousc} A enregistré (maxVa≈{isousc * 230} VA)")
                     last_isousc = isousc
+
+                # PREF (abonnement en mode STANDARD, kVA) — record-on-change (chantier ISOUSC std).
+                # Le standard ne donne pas ISOUSC ; PREF×1000 calibre la jauge (arbitré par /live).
+                pref = labels.get("PREF")
+                if (pref is not None and pref != last_pref
+                        and measurements_db is not None):
+                    if db.record_pref(measurements_db, PDL_INDEX, pref):
+                        log.info(f"PREF={pref} kVA enregistré (maxVa≈{pref * 1000} VA)")
+                    last_pref = pref
 
                 iinst  = labels.get("IINST")
                 papp   = labels.get("PAPP")
