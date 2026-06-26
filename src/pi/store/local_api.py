@@ -164,8 +164,12 @@ class Handler(BaseHTTPRequestHandler):
                     "now": int(time.time())})
 
     def _unprovision(self, qs):
-        """Désappaire le boîtier : oublie le WiFi (→ provisioning BLE au reboot),
-        efface optionnellement les données (`?wipe=1`), puis reboot.
+        """Désappaire le boîtier : oublie le WiFi (→ provisioning BLE au prochain
+        allumage), efface optionnellement les données (`?wipe=1`), puis S'ÉTEINT.
+
+        Le boîtier s'éteint TOUJOURS (poweroff), avec ou sans wipe : il part hors
+        tension ; quand l'utilisateur le rallume, l'absence de WiFi le fait
+        démarrer en mode configuration (BLE).
 
         ORDRE CRITIQUE : on répond AVANT de couper le réseau, puis on fait le
         désappairage + reboot en ASYNCHRONE. Sinon supprimer la connexion WiFi
@@ -205,16 +209,12 @@ class Handler(BaseHTTPRequestHandler):
                               flush=True)
                     except OSError:
                         pass
-                # « Supprimer les données » = prépa livraison → on ÉTEINT (poweroff/halt),
-                # PAS reboot : le boîtier part HORS TENSION chez le béta-testeur, qui le
-                # rallumera pour provisionner via l'app (BLE).
-                print("[unprovision] poweroff (wipe)", flush=True)
-                subprocess.Popen(["sudo", "systemctl", "poweroff"])
-            else:
-                # Unpair simple (sans suppression) → reboot en provisioning BLE (re-pairing
-                # immédiat sur un autre réseau).
-                print("[unprovision] reboot", flush=True)
-                subprocess.Popen(["sudo", "systemctl", "reboot"])
+            # Désappairage → le boîtier S'ÉTEINT TOUJOURS (poweroff), avec ou sans
+            # wipe : il part hors tension. Au prochain allumage, plus de WiFi →
+            # démarrage en mode configuration (BLE). (Avant : reboot quand pas de
+            # wipe ; on éteint désormais dans tous les cas pour un signal clair.)
+            print(f"[unprovision] poweroff (wipe={wipe})", flush=True)
+            subprocess.Popen(["sudo", "systemctl", "poweroff"])
 
         threading.Timer(2.0, _teardown).start()
 

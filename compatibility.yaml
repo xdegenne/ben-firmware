@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.46"
+        latest: "0.0.47"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -132,6 +132,9 @@ devices:
           - version: "0.0.46"
             released: "2026-06-24"
             notes: "Trame courbe LoRa v0x05 : HORODATAGE PAR POINT. Chaque point porte son intervalle réel (dt en secondes, varint) depuis le précédent au lieu d'un period_ds uniforme supposé → le récepteur reconstruit t[i] = t0 + Σdt (courbe fidèle quelle que soit la cadence, trames ratées incluses). En standard le dt vient de l'horodate compteur (instant de mesure, sans dérive) → meter_ts exact ; en historique de millis(). Décodeur curve_codec.py expose sample_dt_s ; anchor_timestamps/meter_timestamps cumulent les dt. period_ds conservé comme moyenne/hint. Compat v0x04 RETIRÉE (un seul émetteur en service). AUCUNE migration BDD (ts/meter_ts déjà présents). Transition = restart ben-local-api + ben-lora-receiver. ⚠️ déployer le Pi AVANT de flasher l'Arduino 0.0.6 (un récepteur < 0.0.46 rejette le v0x05 → « 20 attendus »)."
+          - version: "0.0.47"
+            released: "2026-06-25"
+            notes: "Désappairage : POST /unprovision ÉTEINT TOUJOURS le boîtier (poweroff), avec ou sans wipe (avant : reboot quand pas de wipe). Au prochain allumage, sans WiFi → mode configuration (BLE). Signal d'extinction uniforme. Modif local_api.py. AUCUNE migration. Transition = restart ben-local-api + ben-lora-receiver."
       arduino:
         minimum: "0.0.1"
         latest: "0.0.6"
@@ -157,7 +160,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.46"
+        latest: "0.0.47"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -273,6 +276,9 @@ devices:
           - version: "0.0.46"
             released: "2026-06-24"
             notes: "Alignement no-op avec pi0-lora 0.0.46 (trame courbe LoRa v0x05). curve_codec.py n'est utilisé QUE par le récepteur LoRa → AUCUN impact sur le wired (lecture TIC directe, pas de trame LoRa). Bump pour garder les deux modèles + INITIAL_TAG alignés. AUCUNE migration. Transition = restart ben-tic-reader + ben-local-api."
+          - version: "0.0.47"
+            released: "2026-06-25"
+            notes: "Désappairage : POST /unprovision ÉTEINT TOUJOURS le boîtier (poweroff), avec ou sans wipe (avant : reboot quand pas de wipe). Au prochain allumage, sans WiFi → mode configuration (BLE). Signal d'extinction uniforme. Modif local_api.py. AUCUNE migration. Transition = restart ben-tic-reader + ben-local-api."
 
 updates:
 
@@ -424,6 +430,10 @@ updates:
       to: "0.0.46"
       tag: "pi-0.0.46"
       script: "updates/pi0-lora/0.0.45_to_0.0.46/update.sh"
+    - from: "0.0.46"
+      to: "0.0.47"
+      tag: "pi-0.0.47"
+      script: "updates/pi0-lora/0.0.46_to_0.0.47/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -566,6 +576,10 @@ updates:
       to: "0.0.46"
       tag: "pi-0.0.46"
       script: "updates/pi0-wired/0.0.45_to_0.0.46/update.sh"
+    - from: "0.0.46"
+      to: "0.0.47"
+      tag: "pi-0.0.47"
+      script: "updates/pi0-wired/0.0.46_to_0.0.47/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet
