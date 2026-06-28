@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="robots" content="index, follow" />
+  <title>BEN — Comprenez votre électricité, dimensionnez votre solaire, économisez</title>
+  <meta name="description" content="BEN rend votre consommation électrique enfin lisible. Il vous aide à comprendre votre énergie, à dimensionner votre installation photovoltaïque et à économiser — en gardant la main sur vos données, hébergées en France." />
+  <meta property="og:title" content="BEN — votre électricité, enfin limpide" />
+  <meta property="og:description" content="Comprendre votre énergie · dimensionner votre solaire · économiser. Vos données restent en France." />
+  <meta property="og:type" content="website" />
+  <style>
+    :root{
+      --green:#2e7d32; --green-bright:#3fae46; --navy:#1b2a52; --navy-deep:#101b38;
+      --cyan:#28c8ff; --violet:#6b4bd6;
+      --ink:#13182a; --muted:#5a6275; --bg:#ffffff; --soft:#f4f8f5; --line:#e8ecee;
+      --r:18px;
+    }
+    *{box-sizing:border-box;-webkit-text-size-adjust:100%;}
+    html{scroll-behavior:smooth;}
+    body{
+      margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+      color:var(--ink);background:var(--bg);line-height:1.65;overflow-x:hidden;
+    }
+    a{color:inherit;}
+    .wrap{max-width:1120px;margin:0 auto;padding:0 22px;}
+    h1,h2,h3{line-height:1.15;letter-spacing:-.02em;margin:0;}
+    .grad{background:linear-gradient(100deg,var(--green-bright),var(--cyan));-webkit-background-clip:text;background-clip:text;color:transparent;}
+
+    /* ---------- NAV ---------- */
+    nav{position:sticky;top:0;z-index:50;backdrop-filter:saturate(140%) blur(14px);
+      background:rgba(255,255,255,.72);border-bottom:1px solid var(--line);}
+    nav .wrap{display:flex;align-items:center;justify-content:space-between;height:64px;}
+    nav .brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:1.15rem;color:var(--navy);text-decoration:none;}
+    nav .brand img{height:30px;}
+    nav .links{display:flex;align-items:center;gap:26px;}
+    nav .links a{text-decoration:none;color:var(--muted);font-weight:600;font-size:.95rem;transition:color .15s;}
+    nav .links a:hover{color:var(--ink);}
+    .cta{display:inline-flex;align-items:center;gap:8px;text-decoration:none;font-weight:700;
+      color:#fff;background:var(--green);padding:11px 20px;border-radius:999px;font-size:.95rem;
+      box-shadow:0 8px 22px -8px rgba(46,125,50,.7);transition:transform .15s,box-shadow .15s;}
+    .cta:hover{transform:translateY(-2px);box-shadow:0 14px 28px -8px rgba(46,125,50,.6);}
+    .cta.lg{padding:16px 30px;font-size:1.08rem;}
+    .cta.ghost{background:rgba(255,255,255,.08);color:#fff;border:1px solid rgba(255,255,255,.25);box-shadow:none;}
+    .cta.ghost:hover{background:rgba(255,255,255,.16);}
+    @media(max-width:720px){nav .links a:not(.cta){display:none;}}
+
+    /* ---------- HERO ---------- */
+    .hero{position:relative;color:#eaf0ff;background:
+      radial-gradient(900px 600px at 12% -10%,rgba(40,200,255,.20),transparent 60%),
+      radial-gradient(800px 600px at 95% 0%,rgba(107,75,214,.30),transparent 55%),
+      linear-gradient(160deg,var(--navy-deep),#0a1228 70%);overflow:hidden;}
+    .hero::after{content:"";position:absolute;inset:0;pointer-events:none;
+      background-image:radial-gradient(rgba(255,255,255,.06) 1px,transparent 1px);background-size:24px 24px;
+      -webkit-mask-image:linear-gradient(180deg,transparent,#000 30%,#000 70%,transparent);
+      mask-image:linear-gradient(180deg,transparent,#000 30%,#000 70%,transparent);opacity:.6;}
+    .blob{position:absolute;border-radius:50%;filter:blur(70px);opacity:.5;z-index:0;animation:float 12s ease-in-out infinite;}
+    .blob.a{width:340px;height:340px;background:var(--cyan);top:-60px;right:8%;}
+    .blob.b{width:300px;height:300px;background:var(--violet);bottom:-80px;left:-40px;animation-delay:-4s;}
+    .blob.c{width:260px;height:260px;background:var(--green-bright);top:30%;left:40%;animation-delay:-8s;opacity:.35;}
+    @keyframes float{0%,100%{transform:translateY(0) translateX(0);}50%{transform:translateY(-26px) translateX(16px);}}
+    .hero .wrap{position:relative;z-index:2;display:grid;grid-template-columns:1.1fr .9fr;gap:40px;
+      align-items:center;padding-top:70px;padding-bottom:90px;}
+    .pill{display:inline-flex;align-items:center;gap:8px;font-size:.82rem;font-weight:700;letter-spacing:.02em;
+      background:rgba(63,174,70,.16);color:#9be7a0;border:1px solid rgba(63,174,70,.35);
+      padding:7px 14px;border-radius:999px;margin-bottom:22px;}
+    .pill .dot{width:8px;height:8px;border-radius:50%;background:var(--green-bright);box-shadow:0 0 10px var(--green-bright);}
+    .hero h1{font-size:clamp(2.2rem,5vw,3.5rem);font-weight:850;color:#fff;}
+    .hero p.sub{font-size:clamp(1.05rem,2vw,1.28rem);color:#b9c3df;margin:20px 0 32px;max-width:33ch;}
+    .hero .btns{display:flex;flex-wrap:wrap;gap:14px;}
+    .hero .trust{margin-top:26px;display:flex;flex-wrap:wrap;gap:18px;color:#8fa0c4;font-size:.86rem;font-weight:600;}
+    .hero .trust span{display:inline-flex;align-items:center;gap:7px;}
+    .hero .trust svg{width:16px;height:16px;stroke:var(--green-bright);}
+    /* mascot */
+    .mascot-stage{position:relative;display:flex;justify-content:center;align-items:center;min-height:320px;}
+    .mascot-glow{position:absolute;width:300px;height:300px;border-radius:50%;
+      background:radial-gradient(circle,rgba(40,200,255,.5),transparent 65%);filter:blur(20px);}
+    .mascot{position:relative;width:min(330px,72vw);z-index:2;animation:bob 5s ease-in-out infinite;
+      filter:drop-shadow(0 30px 50px rgba(0,0,0,.5));}
+    @keyframes bob{0%,100%{transform:translateY(0) rotate(-1deg);}50%{transform:translateY(-16px) rotate(1deg);}}
+    .chip{position:absolute;z-index:3;background:rgba(255,255,255,.95);color:var(--navy);
+      font-weight:800;font-size:.82rem;padding:9px 13px;border-radius:13px;box-shadow:0 14px 30px -10px rgba(0,0,0,.5);
+      display:flex;align-items:center;gap:8px;animation:bob 6s ease-in-out infinite;}
+    .chip .v{font-size:1.05rem;color:var(--green);}
+    .chip.c1{top:8%;left:-2%;animation-delay:-1s;}
+    .chip.c2{bottom:14%;right:-4%;animation-delay:-3s;}
+    @media(max-width:860px){
+      .hero .wrap{grid-template-columns:1fr;text-align:center;padding-bottom:60px;}
+      .hero p.sub{margin-left:auto;margin-right:auto;}
+      .hero .btns,.hero .trust{justify-content:center;}
+      .mascot-stage{order:-1;min-height:260px;}
+      .chip{display:none;}
+    }
+
+    /* ---------- MARQUEE / wave divider ---------- */
+    .wave{display:block;width:100%;height:60px;}
+
+    /* ---------- SECTION shells ---------- */
+    section{padding:78px 0;}
+    .eyebrow{display:inline-block;font-weight:800;letter-spacing:.08em;text-transform:uppercase;
+      font-size:.78rem;color:var(--green);margin-bottom:14px;}
+    .sec-head{max-width:640px;margin:0 auto 46px;text-align:center;}
+    .sec-head h2{font-size:clamp(1.8rem,3.6vw,2.6rem);font-weight:850;}
+    .sec-head p{color:var(--muted);font-size:1.1rem;margin-top:14px;}
+
+    /* pillars (the 4 objectives) */
+    .pillars{display:grid;grid-template-columns:repeat(4,1fr);gap:18px;}
+    .pcard{background:#fff;border:1px solid var(--line);border-radius:var(--r);padding:26px 22px;
+      transition:transform .2s,box-shadow .2s,border-color .2s;position:relative;overflow:hidden;}
+    .pcard:hover{transform:translateY(-6px);box-shadow:0 24px 50px -24px rgba(20,30,60,.35);border-color:transparent;}
+    .pcard .ic{width:50px;height:50px;border-radius:14px;display:flex;align-items:center;justify-content:center;
+      margin-bottom:18px;background:linear-gradient(140deg,var(--green-bright),var(--cyan));}
+    .pcard:nth-child(2) .ic{background:linear-gradient(140deg,var(--cyan),var(--violet));}
+    .pcard:nth-child(3) .ic{background:linear-gradient(140deg,#f6b73c,var(--green-bright));}
+    .pcard:nth-child(4) .ic{background:linear-gradient(140deg,var(--violet),#d6457f);}
+    .pcard .ic svg{width:26px;height:26px;stroke:#fff;fill:none;stroke-width:2;}
+    .pcard h3{font-size:1.18rem;}
+    .pcard p{color:var(--muted);font-size:.96rem;margin:10px 0 0;}
+    @media(max-width:900px){.pillars{grid-template-columns:repeat(2,1fr);}}
+    @media(max-width:520px){.pillars{grid-template-columns:1fr;}}
+
+    /* loop section */
+    .loop{background:var(--soft);}
+    .loop-track{display:flex;align-items:stretch;gap:0;flex-wrap:wrap;justify-content:center;}
+    .step{flex:1 1 0;min-width:150px;text-align:center;padding:6px 10px;position:relative;}
+    .step .n{width:46px;height:46px;border-radius:50%;margin:0 auto 14px;display:flex;align-items:center;justify-content:center;
+      font-weight:800;color:#fff;background:var(--navy);font-size:1.05rem;
+      box-shadow:0 10px 22px -10px rgba(27,42,82,.7);}
+    .step:nth-child(1) .n{background:var(--green);}
+    .step:nth-child(2) .n{background:#1f9bc4;}
+    .step:nth-child(3) .n{background:var(--violet);}
+    .step:nth-child(4) .n{background:#d6457f;}
+    .step h4{font-size:1.05rem;margin:0 0 6px;}
+    .step p{color:var(--muted);font-size:.9rem;margin:0;}
+    .step .arrow{position:absolute;top:23px;right:-12px;color:#c4cdd6;font-size:1.4rem;line-height:1;}
+    .step:last-child .arrow{display:none;}
+    .loop-note{text-align:center;max-width:620px;margin:38px auto 0;color:var(--muted);font-size:.98rem;
+      background:#fff;border:1px dashed var(--green);border-radius:14px;padding:16px 20px;}
+    .loop-note strong{color:var(--green);}
+    @media(max-width:680px){.step .arrow{display:none;}.step{flex:1 1 45%;}}
+
+    /* solar highlight (split) */
+    .split{display:grid;grid-template-columns:1fr 1fr;gap:46px;align-items:center;}
+    .split .panel{background:linear-gradient(150deg,#0f1c3a,#16284e);border-radius:24px;padding:8px;
+      position:relative;overflow:hidden;min-height:300px;display:flex;align-items:center;justify-content:center;}
+    .gauge{position:relative;width:230px;height:230px;}
+    .gauge svg{transform:rotate(-90deg);}
+    .gauge .val{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#fff;}
+    .gauge .val b{font-size:2.4rem;font-weight:850;line-height:1;}
+    .gauge .val small{color:#9fb0d6;font-size:.8rem;margin-top:6px;letter-spacing:.04em;}
+    .split h2{font-size:clamp(1.7rem,3.4vw,2.4rem);font-weight:850;}
+    .split p{color:var(--muted);font-size:1.08rem;margin:16px 0;}
+    .check{list-style:none;padding:0;margin:18px 0 0;}
+    .check li{display:flex;gap:12px;align-items:flex-start;margin:12px 0;font-size:1rem;}
+    .check svg{flex:none;width:22px;height:22px;stroke:var(--green);fill:none;stroke-width:2.4;margin-top:3px;}
+    @media(max-width:820px){.split{grid-template-columns:1fr;gap:30px;}.split .panel{order:-1;}}
+
+    /* sovereignty dark band */
+    .sov{position:relative;color:#e9eefc;background:
+      radial-gradient(700px 400px at 85% 20%,rgba(63,174,70,.22),transparent 60%),
+      linear-gradient(160deg,#101b38,#0a1228);overflow:hidden;}
+    .sov .eyebrow{color:#7fe089;}
+    .sov .sec-head h2{color:#fff;}
+    .sov .sec-head p{color:#aeb9d6;}
+    .sgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;}
+    .scard{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:16px;padding:24px 20px;
+      transition:background .2s,transform .2s;}
+    .scard:hover{background:rgba(255,255,255,.09);transform:translateY(-4px);}
+    .scard svg{width:30px;height:30px;stroke:var(--green-bright);fill:none;stroke-width:1.8;margin-bottom:14px;}
+    .scard h4{font-size:1.05rem;color:#fff;margin:0 0 8px;}
+    .scard p{color:#aeb9d6;font-size:.92rem;margin:0;}
+    @media(max-width:900px){.sgrid{grid-template-columns:repeat(2,1fr);}}
+    @media(max-width:480px){.sgrid{grid-template-columns:1fr;}}
+
+    /* hardware */
+    .hw-grid{display:grid;grid-template-columns:1.1fr .9fr;gap:40px;align-items:center;}
+    .hw-photos{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+    .hw-photos figure{margin:0;}
+    .hw-photos img{width:100%;height:220px;object-fit:cover;border-radius:16px;box-shadow:0 18px 40px -22px rgba(0,0,0,.5);}
+    .hw-photos figcaption{color:var(--muted);font-size:.84rem;margin-top:8px;text-align:center;}
+    .hw h2{font-size:clamp(1.7rem,3.4vw,2.4rem);font-weight:850;}
+    .hw p{color:var(--muted);font-size:1.08rem;margin:16px 0;}
+    .modes{display:flex;gap:12px;flex-wrap:wrap;margin-top:18px;}
+    .mode{flex:1 1 200px;border:1px solid var(--line);border-radius:14px;padding:16px 18px;}
+    .mode b{display:block;color:var(--navy);margin-bottom:4px;}
+    .mode small{color:var(--muted);}
+    @media(max-width:820px){.hw-grid{grid-template-columns:1fr;}.hw-photos img{height:180px;}}
+
+    /* final CTA */
+    .final{text-align:center;position:relative;color:#fff;overflow:hidden;background:
+      radial-gradient(600px 400px at 50% 120%,rgba(40,200,255,.3),transparent 60%),
+      linear-gradient(160deg,var(--green),#1d6b21);}
+    .final h2{font-size:clamp(2rem,4.5vw,3rem);font-weight:850;color:#fff;}
+    .final p{color:#dff3e0;font-size:1.15rem;margin:18px auto 30px;max-width:34ch;}
+    .final .cta{background:#fff;color:var(--green);}
+    .final .cta:hover{background:#f3fff4;}
+    .final .mini{margin-top:18px;color:#cdeccd;font-size:.9rem;}
+
+    /* footer */
+    footer.site{background:#0a1228;color:#8fa0c4;padding:48px 0 40px;}
+    footer.site .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:24px;align-items:center;}
+    footer.site .brand{display:flex;align-items:center;gap:10px;color:#fff;font-weight:800;font-size:1.1rem;}
+    footer.site .brand img{height:26px;}
+    footer.site .fl{display:flex;flex-wrap:wrap;gap:22px;}
+    footer.site a{color:#aab6d4;text-decoration:none;font-weight:600;font-size:.92rem;}
+    footer.site a:hover{color:#fff;}
+    footer.site .copy{width:100%;border-top:1px solid rgba(255,255,255,.08);padding-top:20px;font-size:.82rem;color:#6c77aa;}
+
+    /* reveal on scroll */
+    .reveal{opacity:0;transform:translateY(24px);transition:opacity .7s ease,transform .7s ease;}
+    .reveal.in{opacity:1;transform:none;}
+    @media(prefers-reduced-motion:reduce){
+      .blob,.mascot,.chip{animation:none;}
+      .reveal{opacity:1;transform:none;transition:none;}
+      html{scroll-behavior:auto;}
+    }
+  </style>
+</head>
+<body>
+
+  <!-- ===== NAV ===== -->
+  <nav>
+    <div class="wrap">
+      <a class="brand" href="#top"><img src="assets/ben_logo.png" alt="BEN" /></a>
+      <div class="links">
+        <a href="#comprendre">Comprendre</a>
+        <a href="#solaire">Solaire</a>
+        <a href="#confiance">Vos données</a>
+        <a href="#boitier">Le boîtier</a>
+        <a class="cta" href="install/">Installer BEN</a>
+      </div>
+    </div>
+  </nav>
+
+  <!-- ===== HERO ===== -->
+  <header class="hero" id="top">
+    <span class="blob a"></span><span class="blob b"></span><span class="blob c"></span>
+    <div class="wrap">
+      <div>
+        <span class="pill"><span class="dot"></span> Vos données restent en France 🇫🇷</span>
+        <h1>Votre électricité,<br /><span class="grad">enfin limpide.</span></h1>
+        <p class="sub">BEN lit votre compteur Linky en temps réel et transforme des chiffres abstraits en quelque chose que l'on comprend vraiment.</p>
+        <div class="btns">
+          <a class="cta lg" href="install/">Installer BEN ⚡</a>
+          <a class="cta lg ghost" href="#comprendre">Comment ça marche</a>
+        </div>
+        <div class="trust">
+          <span><svg viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg> Installation en 5 min</span>
+          <span><svg viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg> Sans abonnement obligatoire</span>
+          <span><svg viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg> Firmware open source</span>
+        </div>
+      </div>
+      <div class="mascot-stage">
+        <span class="mascot-glow"></span>
+        <img class="mascot" src="assets/ben_mascot.png" alt="BEN, la mascotte robot" />
+        <div class="chip c1"><span class="v">1,2 kW</span> en direct</div>
+        <div class="chip c2">🍳 Four détecté</div>
+      </div>
+    </div>
+    <svg class="wave" viewBox="0 0 1440 60" preserveAspectRatio="none" aria-hidden="true">
+      <path fill="#ffffff" d="M0,40 C360,75 1080,5 1440,40 L1440,60 L0,60 Z"></path>
+    </svg>
+  </header>
+
+  <!-- ===== PILLARS / 4 objectives ===== -->
+  <section id="comprendre">
+    <div class="wrap">
+      <div class="sec-head reveal">
+        <span class="eyebrow">Ce que BEN fait pour vous</span>
+        <h2>Comprendre, maîtriser, dimensionner, <span class="grad">économiser</span>.</h2>
+        <p>Une seule petite boîte sur votre compteur, et l'énergie de votre maison devient enfin lisible.</p>
+      </div>
+      <div class="pillars">
+        <div class="pcard reveal">
+          <div class="ic"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2" stroke-linecap="round"/></svg></div>
+          <h3>Comprendre l'énergie</h3>
+          <p>Un kWh, un talon de conso, un pic… BEN rend concret ce qui était invisible. On apprend en regardant.</p>
+        </div>
+        <div class="pcard reveal">
+          <div class="ic"><svg viewBox="0 0 24 24"><path d="M3 17l5-6 4 4 5-7 4 5" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <h3>Maîtriser sa conso</h3>
+          <p>Voyez en direct quel appareil consomme. Associez un pic au lave-linge, au four, à la voiture qui charge.</p>
+        </div>
+        <div class="pcard reveal">
+          <div class="ic"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M5 19l2-2M17 7l2-2" stroke-linecap="round"/></svg></div>
+          <h3>Dimensionner son solaire</h3>
+          <p>À partir de votre profil de conso réel, BEN vous aide à choisir la bonne taille de panneaux — ni trop, ni trop peu.</p>
+        </div>
+        <div class="pcard reveal">
+          <div class="ic"><svg viewBox="0 0 24 24"><path d="M12 1v22M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <h3>Économiser</h3>
+          <p>Comprendre, c'est déjà agir. Repérez les gaspillages, ajustez vos usages, allégez la facture.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== LOOP ===== -->
+  <section class="loop">
+    <div class="wrap">
+      <div class="sec-head reveal">
+        <span class="eyebrow">La boucle BEN</span>
+        <h2>Plus vous l'utilisez, plus il devient malin</h2>
+        <p>BEN apprend de vous. Chaque appareil que vous nommez l'aide à les reconnaître tout seul ensuite.</p>
+      </div>
+      <div class="loop-track">
+        <div class="step reveal"><div class="n">1</div><h4>Collecter</h4><p>Lecture de la téléinfo Linky en temps réel.</p><span class="arrow">→</span></div>
+        <div class="step reveal"><div class="n">2</div><h4>Visualiser</h4><p>Vos courbes de conso, claires, dans l'app.</p><span class="arrow">→</span></div>
+        <div class="step reveal"><div class="n">3</div><h4>Labelliser</h4><p>« Ça, c'est le four. » Vous nommez vos pics.</p><span class="arrow">→</span></div>
+        <div class="step reveal"><div class="n">4</div><h4>Reconnaître</h4><p>BEN identifie ensuite vos appareils tout seul.</p></div>
+      </div>
+      <p class="loop-note reveal">Les étiquettes que vous posez sont la <strong>matière première</strong> de la reconnaissance automatique — le cœur de BEN. Et tout reste chez vous, sur votre réseau.</p>
+    </div>
+  </section>
+
+  <!-- ===== SOLAR ===== -->
+  <section id="solaire">
+    <div class="wrap split">
+      <div class="reveal">
+        <span class="eyebrow">Photovoltaïque</span>
+        <h2>Dimensionnez votre solaire <span class="grad">au plus juste</span></h2>
+        <p>Installer des panneaux, c'est un investissement. Trop petits, vous passez à côté ; trop grands, vous payez pour rien. BEN connaît votre vraie consommation, heure par heure.</p>
+        <ul class="check">
+          <li><svg viewBox="0 0 24 24"><path d="M5 13l4 4L19 7" stroke-linecap="round" stroke-linejoin="round"/></svg> Votre profil de conso réel, sur des semaines de mesure</li>
+          <li><svg viewBox="0 0 24 24"><path d="M5 13l4 4L19 7" stroke-linecap="round" stroke-linejoin="round"/></svg> La part que des panneaux pourraient réellement couvrir</li>
+          <li><svg viewBox="0 0 24 24"><path d="M5 13l4 4L19 7" stroke-linecap="round" stroke-linejoin="round"/></svg> Une décision éclairée, pas un devis au doigt mouillé</li>
+        </ul>
+      </div>
+      <div class="panel reveal">
+        <div class="gauge">
+          <svg width="230" height="230" viewBox="0 0 230 230">
+            <circle cx="115" cy="115" r="95" fill="none" stroke="rgba(255,255,255,.12)" stroke-width="18"/>
+            <circle cx="115" cy="115" r="95" fill="none" stroke="url(#g)" stroke-width="18" stroke-linecap="round"
+              stroke-dasharray="597" stroke-dashoffset="170"/>
+            <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#3fae46"/><stop offset="1" stop-color="#28c8ff"/>
+            </linearGradient></defs>
+          </svg>
+          <div class="val"><b>72%</b><small>COUVERTURE SOLAIRE ESTIMÉE</small></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== SOVEREIGNTY ===== -->
+  <section class="sov" id="confiance">
+    <div class="wrap">
+      <div class="sec-head reveal">
+        <span class="eyebrow">Confiance &amp; souveraineté</span>
+        <h2>Vos habitudes vous appartiennent</h2>
+        <p>Vos données de conso racontent votre vie : quand vous êtes là, quand vous dormez, ce que vous faites. Chez BEN, elles ne partent jamais à l'étranger.</p>
+      </div>
+      <div class="sgrid">
+        <div class="scard reveal">
+          <svg viewBox="0 0 24 24"><path d="M12 3l7 4v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V7z" stroke-linejoin="round"/></svg>
+          <h4>Hébergées en France</h4>
+          <p>Infrastructure française (Scaleway, Paris). Aucun service soumis au CLOUD Act américain.</p>
+        </div>
+        <div class="scard reveal">
+          <svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 018 0v3" stroke-linecap="round"/></svg>
+          <h4>Identité chiffrée</h4>
+          <p>Votre point de livraison ne circule jamais en clair. Chaque boîtier s'authentifie par certificat.</p>
+        </div>
+        <div class="scard reveal">
+          <svg viewBox="0 0 24 24"><path d="M8 3H4v4M16 3h4v4M8 21H4v-4M16 21h4v-4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="12" cy="12" r="3"/></svg>
+          <h4>Local d'abord</h4>
+          <p>BEN fonctionne sur votre réseau, sans cloud obligatoire. Vous restez maître de ce qui sort de chez vous.</p>
+        </div>
+        <div class="scard reveal">
+          <svg viewBox="0 0 24 24"><path d="M8 18l-5-6 5-6M16 6l5 6-5 6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <h4>Open source</h4>
+          <p>Le firmware est public et vérifiable. Pas de boîte noire : la transparence comme garantie.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== HARDWARE ===== -->
+  <section class="hw" id="boitier">
+    <div class="wrap hw-grid">
+      <div class="hw-photos reveal">
+        <figure>
+          <img src="assets/linky-open.jpg" alt="Compteur Linky, capot retiré, bornier téléinfo visible" />
+          <figcaption>Le bornier téléinfo du Linky</figcaption>
+        </figure>
+        <figure>
+          <img src="assets/linky-wired.jpg" alt="Le boîtier BEN branché sur les bornes I1 et I2 du Linky" />
+          <figcaption>BEN branché — deux fils, c'est tout</figcaption>
+        </figure>
+      </div>
+      <div class="reveal">
+        <span class="eyebrow">Le boîtier</span>
+        <h2>Petit, simple, <span class="grad">sans risque</span></h2>
+        <p>BEN se branche sur la sortie téléinfo du Linky — du courant faible, en très basse tension. Rien à voir avec le 230&nbsp;V. Deux fils à clipser, et c'est parti.</p>
+        <div class="modes">
+          <div class="mode">
+            <b>Filaire</b>
+            <small>Le boîtier directement sur le compteur. Le plus simple.</small>
+          </div>
+          <div class="mode">
+            <b>Radio LoRa</b>
+            <small>Compteur loin de la box&nbsp;? Un relais radio longue portée fait le lien.</small>
+          </div>
+        </div>
+        <div style="margin-top:26px;">
+          <a class="cta lg" href="install/">Voir le guide d'installation →</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== FINAL CTA ===== -->
+  <section class="final">
+    <div class="wrap reveal">
+      <h2>Prêt à voir votre énergie autrement&nbsp;?</h2>
+      <p>Branchez BEN, ouvrez l'app, laissez-vous guider. Cinq minutes, et tout devient clair.</p>
+      <a class="cta lg" href="install/">Installer BEN maintenant</a>
+      <p class="mini">iPhone &amp; Android · une question&nbsp;? <a href="contact/" style="color:#fff;text-decoration:underline;">écrivez-nous</a></p>
+    </div>
+  </section>
+
+  <!-- ===== FOOTER ===== -->
+  <footer class="site">
+    <div class="wrap">
+      <div class="brand"><img src="assets/ben_logo.png" alt="BEN" /></div>
+      <div class="fl">
+        <a href="install/">Installation</a>
+        <a href="contact/">Contact</a>
+        <a href="privacy/">Confidentialité</a>
+        <a href="terms/">Conditions</a>
+        <a href="https://github.com/xdegenne/ben-firmware">Open source ↗</a>
+      </div>
+      <div class="copy">BEN — votre conso électrique, simplement. Données hébergées en France. © 2026</div>
+    </div>
+  </footer>
+
+  <script>
+    // reveal on scroll
+    var io = new IntersectionObserver(function(entries){
+      entries.forEach(function(e){ if(e.isIntersecting){ e.target.classList.add('in'); io.unobserve(e.target); } });
+    }, {threshold:.12});
+    document.querySelectorAll('.reveal').forEach(function(el,i){
+      el.style.transitionDelay = (Math.min(i%4,3)*0.08)+'s';
+      io.observe(el);
+    });
+  </script>
+
+</body>
+</html>
