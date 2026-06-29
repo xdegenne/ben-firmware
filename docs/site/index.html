@@ -36,6 +36,7 @@
     nav .links{display:flex;align-items:center;gap:26px;}
     nav .links a{text-decoration:none;color:var(--muted);font-weight:600;font-size:.95rem;transition:color .15s;}
     nav .links a:hover{color:var(--ink);}
+    nav .links a.cta,nav .links a.cta:hover{color:#fff;}
     .cta{display:inline-flex;align-items:center;gap:8px;text-decoration:none;font-weight:700;
       color:#fff;background:var(--green);padding:11px 20px;border-radius:999px;font-size:.95rem;
       box-shadow:0 8px 22px -8px rgba(46,125,50,.7);transition:transform .15s,box-shadow .15s;}
@@ -68,6 +69,7 @@
     .hero h1{font-size:clamp(2.2rem,5vw,3.5rem);font-weight:850;color:#fff;}
     .hero p.sub{font-size:clamp(1.05rem,2vw,1.28rem);color:#b9c3df;margin:20px 0 32px;max-width:33ch;}
     .hero .btns{display:flex;flex-wrap:wrap;gap:14px;}
+    .hero .hint{margin:16px 0 0;color:#8fa0c4;font-size:.9rem;}
     .hero .trust{margin-top:26px;display:flex;flex-wrap:wrap;gap:18px;color:#8fa0c4;font-size:.86rem;font-weight:600;}
     .hero .trust span{display:inline-flex;align-items:center;gap:7px;}
     .hero .trust svg{width:16px;height:16px;stroke:var(--green-bright);}
@@ -190,6 +192,8 @@
     .final{text-align:center;position:relative;color:#fff;overflow:hidden;background:
       radial-gradient(600px 400px at 50% 120%,rgba(40,200,255,.3),transparent 60%),
       linear-gradient(160deg,var(--green),#1d6b21);}
+    .final .badge{display:inline-block;background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.35);
+      color:#fff;font-weight:700;font-size:.82rem;padding:7px 15px;border-radius:999px;margin-bottom:18px;}
     .final h2{font-size:clamp(2rem,4.5vw,3rem);font-weight:850;color:#fff;}
     .final p{color:#dff3e0;font-size:1.15rem;margin:18px auto 30px;max-width:34ch;}
     .final .cta{background:#fff;color:var(--green);}
@@ -227,7 +231,7 @@
         <a href="#solaire">Solaire</a>
         <a href="#confiance">Vos données</a>
         <a href="#boitier">Le boîtier</a>
-        <a class="cta" href="install/">Installer BEN</a>
+        <a class="cta" href="#beta">Rejoindre la bêta</a>
       </div>
     </div>
   </nav>
@@ -237,16 +241,17 @@
     <span class="blob a"></span><span class="blob b"></span><span class="blob c"></span>
     <div class="wrap">
       <div>
-        <span class="pill"><span class="dot"></span> Vos données restent en France 🇫🇷</span>
+        <span class="pill"><span class="dot"></span> 🧪 Bêta privée · sur invitation</span>
         <h1>Votre électricité,<br /><span class="grad">enfin limpide.</span></h1>
         <p class="sub">BEN lit votre compteur Linky en temps réel et transforme des chiffres abstraits en quelque chose que l'on comprend vraiment.</p>
         <div class="btns">
-          <a class="cta lg" href="install/">Installer BEN ⚡</a>
+          <a class="cta lg" href="#beta">Rejoindre la bêta ⚡</a>
           <a class="cta lg ghost" href="#comprendre">Comment ça marche</a>
         </div>
+        <p class="hint">Programme limité — nous vous envoyons un boîtier et on vous accompagne.</p>
         <div class="trust">
-          <span><svg viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg> Installation en 5 min</span>
-          <span><svg viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg> Sans abonnement obligatoire</span>
+          <span><svg viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg> Boîtier fourni</span>
+          <span><svg viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg> Données 100% en France 🇫🇷</span>
           <span><svg viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg> Firmware open source</span>
         </div>
       </div>
@@ -403,19 +408,20 @@
           </div>
         </div>
         <div style="margin-top:26px;">
-          <a class="cta lg" href="install/">Voir le guide d'installation →</a>
+          <a class="cta lg" href="#beta">Participer à la bêta →</a>
         </div>
       </div>
     </div>
   </section>
 
   <!-- ===== FINAL CTA ===== -->
-  <section class="final">
+  <section class="final" id="beta">
     <div class="wrap reveal">
-      <h2>Prêt à voir votre énergie autrement&nbsp;?</h2>
-      <p>Branchez BEN, ouvrez l'app, laissez-vous guider. Cinq minutes, et tout devient clair.</p>
-      <a class="cta lg" href="install/">Installer BEN maintenant</a>
-      <p class="mini">iPhone &amp; Android · une question&nbsp;? <a href="contact/" style="color:#fff;text-decoration:underline;">écrivez-nous</a></p>
+      <span class="badge">🧪 Programme bêta privé</span>
+      <h2>Rejoignez les premiers testeurs</h2>
+      <p>BEN n'est pas encore en vente libre. Les places sont limitées&nbsp;: nous vous envoyons un boîtier, et on vous accompagne pas à pas pour le mettre en route.</p>
+      <a class="cta lg" href="contact/">Demander à participer</a>
+      <p class="mini">Vous avez déjà reçu votre boîtier&nbsp;? <a href="install/" style="color:#fff;text-decoration:underline;">Suivez le guide d'installation</a></p>
     </div>
   </section>
 
