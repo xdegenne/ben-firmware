@@ -60,24 +60,28 @@
     .blob.b{width:300px;height:300px;background:var(--violet);bottom:-80px;left:-40px;animation-delay:-4s;}
     .blob.c{width:260px;height:260px;background:var(--green-bright);top:30%;left:40%;animation-delay:-8s;opacity:.35;}
     @keyframes float{0%,100%{transform:translateY(0) translateX(0);}50%{transform:translateY(-26px) translateX(16px);}}
-    .hero .wrap{position:relative;z-index:2;display:grid;grid-template-columns:1.1fr .9fr;gap:40px;
-      align-items:center;padding-top:70px;padding-bottom:90px;}
+    .hero .wrap{position:relative;z-index:2;display:grid;grid-template-columns:1.05fr .95fr;gap:48px;
+      align-items:center;text-align:left;padding-top:60px;padding-bottom:84px;}
+    .hero-story{margin:0 0 16px;}
+    .hero-story p{color:#b9c3df;font-size:clamp(1rem,2vw,1.18rem);line-height:1.55;margin:0 0 14px;}
+    .hero-story .big{display:block;color:#fff;font-weight:800;letter-spacing:-.01em;
+      font-size:clamp(1.25rem,2.7vw,1.6rem);margin-bottom:8px;}
     .pill{display:inline-flex;align-items:center;gap:8px;font-size:.82rem;font-weight:700;letter-spacing:.02em;
       background:rgba(63,174,70,.16);color:#9be7a0;border:1px solid rgba(63,174,70,.35);
       padding:7px 14px;border-radius:999px;margin-bottom:22px;}
     .pill .dot{width:8px;height:8px;border-radius:50%;background:var(--green-bright);box-shadow:0 0 10px var(--green-bright);}
     .hero h1{font-size:clamp(2.2rem,5vw,3.5rem);font-weight:850;color:#fff;}
-    .hero p.sub{font-size:clamp(1.05rem,2vw,1.28rem);color:#b9c3df;margin:20px 0 32px;max-width:33ch;}
+    .hero p.sub{font-size:clamp(1.05rem,2vw,1.28rem);color:#b9c3df;margin:16px 0 28px;max-width:42ch;}
     .hero .btns{display:flex;flex-wrap:wrap;gap:14px;}
     .hero .hint{margin:16px 0 0;color:#8fa0c4;font-size:.9rem;}
     .hero .trust{margin-top:26px;display:flex;flex-wrap:wrap;gap:18px;color:#8fa0c4;font-size:.86rem;font-weight:600;}
     .hero .trust span{display:inline-flex;align-items:center;gap:7px;}
     .hero .trust svg{width:16px;height:16px;stroke:var(--green-bright);}
     /* mascot */
-    .mascot-stage{position:relative;display:flex;justify-content:center;align-items:center;min-height:320px;}
-    .mascot-glow{position:absolute;width:300px;height:300px;border-radius:50%;
+    .mascot-stage{position:relative;display:flex;justify-content:center;align-items:center;min-height:300px;}
+    .mascot-glow{position:absolute;width:280px;height:280px;border-radius:50%;
       background:radial-gradient(circle,rgba(40,200,255,.5),transparent 65%);filter:blur(20px);}
-    .mascot{position:relative;width:min(330px,72vw);z-index:2;animation:bob 5s ease-in-out infinite;
+    .mascot{position:relative;width:min(300px,70vw);z-index:2;animation:bob 5s ease-in-out infinite;
       filter:drop-shadow(0 30px 50px rgba(0,0,0,.5));}
     @keyframes bob{0%,100%{transform:translateY(0) rotate(-1deg);}50%{transform:translateY(-16px) rotate(1deg);}}
     .chip{position:absolute;z-index:3;background:rgba(255,255,255,.95);color:var(--navy);
@@ -191,14 +195,6 @@
     .mode small{color:var(--muted);}
     @media(max-width:820px){.hw-grid{grid-template-columns:1fr;}}
 
-    /* intro / histoire */
-    .intro-story{padding:80px 0;text-align:center;background:#fff;}
-    .intro-story .wrap{max-width:740px;}
-    .intro-story .story{font-size:clamp(1.15rem,2.3vw,1.5rem);color:var(--muted);line-height:1.55;margin:0 0 24px;}
-    .intro-story .story .big{display:block;color:var(--ink);font-weight:850;letter-spacing:-.02em;
-      font-size:clamp(1.5rem,3.2vw,2.2rem);margin-bottom:10px;}
-    .intro-story .punch{font-weight:800;color:var(--ink);font-size:clamp(1.3rem,2.8vw,1.85rem);margin-top:6px;}
-
     /* pourquoi BEN */
     .why-ben{background:var(--soft);}
     .why-card{max-width:680px;margin:0 auto;text-align:center;background:#fff;border:1px solid var(--line);
@@ -266,10 +262,16 @@
   <header class="hero" id="top">
     <span class="blob a"></span><span class="blob b"></span><span class="blob c"></span>
     <div class="wrap">
-      <div>
-        <span class="pill"><span class="dot"></span> 🧪 Bêta privée · sur invitation</span>
+      <div class="hero-text">
+        <div class="hero-story">
+          <p><span class="big">L'électricité, c'est un peu comme l'eau.</span>
+            Un fluide que vous payez… sauf que celui-là, vous ne le voyez jamais couler.</p>
+          <p>Une fuite d'eau, vous la repérez vite. Mais l'électricité&nbsp;? Sauriez-vous dire
+            ce qui consomme le plus chez vous — ou que votre vieux congélateur givré s'est
+            mis à dévorer du courant&nbsp;?</p>
+        </div>
         <h1>Votre électricité,<br /><span class="grad">enfin limpide.</span></h1>
-        <p class="sub">BEN lit votre compteur Linky en temps réel et transforme des chiffres abstraits en quelque chose que l'on comprend vraiment.</p>
+        <p class="sub">BEN lit votre compteur Linky en temps réel et la rend aussi limpide qu'un robinet qu'on regarde couler.</p>
         <div class="btns">
           <a class="cta lg" href="#beta">Rejoindre la bêta ⚡</a>
           <a class="cta lg ghost" href="#comprendre">Comment ça marche</a>
@@ -292,19 +294,6 @@
       <path fill="#ffffff" d="M0,40 C360,75 1080,5 1440,40 L1440,60 L0,60 Z"></path>
     </svg>
   </header>
-
-  <!-- ===== INTRO / HISTOIRE (reprise de l'app pendant le provisioning) ===== -->
-  <section class="intro-story">
-    <div class="wrap">
-      <p class="story reveal"><span class="big">L'électricité, c'est un peu comme l'eau.</span>
-        Un fluide que vous payez… sauf que celui-là, vous ne le voyez jamais couler.</p>
-      <p class="story reveal">Une fuite d'eau, vous la repérez vite. Mais l'électricité&nbsp;?
-        Sauriez-vous dire ce qui consomme le plus chez vous — ou que votre vieux congélateur
-        givré s'est mis à dévorer du courant&nbsp;?</p>
-      <p class="story punch reveal">BEN est là pour ça&nbsp;: rendre votre électricité
-        <span class="grad">aussi limpide qu'un robinet qu'on regarde couler.</span></p>
-    </div>
-  </section>
 
   <!-- ===== PILLARS / 4 objectives ===== -->
   <section id="comprendre">
