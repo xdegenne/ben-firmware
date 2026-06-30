@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="robots" content="noindex" />
   <title>BEN — Quel boîtier pour vous ?</title>
-  <meta name="description" content="Quelques questions pour savoir si votre compteur Linky relève d'un BEN filaire ou LoRa, et candidater à la bêta." />
+  <meta name="description" content="Quelques questions pour savoir si votre compteur Linky relève d'un BEN Filaire ou BEN Radio, et candidater à la bêta." />
   <style>
     :root{
       --green:#2e7d32; --green-bright:#3fae46; --navy-deep:#101b38;
@@ -183,14 +183,14 @@
     }
 
     var R = {
-      wired:{ cls:'wired', badge:'BEN filaire', title:'Le BEN filaire, c’est pour vous',
+      wired:{ cls:'wired', badge:'BEN Filaire', title:'Le BEN Filaire, c’est pour vous',
         text:'Le boîtier se pose directement sur votre Linky. L’installation la plus simple, deux fils à clipser.',
         why:'Téléinfo libre, compteur en partie privative, avec Wi-Fi et prise à proximité : tout ce qu’il faut pour le boîtier filaire.' },
-      lora:{ cls:'lora', badge:'BEN LoRa', title:'Le BEN LoRa est fait pour votre cas',
+      lora:{ cls:'lora', badge:'BEN Radio', title:'Le BEN Radio est fait pour votre cas',
         text:'Un petit émetteur radio se place au compteur (il s’alimente tout seul) et envoie les données à un boîtier installé chez vous, là où il y a du Wi-Fi.',
-        why:'Votre compteur est trop éloigné, inaccessible ou sans Wi-Fi pour un boîtier filaire : la liaison radio LoRa contourne le problème.' },
+        why:'Votre compteur est trop éloigné, inaccessible ou sans Wi-Fi pour un boîtier filaire : la liaison radio contourne le problème.' },
       maybe:{ cls:'maybe', badge:'À voir ensemble', title:'Ça se joue de peu',
-        text:'Selon la portée réelle du Wi-Fi au compteur, ce sera filaire ou LoRa. On regarde ça avec vous, sans risque de se tromper.',
+        text:'Selon la portée réelle du Wi-Fi au compteur, ce sera le BEN Filaire ou le BEN Radio. On regarde ça avec vous, sans risque de se tromper.',
         why:'Compteur en partie privative mais Wi-Fi incertain sur place : un petit échange nous permet de choisir la bonne option.' },
       nope:{ cls:'nope', badge:'Pas encore disponible', title:'BEN n’est pas encore prêt pour votre installation',
         text:'Un autre appareil utilise déjà votre téléinfo. Pour cohabiter, BEN doit re-diffuser le signal (un « relais ») — une fonction qu’on ne propose pas encore en bêta.',
@@ -216,7 +216,12 @@
         '— Emplacement du Linky : ' + locTxt + '\n' +
         (answers.wifi  ? '— Wi-Fi au compteur : ' + answers.wifi + '\n' : '') +
         (answers.power ? '— Prise à proximité : ' + answers.power + '\n' : '') +
-        '\nMes coordonnées :\n- Nom :\n- Adresse postale (pour l’envoi du boîtier) :\n- Téléphone :\n\nMerci !';
+        '\nMes coordonnées :\n- Nom :\n- Téléphone :\n' +
+        '\nEnvie de nous en dire un peu plus ? (c’est tout à fait facultatif — ne partagez que ce que vous voulez)\n' +
+        '- Un projet photovoltaïque, en cours ou en réflexion ?\n' +
+        '- La nature de votre foyer (maison ou appartement, nombre de personnes…) ?\n' +
+        '- Ce qui vous donne envie de mieux suivre votre conso ?\n' +
+        '\nMerci !';
       return 'mailto:' + to + '?subject=' + encodeURIComponent(subject) + '&body=' + encodeURIComponent(body);
     }
 
