@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="robots" content="noindex" />
+  <title>BEN — Quel boîtier pour vous ?</title>
+  <meta name="description" content="Quelques questions pour savoir si votre compteur Linky relève d'un BEN filaire ou LoRa, et candidater à la bêta." />
+  <style>
+    :root{
+      --green:#2e7d32; --green-bright:#3fae46; --navy-deep:#101b38;
+      --cyan:#28c8ff; --violet:#6b4bd6; --ink:#13182a; --muted:#9fb0d6; --line:rgba(255,255,255,.14);
+    }
+    *{box-sizing:border-box;-webkit-text-size-adjust:100%;}
+    body{
+      margin:0;min-height:100vh;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+      color:#eaf0ff;line-height:1.6;display:flex;flex-direction:column;align-items:center;
+      padding:28px 18px 56px;
+      background:
+        radial-gradient(800px 500px at 12% -10%,rgba(40,200,255,.18),transparent 60%),
+        radial-gradient(700px 500px at 95% 0%,rgba(107,75,214,.26),transparent 55%),
+        linear-gradient(160deg,var(--navy-deep),#0a1228 70%);
+    }
+    a{color:inherit;}
+    .logo{height:34px;display:block;margin:0 auto 6px;}
+    .top{text-align:center;margin-bottom:20px;}
+    .mascot{width:84px;height:auto;filter:drop-shadow(0 14px 24px rgba(0,0,0,.5));}
+    .card{width:100%;max-width:560px;background:rgba(255,255,255,.04);border:1px solid var(--line);
+      border-radius:22px;padding:30px 26px;backdrop-filter:blur(8px);}
+    /* progress */
+    .prog{display:flex;gap:8px;justify-content:center;margin-bottom:24px;}
+    .prog i{width:30px;height:5px;border-radius:99px;background:rgba(255,255,255,.16);transition:background .3s;}
+    .prog i.on{background:linear-gradient(90deg,var(--green-bright),var(--cyan));}
+    h1{font-size:1.4rem;font-weight:800;letter-spacing:-.02em;margin:0 0 4px;color:#fff;text-align:center;}
+    .sub{color:var(--muted);font-size:.95rem;text-align:center;margin:0 0 22px;}
+    /* options */
+    .opt{display:flex;align-items:center;gap:14px;width:100%;text-align:left;cursor:pointer;
+      background:rgba(255,255,255,.05);border:1.5px solid var(--line);border-radius:14px;
+      padding:16px 18px;margin:10px 0;color:#eaf0ff;font:inherit;font-size:1rem;
+      transition:border-color .15s,background .15s,transform .12s;}
+    .opt:hover{border-color:var(--cyan);background:rgba(40,200,255,.08);transform:translateY(-2px);}
+    .opt .em{font-size:1.5rem;flex:none;line-height:1;}
+    .opt .t b{display:block;font-weight:700;}
+    .opt .t small{color:var(--muted);font-size:.86rem;}
+    .back{margin-top:18px;background:none;border:0;color:var(--muted);font:inherit;font-size:.9rem;cursor:pointer;
+      display:inline-flex;align-items:center;gap:6px;}
+    .back:hover{color:#fff;}
+    .hide{display:none;}
+    /* result */
+    .res{text-align:center;}
+    .res .badge{display:inline-block;font-weight:800;font-size:.8rem;letter-spacing:.06em;text-transform:uppercase;
+      padding:7px 15px;border-radius:99px;margin-bottom:16px;}
+    .res.wired .badge{background:rgba(63,174,70,.18);border:1px solid rgba(63,174,70,.5);color:#9be7a0;}
+    .res.lora  .badge{background:rgba(40,200,255,.16);border:1px solid rgba(40,200,255,.5);color:#9ad9f5;}
+    .res.maybe .badge{background:rgba(246,183,60,.16);border:1px solid rgba(246,183,60,.5);color:#f6cf8c;}
+    .res.nope  .badge{background:rgba(214,69,127,.18);border:1px solid rgba(214,69,127,.55);color:#f3a8c4;}
+    .res h2{font-size:1.6rem;color:#fff;margin:0 0 8px;}
+    .res p{color:#c4cfe8;font-size:1rem;margin:8px 0 0;}
+    .res .why{background:rgba(255,255,255,.05);border:1px solid var(--line);border-radius:12px;
+      padding:14px 16px;margin:18px 0;font-size:.9rem;color:var(--muted);text-align:left;}
+    .cta{display:inline-flex;align-items:center;justify-content:center;gap:9px;width:100%;
+      text-decoration:none;font-weight:700;font-size:1.05rem;color:#fff;
+      background:linear-gradient(100deg,var(--green),#1d6b21);padding:16px;border-radius:13px;margin-top:8px;
+      box-shadow:0 14px 30px -12px rgba(46,125,50,.8);transition:transform .15s;cursor:pointer;border:0;font-family:inherit;}
+    .cta.alt{background:linear-gradient(100deg,#345,#223);box-shadow:none;}
+    .cta:hover{transform:translateY(-2px);}
+    .home{display:block;margin-top:24px;color:var(--muted);font-size:.85rem;text-align:center;text-decoration:none;}
+    .home:hover{color:#fff;}
+    @media(max-width:420px){.card{padding:24px 18px;}h1{font-size:1.25rem;}}
+  </style>
+</head>
+<body>
+
+  <div class="top">
+    <a href="../"><img class="logo" src="../assets/ben_logo.png" alt="BEN" /></a>
+    <img class="mascot" src="../assets/ben_mascot.png" alt="BEN" />
+  </div>
+
+  <div class="card">
+    <div class="prog"><i class="on"></i><i></i><i></i><i></i></div>
+
+    <!-- STEP 0 : appareil déjà sur la téléinfo -->
+    <section class="step" data-step="0">
+      <h1>Un autre appareil lit-il déjà la téléinfo de votre Linky&nbsp;?</h1>
+      <p class="sub">Par exemple un suivi conso, une box domotique (Home&nbsp;Assistant, Jeedom, eedomus…) ou un écran branché sur les bornes&nbsp;I1/I2.</p>
+      <button class="opt" data-q="tic" data-v="non">
+        <span class="em">✅</span><span class="t"><b>Non, rien n'est branché</b><small>les bornes téléinfo sont libres (le cas le plus courant)</small></span>
+      </button>
+      <button class="opt" data-q="tic" data-v="oui">
+        <span class="em">🔗</span><span class="t"><b>Oui, un appareil y est déjà raccordé</b><small>un autre lecteur utilise déjà la téléinfo</small></span>
+      </button>
+      <button class="opt" data-q="tic" data-v="?">
+        <span class="em">🤔</span><span class="t"><b>Je ne sais pas</b><small>je ne suis pas sûr de ce qui est branché</small></span>
+      </button>
+    </section>
+
+    <!-- STEP 1 : emplacement -->
+    <section class="step hide" data-step="1">
+      <h1>Où se trouve votre compteur Linky&nbsp;?</h1>
+      <p class="sub">C'est ce qui détermine le type de boîtier.</p>
+      <button class="opt" data-q="loc" data-v="prive">
+        <span class="em">🏠</span><span class="t"><b>Dans mon logement</b><small>pièce, placard, cellier, couloir…</small></span>
+      </button>
+      <button class="opt" data-q="loc" data-v="prive">
+        <span class="em">🔧</span><span class="t"><b>Garage / cave / dépendance privative</b><small>un espace qui m'appartient</small></span>
+      </button>
+      <button class="opt" data-q="loc" data-v="commun">
+        <span class="em">🚪</span><span class="t"><b>Au portail / en limite de propriété</b><small>coffret extérieur, en bordure</small></span>
+      </button>
+      <button class="opt" data-q="loc" data-v="commun">
+        <span class="em">🏢</span><span class="t"><b>Parties communes / local compteurs</b><small>immeuble, local collectif</small></span>
+      </button>
+    </section>
+
+    <!-- STEP 2 : wifi -->
+    <section class="step hide" data-step="2">
+      <h1>Le Wi-Fi de votre box porte-t-il jusqu'au compteur&nbsp;?</h1>
+      <p class="sub">Le boîtier filaire a besoin du Wi-Fi sur place.</p>
+      <button class="opt" data-q="wifi" data-v="oui">
+        <span class="em">📶</span><span class="t"><b>Oui, bon signal</b><small>mon téléphone capte bien là-bas</small></span>
+      </button>
+      <button class="opt" data-q="wifi" data-v="faible">
+        <span class="em">📡</span><span class="t"><b>Faible / je ne suis pas sûr</b><small>ça capte mal ou par moments</small></span>
+      </button>
+      <button class="opt" data-q="wifi" data-v="non">
+        <span class="em">🚫</span><span class="t"><b>Non, ça ne porte pas</b><small>aucun signal au compteur</small></span>
+      </button>
+    </section>
+
+    <!-- STEP 3 : prise -->
+    <section class="step hide" data-step="3">
+      <h1>Une prise de courant à proximité du compteur&nbsp;?</h1>
+      <p class="sub">À portée de câble, disons moins de 2&nbsp;mètres.</p>
+      <button class="opt" data-q="power" data-v="oui">
+        <span class="em">🔌</span><span class="t"><b>Oui</b><small>une prise dispo juste à côté</small></span>
+      </button>
+      <button class="opt" data-q="power" data-v="non">
+        <span class="em">❌</span><span class="t"><b>Non</b><small>pas de prise accessible</small></span>
+      </button>
+    </section>
+
+    <!-- RESULT -->
+    <section class="step hide" data-step="result">
+      <div class="res" id="res">
+        <span class="badge" id="resBadge"></span>
+        <h2 id="resTitle"></h2>
+        <p id="resText"></p>
+        <div class="why" id="resWhy"></div>
+        <button class="cta" id="resCta">Candidater à la bêta →</button>
+      </div>
+    </section>
+
+    <button class="back hide" id="back">← Précédent</button>
+  </div>
+
+  <a class="home" href="../">← Retour à l'accueil BEN</a>
+
+  <script>
+    var answers = {};
+    var hist = [];          // pile des steps visités (pour Précédent)
+    var current = 0;
+    var steps = document.querySelectorAll('.step');
+    var dots  = document.querySelectorAll('.prog i');
+    var back  = document.getElementById('back');
+
+    function show(step){
+      steps.forEach(function(s){ s.classList.toggle('hide', s.dataset.step != String(step)); });
+      dots.forEach(function(d,i){
+        d.classList.toggle('on', step === 'result' ? true : i <= Number(step));
+      });
+      back.classList.toggle('hide', hist.length === 0);
+      current = step;
+      window.scrollTo(0,0);
+    }
+
+    function decide(){
+      if(answers.tic === 'oui')      return 'nope';   // appareil déjà sur la TIC -> relais requis -> hors bêta
+      if(answers.loc === 'commun')   return 'lora';   // filaire impossible
+      if(answers.power === 'non')    return 'lora';
+      if(answers.wifi === 'non')     return 'lora';
+      if(answers.wifi === 'faible')  return 'maybe';
+      return 'wired';                                  // privatif + wifi oui + prise oui
+    }
+
+    var R = {
+      wired:{ cls:'wired', badge:'BEN filaire', title:'Le BEN filaire, c’est pour vous',
+        text:'Le boîtier se pose directement sur votre Linky. L’installation la plus simple, deux fils à clipser.',
+        why:'Téléinfo libre, compteur en partie privative, avec Wi-Fi et prise à proximité : tout ce qu’il faut pour le boîtier filaire.' },
+      lora:{ cls:'lora', badge:'BEN LoRa', title:'Le BEN LoRa est fait pour votre cas',
+        text:'Un petit émetteur radio se place au compteur (il s’alimente tout seul) et envoie les données à un boîtier installé chez vous, là où il y a du Wi-Fi.',
+        why:'Votre compteur est trop éloigné, inaccessible ou sans Wi-Fi pour un boîtier filaire : la liaison radio LoRa contourne le problème.' },
+      maybe:{ cls:'maybe', badge:'À voir ensemble', title:'Ça se joue de peu',
+        text:'Selon la portée réelle du Wi-Fi au compteur, ce sera filaire ou LoRa. On regarde ça avec vous, sans risque de se tromper.',
+        why:'Compteur en partie privative mais Wi-Fi incertain sur place : un petit échange nous permet de choisir la bonne option.' },
+      nope:{ cls:'nope', badge:'Pas encore disponible', title:'BEN n’est pas encore prêt pour votre installation',
+        text:'Un autre appareil utilise déjà votre téléinfo. Pour cohabiter, BEN doit re-diffuser le signal (un « relais ») — une fonction qu’on ne propose pas encore en bêta.',
+        why:'La téléinfo ne peut alimenter qu’un nombre limité de lecteurs. Le relais arrive plus tard : laissez-nous vos coordonnées et on vous prévient dès que c’est prêt.' }
+    };
+
+    function buildMailto(){
+      var to = ['xavier','degenne'].join('.') + '@' + ['gmail','com'].join('.');
+      var reco = decide();
+      if(reco === 'nope'){
+        var subjN = 'Liste d’attente BEN — téléinfo déjà utilisée (relais)';
+        var bodyN = 'Bonjour BEN,\n\nUn appareil utilise déjà ma téléinfo, mais je suis intéressé(e). ' +
+          'Prévenez-moi quand le relais sera disponible.\n\nMes coordonnées :\n- Nom :\n- E-mail :\n- Ce qui est déjà branché sur la téléinfo :\n\nMerci !';
+        return 'mailto:' + to + '?subject=' + encodeURIComponent(subjN) + '&body=' + encodeURIComponent(bodyN);
+      }
+      var labelReco = R[reco].badge;
+      var locTxt = answers.loc === 'commun' ? 'parties communes / portail / limite' : 'partie privative';
+      var subject = 'Candidature bêta BEN — ' + labelReco;
+      var body =
+        'Bonjour BEN,\n\nJe souhaite participer au programme bêta.\n\n' +
+        '— Recommandation du questionnaire : ' + labelReco + '\n' +
+        '— Téléinfo déjà utilisée : ' + (answers.tic === '?' ? 'à vérifier' : 'non') + '\n' +
+        '— Emplacement du Linky : ' + locTxt + '\n' +
+        (answers.wifi  ? '— Wi-Fi au compteur : ' + answers.wifi + '\n' : '') +
+        (answers.power ? '— Prise à proximité : ' + answers.power + '\n' : '') +
+        '\nMes coordonnées :\n- Nom :\n- Adresse postale (pour l’envoi du boîtier) :\n- Téléphone :\n\nMerci !';
+      return 'mailto:' + to + '?subject=' + encodeURIComponent(subject) + '&body=' + encodeURIComponent(body);
+    }
+
+    function showResult(){
+      var reco = decide();
+      var r = R[reco];
+      var res = document.getElementById('res');
+      res.className = 'res ' + r.cls;
+      document.getElementById('resBadge').textContent = r.badge;
+      document.getElementById('resTitle').textContent = r.title;
+      document.getElementById('resText').textContent  = r.text;
+      document.getElementById('resWhy').textContent   = r.why;
+      var cta = document.getElementById('resCta');
+      cta.textContent = (reco === 'nope') ? 'Me prévenir quand c’est prêt →' : 'Candidater à la bêta →';
+      cta.className = (reco === 'nope') ? 'cta alt' : 'cta';
+      cta.onclick = function(){ window.location.href = buildMailto(); };
+      show('result');
+    }
+
+    // clic sur une option
+    document.querySelectorAll('.opt').forEach(function(btn){
+      btn.addEventListener('click', function(){
+        answers[btn.dataset.q] = btn.dataset.v;
+        hist.push(current);
+        // gate téléinfo : appareil déjà branché -> exclu
+        if(btn.dataset.q === 'tic' && btn.dataset.v === 'oui'){ showResult(); return; }
+        if(current === 0){ show(1); return; }                 // après téléinfo -> emplacement
+        // emplacement non privatif -> résultat direct (LoRa)
+        if(btn.dataset.q === 'loc' && btn.dataset.v === 'commun'){ showResult(); return; }
+        if(current === 1){ show(2); return; }                 // -> wifi
+        if(current === 2){ show(3); return; }                 // -> prise
+        if(current === 3){ showResult(); return; }            // -> résultat
+      });
+    });
+
+    back.addEventListener('click', function(){
+      var prev = hist.pop();
+      if(prev === undefined) return;
+      show(prev);
+    });
+
+    show(0);
+  </script>
+</body>
+</html>
