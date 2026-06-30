@@ -150,6 +150,11 @@
     .gauge .val{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#fff;}
     .gauge .val b{font-size:3rem;font-weight:850;line-height:1;}
     .split .gauge-cap{margin:0;color:#fff;font-size:.92rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;text-align:center;}
+    .panel .roi{display:flex;flex-direction:column;align-items:center;gap:3px;margin-top:18px;padding-top:18px;
+      width:78%;border-top:1px solid rgba(255,255,255,.14);}
+    .panel .roi b{font-size:2rem;font-weight:850;line-height:1;
+      background:linear-gradient(100deg,var(--green-bright),var(--cyan));-webkit-background-clip:text;background-clip:text;color:transparent;}
+    .panel .roi span{color:#fff;font-size:.82rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;}
     .split h2{font-size:clamp(1.7rem,3.4vw,2.4rem);font-weight:850;}
     .split p{color:var(--muted);font-size:1.08rem;margin:16px 0;}
     .check{list-style:none;padding:0;margin:18px 0 0;}
@@ -338,9 +343,11 @@
         <span class="eyebrow">Photovoltaïque</span>
         <h2>Dimensionnez votre solaire <span class="grad">au plus juste</span></h2>
         <p>Installer des panneaux, c'est un investissement. Trop petits, vous passez à côté ; trop grands, vous payez pour rien. BEN connaît votre vraie consommation, heure par heure.</p>
+        <p>Et notre ambition va plus loin que le dimensionnement&nbsp;: à partir de votre conso réelle et de votre production potentielle, BEN vise à estimer <strong>précisément le retour sur investissement</strong> de votre installation — en combien d'années elle se rembourse, vraiment.</p>
         <ul class="check">
           <li><svg viewBox="0 0 24 24"><path d="M5 13l4 4L19 7" stroke-linecap="round" stroke-linejoin="round"/></svg> Votre profil de conso réel, sur des semaines de mesure</li>
-          <li><svg viewBox="0 0 24 24"><path d="M5 13l4 4L19 7" stroke-linecap="round" stroke-linejoin="round"/></svg> La part que des panneaux pourraient réellement couvrir</li>
+          <li><svg viewBox="0 0 24 24"><path d="M5 13l4 4L19 7" stroke-linecap="round" stroke-linejoin="round"/></svg> Le bon dimensionnement&nbsp;: la part que des panneaux couvriraient vraiment</li>
+          <li><svg viewBox="0 0 24 24"><path d="M5 13l4 4L19 7" stroke-linecap="round" stroke-linejoin="round"/></svg> Le retour sur investissement chiffré au plus juste — en années, pas en promesses</li>
           <li><svg viewBox="0 0 24 24"><path d="M5 13l4 4L19 7" stroke-linecap="round" stroke-linejoin="round"/></svg> Une décision éclairée, pas un devis au doigt mouillé</li>
         </ul>
       </div>
@@ -357,6 +364,10 @@
           <div class="val"><b>72%</b></div>
         </div>
         <p class="gauge-cap">Couverture solaire estimée</p>
+        <div class="roi">
+          <span>Rentable en…</span>
+          <b>≈ 5 ans</b>
+        </div>
       </div>
     </div>
   </section>
