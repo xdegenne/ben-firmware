@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# update.sh — pi-0.0.49 → pi-0.0.50   (pi0-wired)
+#
+# Chantier index énergie bi-mode, Lot B (suite) : endpoint /consumption. Idem
+# pi0-lora : le carry-forward (conso PAR REGISTRE sur une plage) est calculé
+# SERVER-SIDE — Pi maintenant, cloud plus tard, MÊME contrat.
+#   - db.py        : consumption(pdl, since, until) → {by_register:[{src_standard,
+#                    index_id, wh}], total_wh}. Par registre MAX(index)-MIN(index)
+#                    (COALESCE index_value/base/hchc/hchp → bi-mode + legacy).
+#   - local_api.py : GET /consumption?pdl_index&since&until.
+#
+# AUCUNE migration (lecture seule sur colonnes existantes). Endpoint ADDITIF (app
+# pas-à-jour intacte). Code déjà sur disque après `git checkout pi-0.0.50`. Tourne
+# en `ben`.
+
+set -euo pipefail
+
+TR="pi-0.0.49 → pi-0.0.50"
+log()  { echo "[update $TR] $*"; }
+fail() { echo "[update $TR] ✗ ERREUR : $*" >&2; exit 1; }
+
+REPO="${REPO_PATH:-/opt/ben/repo}"
+
+# Garde-fou : le checkout a-t-il bien amené /consumption ?
+grep -q 'def consumption' "$REPO/src/pi/store/db.py" \
+    || fail "db.py pas à jour (consumption absent — checkout incomplet ?)"
+
+log "[1/1] restart ben-tic-reader + ben-local-api (endpoint /consumption)"
+sudo systemctl restart ben-tic-reader.service || fail "restart ben-tic-reader"
+sudo systemctl restart ben-local-api.service  || fail "restart ben-local-api"
+
+log "✓ update OK — /consumption (conso par registre, carry-forward server-side)"

@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.49"
+        latest: "0.0.50"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -141,6 +141,9 @@ devices:
           - version: "0.0.49"
             released: "2026-07-01"
             notes: "Chantier index énergie bi-mode, Lot B (exposition API). /live, /measurements et curve_buckets exposent désormais l'index GÉNÉRIQUE (index_id, index_value, src_standard, inject_total) : le coût/conso manquait en mode STANDARD où base/hchc/hchp sont NULL et l'index vit dans index_value. /live ajoute le flag producer (injection constatée → jauge bidir soutirage/injection de l'app). PERF : index COUVRANT idx_meas_pdl_ts_papp (pdl_index,ts,papp) remplace idx_meas_pdl_ts → l'agrégation /curve se résout depuis l'index (point chaud du 7j). MIGRATION = création index couvrant + DROP ancien au 1er db.connect (schéma, idempotent ; ~qq s one-shot sur grosse base, NON destructif, aucune perte). Exposition API purement ADDITIVE (app pas-à-jour intacte). Transition = restart ben-local-api + ben-lora-receiver."
+          - version: "0.0.50"
+            released: "2026-07-01"
+            notes: "Chantier index énergie bi-mode, Lot B (suite) : endpoint /consumption. Le carry-forward (conso PAR REGISTRE sur une plage) est calculé SERVER-SIDE — Pi maintenant, cloud plus tard, MÊME contrat → l'app est agnostique du backend, logique non dupliquée. db.py : consumption(pdl,since,until) → {by_register:[{src_standard,index_id,wh}],total_wh} ; par registre MAX(index)-MIN(index) (index monotone → exact, immunisé au saut de registre ; COALESCE index_value/base/hchc/hchp → bi-mode + legacy histo). local_api : GET /consumption?pdl_index&since&until. L'app applique le prix (Σ wh×prix moyen aujourd'hui ; par registre à terme = coût à l'euro près, rétroactif, sans changer le contrat). AUCUNE migration (lecture seule sur colonnes existantes). Endpoint ADDITIF (app pas-à-jour intacte). Transition = restart ben-local-api + ben-lora-receiver."
       arduino:
         minimum: "0.0.1"
         latest: "0.0.7"
@@ -169,7 +172,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.49"
+        latest: "0.0.50"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -294,6 +297,9 @@ devices:
           - version: "0.0.49"
             released: "2026-07-01"
             notes: "Chantier index énergie bi-mode, Lot B (exposition API). Idem pi0-lora : db.py expose l'index GÉNÉRIQUE (index_id, index_value, src_standard, inject_total) + flag producer dans /live, /measurements et curve_buckets — débloque le coût/conso en mode STANDARD (base/hchc/hchp NULL, index dans index_value). PERF : index COUVRANT idx_meas_pdl_ts_papp (pdl_index,ts,papp) remplace idx_meas_pdl_ts → l'agrégation /curve se résout depuis l'index. MIGRATION = index couvrant créé + ancien droppé au 1er db.connect (schéma, idempotent ; ~qq s one-shot sur grosse base, NON destructif, aucune perte). Exposition API purement ADDITIVE (app pas-à-jour intacte). Transition = restart ben-tic-reader + ben-local-api."
+          - version: "0.0.50"
+            released: "2026-07-01"
+            notes: "Chantier index énergie bi-mode, Lot B (suite) : endpoint /consumption. Idem pi0-lora : le carry-forward (conso PAR REGISTRE sur une plage) est calculé SERVER-SIDE — Pi maintenant, cloud plus tard, MÊME contrat. db.py : consumption(pdl,since,until) → {by_register:[{src_standard,index_id,wh}],total_wh} ; par registre MAX(index)-MIN(index) (COALESCE index_value/base/hchc/hchp → bi-mode + legacy). local_api : GET /consumption?pdl_index&since&until. L'app applique le prix (Σ wh×prix moyen ; par registre à terme). AUCUNE migration (lecture seule). Endpoint ADDITIF. Transition = restart ben-tic-reader + ben-local-api."
 
 updates:
 
@@ -457,6 +463,10 @@ updates:
       to: "0.0.49"
       tag: "pi-0.0.49"
       script: "updates/pi0-lora/0.0.48_to_0.0.49/update.sh"
+    - from: "0.0.49"
+      to: "0.0.50"
+      tag: "pi-0.0.50"
+      script: "updates/pi0-lora/0.0.49_to_0.0.50/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -611,6 +621,10 @@ updates:
       to: "0.0.49"
       tag: "pi-0.0.49"
       script: "updates/pi0-wired/0.0.48_to_0.0.49/update.sh"
+    - from: "0.0.49"
+      to: "0.0.50"
+      tag: "pi-0.0.50"
+      script: "updates/pi0-wired/0.0.49_to_0.0.50/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet

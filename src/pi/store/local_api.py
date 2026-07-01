@@ -24,6 +24,10 @@ Endpoints :
   GET /curve?pdl_index=N[&since=ts&until=ts&buckets=K]
       → courbe agrégée par bucket (min/max/avg, pics préservés). `buckets` =
         résolution voulue par l'app (défaut 500, max 2000). Endpoint riche.
+  GET /consumption?pdl_index=N[&since=ts&until=ts]
+      → conso PAR REGISTRE (Wh) sur la plage : {by_register:[{src_standard,
+        index_id,wh}],total_wh}. Carry-forward server-side (MAX-MIN par registre,
+        bi-mode). Contrat commun Pi/cloud ; l'app applique le prix (Σ wh×prix).
   GET /lora-link?pdl_index=N[&since=ts&limit=N]
       → qualité de réception LoRa (rssi/snr) — modèles pi0-lora
 
@@ -113,6 +117,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._measurements(qs)
             if path == "/curve":
                 return self._curve(qs)
+            if path == "/consumption":
+                return self._consumption(qs)
             if path == "/lora-link":
                 return self._lora_link(qs)
             if path == "/settings":
@@ -345,6 +351,22 @@ class Handler(BaseHTTPRequestHandler):
             pts = db.curve_buckets(conn, pdl, since, until, bucket_sec)
         self._send({"pdl_index": pdl, "since": since, "until": until,
                     "bucket_sec": bucket_sec, "count": len(pts), "points": pts})
+
+    def _consumption(self, qs):
+        """Conso par registre sur [since, until] — carry-forward server-side
+        (cf. db.consumption). Contrat commun Pi/cloud ; l'app appelle en débounce
+        au repos du pan/zoom et applique le prix (Σ wh × prix)."""
+        pdl = _int(qs, "pdl_index")
+        if pdl is None:
+            return self._send({"error": "pdl_index_required"}, 400)
+        now = int(time.time())
+        since = _int(qs, "since", now - DEFAULT_WINDOW_SEC)
+        until = _int(qs, "until", now)
+        if until <= since:
+            return self._send({"error": "bad_range"}, 400)
+        with db.connect(read_only=True) as conn:
+            res = db.consumption(conn, pdl, since, until)
+        self._send({"pdl_index": pdl, "since": since, "until": until, **res})
 
     def _lora_link(self, qs):
         pdl = _int(qs, "pdl_index")

@@ -529,6 +529,44 @@ def curve_buckets(
     return out
 
 
+def consumption(
+    conn: sqlite3.Connection, pdl_index: int, since: int, until: int,
+) -> dict:
+    """Consommation PAR REGISTRE (Wh) sur `[since, until]`, calculée server-side.
+
+    **Contrat commun Pi-local / cloud** (l'app est agnostique du backend, cf.
+    §12.2 souveraineté : les données seront aussi déversées dans le cloud qui
+    servira le MÊME `/consumption`). Le carry-forward vit ICI, pas dans l'app —
+    une seule implémentation, réutilisée par app + cloud + Home Assistant.
+
+    Par registre : `MAX(index) − MIN(index)`. L'index d'un registre est **monotone**
+    → exact et **immunisé au saut de registre** (pas besoin de détecter les
+    bascules). `reg` = `index_id` générique (v0x05) sinon `tariff` (legacy histo) ;
+    la valeur = `index_value` sinon `base/hchc/hchp` (registre actif legacy) — via
+    `COALESCE`, donc bi-mode ET rétro-compatible avec la donnée pré-v0x05.
+
+    Retourne `{by_register: [{src_standard, index_id, wh}], total_wh}`. L'app
+    applique le prix : `Σ wh_r × prix_r` — prix moyen unique aujourd'hui ; **par
+    registre à terme** (coût à l'euro près, rétroactif) sans changer ce contrat.
+    Cf. `docs/chantier-index-energie-bimode.md` §6-7."""
+    rows = conn.execute(
+        "SELECT src_standard, COALESCE(index_id, tariff) AS reg, "
+        "       MAX(COALESCE(index_value, base, hchc, hchp)) - "
+        "       MIN(COALESCE(index_value, base, hchc, hchp)) AS wh "
+        "FROM measurements "
+        "WHERE pdl_index=? AND ts>=? AND ts<=? "
+        "      AND COALESCE(index_value, base, hchc, hchp) IS NOT NULL "
+        "GROUP BY src_standard, reg",
+        (pdl_index, since, until),
+    ).fetchall()
+    by_register = [
+        {"src_standard": r["src_standard"], "index_id": r["reg"], "wh": r["wh"]}
+        for r in rows if r["wh"] is not None
+    ]
+    total = sum(x["wh"] for x in by_register)
+    return {"by_register": by_register, "total_wh": total}
+
+
 def prune(conn: sqlite3.Connection, retention_days: int = RETENTION_DAYS) -> dict:
     """Supprime les points plus vieux que la rétention dans les deux tables.
     Retourne le nombre de lignes supprimées par table."""
