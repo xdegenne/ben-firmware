@@ -238,7 +238,8 @@ class Handler(BaseHTTPRequestHandler):
             if pdl is not None:
                 rows = _rows(
                     conn,
-                    "SELECT ts, pdl_index, base, hchc, hchp, papp, iinst, tariff "
+                    "SELECT ts, pdl_index, base, hchc, hchp, papp, iinst, tariff, "
+                    "index_id, index_value, src_standard, inject_total "
                     "FROM measurements WHERE pdl_index=? ORDER BY ts DESC LIMIT 1",
                     (pdl,),
                 )
@@ -247,7 +248,8 @@ class Handler(BaseHTTPRequestHandler):
                 rows = _rows(
                     conn,
                     "SELECT m.ts, m.pdl_index, m.base, m.hchc, m.hchp, m.papp, "
-                    "m.iinst, m.tariff "
+                    "m.iinst, m.tariff, m.index_id, m.index_value, m.src_standard, "
+                    "m.inject_total "
                     "FROM measurements m "
                     "JOIN (SELECT pdl_index, MAX(ts) mx FROM measurements "
                     "      GROUP BY pdl_index) g "
@@ -265,6 +267,11 @@ class Handler(BaseHTTPRequestHandler):
                 # En standard, `papp` est le NET SIGNÉ (>0 soutiré, <0 surplus injecté).
                 mode = db.tic_mode(conn, row["pdl_index"])
                 row["tic_mode"] = mode
+                # Producteur = injection CONSTATÉE (pas juste EAIT présent) → l'app
+                # affiche la jauge bidir soutirage⇄injection (Lot C). inject_total
+                # est déjà dans la ligne (index monotone → dernière valeur = MAX).
+                row["producer"] = db.producer(
+                    conn, row["pdl_index"], row.get("inject_total"))
                 # Abonnement souscrit (réglages app + étalonnage jauge), exposé brut
                 # dans son unité d'origine : ISOUSC (A) en histo, PREF (kVA) en standard.
                 # Étalonnage maxVa : on prend la source du MODE COURANT (standard→PREF×1000,
@@ -309,7 +316,8 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 rows = _rows(
                     conn,
-                    "SELECT ts, base, hchc, hchp, papp, iinst, tariff FROM measurements "
+                    "SELECT ts, base, hchc, hchp, papp, iinst, tariff, "
+                    "index_id, index_value, src_standard, inject_total FROM measurements "
                     "WHERE pdl_index=? AND ts>=? AND ts<=? ORDER BY ts ASC LIMIT ?",
                     (pdl, since, until, limit),
                 )

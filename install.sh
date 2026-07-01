@@ -13,7 +13,7 @@ set -euo pipefail
 
 REPO_URL="https://github.com/xdegenne/ben-firmware.git"
 REPO_PATH="/opt/ben/repo"
-INITIAL_TAG="pi-0.0.48"
+INITIAL_TAG="pi-0.0.49"
 # Version écrite dans device.json — DOIT correspondre au tag checkout, sinon
 # l'OTA re-grimpe depuis une version périmée. Dérivée de INITIAL_TAG pour
 # qu'elles ne puissent jamais diverger (ex. pi-0.0.28 → 0.0.28).

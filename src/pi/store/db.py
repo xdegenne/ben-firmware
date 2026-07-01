@@ -50,7 +50,13 @@ CREATE TABLE IF NOT EXISTS measurements (
     meter_ts      INTEGER,
     sent          INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_meas_pdl_ts   ON measurements(pdl_index, ts);
+-- Index COUVRANT (pdl_index, ts, papp) : la CTE d'agrégation de curve_buckets
+-- (AVG/MIN/MAX(papp) par bucket sur une plage) se résout alors ENTIÈREMENT depuis
+-- l'index, sans lookup table ligne par ligne — c'est le point chaud du /curve 7j
+-- (~640k lignes en standard → ~13 s). Supersede idx_meas_pdl_ts (dont (pdl_index,
+-- ts) est le préfixe), qu'on retire pour ne pas doubler le coût d'écriture.
+CREATE INDEX IF NOT EXISTS idx_meas_pdl_ts_papp ON measurements(pdl_index, ts, papp);
+DROP INDEX IF EXISTS idx_meas_pdl_ts;
 CREATE INDEX IF NOT EXISTS idx_meas_pdl_papp ON measurements(pdl_index, papp);
 CREATE INDEX IF NOT EXISTS idx_meas_sent     ON measurements(sent);
 
@@ -431,6 +437,25 @@ def _snap_bucket_sec(sec: int) -> int:
     return 86400 * ((sec + 86399) // 86400)  # au-delà d'un jour : multiples de 86400
 
 
+def producer(conn: sqlite3.Connection, pdl_index: int,
+             latest_inject_total: int | None = None) -> bool:
+    """True si le PDL a une injection CONSTATÉE — pilote la jauge bidir
+    soutirage/injection de l'app (Lot C). Deux signaux :
+      - EAIT cumulé > 0 : `inject_total` est un index monotone (croissant), donc
+        la DERNIÈRE valeur suffit (== MAX) → passée par `latest_inject_total`, zéro
+        requête ;
+      - un `papp` NET négatif déjà vu : en standard `papp` est signé (<0 = surplus
+        injecté). `MIN(papp)` est instantané via l'index (pdl_index, papp).
+    Volontairement PAS « EAIT présent » : un foyer anti-injection (cas A) déclare un
+    EAIT figé à 0 → jauge bidir inutile (cf. chantier-index-energie-bimode.md §inj)."""
+    if latest_inject_total and latest_inject_total > 0:
+        return True
+    row = conn.execute(
+        "SELECT MIN(papp) AS mp FROM measurements WHERE pdl_index=?", (pdl_index,)
+    ).fetchone()
+    return row is not None and row["mp"] is not None and row["mp"] < 0
+
+
 def curve_buckets(
     conn: sqlite3.Connection,
     pdl_index: int,
@@ -476,7 +501,9 @@ def curve_buckets(
         # pas de coût sur les vues agrégées. GROUP BY a.bucket dédoublonne un ts_max
         # éventuellement partagé.
         "SELECT a.ts AS ts, a.papp_avg, a.papp_min, a.papp_max, a.n, "
-        "       l.tariff AS tariff, l.base AS base, l.hchc AS hchc, l.hchp AS hchp "
+        "       l.tariff AS tariff, l.base AS base, l.hchc AS hchc, l.hchp AS hchp, "
+        "       l.index_id AS index_id, l.index_value AS index_value, "
+        "       l.src_standard AS src_standard, l.inject_total AS inject_total "
         "FROM agg a "
         "LEFT JOIN measurements l ON l.pdl_index=? AND l.ts=a.ts_max "
         "GROUP BY a.bucket ORDER BY a.bucket",
@@ -486,7 +513,15 @@ def curve_buckets(
     for r in rows:
         pt = {"ts": r["ts"], "papp": int(round(r["papp_avg"])),
               "tariff": r["tariff"], "base": r["base"], "hchc": r["hchc"],
-              "hchp": r["hchp"], "n": r["n"]}
+              "hchp": r["hchp"], "n": r["n"],
+              # Index GÉNÉRIQUE bi-mode (échantillon à ts_max, comme base/hchc/hchp).
+              # index_id = QUEL registre (histo: rang PTEC 0..0x0A ; standard: NTARF
+              # 1..10), index_value = sa valeur Wh. En STANDARD base/hchc/hchp sont
+              # NULL → seul (index_id, index_value) porte la conso. Le couple permet
+              # à l'app de reconstruire chaque registre (HC vs HP…) par carry-forward
+              # et de sommer (cf. chantier-index-energie-bimode.md §6, Lot C).
+              "index_id": r["index_id"], "index_value": r["index_value"],
+              "src_standard": r["src_standard"], "inject_total": r["inject_total"]}
         if with_minmax:
             pt["papp_min"] = r["papp_min"]
             pt["papp_max"] = r["papp_max"]
