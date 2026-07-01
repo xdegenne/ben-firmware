@@ -187,10 +187,18 @@ def _generic_cols(labels: dict) -> tuple:
     de labels, posées par le reader wired ou le récepteur LoRa. Absentes → NULL/0.
       _src_standard (0/1) · _index_id · _index_value · _inject_total · _meter_ts
     Cohabite avec base/hchc/hchp (double-écriture transitoire)."""
+    # Garde `index_value == 0 → NULL` : un index d'énergie cumulatif compteur n'est
+    # JAMAIS 0. Des `index_value=0` parasites (carry-forward EASF empoisonné côté
+    # émetteur — cf. chantier-index-energie-bimode / fix Arduino) polluaient la
+    # donnée BRUTE (courbe, /measurements) au-delà de /consumption. On les normalise
+    # en NULL à l'écriture → base propre pour tous les lecteurs (+ futur cloud).
+    index_value = labels.get("_index_value")
+    if index_value == 0:
+        index_value = None
     return (
         int(labels.get("_src_standard", 0) or 0),
         labels.get("_index_id"),
-        labels.get("_index_value"),
+        index_value,
         labels.get("_inject_total"),
         labels.get("_meter_ts"),
     )
@@ -549,13 +557,18 @@ def consumption(
     applique le prix : `Σ wh_r × prix_r` — prix moyen unique aujourd'hui ; **par
     registre à terme** (coût à l'euro près, rétroactif) sans changer ce contrat.
     Cf. `docs/chantier-index-energie-bimode.md` §6-7."""
+    # `> 0` (et pas `IS NOT NULL`) : un index d'énergie cumulatif compteur n'est
+    # JAMAIS 0 (le Linky tourne depuis des années). Des `index_value=0` parasites
+    # (trame LoRa dont l'EASF a sauté / keyframe avant 1re lecture → carry-forward
+    # non encore amorcé) polluaient sinon le MIN → `MAX-MIN` = l'index ABSOLU
+    # (~15 MWh → coût délirant). Les exclure rend le calcul robuste.
     rows = conn.execute(
         "SELECT src_standard, COALESCE(index_id, tariff) AS reg, "
         "       MAX(COALESCE(index_value, base, hchc, hchp)) - "
         "       MIN(COALESCE(index_value, base, hchc, hchp)) AS wh "
         "FROM measurements "
         "WHERE pdl_index=? AND ts>=? AND ts<=? "
-        "      AND COALESCE(index_value, base, hchc, hchp) IS NOT NULL "
+        "      AND COALESCE(index_value, base, hchc, hchp) > 0 "
         "GROUP BY src_standard, reg",
         (pdl_index, since, until),
     ).fetchall()
