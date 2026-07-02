@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.52"
+        latest: "0.0.53"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -150,6 +150,9 @@ devices:
           - version: "0.0.52"
             released: "2026-07-02"
             notes: "Deux ajouts Pi-side, low-risk. (1) CHECKPOINT WAL périodique : db.prune() fait PRAGMA wal_checkpoint(TRUNCATE) (~1×/h) → le fichier -wal, qui ne se tronque jamais seul (observé 392 Mo sur ben-0001 → ralentit toutes les lectures), reste borné. Maintenance pure, aucune donnée modifiée. (2) INSTRUMENTATION index=0 : le récepteur logge un WARNING greppable INDEX0 (batch_seq/NTARF/rssi/snr/gap) quand l'émetteur envoie un keyframe index_value=0 → capture le contexte de la cause racine (carry-forward EASF empoisonné côté Arduino, à corréler). AUCUNE migration. Transition = restart ben-local-api + ben-lora-receiver."
+          - version: "0.0.53"
+            released: "2026-07-02"
+            notes: "MIGRATION backfill index générique legacy. db.connect() dérive index_id/index_value de tariff + base/hchc/hchp pour les vieilles lignes histo (index_value NULL, d'avant que le reader ne peuple la générique en pi-0.0.43). Sans ça /consumption fait COALESCE(index_value,base,hchc,hchp) qui écrase HC et HP dans une seule colonne → sur-comptage (~+30 % mesuré sur legacy HC/HP, ben-0003 : 43486 au lieu de 33252 Wh sur 7j). ONE-SHOT via user_version, idempotent. UPDATE en masse au 1er db.connect du reader après MAJ (~qq s ; ben-0001 ~315k lignes) → démarrage un peu plus lent cette fois-là. Données non perdues, index_value peuplé. Transition = restart ben-lora-receiver + ben-local-api."
       arduino:
         minimum: "0.0.1"
         latest: "0.0.7"
@@ -178,7 +181,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.52"
+        latest: "0.0.53"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -312,6 +315,9 @@ devices:
           - version: "0.0.52"
             released: "2026-07-02"
             notes: "CHECKPOINT WAL périodique : db.prune() fait PRAGMA wal_checkpoint(TRUNCATE) (~1×/h) → le fichier -wal (qui ne se tronque jamais seul) reste borné, accélère les lectures ; le tic-reader wired exécute prune → bénéficie du fix. Maintenance pure, aucune donnée modifiée. (L'instrumentation INDEX0 de pi0-lora est côté récepteur LoRa → sans objet en wired.) AUCUNE migration. Transition = restart ben-tic-reader + ben-local-api."
+          - version: "0.0.53"
+            released: "2026-07-02"
+            notes: "MIGRATION backfill index générique legacy (idem pi0-lora). db.connect() dérive index_id/index_value de tariff + base/hchc/hchp pour les vieilles lignes histo (index_value NULL). Corrige /consumption sur legacy HC/HP (sur-comptage ~+30 % sinon : ben-0003 43486 au lieu de 33252 Wh/7j). ONE-SHOT via user_version, idempotent. UPDATE en masse au 1er db.connect du tic-reader après MAJ (~qq s ; ben-0003 ~241k lignes). Données non perdues, index_value peuplé. Transition = restart ben-tic-reader + ben-local-api."
 
 updates:
 
@@ -487,6 +493,10 @@ updates:
       to: "0.0.52"
       tag: "pi-0.0.52"
       script: "updates/pi0-lora/0.0.51_to_0.0.52/update.sh"
+    - from: "0.0.52"
+      to: "0.0.53"
+      tag: "pi-0.0.53"
+      script: "updates/pi0-lora/0.0.52_to_0.0.53/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -653,6 +663,10 @@ updates:
       to: "0.0.52"
       tag: "pi-0.0.52"
       script: "updates/pi0-wired/0.0.51_to_0.0.52/update.sh"
+    - from: "0.0.52"
+      to: "0.0.53"
+      tag: "pi-0.0.53"
+      script: "updates/pi0-wired/0.0.52_to_0.0.53/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet

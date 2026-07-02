@@ -145,6 +145,20 @@ def connect(path: str = DB_PATH, *, read_only: bool = False) -> sqlite3.Connecti
         # Le standard ne fournit pas ISOUSC (A) mais PREF (kVA) ; on stocke brut, /live arbitre.
         if "pref" not in lvl_cols:
             conn.execute("ALTER TABLE level_profile ADD COLUMN pref INTEGER")
+        # Backfill index GÉNÉRIQUE de la donnée LEGACY histo (index_value NULL, d'avant
+        # que le reader ne peuple la générique en pi-0.0.43) : dérivé de `tariff` +
+        # base/hchc/hchp. Sans lui, /consumption fait COALESCE(index_value,base,hchc,hchp)
+        # qui écrase HC et HP dans une seule colonne (hchc) → registres mal calculés
+        # (sur-comptage ~+30 % mesuré sur legacy HC/HP, ben-0003). ONE-SHOT via
+        # user_version : les écritures récentes peuplent déjà index_value → jamais
+        # de re-run. UPDATE en masse une fois (~qq s sur grosse base, au 1er boot post-MAJ).
+        if conn.execute("PRAGMA user_version").fetchone()[0] < 1:
+            conn.execute(
+                "UPDATE measurements SET index_id = tariff, "
+                "index_value = CASE tariff WHEN 0 THEN base WHEN 1 THEN hchc "
+                "                          WHEN 2 THEN hchp END "
+                "WHERE src_standard=0 AND index_value IS NULL AND tariff IS NOT NULL")
+            conn.execute("PRAGMA user_version = 1")
         conn.commit()
     conn.row_factory = sqlite3.Row
     return conn
