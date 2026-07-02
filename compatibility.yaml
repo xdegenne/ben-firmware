@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.51"
+        latest: "0.0.52"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -147,6 +147,9 @@ devices:
           - version: "0.0.51"
             released: "2026-07-01"
             notes: "Robustesse aux index_value=0 parasites. Un index compteur cumulatif n'est JAMAIS 0 ; des index_value=0 (carry-forward EASF empoisonné côté émetteur — cause racine à confirmer, cf. chantier Arduino) faisaient renvoyer par /consumption l'index ABSOLU (MAX-MIN, ~15 MWh → coût délirant, ex. 2957 €/jour). db.py : /consumption filtre COALESCE(...) > 0 (au lieu de IS NOT NULL) ; écriture (_generic_cols) normalise index_value=0 → NULL (donnée BRUTE propre : courbe, /measurements, futur cloud). AUCUNE migration (garde en lecture + normalisation des nouvelles écritures ; les 0 déjà stockés restent mais /consumption les ignore). Transition = restart ben-local-api + ben-lora-receiver."
+          - version: "0.0.52"
+            released: "2026-07-02"
+            notes: "Deux ajouts Pi-side, low-risk. (1) CHECKPOINT WAL périodique : db.prune() fait PRAGMA wal_checkpoint(TRUNCATE) (~1×/h) → le fichier -wal, qui ne se tronque jamais seul (observé 392 Mo sur ben-0001 → ralentit toutes les lectures), reste borné. Maintenance pure, aucune donnée modifiée. (2) INSTRUMENTATION index=0 : le récepteur logge un WARNING greppable INDEX0 (batch_seq/NTARF/rssi/snr/gap) quand l'émetteur envoie un keyframe index_value=0 → capture le contexte de la cause racine (carry-forward EASF empoisonné côté Arduino, à corréler). AUCUNE migration. Transition = restart ben-local-api + ben-lora-receiver."
       arduino:
         minimum: "0.0.1"
         latest: "0.0.7"
@@ -175,7 +178,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.51"
+        latest: "0.0.52"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -306,6 +309,9 @@ devices:
           - version: "0.0.51"
             released: "2026-07-01"
             notes: "Idem pi0-lora : robustesse aux index_value=0 parasites. db.py : /consumption filtre COALESCE(...) > 0 ; écriture (_generic_cols) normalise index_value=0 → NULL. Corrige le coût délirant (index absolu ~15 MWh renvoyé par MAX-MIN). AUCUNE migration. Transition = restart ben-tic-reader + ben-local-api."
+          - version: "0.0.52"
+            released: "2026-07-02"
+            notes: "CHECKPOINT WAL périodique : db.prune() fait PRAGMA wal_checkpoint(TRUNCATE) (~1×/h) → le fichier -wal (qui ne se tronque jamais seul) reste borné, accélère les lectures ; le tic-reader wired exécute prune → bénéficie du fix. Maintenance pure, aucune donnée modifiée. (L'instrumentation INDEX0 de pi0-lora est côté récepteur LoRa → sans objet en wired.) AUCUNE migration. Transition = restart ben-tic-reader + ben-local-api."
 
 updates:
 
@@ -477,6 +483,10 @@ updates:
       to: "0.0.51"
       tag: "pi-0.0.51"
       script: "updates/pi0-lora/0.0.50_to_0.0.51/update.sh"
+    - from: "0.0.51"
+      to: "0.0.52"
+      tag: "pi-0.0.52"
+      script: "updates/pi0-lora/0.0.51_to_0.0.52/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -639,6 +649,10 @@ updates:
       to: "0.0.51"
       tag: "pi-0.0.51"
       script: "updates/pi0-wired/0.0.50_to_0.0.51/update.sh"
+    - from: "0.0.51"
+      to: "0.0.52"
+      tag: "pi-0.0.52"
+      script: "updates/pi0-wired/0.0.51_to_0.0.52/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet

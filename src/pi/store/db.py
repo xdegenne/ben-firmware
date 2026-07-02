@@ -587,4 +587,13 @@ def prune(conn: sqlite3.Connection, retention_days: int = RETENTION_DAYS) -> dic
     m = conn.execute("DELETE FROM measurements WHERE ts < ?", (cutoff,)).rowcount
     l = conn.execute("DELETE FROM lora_link WHERE ts < ?", (cutoff,)).rowcount
     conn.commit()
+    # Checkpoint WAL TRUNCATE (maintenance ~horaire via _maybe_prune) : le fichier
+    # `-wal` ne se tronque JAMAIS seul (grossit à son high-water mark → observé
+    # 392 Mo sur ben-0001, ce qui ralentit toutes les lectures). On rapatrie les
+    # frames dans la base et on remet le fichier à 0. Sur la connexion WRITER
+    # (prune) → aucune contention. Aucune donnée modifiée (pure maintenance).
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.OperationalError:
+        pass  # un lecteur tient un vieux snapshot → retenté au prochain prune
     return {"measurements": m, "lora_link": l}

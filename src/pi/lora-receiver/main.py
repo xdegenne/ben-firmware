@@ -510,6 +510,18 @@ def on_recv_curve(raw, rssi, snr, pdl_index, now, time_since_prev) -> None:
     if event:
         log.info(f"EVENT {event} {details}")
 
+    # INDEX0 — instrumentation cause racine : l'émetteur a envoyé un keyframe
+    # index_value=0 (carry-forward EASF empoisonné côté Arduino, cf. chantier
+    # reflash Arduino). Le récepteur ne voit PAS la ligne EASF brute (elle est sur
+    # l'Arduino) ; on logue le CONTEXTE (greppable "INDEX0") pour corréler l'épisode :
+    # gap radio ? bascule NTARF ? lien marginal (rssi/snr) ? Rare (~0-2 batchs/j).
+    if index_value == 0:
+        log.warning(
+            f"INDEX0 keyframe index_value=0 batch_seq={batch_seq} NTARF={index_id} "
+            f"n={decoded['n']} papp[0]={papp[0]} papp[-1]={papp[-1]} "
+            f"rssi={rssi} snr={snr} dt_prev={time_since_prev} "
+            f"event={event or '-'} {details or ''}")
+
     # Stockage : un row par échantillon. L'index actif est CONSTANT sur le batch (l'Arduino
     # coupe au changement d'index) → estampillé sur CHAQUE row (curve_buckets JOIN ts_max →
     # jamais d'index NULL). Colonnes GÉNÉRIQUES (_src_standard/_index_id/_index_value) +
