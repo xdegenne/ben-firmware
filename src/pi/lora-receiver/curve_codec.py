@@ -41,6 +41,7 @@ MIN_FRAME_LEN = KEYFRAME_LEN + HMAC_LEN  # 28 octets : keyframe (N=1, 0 delta) +
 FLAG_TS_VALID = 0x10
 FLAG_SRC_STANDARD = 0x20
 FLAG_HAS_EXT = 0x40
+FLAG_EXT_V2 = 0x80   # bit7 : bloc ext v2 (bitmask ext_fields) — EAIT / LTARF / DIAG index=0
 
 PAPP_MAX = 0xFFFF  # PAPP est un uint16 côté émetteur
 
@@ -69,6 +70,17 @@ def _read_varint(buf, pos):
 def _unzigzag(u):
     """Décode le zig-zag (mappe non-signé → signé : 0,1,2,3,… → 0,-1,1,-2,…)."""
     return (u >> 1) ^ -(u & 1)
+
+
+def _read_str(buf, pos):
+    """Lit un champ `[len:1][ascii:len]` → (str, new_pos). Lève si tronqué."""
+    if pos >= len(buf):
+        raise CurveDecodeError("ext : champ chaîne tronqué (longueur absente)")
+    n = buf[pos]
+    pos += 1
+    if pos + n > len(buf):
+        raise CurveDecodeError("ext : champ chaîne tronqué (ascii)")
+    return buf[pos:pos + n].decode("ascii", errors="replace").strip(), pos + n
 
 
 def decode_v04(payload: bytes, key: bytes) -> dict:
@@ -121,13 +133,32 @@ def decode_v04(payload: bytes, key: bytes) -> dict:
             raise CurveDecodeError(f"PAPP reconstruite hors bornes : {v}")
         papp.append(v)
 
-    # 4) Bloc extension (has_ext=1) en signed[pos:] : énergie injectée totale EAIT (uint32 LE).
+    # 4) Bloc extension v2 en signed[pos:] (flag bit7) : [ext_fields:1] puis, dans l'ordre
+    #    des bits — bit0 EAIT (uint32 LE), bit1 LTARF ([len][ascii]), bit2 DIAG index=0
+    #    ([n_ht:1][len][ascii]). Un seul émetteur LoRa (ben-0001), reflashé de façon coordonnée
+    #    avec le récepteur → PAS de rétro-compat de format de trame (on ne parse que le v2).
     inject_total = None
-    if flags & FLAG_HAS_EXT:
-        if pos + 4 > len(signed):
-            raise CurveDecodeError("bloc extension tronqué (has_ext mais < 4 octets)")
-        inject_total = struct.unpack_from("<I", signed, pos)[0]
-        pos += 4
+    ltarf = None
+    diag = None
+    if flags & FLAG_EXT_V2:
+        if pos >= len(signed):
+            raise CurveDecodeError("ext v2 : ext_fields absent")
+        ext_fields = signed[pos]
+        pos += 1
+        if ext_fields & 0x01:                       # EAIT
+            if pos + 4 > len(signed):
+                raise CurveDecodeError("ext v2 : EAIT tronqué")
+            inject_total = struct.unpack_from("<I", signed, pos)[0]
+            pos += 4
+        if ext_fields & 0x02:                       # LTARF (label tarif courant)
+            ltarf, pos = _read_str(signed, pos)
+        if ext_fields & 0x04:                       # DIAG index=0 (capture ligne EASF brute)
+            if pos >= len(signed):
+                raise CurveDecodeError("ext v2 : DIAG tronqué (n_ht absent)")
+            n_ht = signed[pos]
+            pos += 1
+            raw, pos = _read_str(signed, pos)
+            diag = {"n_ht": n_ht, "raw": raw}
 
     return {
         "version": version,
@@ -144,6 +175,8 @@ def decode_v04(payload: bytes, key: bytes) -> dict:
         "ts_season": ts_season,
         "ts_raw": ts_raw,
         "inject_total": inject_total,   # Wh injectés (standard producteur) ou None
+        "ltarf": ltarf,                 # libellé tarif courant (ext v2) ou None
+        "diag": diag,                   # {n_ht, raw} capture index=0 (ext v2) ou None
         "papp": papp,
         "sample_dt_s": sample_dt_s,     # dt par point en s (v0x05 réel ; v0x04 = period_ds/10 uniforme)
     }

@@ -119,6 +119,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._curve(qs)
             if path == "/consumption":
                 return self._consumption(qs)
+            if path == "/registers":
+                return self._registers(qs)
             if path == "/lora-link":
                 return self._lora_link(qs)
             if path == "/settings":
@@ -293,6 +295,13 @@ class Handler(BaseHTTPRequestHandler):
                     row["maxVa"] = from_pref or from_isousc
                 else:
                     row["maxVa"] = from_isousc or from_pref
+                # Libellé tarifaire EN COURS (jauge HP/HC) — résolu côté serveur :
+                # standard→LTARF autoritatif, histo→convention PTEC. None → l'app garde
+                # sa propre convention (rétro-compat). Cf. chantier unification labels.
+                row["tariff_label"] = db.resolve_label(
+                    conn, row["pdl_index"], row.get("src_standard"), row.get("index_id"))
+                # Contrat (NGTF, quasi-statique) — distinct du tarif en cours ci-dessus.
+                row["contract"] = db.get_ngtf(conn, row["pdl_index"])
         self._send(rows)
 
     def _measurements(self, qs):
@@ -367,6 +376,17 @@ class Handler(BaseHTTPRequestHandler):
         with db.connect(read_only=True) as conn:
             res = db.consumption(conn, pdl, since, until)
         self._send({"pdl_index": pdl, "since": since, "until": until, **res})
+
+    def _registers(self, qs):
+        """Registres tarifaires d'un PDL (libellé résolu server-side + dernier index).
+        Sert la carte réglages de l'app — un registre par tarif (Base / HC / HP…)."""
+        pdl = _int(qs, "pdl_index")
+        if pdl is None:
+            return self._send({"error": "pdl_index_required"}, 400)
+        with db.connect(read_only=True) as conn:
+            regs = db.registers(conn, pdl)
+            contract = db.get_ngtf(conn, pdl)   # NGTF = le contrat (calendrier fournisseur)
+        self._send({"pdl_index": pdl, "contract": contract, "registers": regs})
 
     def _lora_link(self, qs):
         pdl = _int(qs, "pdl_index")

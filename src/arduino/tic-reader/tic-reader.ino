@@ -87,8 +87,9 @@
 // ---------------------------------------------------------------------------
 #define PROTOCOL_VERSION_BOOT  0x01   // trame d'identité (ADCO)
 #define PROTOCOL_VERSION_CURVE 0x05   // trame courbe batchée (v0x05 : dt par point)
-#define FW_VERSION             "0.0.7"  // version firmware, échoée au boot (debug / confirmation flash)
-#define BOOT_PAYLOAD_LEN       20     // v0x01 : version + ADCO(12), padding
+#define FW_VERSION             "0.0.9"  // version firmware, échoée au boot (debug / confirmation flash)
+#define BOOT_PAYLOAD_LEN       20     // v0x01 : version + ADCO(12) + ISOUSC + PREF, padding jusqu'à 20 (rétro)
+#define BOOT_MAX_LEN           32     // v0x01 étendu : + NGTF [len:1][ascii:≤16] = 15 + 1 + 16
 #define HMAC_LEN                8
 
 // Courbe v0x04
@@ -129,6 +130,7 @@
 #define FLAG_TS_VALID    0x10   // octets 13-19 (horodate compteur) valides
 #define FLAG_SRC_STANDARD 0x20  // 0=historique, 1=standard ; dit aussi de lire papp en int16 signé
 #define FLAG_HAS_EXT     0x40   // bloc extension présent (EAIT injecté, 4 o)
+#define FLAG_EXT_V2      0x80   // bloc ext v2 (bitmask ext_fields : bit0 EAIT, bit1 LTARF) — récepteur ≥ pi-0.0.54
 
 // ---------------------------------------------------------------------------
 // Modes TIC (Enedis-NOI-CPT_54E) + auto-détection
@@ -181,8 +183,11 @@ static bool     curveActive  = false;
 static uint8_t  curveIndexId = IDX_UNKNOWN;  // index_id du batch courant (homogène)
 static bool     curveHasInject = false;      // batch standard producteur → bloc ext EAIT
 static uint32_t curveEait     = 0;           // EAIT au keyframe (Wh) — écrit dans le bloc ext
+static char     curveLtarf[17] = {0};        // LTARF capté au keyframe (ext v2 bit1) si NTARF a changé
+static bool     curveSendLtarf = false;      // ce batch doit-il transporter LTARF ?
 static uint8_t  lastSentIsousc = 0;          // dernier ISOUSC émis (v0x01) → ré-émet sur changement
 static uint8_t  lastSentPref   = 0;          // dernier PREF émis (v0x01, standard) → ré-émet sur changement
+static uint16_t lastSentNgtfHash = 0;        // hash du dernier NGTF émis (v0x01) → détecte le changement fournisseur (économe RAM vs stocker la chaîne)
 static uint16_t batch_seq    = 0;     // RAM, reset au boot, +1/batch
 static unsigned long curveT0 = 0;     // millis() du début de batch (flush périodique)
 static uint32_t curveLastOffSec = 0;  // histo : offset cumulé (s) du dernier point vs curveT0 (dt v0x05)
@@ -193,6 +198,7 @@ static uint8_t  ticMode      = MODE_HISTO;
 static uint8_t  consecFail   = 0;
 static uint32_t lastStdIndex = 0;     // standard : dernier EASF[NTARF] vu (carry-forward)
 static uint8_t  lastNtarf    = 0;     // standard : dernier NTARF vu (carry-forward)
+static uint8_t  ltarfSentForNtarf = 0;  // standard : NTARF dont le LTARF a été transmis (dédup ext LTARF)
 
 // ---------------------------------------------------------------------------
 // TIC values
@@ -241,6 +247,8 @@ struct TICValues {
   uint32_t eait;          // énergie active injectée totale (Wh) — producteur
   bool     has_inject;    // EAIT présent (foyer producteur)
   char     ts[14];        // horodate DATE "SAAMMJJhhmmss" (saison + 12 chiffres)
+  char     ltarf[17];     // libellé tarif EN COURS (standard, LTARF) — label du registre actif
+  char     ngtf[17];      // nom du calendrier tarifaire fournisseur (standard, NGTF) — quasi-statique
 };
 
 // ---------------------------------------------------------------------------
@@ -474,6 +482,8 @@ static void parseTICLineStd(char* line, uint8_t len, TICValues& v) {
   }
   else if (!strcmp(name, "EAIT")) { v.eait = strtoul(val, 0, 10); v.has_inject = true; }
   else if (!strcmp(name, "PREF")) v.pref = (uint8_t)strtoul(val, 0, 10);  // abonnement std (kVA)
+  else if (!strcmp(name, "LTARF")) strncpy(v.ltarf, val, sizeof(v.ltarf) - 1);  // libellé tarif courant
+  else if (!strcmp(name, "NGTF"))  strncpy(v.ngtf,  val, sizeof(v.ngtf)  - 1);  // calendrier tarifaire fournisseur
   else if (!strcmp(name, "DATE")) {              // horodatée, donnée vide → horodate = champ 2
     if (n >= 3) { line[ht[1]] = 0; strncpy(v.ts, line + ht[0] + 1, sizeof(v.ts) - 1); }
   }
@@ -607,17 +617,40 @@ bool isVoltageSufficient() {
 // ---------------------------------------------------------------------------
 // Trame boot (version=0x01) : ADCO octets 1-12, ISOUSC (A, histo) octet 13, PREF (kVA, std) octet 14.
 // Chiffrement PDL : sujet separe, a traiter ulterieurement.
-void sendBootFrame(const char* adco, uint8_t isousc, uint8_t pref) {
-  uint8_t buf[BOOT_PAYLOAD_LEN];
-  memset(buf, 0, BOOT_PAYLOAD_LEN);
+// Hash 16 bits (djb2-xor) pour détecter un changement de chaîne (NGTF) sans la stocker.
+static uint16_t strhash16(const char* s) {
+  uint16_t h = 5381;
+  while (*s) h = (uint16_t)(((h << 5) + h) ^ (uint8_t)*s++);
+  return h;
+}
+
+// Contrat (calendrier tarifaire) mode-agnostique pour la trame boot : NGTF en STANDARD,
+// OPTARIF en HISTORIQUE. Le récepteur le stocke comme « contrat » (level_profile.ngtf).
+static const char* contractOf(const TICValues& v) {
+  return (ticMode == MODE_STANDARD) ? v.ngtf : v.optarif;
+}
+
+void sendBootFrame(const char* adco, uint8_t isousc, uint8_t pref, const char* ngtf) {
+  uint8_t buf[BOOT_MAX_LEN];
+  memset(buf, 0, sizeof(buf));
   buf[0] = PROTOCOL_VERSION_BOOT;
   memcpy(buf + 1, adco, 12);
   buf[13] = isousc;          // octet 13 = ISOUSC (A, histo)     ; 0 = absent
   buf[14] = pref;            // octet 14 = PREF   (kVA, standard) ; 0 = absent (chantier ISOUSC std)
+  uint16_t len = BOOT_PAYLOAD_LEN;                // défaut 20 (rétro : padding jusqu'à 20)
+  // NGTF (calendrier tarifaire fournisseur, std) : octet 15 = longueur, 16.. = ascii
+  // (0/absent → padding, len reste 20). Récepteur ≥ pi-0.0.54 lit [15]=len puis l'ascii.
+  uint8_t nl = ngtf ? strlen(ngtf) : 0;
+  if (nl > 16) nl = 16;
+  if (nl) {
+    buf[15] = nl;
+    memcpy(buf + 16, ngtf, nl);
+    len = 16 + nl;
+  }
 
   if (loraOk) {
     driver.setModeIdle();
-    manager.sendtoWait(buf, BOOT_PAYLOAD_LEN, SERVER_ADDRESS);
+    manager.sendtoWait(buf, len, SERVER_ADDRESS);
     blinkRGB(0, 0, 255);  // bleu = boot frame envoyee
     driver.sleep();
   }
@@ -645,7 +678,8 @@ void curveStart(const TICValues& v, uint8_t id, uint32_t value) {
     flags = FLAG_SRC_STANDARD;
     tsValid = (v.ts[0] == 'E' || v.ts[0] == 'H');   // saison MAJUSCULE = horloge fiable (≠ dégradé)
     if (tsValid)      flags |= FLAG_TS_VALID;
-    if (v.has_inject) flags |= FLAG_HAS_EXT;
+    // EAIT (injection) et LTARF passent par l'ext v2 (flag bit7), posé dans curveFlush
+    // selon ce qui est présent — plus via FLAG_HAS_EXT (bit6, legacy retiré).
   } else {
     flags = buildFlags(v);                  // bits 0-3 ; bits 4/5/6 = 0 en historique
   }
@@ -672,6 +706,10 @@ void curveStart(const TICValues& v, uint8_t id, uint32_t value) {
   curveIndexId   = id;
   curveHasInject = (ticMode == MODE_STANDARD && v.has_inject);
   curveEait      = v.eait;
+  // LTARF (ext v2) : transporté quand le NTARF de ce batch diffère de celui déjà confirmé
+  // (dédup — le libellé est quasi-statique par NTARF). Le récepteur cache NTARF→LTARF.
+  curveSendLtarf = (ticMode == MODE_STANDARD && v.ltarf[0] && id != ltarfSentForNtarf);
+  if (curveSendLtarf) strncpy(curveLtarf, v.ltarf, sizeof(curveLtarf) - 1);
   curveT0         = millis();
   curveLastOffSec = 0;                                                 // histo : origine des dt (millis)
   curveLastTod    = (ticMode == MODE_STANDARD) ? todSeconds(v.ts) : 0; // standard : tod du keyframe (point 0)
@@ -715,7 +753,8 @@ void curveAdd(int32_t papp, const TICValues& v) {
   papp_prev = papp;
   curveN++;
   // marge worst-case = 2 varints de 3 o (dt + delta) = 6 ; -HMAC_LEN = signature ; -ext = bloc EAIT.
-  uint8_t extReserve = curveHasInject ? EXT_INJECT_LEN : 0;
+  // ext v2 worst-case : ext_fields(1) + EAIT(4) + [len(1)+LTARF(≤16)] = 22 o.
+  uint8_t extReserve = (curveHasInject || curveSendLtarf) ? (1 + EXT_INJECT_LEN + 1 + 16) : 0;
   if (curvePos >= CURVE_BUF_LEN - HMAC_LEN - extReserve - 6 || curveN >= CURVE_MAX_SAMPLES)
     curveFlush();
 }
@@ -737,11 +776,27 @@ void curveFlush() {
     curveBuf[12] = pds;   // N==1 (keyframe seul) → garde le nominal (période sans objet)
   }
 
-  // Bloc extension (entre les deltas et le HMAC) : EAIT injecté (uint32 LE, Wh).
-  // Posé seulement si FLAG_HAS_EXT (producteur standard) ; signé par le HMAC.
-  if (curveHasInject) {
-    memcpy(curveBuf + curvePos, &curveEait, EXT_INJECT_LEN);
-    curvePos += EXT_INJECT_LEN;
+  // Bloc extension v2 (entre les deltas et le HMAC ; signé par le HMAC). Flag bit7 +
+  // [ext_fields] puis, dans l'ordre des bits : bit0 EAIT (uint32 LE), bit1 LTARF ([len][ascii]).
+  {
+    uint8_t ext_fields = 0;
+    if (curveHasInject) ext_fields |= 0x01;
+    if (curveSendLtarf) ext_fields |= 0x02;
+    if (ext_fields) {
+      curveBuf[1] |= FLAG_EXT_V2;                 // pose le bit7 (flags = curveBuf[1])
+      curveBuf[curvePos++] = ext_fields;
+      if (ext_fields & 0x01) {                    // EAIT
+        memcpy(curveBuf + curvePos, &curveEait, EXT_INJECT_LEN);
+        curvePos += EXT_INJECT_LEN;
+      }
+      if (ext_fields & 0x02) {                    // LTARF ([len][ascii])
+        uint8_t l = strlen(curveLtarf);
+        if (l > 16) l = 16;
+        curveBuf[curvePos++] = l;
+        memcpy(curveBuf + curvePos, curveLtarf, l);
+        curvePos += l;
+      }
+    }
   }
 
   uint8_t mac[32];
@@ -756,6 +811,9 @@ void curveFlush() {
     bool acked = manager.sendtoWait(curveBuf, len, SERVER_ADDRESS);
     blinkRGB(40, 40, 40, 30);          // blanc bref = batch courbe ÉMIS en LoRa
     if (acked) blinkRGB(0, 60, 0, 40); // vert = ACK reçu du récepteur
+    // LTARF confirmé livré pour ce NTARF → on ne le re-transmet plus (jusqu'à changement de
+    // NTARF). Pas d'ACK → curveSendLtarf reste vrai au prochain batch = re-transmission (robuste).
+    if (curveSendLtarf && acked) ltarfSentForNtarf = curveIndexId;
     driver.sleep();
   }
 
@@ -837,9 +895,10 @@ void loop() {
     persistMode(ticMode);
     TICValues v0;                     // une trame du bon mode pour l'identité (ADCO/ADSC + ISOUSC)
     if (readAndParseTIC(v0, ticMode) && v0.adco[0] != 0) {
-      sendBootFrame(v0.adco, v0.isousc, v0.pref);
+      sendBootFrame(v0.adco, v0.isousc, v0.pref, contractOf(v0));
       lastSentIsousc = v0.isousc;
       lastSentPref = v0.pref;
+      lastSentNgtfHash = strhash16(contractOf(v0));
     }
     firstFrame = false;
     return;
@@ -860,14 +919,17 @@ void loop() {
   consecFail = 0;
   blinkRGB(0, 0, 40, 8);               // bleu bref = trame TIC lue (heartbeat lecture)
 
-  // Abonnement (statique) : si ISOUSC (histo, A) OU PREF (standard, kVA) change, ré-émettre
-  // la trame d'identité v0x01 (octet 13 = ISOUSC, octet 14 = PREF ; 0 = absent dans le mode courant).
+  // Métadonnées contrat (statiques) : ré-émettre la trame d'identité v0x01 si ISOUSC (histo, A)
+  // OU PREF (standard, kVA) OU le CONTRAT (NGTF en standard / OPTARIF en histo) change. Un
+  // changement de contrat = nouvelle époque tarifaire côté serveur (segmentation des registres).
   if (v.adco[0] != 0 &&
       ((v.isousc != 0 && v.isousc != lastSentIsousc) ||
-       (v.pref   != 0 && v.pref   != lastSentPref))) {
-    sendBootFrame(v.adco, v.isousc, v.pref);
+       (v.pref   != 0 && v.pref   != lastSentPref) ||
+       (contractOf(v)[0] && strhash16(contractOf(v)) != lastSentNgtfHash))) {
+    sendBootFrame(v.adco, v.isousc, v.pref, contractOf(v));
     lastSentIsousc = v.isousc;
     lastSentPref = v.pref;
+    lastSentNgtfHash = strhash16(contractOf(v));
   }
 
   // --- Sélection index + garde, par mode -----------------------------------------------
@@ -884,6 +946,11 @@ void loop() {
       if (v.easf_seen & (1 << (v.ntarf - 1))) lastStdIndex = v.easf[v.ntarf - 1];  // maj carry-forward EASF
     }
     if (lastNtarf < 1 || lastNtarf > 10) return;                  // NTARF jamais vu → skip silencieux
+    // Cold-start (reboot) : NTARF vu mais EASF actif pas encore capturé (1re trame tronquée /
+    // checksum) → lastStdIndex=0. Ne PAS démarrer la courbe sur un index 0 (sinon la keyframe
+    // fige 0 pour tout le batch). On saute cette trame → le batch démarrera à la trame suivante
+    // avec le vrai index. Coût : au pire 1 point PAPP par reboot (cf. instrumentation INDEX0).
+    if (lastStdIndex == 0) return;
     id = lastNtarf;
     value = lastStdIndex;
   } else {

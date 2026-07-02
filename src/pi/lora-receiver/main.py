@@ -78,6 +78,7 @@ RFM95_RST_PIN      = 17
 # ---------------------------------------------------------------------------
 PROTOCOL_VERSION = 0x02
 PAYLOAD_LEN      = 20
+BOOT_MAX_LEN     = 32   # v0x01 étendu : version + ADCO(12) + ISOUSC + PREF + NGTF([len]+≤16)
 HMAC_OFFSET      = 12
 HMAC_LEN         = 8
 
@@ -324,9 +325,10 @@ def on_recv(payload) -> None:
             on_recv_curve(raw, rssi, snr, pdl_index, now, time_since_prev)
             return
 
-        # v0x01 (boot) et v0x02 (mesure) sont à longueur fixe (20 o).
-        if len(raw) != PAYLOAD_LEN:
-            log.error(f"Longueur incorrecte : {len(raw)} octets, {PAYLOAD_LEN} attendus")
+        # v0x02 (mesure) = 20 o fixe ; v0x01 (boot) = VARIABLE 15..32 (extension NGTF). On borne
+        # large ; le dispatch par version lit ensuite les bons offsets (et v0x02 est validé HMAC).
+        if len(raw) < 15 or len(raw) > BOOT_MAX_LEN:
+            log.error(f"Longueur invalide : {len(raw)} octets (attendu 15..{BOOT_MAX_LEN})")
             blink_rgb(30, 0, 0, 0.3, bypass=True)  # rouge — erreur proto
             return
 
@@ -364,6 +366,16 @@ def on_recv(payload) -> None:
                                  f"(maxVa≈{pref * 1000} VA) pdl_index={pdl_index}")
                 except Exception as e:
                     log.warning(f"store: record_pref échoué: {e}")
+            # NGTF (nom du calendrier tarifaire fournisseur, standard) : octet 15 = longueur,
+            # 16.. = ascii (0/absent = ancien émetteur → trame 20 o padding). Chantier labels :
+            # sert à segmenter les registres au changement de fournisseur. record_ngtf on-change.
+            if len(raw) > 15 and raw[15] and measurements_db is not None:
+                ngtf = raw[16:16 + raw[15]].decode("ascii", errors="replace").strip()
+                try:
+                    if db.record_ngtf(measurements_db, pdl_index, ngtf):
+                        log.info(f"NGTF={ngtf!r} enregistré pdl_index={pdl_index}")
+                except Exception as e:
+                    log.warning(f"store: record_ngtf échoué: {e}")
             blink_rgb(30, 30, 30, 2.0)   # blanc long = discovery
             return
 
@@ -521,6 +533,24 @@ def on_recv_curve(raw, rssi, snr, pdl_index, now, time_since_prev) -> None:
             f"n={decoded['n']} papp[0]={papp[0]} papp[-1]={papp[-1]} "
             f"rssi={rssi} snr={snr} dt_prev={time_since_prev} "
             f"event={event or '-'} {details or ''}")
+
+    # LTARF (label tarif standard, ext v2) : cache NTARF→LTARF (write-on-change) → alimente
+    # la résolution de label serveur (/registers, /live.tariff_label). Chantier labels+index.
+    if decoded.get("ltarf") and measurements_db is not None:
+        try:
+            ngtf = db.get_ngtf(measurements_db, pdl_index) or ""   # contrat courant → scope du label
+            if db.record_tariff_label(measurements_db, pdl_index,
+                                      1 if src_standard else 0, index_id, decoded["ltarf"], ngtf):
+                log.info(f"LTARF NTARF={index_id} → {decoded['ltarf']!r} pdl_index={pdl_index}")
+        except Exception as e:
+            log.warning(f"store: record_tariff_label échoué: {e}")
+
+    # DIAG index=0 (ext v2) : capture Arduino de la ligne EASF brute mal parsée (ce que le
+    # récepteur ne voit PAS). On la logue → confirme/infirme l'edge de découpe HT (n_ht ≠ 2).
+    if decoded.get("diag"):
+        d = decoded["diag"]
+        log.warning(f"INDEX0-DIAG (source Arduino) batch_seq={batch_seq} NTARF={index_id} "
+                    f"n_ht={d['n_ht']} raw={d['raw']!r}")
 
     # Stockage : un row par échantillon. L'index actif est CONSTANT sur le batch (l'Arduino
     # coupe au changement d'index) → estampillé sur CHAQUE row (curve_buckets JOIN ts_max →

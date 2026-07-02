@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.53"
+        latest: "0.0.54"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -153,9 +153,12 @@ devices:
           - version: "0.0.53"
             released: "2026-07-02"
             notes: "MIGRATION backfill index générique legacy. db.connect() dérive index_id/index_value de tariff + base/hchc/hchp pour les vieilles lignes histo (index_value NULL, d'avant que le reader ne peuple la générique en pi-0.0.43). Sans ça /consumption fait COALESCE(index_value,base,hchc,hchp) qui écrase HC et HP dans une seule colonne → sur-comptage (~+30 % mesuré sur legacy HC/HP, ben-0003 : 43486 au lieu de 33252 Wh sur 7j). ONE-SHOT via user_version, idempotent. UPDATE en masse au 1er db.connect du reader après MAJ (~qq s ; ben-0001 ~315k lignes) → démarrage un peu plus lent cette fois-là. Données non perdues, index_value peuplé. Transition = restart ben-lora-receiver + ben-local-api."
+          - version: "0.0.54"
+            released: "2026-07-03"
+            notes: "Chantier « unification labels + contrat ». Récepteur LoRa : décode l'EXT COURBE v2 (flag bit7) = EAIT + LTARF (label tarif standard) + DIAG index=0 ; contrat NGTF (standard) / OPTARIF (histo) dans la trame boot v0x01 (octet 15 = longueur, 16.. = ascii ; borne relâchée 15..32 o). Résolution de label UNIFIÉE côté serveur (resolve_label : standard=LTARF autoritatif via tariff_labels / histo=convention statique HISTO_LABELS) + API : /live.tariff_label + /live.contract + nouvel endpoint /registers (registres + index par tarif + contrat). Stockage : table tariff_labels keyée (pdl,src,index_id,ngtf) — segmentée par CONTRAT — + colonne level_profile.ngtf. STRICTEMENT ADDITIF : aucun champ /live retiré ni renommé → app legacy inchangées, wired histo intact. MIGRATION idempotente au 1er db.connect (CREATE tariff_labels avec la nouvelle PK + ALTER level_profile.ngtf ; drop/recreate tariff_labels si ancienne PK). Transition = restart ben-lora-receiver + ben-local-api. NB : les nouveaux champs restent dormants tant que l'émetteur n'émet pas LTARF/contrat (arduino ≥ 0.0.9) — rétro-compatible (trames actuelles décodées à l'identique)."
       arduino:
         minimum: "0.0.1"
-        latest: "0.0.7"
+        latest: "0.0.9"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -177,11 +180,17 @@ devices:
           - version: "0.0.7"
             released: "2026-06-26"
             notes: "Chantier ISOUSC standard : l'émetteur parse PREF (puiss. de réf., kVA, mode standard) et le place dans la trame d'identité v0x01 (octet 14 ; octet 13 reste ISOUSC histo). Ré-émet le boot frame au démarrage ET sur changement d'abonnement (ISOUSC ou PREF). Rétro-compatible (octet de padding réservé ; récepteur < pi-0.0.48 ignore l'octet 14). minimum reste 0.0.1. À flasher avec le Pi en pi-0.0.48 (qui lit l'octet 14)."
+          - version: "0.0.8"
+            released: "2026-07-02"
+            notes: "Chantier labels + fix index=0. (1) GARDE index=0 : en standard, ne pas démarrer la courbe tant que lastStdIndex==0 (cold-start post-reboot : NTARF vu mais EASF pas encore capté → keyframe figée à 0 sur tout le batch) → on saute la trame, le batch démarre à la suivante avec le vrai index (au pire 1 point perdu). Cause confirmée par l'instrumentation INDEX0 (pi-0.0.52). (2) LTARF : parsé + transporté dans l'ext courbe v2 (flag bit7, ext_fields bit1), on-change de NTARF, dédup + re-tx jusqu'à ACK → label tarif standard autoritatif. (3) NGTF : parsé + ajouté à la trame boot v0x01 (octet 15 = len, 16.. = ascii). minimum reste 0.0.1. ⚠️ flasher APRÈS avoir déployé le Pi récepteur en pi-0.0.54 (qui décode l'ext v2 + la trame boot étendue). Rétro-compatible : un récepteur < pi-0.0.54 ignore l'ext v2 (frames décodées à l'identique)."
+          - version: "0.0.9"
+            released: "2026-07-03"
+            notes: "Contrat mode-agnostique dans la trame boot : contractOf(v) = NGTF en standard / OPTARIF en historique (le champ 'contrat' de la trame boot porte l'un ou l'autre selon le mode) → le récepteur le stocke comme contrat (level_profile.ngtf) quel que soit le mode. Complète 0.0.8 (qui n'envoyait NGTF qu'en standard). Aucun impact sur un émetteur standard (contractOf renvoie NGTF, identique à 0.0.8) — l'ajout OPTARIF ne sert qu'en histo. minimum reste 0.0.1. À flasher avec le Pi ≥ pi-0.0.54."
 
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.53"
+        latest: "0.0.54"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -318,6 +327,9 @@ devices:
           - version: "0.0.53"
             released: "2026-07-02"
             notes: "MIGRATION backfill index générique legacy (idem pi0-lora). db.connect() dérive index_id/index_value de tariff + base/hchc/hchp pour les vieilles lignes histo (index_value NULL). Corrige /consumption sur legacy HC/HP (sur-comptage ~+30 % sinon : ben-0003 43486 au lieu de 33252 Wh/7j). ONE-SHOT via user_version, idempotent. UPDATE en masse au 1er db.connect du tic-reader après MAJ (~qq s ; ben-0003 ~241k lignes). Données non perdues, index_value peuplé. Transition = restart ben-tic-reader + ben-local-api."
+          - version: "0.0.54"
+            released: "2026-07-03"
+            notes: "Chantier « unification labels + contrat », côté WIRED. main_uart lit LTARF + le contrat (NGTF en standard / OPTARIF en historique, mode-agnostique) directement dans la TIC et les stocke (tariff_labels keyée par contrat + level_profile.ngtf). Résolution de label UNIFIÉE côté serveur (resolve_label) + API : /live.tariff_label + /live.contract + nouvel endpoint /registers. STRICTEMENT ADDITIF : aucun champ retiré/renommé → app legacy inchangées ; histo intact (LTARF absent en histo → skip ; OPTARIF capté comme contrat). MIGRATION idempotente au 1er db.connect (CREATE tariff_labels + ALTER level_profile.ngtf). Transition = restart ben-tic-reader + ben-local-api."
 
 updates:
 
@@ -497,6 +509,10 @@ updates:
       to: "0.0.53"
       tag: "pi-0.0.53"
       script: "updates/pi0-lora/0.0.52_to_0.0.53/update.sh"
+    - from: "0.0.53"
+      to: "0.0.54"
+      tag: "pi-0.0.54"
+      script: "updates/pi0-lora/0.0.53_to_0.0.54/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -667,6 +683,10 @@ updates:
       to: "0.0.53"
       tag: "pi-0.0.53"
       script: "updates/pi0-wired/0.0.52_to_0.0.53/update.sh"
+    - from: "0.0.53"
+      to: "0.0.54"
+      tag: "pi-0.0.54"
+      script: "updates/pi0-wired/0.0.53_to_0.0.54/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet

@@ -199,6 +199,8 @@ def _parse_label(line: str, out: dict) -> None:
             pass
     elif name == "PTEC":
         out["PTEC"] = value
+    elif name == "OPTARIF":                     # option tarifaire = le CONTRAT (équiv. NGTF standard)
+        out["OPTARIF"] = value.strip()
     elif name == "DEMAIN":
         out["DEMAIN"] = value
     elif name == "IINST":
@@ -287,6 +289,8 @@ def _parse_label_std(line: str, out: dict) -> None:
         out["PREF"] = _std_int(data)
     elif name == "LTARF":                     # libellé tarif fournisseur en cours
         out["LTARF"] = data.strip()
+    elif name == "NGTF":                      # nom du calendrier tarifaire fournisseur
+        out["NGTF"] = data.strip()
     elif name == "VTIC":                      # version de la TIC (« 02 »)
         out["VTIC"] = data.strip()
     elif name == "DATE":                      # horodatée, donnée vide → horodate = 2e champ
@@ -550,6 +554,8 @@ last_flush = time.time()
 last_heartbeat = 0.0
 last_isousc: int | None = None  # garde RAM : record_isousc seulement sur changement
 last_pref: int | None = None    # garde RAM : record_pref (abonnement standard, kVA) sur changement
+last_ltarf: tuple | None = None # garde RAM : record_tariff_label (NTARF, LTARF) sur changement
+last_ngtf: str | None = None    # garde RAM : record_ngtf (calendrier fournisseur) sur changement
 
 
 def flush_batch() -> None:
@@ -619,6 +625,27 @@ try:
                     if db.record_pref(measurements_db, PDL_INDEX, pref):
                         log.info(f"PREF={pref} kVA enregistré (maxVa≈{pref * 1000} VA)")
                     last_pref = pref
+
+                # LTARF (libellé tarif standard AUTORITATIF) — cache NTARF→label, on-change.
+                # Le wired lit LTARF gratuitement dans la TIC standard (chantier unification labels).
+                ltarf = labels.get("LTARF")
+                ntarf_lbl = labels.get("NTARF")
+                # LTARF n'existe qu'en standard → le contrat associé = NGTF.
+                lt_key = (ntarf_lbl, ltarf, labels.get("NGTF"))
+                if (ltarf and ntarf_lbl and lt_key != last_ltarf
+                        and measurements_db is not None):
+                    if db.record_tariff_label(measurements_db, PDL_INDEX, 1, ntarf_lbl, ltarf,
+                                              labels.get("NGTF") or ""):
+                        log.info(f"LTARF NTARF={ntarf_lbl} → {ltarf!r} enregistré")
+                    last_ltarf = lt_key
+
+                # Contrat (calendrier tarifaire) — NGTF en standard, OPTARIF en historique.
+                # Mode-agnostique → level_profile.ngtf. On-change (changement fournisseur/offre).
+                contract = labels.get("NGTF") or labels.get("OPTARIF")
+                if contract and contract != last_ngtf and measurements_db is not None:
+                    if db.record_ngtf(measurements_db, PDL_INDEX, contract):
+                        log.info(f"Contrat={contract!r} enregistré")
+                    last_ngtf = contract
 
                 iinst  = labels.get("IINST")
                 papp   = labels.get("PAPP")

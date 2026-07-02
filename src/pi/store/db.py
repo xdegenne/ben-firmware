@@ -70,6 +70,16 @@ CREATE TABLE IF NOT EXISTS lora_link (
 CREATE INDEX IF NOT EXISTS idx_lora_pdl_ts ON lora_link(pdl_index, ts);
 CREATE INDEX IF NOT EXISTS idx_lora_sent   ON lora_link(sent);
 
+CREATE TABLE IF NOT EXISTS tariff_labels (
+    pdl_index    INTEGER NOT NULL,
+    src_standard INTEGER NOT NULL,
+    index_id     INTEGER NOT NULL,
+    ngtf         TEXT    NOT NULL DEFAULT '',   -- CONTRAT (calendrier fournisseur) sous lequel ce label vaut
+    label        TEXT    NOT NULL,
+    updated_ts   INTEGER NOT NULL,
+    PRIMARY KEY (pdl_index, src_standard, index_id, ngtf)
+);
+
 CREATE TABLE IF NOT EXISTS level_profile (
     pdl_index        INTEGER PRIMARY KEY,
     computed_ts      INTEGER NOT NULL,
@@ -145,6 +155,19 @@ def connect(path: str = DB_PATH, *, read_only: bool = False) -> sqlite3.Connecti
         # Le standard ne fournit pas ISOUSC (A) mais PREF (kVA) ; on stocke brut, /live arbitre.
         if "pref" not in lvl_cols:
             conn.execute("ALTER TABLE level_profile ADD COLUMN pref INTEGER")
+        # Chantier labels+index : NGTF (nom du calendrier tarifaire fournisseur, standard)
+        # par PDL, write-on-change → sert à keyer/segmenter les registres au changement de
+        # fournisseur (cf. CHANTIERS.md « Unification labels + index »).
+        if "ngtf" not in lvl_cols:
+            conn.execute("ALTER TABLE level_profile ADD COLUMN ngtf TEXT")
+        # Segmenter les labels par CONTRAT → `ngtf` dans la PK de tariff_labels (un changement
+        # de fournisseur crée de nouvelles lignes sans écraser l'historique). SQLite ne peut pas
+        # ajouter une colonne à une PK existante → drop + recreate (labels re-captés en direct
+        # depuis LTARF, donnée non critique). No-op si déjà à la bonne def.
+        tl_cols = [r[1] for r in conn.execute("PRAGMA table_info(tariff_labels)")]
+        if tl_cols and "ngtf" not in tl_cols:
+            conn.execute("DROP TABLE tariff_labels")
+            conn.executescript(_SCHEMA)   # recrée tariff_labels (nouvelle PK) ; autres tables = no-op
         # Backfill index GÉNÉRIQUE de la donnée LEGACY histo (index_value NULL, d'avant
         # que le reader ne peuple la générique en pi-0.0.43) : dérivé de `tariff` +
         # base/hchc/hchp. Sans lui, /consumption fait COALESCE(index_value,base,hchc,hchp)
@@ -181,6 +204,17 @@ def tariff_from_ptec(ptec: str | None) -> int | None:
     if p.startswith("PM"):
         return 4  # EJP Pointe Mobile
     return None
+
+
+# Libellés HISTORIQUE par rang PTEC (cf. tariff_from_ptec) — convention (l'histo ne porte
+# pas de LTARF). Le STANDARD, lui, a le LTARF autoritatif capté dans tariff_labels.
+HISTO_LABELS = {
+    0: "Base",
+    1: "Heures Creuses",
+    2: "Heures Pleines",
+    3: "EJP Heures Normales",
+    4: "EJP Pointe Mobile",
+}
 
 
 def _tariff_from_labels(labels: dict) -> int | None:
@@ -592,6 +626,101 @@ def consumption(
     ]
     total = sum(x["wh"] for x in by_register)
     return {"by_register": by_register, "total_wh": total}
+
+
+def record_tariff_label(conn: sqlite3.Connection, pdl_index: int,
+                        src_standard: int, index_id: int, label: str,
+                        ngtf: str = "") -> bool:
+    """Cache le libellé tarifaire d'un registre (LTARF standard capté par le reader), SCOPÉ au
+    CONTRAT (`ngtf`) → un changement de fournisseur crée de nouvelles lignes sans écraser
+    l'historique. **Write-on-change** : n'écrit que si absent ou différent. Retourne True si
+    écrit. Alimente la résolution de label serveur (`/registers`, `/live.tariff_label`)."""
+    label = (label or "").strip()
+    if not label:
+        return False
+    ngtf = (ngtf or "").strip()
+    row = conn.execute(
+        "SELECT label FROM tariff_labels "
+        "WHERE pdl_index=? AND src_standard=? AND index_id=? AND ngtf=?",
+        (pdl_index, src_standard, index_id, ngtf)).fetchone()
+    if row is not None and row[0] == label:
+        return False
+    conn.execute(
+        "INSERT INTO tariff_labels(pdl_index, src_standard, index_id, ngtf, label, updated_ts) "
+        "VALUES(?,?,?,?,?,?) ON CONFLICT(pdl_index, src_standard, index_id, ngtf) "
+        "DO UPDATE SET label=excluded.label, updated_ts=excluded.updated_ts",
+        (pdl_index, src_standard, index_id, ngtf, label, int(time.time())))
+    conn.commit()
+    return True
+
+
+def record_ngtf(conn: sqlite3.Connection, pdl_index: int, ngtf: str) -> bool:
+    """NGTF (nom du calendrier tarifaire fournisseur) par PDL — **write-on-change**.
+    Un changement de `ngtf` = changement de fournisseur/offre → époque tarifaire."""
+    ngtf = (ngtf or "").strip()
+    if not ngtf:
+        return False
+    row = conn.execute(
+        "SELECT ngtf FROM level_profile WHERE pdl_index=?", (pdl_index,)).fetchone()
+    if row is not None and row[0] == ngtf:
+        return False
+    conn.execute(
+        "INSERT INTO level_profile(pdl_index, computed_ts, ngtf) VALUES(?,0,?) "
+        "ON CONFLICT(pdl_index) DO UPDATE SET ngtf=excluded.ngtf",
+        (pdl_index, ngtf))
+    conn.commit()
+    return True
+
+
+def resolve_label(conn: sqlite3.Connection, pdl_index: int,
+                  src_standard: int, index_id) -> str | None:
+    """Libellé tarifaire d'un registre — résolution **UNIFIÉE côté serveur** (cœur du
+    chantier labels). Standard : LTARF autoritatif capté (`tariff_labels`) ; historique :
+    convention `HISTO_LABELS` (rang PTEC). None si inconnu → l'app peut retomber sur sa
+    propre convention (rétro-compat). Mode-agnostique pour l'appelant."""
+    if index_id is None:
+        return None
+    if src_standard:
+        # Label du registre SOUS LE CONTRAT COURANT (level_profile.ngtf).
+        ngtf = get_ngtf(conn, pdl_index) or ""
+        row = conn.execute(
+            "SELECT label FROM tariff_labels "
+            "WHERE pdl_index=? AND src_standard=1 AND index_id=? AND ngtf=?",
+            (pdl_index, index_id, ngtf)).fetchone()
+        if row and row[0]:
+            return row[0]
+        # Repli : label le plus récent pour ce registre, tous contrats (ex. NGTF pas encore
+        # capté au moment où le LTARF est arrivé) → évite un None inutile.
+        row = conn.execute(
+            "SELECT label FROM tariff_labels WHERE pdl_index=? AND src_standard=1 AND index_id=? "
+            "ORDER BY updated_ts DESC LIMIT 1", (pdl_index, index_id)).fetchone()
+        return row[0] if row and row[0] else None
+    return HISTO_LABELS.get(index_id)
+
+
+def get_ngtf(conn: sqlite3.Connection, pdl_index: int) -> str | None:
+    """NGTF = le CONTRAT (nom du calendrier tarifaire fournisseur). None si inconnu.
+    À ne pas confondre avec LTARF (tarif EN COURS, dans tariff_labels)."""
+    row = conn.execute(
+        "SELECT ngtf FROM level_profile WHERE pdl_index=?", (pdl_index,)).fetchone()
+    return row[0] if row and row[0] else None
+
+
+def registers(conn: sqlite3.Connection, pdl_index: int) -> list:
+    """Registres tarifaires vus pour un PDL : libellé résolu + dernier index (monotone → MAX).
+    Sert la carte réglages de l'app (un registre par tarif : Base / HC / HP…)."""
+    rows = conn.execute(
+        "SELECT src_standard, index_id, MAX(index_value) AS index_value, MAX(ts) AS last_ts "
+        "FROM measurements WHERE pdl_index=? AND index_id IS NOT NULL AND index_value IS NOT NULL "
+        "GROUP BY src_standard, index_id ORDER BY src_standard, index_id",
+        (pdl_index,)).fetchall()
+    return [{
+        "src_standard": r["src_standard"],
+        "index_id": r["index_id"],
+        "label": resolve_label(conn, pdl_index, r["src_standard"], r["index_id"]),
+        "index_value": r["index_value"],
+        "last_ts": r["last_ts"],
+    } for r in rows]
 
 
 def prune(conn: sqlite3.Connection, retention_days: int = RETENTION_DAYS) -> dict:
