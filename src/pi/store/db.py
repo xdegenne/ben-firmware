@@ -93,6 +93,34 @@ CREATE TABLE IF NOT EXISTS level_profile (
     n_samples        INTEGER NOT NULL DEFAULT 0,
     span_sec         INTEGER NOT NULL DEFAULT 0
 );
+
+-- Résumé pré-agrégé de la courbe, UNE ligne par (tranche de temps, tarif). Le tarif
+-- (index_id) est DANS la clé → une bascule HC↔HP coupe la tranche automatiquement (2 lignes).
+-- Alimenté au fil de l'eau (§3) + backfill progressif (§3bis). Sert /curve large + bandes HP/HC
+-- + index par tarif SANS rescanner measurements. Cf. docs/rollup-par-index.md.
+CREATE TABLE IF NOT EXISTS curve_rollup (
+    pdl_index    INTEGER NOT NULL,
+    bucket_ts    INTEGER NOT NULL,   -- début aligné de la tranche (ts // ROLLUP_BUCKET_SEC)
+    src_standard INTEGER NOT NULL,
+    index_id     INTEGER NOT NULL,   -- LE TARIF, dans la clé
+    ts_start     INTEGER NOT NULL,   -- ts RÉEL du 1er point (bornes exactes des bandes)
+    ts_end       INTEGER NOT NULL,   -- ts RÉEL du dernier point
+    papp_min     INTEGER,
+    papp_max     INTEGER,            -- pics préservés (démarrages)
+    papp_sum     INTEGER,            -- + count → moyenne à la lecture (incrémental)
+    papp_count   INTEGER,
+    index_last   INTEGER,            -- dernier index cumulé (Wh) → coût + index par tarif
+    PRIMARY KEY (pdl_index, bucket_ts, src_standard, index_id)
+);
+
+-- État du backfill du rollup (singleton). `watermark` = borne basse couverte : le rollup est
+-- complet pour [watermark, now] ; le backfill fait RECULER watermark (newest-first). Persistant
+-- → reprise exacte après brownout. `done`=1 quand watermark a atteint la plus vieille mesure.
+CREATE TABLE IF NOT EXISTS rollup_state (
+    id         INTEGER PRIMARY KEY CHECK (id = 0),
+    watermark  INTEGER,
+    done       INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -252,6 +280,54 @@ def _generic_cols(labels: dict) -> tuple:
     )
 
 
+ROLLUP_BUCKET_SEC = 120   # tranche de résumé = 2 min (compromis finesse bandes / volume rollup)
+
+
+def _rollup_ingest(conn: sqlite3.Connection, pdl_index: int, points: list) -> None:
+    """Agrège des points `(ts, src_standard, index_id, papp, index_value)` dans `curve_rollup`,
+    groupés par (tranche `ROLLUP_BUCKET_SEC`, tarif `index_id`). UPSERT incrémental
+    (min/max/sum/count/index_last) au fil de l'eau — cf. docs/rollup-par-index.md §3.
+    Points sans `papp` OU sans `index_id` (pas de tarif) ignorés. Un paquet LoRa (~58 pts)
+    tombe dans 1-2 tranches → 1-2 upserts (bien moins que 58 écritures)."""
+    # a = [ts_min, ts_max, papp_min, papp_max, papp_sum, papp_count, index_last, index_last_ts]
+    agg: dict = {}
+    for ts, src_standard, index_id, papp, index_value in points:
+        if papp is None or index_id is None:
+            continue
+        bucket = (ts // ROLLUP_BUCKET_SEC) * ROLLUP_BUCKET_SEC
+        key = (bucket, int(src_standard or 0), index_id)
+        a = agg.get(key)
+        if a is None:
+            agg[key] = [ts, ts, papp, papp, papp, 1, index_value, ts]
+        else:
+            if ts < a[0]: a[0] = ts
+            if ts > a[1]: a[1] = ts
+            if papp < a[2]: a[2] = papp
+            if papp > a[3]: a[3] = papp
+            a[4] += papp
+            a[5] += 1
+            if ts >= a[7] and index_value is not None:   # index_last = index du point le + récent
+                a[6] = index_value
+                a[7] = ts
+    for (bucket, src, idx), a in agg.items():
+        conn.execute(
+            "INSERT INTO curve_rollup "
+            "(pdl_index, bucket_ts, src_standard, index_id, ts_start, ts_end, "
+            " papp_min, papp_max, papp_sum, papp_count, index_last) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(pdl_index, bucket_ts, src_standard, index_id) DO UPDATE SET "
+            "  ts_start   = MIN(ts_start, excluded.ts_start), "
+            "  ts_end     = MAX(ts_end,   excluded.ts_end), "
+            "  papp_min   = MIN(papp_min, excluded.papp_min), "
+            "  papp_max   = MAX(papp_max, excluded.papp_max), "
+            "  papp_sum   = papp_sum   + excluded.papp_sum, "
+            "  papp_count = papp_count + excluded.papp_count, "
+            "  index_last = CASE WHEN excluded.ts_end >= ts_end AND excluded.index_last IS NOT NULL "
+            "                    THEN excluded.index_last ELSE index_last END",
+            (pdl_index, bucket, src, idx, a[0], a[1], a[2], a[3], a[4], a[5], a[6]),
+        )
+
+
 def record_measurement(
     conn: sqlite3.Connection,
     pdl_index: int,
@@ -264,6 +340,7 @@ def record_measurement(
     `tariff` = index tarifaire actif (PTEC wired / index LoRa)."""
     ts = int(ts if ts is not None else time.time())
     papp = labels.get("PAPP")
+    gcols = _generic_cols(labels)   # (src_standard, index_id, index_value, inject_total, meter_ts)
     conn.execute(
         "INSERT INTO measurements "
         "(ts, pdl_index, base, hchc, hchp, papp, iinst, tariff, "
@@ -278,7 +355,7 @@ def record_measurement(
             papp,
             labels.get("IINST"),
             _tariff_from_labels(labels),
-            *_generic_cols(labels),
+            *gcols,
         ),
     )
     # High-water mark monotone de la PAPP (plafond du modèle de niveau). Mis à
@@ -293,6 +370,8 @@ def record_measurement(
             "papp_max_alltime = MAX(COALESCE(papp_max_alltime, 0), excluded.papp_max_alltime)",
             (pdl_index, papp),
         )
+    # Rollup incrémental (fil de l'eau) — cette mesure unique.
+    _rollup_ingest(conn, pdl_index, [(ts, gcols[0], gcols[1], papp, gcols[2])])
     conn.commit()
 
 
@@ -313,10 +392,13 @@ def record_measurements_batch(
         return 0
     params = []
     maxima: dict[int, int] = {}  # pdl_index -> max PAPP du lot
+    rollup_pts: dict = {}        # pdl_index -> [(ts, src, idx, papp, index_value)] pour le rollup
     for pdl_index, labels, ts in rows:
         papp = labels.get("PAPP")
+        gcols = _generic_cols(labels)
+        ts = int(ts)
         params.append((
-            int(ts),
+            ts,
             pdl_index,
             labels.get("BASE"),
             labels.get("HCHC"),
@@ -324,10 +406,11 @@ def record_measurements_batch(
             papp,
             labels.get("IINST"),
             _tariff_from_labels(labels),
-            *_generic_cols(labels),
+            *gcols,
         ))
         if papp is not None and papp > maxima.get(pdl_index, -1):
             maxima[pdl_index] = papp
+        rollup_pts.setdefault(pdl_index, []).append((ts, gcols[0], gcols[1], papp, gcols[2]))
     conn.executemany(
         "INSERT INTO measurements "
         "(ts, pdl_index, base, hchc, hchp, papp, iinst, tariff, "
@@ -345,6 +428,9 @@ def record_measurements_batch(
             "papp_max_alltime = MAX(COALESCE(papp_max_alltime, 0), excluded.papp_max_alltime)",
             (pdl_index, papp),
         )
+    # Rollup incrémental : chaque paquet résumé en 1-2 tranches (bien moins d'écritures que N).
+    for pdl_index, pts in rollup_pts.items():
+        _rollup_ingest(conn, pdl_index, pts)
     conn.commit()
     return len(params)
 
@@ -723,12 +809,65 @@ def registers(conn: sqlite3.Connection, pdl_index: int) -> list:
     } for r in rows]
 
 
+ROLLUP_BACKFILL_BATCH_SEC = 86400   # 1 jour par pas de backfill (le GROUP BY d'UN jour est tractable)
+
+
+def rollup_backfill_step(conn: sqlite3.Connection) -> dict:
+    """UN pas de backfill du rollup, de MAINTENANT vers le passé (newest-first) : recompute une
+    tranche de 1 jour depuis le brut via INSERT OR REPLACE → IDEMPOTENT + reprenable (curseur
+    `watermark` persistant, survit au brownout). Disjoint de l'incrémental (qui n'écrit que le
+    présent). Greffé sur `prune()`. Cf. docs/rollup-par-index.md §3bis.
+    Retourne `{advanced, watermark, done}`."""
+    oldest = conn.execute("SELECT MIN(ts) FROM measurements").fetchone()[0]
+    if oldest is None:
+        return {"advanced": False, "watermark": None, "done": True}
+    oldest_bucket = (oldest // ROLLUP_BUCKET_SEC) * ROLLUP_BUCKET_SEC
+    row = conn.execute("SELECT watermark, done FROM rollup_state WHERE id = 0").fetchone()
+    if row is not None and row[1]:
+        return {"advanced": False, "watermark": row[0], "done": True}
+    watermark = row[0] if row is not None else None
+    if watermark is None:
+        # Init : borne = plus vieux bucket DÉJÀ présent (incrémental ≈ déploiement) ; rollup vide
+        # → plus vieille mesure. Le backfill remplit STRICTEMENT en dessous de cette borne.
+        r = conn.execute("SELECT MIN(bucket_ts) FROM curve_rollup").fetchone()
+        watermark = r[0] if r and r[0] is not None else oldest_bucket
+    if watermark <= oldest_bucket:
+        conn.execute(
+            "INSERT INTO rollup_state (id, watermark, done) VALUES (0, ?, 1) "
+            "ON CONFLICT(id) DO UPDATE SET watermark = excluded.watermark, done = 1",
+            (oldest_bucket,))
+        conn.commit()
+        return {"advanced": False, "watermark": oldest_bucket, "done": True}
+    start = max(oldest_bucket, watermark - ROLLUP_BACKFILL_BATCH_SEC)
+    # Recompute [start, watermark) depuis le brut. index_last = MAX(index_value) (index cumulé
+    # monotone → le max = le plus récent). INSERT OR REPLACE → ré-exécuter un batch = même résultat.
+    conn.execute(
+        "INSERT OR REPLACE INTO curve_rollup "
+        "(pdl_index, bucket_ts, src_standard, index_id, ts_start, ts_end, "
+        " papp_min, papp_max, papp_sum, papp_count, index_last) "
+        "SELECT pdl_index, CAST(ts / ? AS INT) * ?, COALESCE(src_standard, 0), index_id, "
+        "       MIN(ts), MAX(ts), MIN(papp), MAX(papp), SUM(papp), COUNT(papp), MAX(index_value) "
+        "FROM measurements "
+        "WHERE ts >= ? AND ts < ? AND papp IS NOT NULL AND index_id IS NOT NULL "
+        "GROUP BY pdl_index, CAST(ts / ? AS INT) * ?, COALESCE(src_standard, 0), index_id",
+        (ROLLUP_BUCKET_SEC, ROLLUP_BUCKET_SEC, start, watermark,
+         ROLLUP_BUCKET_SEC, ROLLUP_BUCKET_SEC),
+    )
+    conn.execute(
+        "INSERT INTO rollup_state (id, watermark, done) VALUES (0, ?, 0) "
+        "ON CONFLICT(id) DO UPDATE SET watermark = excluded.watermark",
+        (start,))
+    conn.commit()
+    return {"advanced": True, "watermark": start, "done": False}
+
+
 def prune(conn: sqlite3.Connection, retention_days: int = RETENTION_DAYS) -> dict:
     """Supprime les points plus vieux que la rétention dans les deux tables.
     Retourne le nombre de lignes supprimées par table."""
     cutoff = int(time.time()) - retention_days * 86400
     m = conn.execute("DELETE FROM measurements WHERE ts < ?", (cutoff,)).rowcount
     l = conn.execute("DELETE FROM lora_link WHERE ts < ?", (cutoff,)).rowcount
+    r = conn.execute("DELETE FROM curve_rollup WHERE bucket_ts < ?", (cutoff,)).rowcount
     conn.commit()
     # Checkpoint WAL TRUNCATE (maintenance ~horaire via _maybe_prune) : le fichier
     # `-wal` ne se tronque JAMAIS seul (grossit à son high-water mark → observé
@@ -739,4 +878,13 @@ def prune(conn: sqlite3.Connection, retention_days: int = RETENTION_DAYS) -> dic
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     except sqlite3.OperationalError:
         pass  # un lecteur tient un vieux snapshot → retenté au prochain prune
-    return {"measurements": m, "lora_link": l}
+    # Backfill progressif du rollup : quelques pas par maintenance, BORNÉ EN TEMPS (~2 s) → pas de
+    # monopolisation du mono-cœur (réception LoRa + API restent prioritaires). Newest-first,
+    # reprenable. Isolé en try : une erreur de backfill ne casse jamais la maintenance. Cf. §3bis.
+    try:
+        budget = time.time() + 2.0
+        while time.time() < budget and rollup_backfill_step(conn)["advanced"]:
+            pass
+    except Exception:
+        pass
+    return {"measurements": m, "lora_link": l, "curve_rollup": r}
