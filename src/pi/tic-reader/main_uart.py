@@ -296,6 +296,10 @@ def _parse_label_std(line: str, out: dict) -> None:
     elif name == "DATE":                      # horodatée, donnée vide → horodate = 2e champ
         if len(parts) >= 4:                   # "SAAMMJJhhmmss" (saison + 12 chiffres)
             out["DATE_HORODATE"] = parts[1]
+    elif name == "NJOURF":                    # n° profil jour courant (Tempo std, 0-9) — collecté, pas stocké
+        out["NJOURF"] = _std_int(data)
+    elif name == "NJOURF+1":                  # n° profil lendemain (Tempo std) — collecté, pas stocké
+        out["NJOURF+1"] = _std_int(data)
 
 
 def _std_horodate_to_epoch(h: str | None) -> int | None:
@@ -387,6 +391,20 @@ def build_flags(labels: dict) -> tuple[str | None, bool, bool]:
     adps   = bool(labels.get("ADPS", False))
     pejp   = bool(labels.get("PEJP", False))
     return demain, adps, pejp
+
+
+# Champs collectés mais NON câblés au stockage (DEMAIN/ADPS/PEJP histo, NJOURF/NJOURF+1 std) :
+# logués À MINIMA, ON-CHANGE en INFO — MÊME format/manière que le récepteur LoRa (main.py
+# log_uncabled). Visibilité sans noyer journald (~1,7 s/trame). MSG1/MSG2 = non émis (RAM ATmega328).
+_last_uncabled: dict = {}
+
+
+def log_uncabled(fields: dict) -> None:
+    """Logge en INFO chaque champ non-câblé quand sa valeur change (aligné LoRa)."""
+    for name, val in fields.items():
+        if val is not None and _last_uncabled.get(name) != val:
+            log.info(f"non câblé : {name}={val!r} (collecté, pas stocké) pdl_index={PDL_INDEX}")
+            _last_uncabled[name] = val
 
 # ---------------------------------------------------------------------------
 # Modes TIC + auto-détection
@@ -669,6 +687,8 @@ try:
                         log.warning("PAPP absent de la trame TIC (checksum KO?) — trame ignorée")
                     else:
                         demain, adps, pejp = build_flags(labels)
+                        # Champs non-câblés (DEMAIN/ADPS/PEJP) → log INFO on-change (aligné LoRa).
+                        log_uncabled({"DEMAIN": demain, "ADPS": adps or None, "PEJP": pejp or None})
                         # Clé générique (chantier index bi-mode) : index_id = rang PTEC.
                         labels["_src_standard"] = 0
                         labels["_index_id"] = active_id
@@ -709,6 +729,8 @@ try:
                         mts = _std_horodate_to_epoch(labels.get("DATE_HORODATE"))
                         if mts is not None:
                             labels["_meter_ts"] = mts
+                        # Champs non-câblés std (NJOURF/NJOURF+1 Tempo) → log INFO on-change (aligné LoRa).
+                        log_uncabled({"NJOURF": labels.get("NJOURF"), "NJOURF+1": labels.get("NJOURF+1")})
                         if not std_first_logged:
                             # 1re trame valide : dump complet en INFO pour valider
                             # le décodage sur un vrai compteur standard.

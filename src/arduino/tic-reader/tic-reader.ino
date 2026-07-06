@@ -59,6 +59,9 @@
 #include <RHReliableDatagram.h>
 #include <Crypto.h>
 #include <SHA256.h>
+// Interrupteur chiffrement (format cible). ⚠ 1 → objet ChaCha en RAM → 84 % → débordement pile à
+// l'envoi (reboot par trame). Nécessite de libérer ~100 o (trim struct/curveBuf) AVANT de repasser à 1.
+#define FRAME_ENCRYPT 1
 #include <EEPROM.h>
 #include <avr/wdt.h>
 #include <string.h>
@@ -87,19 +90,39 @@
 // ---------------------------------------------------------------------------
 #define PROTOCOL_VERSION_BOOT  0x01   // trame d'identité (ADCO)
 #define PROTOCOL_VERSION_CURVE 0x05   // trame courbe batchée (v0x05 : dt par point)
-#define FW_VERSION             "0.0.9"  // version firmware, échoée au boot (debug / confirmation flash)
+#define FW_VERSION             "0.1.0"   // palier 0.1.0 (unification versions, fin du compteur 0.x interne) : garde histo tolérante + IINST 2e courbe + flush 55s + chiffrement ChaCha20 + logging aligné
 #define BOOT_PAYLOAD_LEN       20     // v0x01 : version + ADCO(12) + ISOUSC + PREF, padding jusqu'à 20 (rétro)
-#define BOOT_MAX_LEN           32     // v0x01 étendu : + NGTF [len:1][ascii:≤16] = 15 + 1 + 16
+#define BOOT_MAX_LEN           64     // format cible : header(7) + TLV (ADCO/ISOUSC/PREF/CONTRAT) + MAC(8)
+
+// --- Format cible (docs/lora-frame-format.md) : types + flags core + tags TLV ---
+#define TYPE_CURVE       0x05
+#define TYPE_BOOT        0x01
+#define CF_SRC_STANDARD  0x01   // octet flags du core courbe : bit0
+#define CF_TS_VALID      0x02   // bit1
+#define CF_HAS_IINST     0x04   // bit2 : 2e courbe IINST (histo) présente
+#define T_ADCO    0x01
+#define T_ISOUSC  0x02
+#define T_PREF    0x03
+#define T_CONTRAT 0x04
+#define T_EAIT    0x10
+#define T_LTARF   0x11
+#define T_DEMAIN  0x20
+#define T_NJOURF  0x21
+#define T_NJOURF1 0x22
+#define T_ADPS    0x30
+#define T_PEJP    0x31
+#define T_MSG1    0x40
+#define T_MSG2    0x41
 #define HMAC_LEN                8
 
 // Courbe v0x04
 // CURVE_BUF_LEN dimensionné pour l'HISTORIQUE v1 (flush ~60 s ≈ 30 éch. ≈ ~110 o).
 // 160 o tient un batch de 60 s pire-cas (deltas 2-3 o) avec marge, et économise ~80 o
 // de SRAM sur le 328P. Le mode STANDARD (1 Hz, batch ~3 min, ~175 éch.) demandera ~240.
-#define CURVE_BUF_LEN     160         // < RH_RF95_MAX_MESSAGE_LEN (251)
+#define CURVE_BUF_LEN     130         // < RH_RF95_MAX_MESSAGE_LEN (251)
 #define CURVE_MAX_SAMPLES 130         // garde secondaire (buffer-full domine en pratique)
 #define SAMPLE_PERIOD_DS  20          // période nominale = 2,0 s (cadence TIC historique)
-#define CURVE_FLUSH_MS    60000UL     // flush périodique → fraîcheur /live ~60 s
+#define CURVE_FLUSH_MS    55000UL     // flush périodique → /live garanti < 60 s (batch toujours dans la minute)
 
 // ---------------------------------------------------------------------------
 // Index IDs
@@ -154,6 +177,7 @@
 #define HMAC_KEY_ADDR 0x00
 #define HMAC_KEY_LEN  32
 #define MODE_ADDR     0x20   // mode TIC auto-détecté persisté (reboot rapide)
+#define BOOT_COUNT_ADDR 0x30 // compteur de boot (3 octets EEPROM) — nonce format cible + reboot
 
 // ---------------------------------------------------------------------------
 // TIC
@@ -169,7 +193,9 @@ RHReliableDatagram manager(driver, CLIENT_ADDRESS);
 SHA256 sha256;
 static bool loraOk = false;
 static bool firstFrame = true;
-static uint8_t hmac_key[HMAC_KEY_LEN];
+// Format cible (variante B) : AUCUNE clé stockée — re-dérivées de la clé EEPROM au flush (-96 o).
+static uint32_t boot_count = 0;        // EEPROM, +1/boot (survit brownout) — nonce hi
+static uint32_t msg_count  = 0;        // RAM, +1/trame émise, reset au boot — nonce lo
 
 // --- État courbe v0x04 ---
 // curveBuf est fichier-scope (PAS pile) pour ne pas entrer en collision avec le heap
@@ -178,13 +204,20 @@ static uint8_t hmac_key[HMAC_KEY_LEN];
 static uint8_t  curveBuf[CURVE_BUF_LEN];
 static uint16_t curvePos     = 0;     // curseur d'écriture
 static int32_t  papp_prev    = 0;     // dernière PAPP encodée (signée : net en standard)
+static int32_t  iinst_prev   = 0;     // histo : dernier IINST encodé (2e courbe)
 static uint8_t  curveN       = 0;     // échantillons dans le batch courant
 static bool     curveActive  = false;
+static bool     curveFlushPending = false;  // deferred flush : flush exécuté HORS du bloc v (pile dégagée)
 static uint8_t  curveIndexId = IDX_UNKNOWN;  // index_id du batch courant (homogène)
 static bool     curveHasInject = false;      // batch standard producteur → bloc ext EAIT
 static uint32_t curveEait     = 0;           // EAIT au keyframe (Wh) — écrit dans le bloc ext
 static char     curveLtarf[17] = {0};        // LTARF capté au keyframe (ext v2 bit1) si NTARF a changé
 static bool     curveSendLtarf = false;      // ce batch doit-il transporter LTARF ?
+static uint8_t  curveDemain = 0xFF;          // histo : couleur demain (0=BLEU 1=BLAN 2=ROUG ; 0xFF=absent) → TLV
+static bool     curveAdps   = false;         // histo : dépassement puissance → TLV présence
+static bool     curvePejp   = false;         // histo : préavis EJP → TLV présence
+static uint8_t  curveNjourf  = 0xFF;         // std : n° profil jour (Tempo) → TLV (0xFF = absent)
+static uint8_t  curveNjourf1 = 0xFF;         // std : n° profil lendemain → TLV (0xFF = absent)
 static uint8_t  lastSentIsousc = 0;          // dernier ISOUSC émis (v0x01) → ré-émet sur changement
 static uint8_t  lastSentPref   = 0;          // dernier PREF émis (v0x01, standard) → ré-émet sur changement
 static uint16_t lastSentNgtfHash = 0;        // hash du dernier NGTF émis (v0x01) → détecte le changement fournisseur (économe RAM vs stocker la chaîne)
@@ -242,14 +275,101 @@ struct TICValues {
   // --- Champs MODE STANDARD (Enedis-NOI-CPT_54E §6.2) -----------------------
   int16_t  papp_net;      // net signé : soutiré (SINSTS) + / injection (SINSTI) -
   uint8_t  ntarf;         // n° index tarifaire actif (1..10)
-  uint32_t easf[10];      // index fournisseur EASF01..10 (Wh) — l'actif = easf[ntarf-1]
-  uint16_t easf_seen;     // bit i = EASF(i+1) vu (checksum OK) — garde keyframe
+  uint8_t  njourf;        // n° profil jour courant (Tempo standard, 0-9)
+  uint8_t  njourf1;       // n° profil lendemain (NJOURF+1)
+  uint32_t easf_active;      // TRIM : index fournisseur ACTIF (Wh) — capté au parse via lastNtarf reporté
+  bool     easf_active_seen; // true = EASF actif vu (checksum OK) cette trame
   uint32_t eait;          // énergie active injectée totale (Wh) — producteur
   bool     has_inject;    // EAIT présent (foyer producteur)
   char     ts[14];        // horodate DATE "SAAMMJJhhmmss" (saison + 12 chiffres)
   char     ltarf[17];     // libellé tarif EN COURS (standard, LTARF) — label du registre actif
   char     ngtf[17];      // nom du calendrier tarifaire fournisseur (standard, NGTF) — quasi-statique
 };
+
+// ===================== Format cible — helpers d'encodage =====================
+// docs/lora-frame-format.md. Enveloppe : [ver][boot_count:3][msg_count:3][corps][MAC:8].
+static void bumpBootCount() {     // lit 3 o EEPROM, +1, réécrit (au boot)
+  boot_count = (uint32_t)EEPROM.read(BOOT_COUNT_ADDR)
+             | ((uint32_t)EEPROM.read(BOOT_COUNT_ADDR + 1) << 8)
+             | ((uint32_t)EEPROM.read(BOOT_COUNT_ADDR + 2) << 16);
+  boot_count++;
+  EEPROM.update(BOOT_COUNT_ADDR,     boot_count & 0xFF);
+  EEPROM.update(BOOT_COUNT_ADDR + 1, (boot_count >> 8) & 0xFF);
+  EEPROM.update(BOOT_COUNT_ADDR + 2, (boot_count >> 16) & 0xFF);
+}
+static uint16_t writeHeader(uint8_t* buf, uint8_t type) {   // header clair → pos=7
+  buf[0] = type;
+  buf[1] = boot_count & 0xFF; buf[2] = (boot_count >> 8) & 0xFF; buf[3] = (boot_count >> 16) & 0xFF;
+  buf[4] = msg_count & 0xFF;  buf[5] = (msg_count >> 8) & 0xFF;  buf[6] = (msg_count >> 16) & 0xFF;
+  return 7;
+}
+static uint16_t writeI24(uint8_t* buf, uint16_t pos, int32_t v) {  // int24 LE
+  buf[pos++] = v & 0xFF; buf[pos++] = (v >> 8) & 0xFF; buf[pos++] = (v >> 16) & 0xFF;
+  return pos;
+}
+static uint16_t writeTLV(uint8_t* buf, uint16_t pos, uint8_t tag, const uint8_t* val, uint8_t len) {
+  buf[pos++] = tag; buf[pos++] = len;
+  memcpy(buf + pos, val, len); pos += len;
+  return pos;
+}
+#if FRAME_ENCRYPT
+// ChaCha20 (RFC 8439 IETF) « maison » : keystream calculé sur la PILE, zéro objet permanent.
+// Keystream validé identique à frame_codec._chacha20 (récepteur). ~128 o de pile PENDANT l'appel.
+static inline uint32_t rotl32(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
+#define CHACHA_QR(a,b,c,d) a+=b; d^=a; d=rotl32(d,16); c+=d; b^=c; b=rotl32(b,12); \
+                           a+=b; d^=a; d=rotl32(d,8);  c+=d; b^=c; b=rotl32(b,7);
+#define CHACHA_LE32(p) ((uint32_t)(p)[0]|((uint32_t)(p)[1]<<8)|((uint32_t)(p)[2]<<16)|((uint32_t)(p)[3]<<24))
+static void chacha20_xor(const uint8_t* key, const uint8_t* nonce, uint8_t* buf, uint16_t len) {
+  uint32_t x[16], counter = 0;                       // 64 o de pile (un seul tableau)
+  for (uint16_t off=0; off<len; off+=64) {
+    x[0]=0x61707865UL; x[1]=0x3320646eUL; x[2]=0x79622d32UL; x[3]=0x6b206574UL;
+    for (uint8_t i=0;i<8;i++) x[4+i]=CHACHA_LE32(key+4*i);
+    x[12]=counter;
+    for (uint8_t i=0;i<3;i++) x[13+i]=CHACHA_LE32(nonce+4*i);
+    for (uint8_t r=0;r<10;r++) {
+      CHACHA_QR(x[0],x[4],x[8],x[12]) CHACHA_QR(x[1],x[5],x[9],x[13]) CHACHA_QR(x[2],x[6],x[10],x[14]) CHACHA_QR(x[3],x[7],x[11],x[15])
+      CHACHA_QR(x[0],x[5],x[10],x[15]) CHACHA_QR(x[1],x[6],x[11],x[12]) CHACHA_QR(x[2],x[7],x[8],x[13]) CHACHA_QR(x[3],x[4],x[9],x[14])
+    }
+    for (uint8_t i=0;i<16;i++) {                       // add de l'état INITIAL recalculé (pas stocké)
+      uint32_t si = i<4 ? (i==0?0x61707865UL:i==1?0x3320646eUL:i==2?0x79622d32UL:0x6b206574UL)
+                  : i<12 ? CHACHA_LE32(key+4*(i-4)) : i==12 ? counter : CHACHA_LE32(nonce+4*(i-13));
+      uint32_t v=x[i]+si;
+      for (uint8_t j=0;j<4;j++){ uint16_t pp=off+4*i+j; if (pp<len) buf[pp]^=(uint8_t)(v>>(8*j)); } }
+    counter++;
+  }
+}
+#endif
+
+// Variante B : re-dérive les sous-clés à la volée depuis la clé EEPROM (0 clé stockée).
+static uint16_t frameSeal(uint8_t* buf, uint16_t pos, bool encrypt) {
+  uint8_t dev[HMAC_KEY_LEN], sub[HMAC_KEY_LEN];
+  readKeyFromEEPROM(dev);
+#if FRAME_ENCRYPT
+  if (encrypt) {
+    sha256.resetHMAC(dev, HMAC_KEY_LEN);
+    sha256.update((const uint8_t*)"ben-lora-enc", 12);
+    sha256.finalizeHMAC(dev, HMAC_KEY_LEN, sub, 32);
+    buf[0] |= 0x80;
+    uint8_t nonce[12];
+    nonce[0] = boot_count & 0xFF; nonce[1] = (boot_count >> 8) & 0xFF; nonce[2] = (boot_count >> 16) & 0xFF;
+    nonce[3] = msg_count & 0xFF;  nonce[4] = (msg_count >> 8) & 0xFF;  nonce[5] = (msg_count >> 16) & 0xFF;
+    for (uint8_t i = 6; i < 12; i++) nonce[i] = 0;
+    chacha20_xor(sub, nonce, buf + 7, pos - 7);
+  }
+#else
+  (void)encrypt;
+#endif
+  sha256.resetHMAC(dev, HMAC_KEY_LEN);
+  sha256.update((const uint8_t*)"ben-lora-mac", 12);
+  sha256.finalizeHMAC(dev, HMAC_KEY_LEN, sub, 32);
+  uint8_t mac[32];
+  sha256.resetHMAC(sub, HMAC_KEY_LEN);
+  sha256.update(buf, pos);
+  sha256.finalizeHMAC(sub, HMAC_KEY_LEN, mac, 32);
+  memcpy(buf + pos, mac, HMAC_LEN);
+  return pos + HMAC_LEN;
+}
+// =============================================================================
 
 // ---------------------------------------------------------------------------
 // LED RGB
@@ -403,9 +523,16 @@ bool verifyTICChecksum(const char *line, size_t len) {
     if (line[i] == ' ') { lastSpace = i; break; }
   }
   if (lastSpace < 1) return false;
+  // Historique : DEUX modes de calcul coexistent selon les compteurs — on accepte les deux.
+  //   S1 = somme "label SP data" (hors SP avant checksum).
+  //   S2 = S1 + le SP avant checksum inclus.
+  // Un vrai Linky peut être en S2 alors que le banc tic-gen émet en S1 → sans ça, blinkErr en boucle.
   uint8_t sum = 0;
   for (int i = 0; i < lastSpace; i++) sum += (uint8_t)line[i];
-  return line[len - 1] == (char)((sum & 0x3F) + 0x20);
+  const char cks = line[len - 1];
+  if (cks == (char)((sum & 0x3F) + 0x20)) return true;          // S1
+  sum += (uint8_t)line[lastSpace];                              // + SP avant checksum
+  return cks == (char)((sum & 0x3F) + 0x20);                    // S2
 }
 
 // Parse UNE ligne TIC (déjà validée checksum) directement dans v, EN PLACE,
@@ -478,12 +605,14 @@ static void parseTICLineStd(char* line, uint8_t len, TICValues& v) {
   else if (!strcmp(name, "NTARF")) v.ntarf = (uint8_t)strtoul(val, 0, 10);  // n° tarif actif
   else if (!strncmp(name, "EASF", 4) && name[4] >= '0' && name[5] != 0) {
     uint8_t idx = (uint8_t)strtoul(name + 4, 0, 10);   // EASF01..10 → 1..10
-    if (idx >= 1 && idx <= 10) { v.easf[idx - 1] = strtoul(val, 0, 10); v.easf_seen |= (1 << (idx - 1)); }
+    if (idx == lastNtarf) { v.easf_active = strtoul(val, 0, 10); v.easf_active_seen = true; }  // TRIM : seul l'index actif (NTARF reporté)
   }
   else if (!strcmp(name, "EAIT")) { v.eait = strtoul(val, 0, 10); v.has_inject = true; }
   else if (!strcmp(name, "PREF")) v.pref = (uint8_t)strtoul(val, 0, 10);  // abonnement std (kVA)
   else if (!strcmp(name, "LTARF")) strncpy(v.ltarf, val, sizeof(v.ltarf) - 1);  // libellé tarif courant
   else if (!strcmp(name, "NGTF"))  strncpy(v.ngtf,  val, sizeof(v.ngtf)  - 1);  // calendrier tarifaire fournisseur
+  else if (!strcmp(name, "NJOURF"))   v.njourf  = (uint8_t)strtoul(val, 0, 10);  // n° profil jour (Tempo std)
+  else if (!strcmp(name, "NJOURF+1")) v.njourf1 = (uint8_t)strtoul(val, 0, 10);  // n° profil lendemain
   else if (!strcmp(name, "DATE")) {              // horodatée, donnée vide → horodate = champ 2
     if (n >= 3) { line[ht[1]] = 0; strncpy(v.ts, line + ht[0] + 1, sizeof(v.ts) - 1); }
   }
@@ -505,6 +634,7 @@ static void ticSerialBegin(uint8_t mode) {
 // MODE_STANDARD (9600, HT). Retourne true si ≥1 ligne valide lue.
 bool readAndParseTIC(TICValues& v, uint8_t mode) {
   memset(&v, 0, sizeof(v));
+  v.njourf = 0xFF; v.njourf1 = 0xFF;    // sentinel : 0xFF = absent (profil n°0 = valide)
   digitalWrite(TIC_OUT, HIGH);
   ticSerialBegin(mode);
 
@@ -632,21 +762,16 @@ static const char* contractOf(const TICValues& v) {
 
 void sendBootFrame(const char* adco, uint8_t isousc, uint8_t pref, const char* ngtf) {
   uint8_t buf[BOOT_MAX_LEN];
-  memset(buf, 0, sizeof(buf));
-  buf[0] = PROTOCOL_VERSION_BOOT;
-  memcpy(buf + 1, adco, 12);
-  buf[13] = isousc;          // octet 13 = ISOUSC (A, histo)     ; 0 = absent
-  buf[14] = pref;            // octet 14 = PREF   (kVA, standard) ; 0 = absent (chantier ISOUSC std)
-  uint16_t len = BOOT_PAYLOAD_LEN;                // défaut 20 (rétro : padding jusqu'à 20)
-  // NGTF (calendrier tarifaire fournisseur, std) : octet 15 = longueur, 16.. = ascii
-  // (0/absent → padding, len reste 20). Récepteur ≥ pi-0.0.54 lit [15]=len puis l'ascii.
-  uint8_t nl = ngtf ? strlen(ngtf) : 0;
-  if (nl > 16) nl = 16;
-  if (nl) {
-    buf[15] = nl;
-    memcpy(buf + 16, ngtf, nl);
-    len = 16 + nl;
+  msg_count++;                                       // nonce lo (+1 par trame émise)
+  uint16_t pos = writeHeader(buf, TYPE_BOOT);        // [0-6] header clair
+  pos = writeTLV(buf, pos, T_ADCO, (const uint8_t*)adco, 12);
+  if (isousc) { uint8_t b = isousc; pos = writeTLV(buf, pos, T_ISOUSC, &b, 1); }
+  if (pref)   { uint8_t b = pref;   pos = writeTLV(buf, pos, T_PREF,   &b, 1); }
+  if (ngtf && ngtf[0]) {
+    uint8_t l = strlen(ngtf); if (l > 16) l = 16;
+    pos = writeTLV(buf, pos, T_CONTRAT, (const uint8_t*)ngtf, l);
   }
+  uint16_t len = frameSeal(buf, pos, FRAME_ENCRYPT);   // chiffre (si activé) + MAC → longueur totale
 
   if (loraOk) {
     driver.setModeIdle();
@@ -670,36 +795,30 @@ static inline int32_t pappValue(const TICValues& v) {
 // Démarre un batch : le keyframe EST le 1er échantillon (index actif + PAPP absolue).
 void curveStart(const TICValues& v, uint8_t id, uint32_t value) {
   int32_t papp = pappValue(v);
-  curveBuf[0] = PROTOCOL_VERSION_CURVE;
+  msg_count++;                                        // nonce lo (+1 par trame émise)
+  uint16_t pos = writeHeader(curveBuf, TYPE_CURVE);   // [0-6] header clair → pos = 7
 
-  uint8_t flags;
-  bool tsValid = false;
-  if (ticMode == MODE_STANDARD) {
-    flags = FLAG_SRC_STANDARD;
-    tsValid = (v.ts[0] == 'E' || v.ts[0] == 'H');   // saison MAJUSCULE = horloge fiable (≠ dégradé)
-    if (tsValid)      flags |= FLAG_TS_VALID;
-    // EAIT (injection) et LTARF passent par l'ext v2 (flag bit7), posé dans curveFlush
-    // selon ce qui est présent — plus via FLAG_HAS_EXT (bit6, legacy retiré).
-  } else {
-    flags = buildFlags(v);                  // bits 0-3 ; bits 4/5/6 = 0 en historique
-  }
-  curveBuf[1] = flags;
-
-  memcpy(curveBuf + 2, &batch_seq, 2);
-  curveBuf[4] = id;
-  memcpy(curveBuf + 5, &value, 4);
-  uint16_t papp16 = (uint16_t)papp;         // int16 signé (standard) / uint16 (histo), mêmes 2 o LE
-  memcpy(curveBuf + 9, &papp16, 2);
-  // buf[11]=N et buf[12]=period_ds : écrits à l'envoi (curveFlush).
-  if (tsValid) {                            // horodate compteur : season + YY MM DD hh mm ss (binaire)
-    curveBuf[13] = (uint8_t)v.ts[0];
+  bool tsValid = (ticMode == MODE_STANDARD) &&
+                 (v.ts[0] == 'E' || v.ts[0] == 'H');  // saison MAJUSCULE = horloge fiable
+  uint8_t flags = (ticMode == MODE_STANDARD ? CF_SRC_STANDARD : 0)
+                | (tsValid ? CF_TS_VALID : 0)
+                | (ticMode == MODE_HISTO ? CF_HAS_IINST : 0);
+  curveBuf[pos++] = flags;                            // [7]  flags
+  memcpy(curveBuf + pos, &batch_seq, 2); pos += 2;    // [8-9] batch_seq
+  curveBuf[pos++] = id;                               // [10] index_id
+  memcpy(curveBuf + pos, &value, 4); pos += 4;        // [11-14] index_value
+  pos = writeI24(curveBuf, pos, papp);                // [15-17] papp_ref (int24 signé)
+  pos += 2;                                           // [18]=N, [19]=period_ds : à curveFlush
+  if (tsValid) {                                      // [20-26] horodate compteur (7 o)
+    curveBuf[pos++] = (uint8_t)v.ts[0];
     for (uint8_t i = 0; i < 6; i++)
-      curveBuf[14 + i] = (uint8_t)((v.ts[1 + i * 2] - '0') * 10 + (v.ts[2 + i * 2] - '0'));
-  } else {
-    curveBuf[13] = 0x00;
-    memset(curveBuf + 14, 0, 6);
+      curveBuf[pos++] = (uint8_t)((v.ts[1 + i * 2] - '0') * 10 + (v.ts[2 + i * 2] - '0'));
   }
-  curvePos       = 20;
+  if (ticMode == MODE_HISTO) {                        // 2e courbe : IINST de réf (uint16)
+    memcpy(curveBuf + pos, &v.iinst, 2); pos += 2;
+    iinst_prev = v.iinst;
+  }
+  curvePos       = pos;
   papp_prev      = papp;
   curveN         = 1;
   curveActive    = true;
@@ -710,6 +829,15 @@ void curveStart(const TICValues& v, uint8_t id, uint32_t value) {
   // (dédup — le libellé est quasi-statique par NTARF). Le récepteur cache NTARF→LTARF.
   curveSendLtarf = (ticMode == MODE_STANDARD && v.ltarf[0] && id != ltarfSentForNtarf);
   if (curveSendLtarf) strncpy(curveLtarf, v.ltarf, sizeof(curveLtarf) - 1);
+  // histo : DEMAIN (couleur demain) / ADPS / PEJP → capturés ici, émis en TLV au flush.
+  if (ticMode == MODE_HISTO) {
+    curveDemain = (strncmp(v.demain, "BLEU", 4) == 0) ? 0
+                : (strncmp(v.demain, "BLAN", 4) == 0) ? 1
+                : (strncmp(v.demain, "ROUG", 4) == 0) ? 2 : 0xFF;
+    curveAdps = v.adps_present;
+    curvePejp = v.pejp_present;
+  } else { curveDemain = 0xFF; curveAdps = false; curvePejp = false; }
+  curveNjourf = v.njourf; curveNjourf1 = v.njourf1;   // std Tempo (0xFF = absent) → TLV au flush
   curveT0         = millis();
   curveLastOffSec = 0;                                                 // histo : origine des dt (millis)
   curveLastTod    = (ticMode == MODE_STANDARD) ? todSeconds(v.ts) : 0; // standard : tod du keyframe (point 0)
@@ -751,60 +879,53 @@ void curveAdd(int32_t papp, const TICValues& v) {
   while (zz >= 0x80) { curveBuf[curvePos++] = (zz & 0x7F) | 0x80; zz >>= 7; }
   curveBuf[curvePos++] = (uint8_t)zz;
   papp_prev = papp;
+  if (ticMode == MODE_HISTO) {                              // 2e courbe : delta IINST (zigzag)
+    int32_t  di  = (int32_t)v.iinst - iinst_prev;
+    uint32_t zzi = ((uint32_t)di << 1) ^ (uint32_t)(di >> 31);
+    while (zzi >= 0x80) { curveBuf[curvePos++] = (zzi & 0x7F) | 0x80; zzi >>= 7; }
+    curveBuf[curvePos++] = (uint8_t)zzi;
+    iinst_prev = v.iinst;
+  }
   curveN++;
-  // marge worst-case = 2 varints de 3 o (dt + delta) = 6 ; -HMAC_LEN = signature ; -ext = bloc EAIT.
-  // ext v2 worst-case : ext_fields(1) + EAIT(4) + [len(1)+LTARF(≤16)] = 22 o.
-  uint8_t extReserve = (curveHasInject || curveSendLtarf) ? (1 + EXT_INJECT_LEN + 1 + 16) : 0;
-  if (curvePos >= CURVE_BUF_LEN - HMAC_LEN - extReserve - 6 || curveN >= CURVE_MAX_SAMPLES)
-    curveFlush();
+  // marge worst-case = 2 varints de 3 o (dt+delta) = 6 ; -HMAC_LEN ; -TLV réservés :
+  // EAIT (2+4) + LTARF (2+16). (increment 3 : + DEMAIN/ADPS/PEJP/NJOURF.)
+  uint8_t extReserve = (curveHasInject ? 6 : 0) + (curveSendLtarf ? 18 : 0) + (ticMode == MODE_HISTO ? 7 : 6);
+  if (curvePos >= CURVE_BUF_LEN - HMAC_LEN - extReserve - (ticMode == MODE_HISTO ? 9 : 6) || curveN >= CURVE_MAX_SAMPLES)
+    curveFlushPending = true;   // deferred : envoi après fermeture du bloc v
 }
 
 // Finalise (N, period, [ext], HMAC) et émet le batch. Auto-suffisant : keyframe par
 // trame (§17.3), aucun delta inter-batch.
 void curveFlush() {
   if (!curveActive || curveN == 0) { curveActive = false; return; }
-  curveBuf[11] = curveN;
-  // period_ds = période RÉELLE mesurée (millis), en 1/10 s, pas le nominal théorique :
-  // (durée du batch) / (N-1 intervalles) → le récepteur espace les points au vrai
-  // rythme observé, donc horodatage juste quel que soit le débit. Borné 1..255.
+  curveBuf[18] = curveN;                              // N (offset fixe du core)
+  // period_ds = période RÉELLE mesurée (millis), en 1/10 s : (durée batch)/(N-1). Borné 1..255.
   {
     uint8_t pds = (ticMode == MODE_STANDARD) ? SAMPLE_PERIOD_DS_STD : SAMPLE_PERIOD_DS_HISTO;
     if (curveN >= 2) {
-      uint32_t per_ds = (millis() - curveT0) / (uint32_t)(curveN - 1) / 100UL;  // ms → 1/10 s
+      uint32_t per_ds = (millis() - curveT0) / (uint32_t)(curveN - 1) / 100UL;
       pds = (per_ds < 1) ? 1 : (per_ds > 255 ? 255 : (uint8_t)per_ds);
     }
-    curveBuf[12] = pds;   // N==1 (keyframe seul) → garde le nominal (période sans objet)
+    curveBuf[19] = pds;                              // period_ds (offset fixe)
   }
 
-  // Bloc extension v2 (entre les deltas et le HMAC ; signé par le HMAC). Flag bit7 +
-  // [ext_fields] puis, dans l'ordre des bits : bit0 EAIT (uint32 LE), bit1 LTARF ([len][ascii]).
-  {
-    uint8_t ext_fields = 0;
-    if (curveHasInject) ext_fields |= 0x01;
-    if (curveSendLtarf) ext_fields |= 0x02;
-    if (ext_fields) {
-      curveBuf[1] |= FLAG_EXT_V2;                 // pose le bit7 (flags = curveBuf[1])
-      curveBuf[curvePos++] = ext_fields;
-      if (ext_fields & 0x01) {                    // EAIT
-        memcpy(curveBuf + curvePos, &curveEait, EXT_INJECT_LEN);
-        curvePos += EXT_INJECT_LEN;
-      }
-      if (ext_fields & 0x02) {                    // LTARF ([len][ascii])
-        uint8_t l = strlen(curveLtarf);
-        if (l > 16) l = 16;
-        curveBuf[curvePos++] = l;
-        memcpy(curveBuf + curvePos, curveLtarf, l);
-        curvePos += l;
-      }
-    }
+  // Champs optionnels en TLV (après les points, avant le MAC). On-change / producteur.
+  // increment 3 : + DEMAIN/ADPS/PEJP (histo) + NJOURF/NJOURF+1 (std).
+  if (curveHasInject) {
+    uint8_t eb[4]; memcpy(eb, &curveEait, 4);
+    curvePos = writeTLV(curveBuf, curvePos, T_EAIT, eb, 4);
   }
+  if (curveSendLtarf) {
+    uint8_t l = strlen(curveLtarf); if (l > 16) l = 16;
+    curvePos = writeTLV(curveBuf, curvePos, T_LTARF, (const uint8_t*)curveLtarf, l);
+  }
+  if (curveDemain != 0xFF) curvePos = writeTLV(curveBuf, curvePos, T_DEMAIN, &curveDemain, 1);
+  if (curveAdps)  curvePos = writeTLV(curveBuf, curvePos, T_ADPS, &curveDemain, 0);  // présence (len 0)
+  if (curvePejp)  curvePos = writeTLV(curveBuf, curvePos, T_PEJP, &curveDemain, 0);  // présence (len 0)
+  if (ticMode == MODE_STANDARD && curveNjourf  != 0xFF) curvePos = writeTLV(curveBuf, curvePos, T_NJOURF,  &curveNjourf,  1);
+  if (ticMode == MODE_STANDARD && curveNjourf1 != 0xFF) curvePos = writeTLV(curveBuf, curvePos, T_NJOURF1, &curveNjourf1, 1);
 
-  uint8_t mac[32];
-  sha256.resetHMAC(hmac_key, HMAC_KEY_LEN);
-  sha256.update(curveBuf, curvePos);                          // signe octets 0..pos-1 (ext inclus)
-  sha256.finalizeHMAC(hmac_key, HMAC_KEY_LEN, mac, 32);
-  memcpy(curveBuf + curvePos, mac, HMAC_LEN);
-  uint16_t len = curvePos + HMAC_LEN;
+  uint16_t len = frameSeal(curveBuf, curvePos, FRAME_ENCRYPT);  // chiffre (si activé) + MAC → longueur totale
 
   if (loraOk) {
     driver.setModeIdle();
@@ -834,10 +955,9 @@ void setup() {
   ledBootHello();
 
   // Clé HMAC depuis EEPROM
-  readKeyFromEEPROM(hmac_key);
-  if (isKeyBlank(hmac_key)) {
-    provisioningMode();  // ne retourne pas — reboot à la fin
-  }
+  { uint8_t dev[HMAC_KEY_LEN]; readKeyFromEEPROM(dev);
+    if (isKeyBlank(dev)) provisioningMode(); }
+  bumpBootCount();
 
   Serial.begin(9600);
   Serial.println(F("tic-reader boot v" FW_VERSION));
@@ -904,6 +1024,7 @@ void loop() {
     return;
   }
 
+  {  // --- bloc v : TICValues détruit AVANT le flush différé → ~184 o de pile pour ChaCha ---
   TICValues v;
   if (!readAndParseTIC(v, ticMode)) {
     // Échec lecture : Enedis a peut-être rebasculé le mode → re-discovery après N échecs.
@@ -941,39 +1062,46 @@ void loop() {
     // PAPP/horodate manquent, ou si NTARF n'a jamais été vu (boot).
     bool tsOk = (v.ts[0] == 'E' || v.ts[0] == 'H' || v.ts[0] == 'e' || v.ts[0] == 'h');
     if (!(v.fields_seen & TIC_SEEN_PAPP) || !tsOk) return;         // skip silencieux (pas de rouge)
-    if (v.ntarf >= 1 && v.ntarf <= 10) {
-      lastNtarf = v.ntarf;                                         // maj carry-forward NTARF
-      if (v.easf_seen & (1 << (v.ntarf - 1))) lastStdIndex = v.easf[v.ntarf - 1];  // maj carry-forward EASF
-    }
-    if (lastNtarf < 1 || lastNtarf > 10) return;                  // NTARF jamais vu → skip silencieux
+    // TRIM : easf_active capté au parse via lastNtarf (reporté). id = ce lastNtarf → paire (id,value) cohérente.
+    if (v.easf_active_seen) lastStdIndex = v.easf_active;          // maj carry-forward EASF actif
+    uint8_t idNow = lastNtarf;                                    // NTARF ayant choisi easf_active (AVANT maj)
+    if (v.ntarf >= 1 && v.ntarf <= 10) lastNtarf = v.ntarf;       // maj carry-forward pour la PROCHAINE trame
+    if (idNow < 1 || idNow > 10) return;                          // NTARF pas encore amorcé (1re trame) → skip
     // Cold-start (reboot) : NTARF vu mais EASF actif pas encore capturé (1re trame tronquée /
     // checksum) → lastStdIndex=0. Ne PAS démarrer la courbe sur un index 0 (sinon la keyframe
     // fige 0 pour tout le batch). On saute cette trame → le batch démarrera à la trame suivante
     // avec le vrai index. Coût : au pire 1 point PAPP par reboot (cf. instrumentation INDEX0).
     if (lastStdIndex == 0) return;
-    id = lastNtarf;
+    id = idNow;
     value = lastStdIndex;
   } else {
-    if (!v.valid) { blinkErr(3); return; }                        // histo : trame invalide
+    // TOLÉRANCE front-end marginal : trame histo glitchée (invalide / PTEC inconnu / partielle)
+    // → skip SILENCIEUX. Plus de rouge rouge sur 1 glitch : on lit les bonnes trames entre les
+    // mauvaises (comme le wired). Perte TOTALE de signal = gérée par consecFail (readAndParseTIC false).
+    if (!v.valid) return;                                         // histo : trame invalide
     selectActiveIndex(v, id, value);
-    if (id == IDX_UNKNOWN) { blinkErr(4); return; }               // histo : PTEC inconnu
+    if (id == IDX_UNKNOWN) return;                                // histo : PTEC inconnu (souvent = glitch)
     uint16_t required = TIC_SEEN_PAPP;                            // garde histo : PAPP + index actif
     if (id < sizeof(INDEX_ID_TO_SEEN) / sizeof(INDEX_ID_TO_SEEN[0]))
       required |= INDEX_ID_TO_SEEN[id];
-    if ((v.fields_seen & required) != required) { blinkErr(2); return; }   // trame partielle
+    if ((v.fields_seen & required) != required) return;          // trame partielle
   }
 
   // Accumulation courbe. Changement d'index actif → coupe le batch et repart sur un keyframe
   // du nouvel index → batch homogène (§17.3). En standard, bascule soutiré↔injection sans
   // flush : le delta zig-zag est signé.
-  if (!curveActive || id != curveIndexId) {
-    if (curveActive && curveN > 1) curveFlush();
-    curveStart(v, id, value);
+  if (!curveActive) {
+    curveStart(v, id, value);          // 1er point d'un batch : pas de flush, aucun risque
+  } else if (id != curveIndexId) {
+    curveFlushPending = true;          // changement d'index : flush différé + on SAUTE ce point
+                                       // (le nouveau batch démarre au tour suivant : perte ~1 pt/chgt tarif, osef)
   } else {
-    curveAdd(pappValue(v), v);         // signé en standard ; dt par point ; peut auto-flush
+    curveAdd(pappValue(v), v);         // même index → point (peut lever curveFlushPending si plein)
   }
-
-  // Flush périodique → fraîcheur /live ~60 s (sinon un batch traînerait jusqu'à plein).
+  // Flush périodique → fraîcheur /live ~60 s.
   if (curveActive && curveN > 1 && (millis() - curveT0) >= CURVE_FLUSH_MS)
-    curveFlush();
+    curveFlushPending = true;
+  }  // --- fin bloc v : TICValues détruit, pile dégagée ---
+  // Flush DIFFÉRÉ (+ flush-on-message) : ici v n'est plus sur la pile → chiffrement au large.
+  if (curveFlushPending) { curveFlush(); curveFlushPending = false; }
 }

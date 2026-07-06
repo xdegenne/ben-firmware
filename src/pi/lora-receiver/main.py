@@ -46,7 +46,8 @@ import db  # noqa: E402
 import settings  # noqa: E402
 
 # Décodeur courbe v0x05 (module pur, même dossier — testable hors device).
-import curve_codec  # noqa: E402
+import curve_codec
+import frame_codec  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -317,137 +318,21 @@ def on_recv(payload) -> None:
             blink_rgb(30, 15, 0, 0.3, bypass=True)  # orange — source inconnue
             return
 
-        version = raw[0]
-
-        # v0x05 = trame courbe batchée (longueur VARIABLE) → branche dédiée, AVANT
-        # le contrôle de longueur fixe (sinon toute trame v0x05 serait rejetée ici).
-        if version == curve_codec.PROTOCOL_VERSION_CURVE:
-            on_recv_curve(raw, rssi, snr, pdl_index, now, time_since_prev)
+        try:
+            decoded = frame_codec.decode(raw, HMAC_KEY)
+        except frame_codec.FrameError as e:
+            log.error(f"trame rejetée : {e}")
+            blink_rgb(30, 0, 0, 0.3, bypass=True)  # rouge — MAC / proto
             return
 
-        # v0x02 (mesure) = 20 o fixe ; v0x01 (boot) = VARIABLE 15..32 (extension NGTF). On borne
-        # large ; le dispatch par version lit ensuite les bons offsets (et v0x02 est validé HMAC).
-        if len(raw) < 15 or len(raw) > BOOT_MAX_LEN:
-            log.error(f"Longueur invalide : {len(raw)} octets (attendu 15..{BOOT_MAX_LEN})")
-            blink_rgb(30, 0, 0, 0.3, bypass=True)  # rouge — erreur proto
-            return
-
-        if version == 0x01:
-            adco = raw[1:13].decode("ascii", errors="replace").rstrip("\x00")
-            prev_adco = state.get("adco", "")
-            if adco != prev_adco:
-                log.info(f"BOOT FRAME addr=0x{sender_addr:02x} pdl_index={pdl_index} ADCO={adco} — NOUVEAU PDL, reset state")
-                state["indexes"] = {}
-                state["last_boot_seq"] = None
-                state["last_active_id"] = None
-                state["adco"] = adco
-                save_state(state)
-            else:
-                log.info(f"BOOT FRAME addr=0x{sender_addr:02x} pdl_index={pdl_index} ADCO={adco} (PDL connu)")
-            # ISOUSC (abonnement) : octet 13 de la trame d'identité = intensité
-            # souscrite en A (0 = absent, ex. émetteur < 0.0.2 → rétro-compat).
-            # Chantier ISOUSC. record_isousc fait sa garde (écrit seulement sur
-            # changement) ; le boot frame est rare → pas de garde RAM nécessaire.
-            isousc = raw[13]
-            if isousc and measurements_db is not None:
-                try:
-                    if db.record_isousc(measurements_db, pdl_index, isousc):
-                        log.info(f"ISOUSC={isousc} A enregistré "
-                                 f"(maxVa≈{isousc * 230} VA) pdl_index={pdl_index}")
-                except Exception as e:
-                    log.warning(f"store: record_isousc échoué: {e}")
-            # PREF (abonnement en mode STANDARD, kVA) : octet 14 (0 = absent, ex. émetteur
-            # < 0.0.7 → rétro-compat). Le standard ne porte pas ISOUSC ; PREF×1000 calibre la jauge.
-            pref = raw[14] if len(raw) > 14 else 0
-            if pref and measurements_db is not None:
-                try:
-                    if db.record_pref(measurements_db, pdl_index, pref):
-                        log.info(f"PREF={pref} kVA enregistré "
-                                 f"(maxVa≈{pref * 1000} VA) pdl_index={pdl_index}")
-                except Exception as e:
-                    log.warning(f"store: record_pref échoué: {e}")
-            # NGTF (nom du calendrier tarifaire fournisseur, standard) : octet 15 = longueur,
-            # 16.. = ascii (0/absent = ancien émetteur → trame 20 o padding). Chantier labels :
-            # sert à segmenter les registres au changement de fournisseur. record_ngtf on-change.
-            if len(raw) > 15 and raw[15] and measurements_db is not None:
-                ngtf = raw[16:16 + raw[15]].decode("ascii", errors="replace").strip()
-                try:
-                    if db.record_ngtf(measurements_db, pdl_index, ngtf):
-                        log.info(f"NGTF={ngtf!r} enregistré pdl_index={pdl_index}")
-                except Exception as e:
-                    log.warning(f"store: record_ngtf échoué: {e}")
-            blink_rgb(30, 30, 30, 2.0)   # blanc long = discovery
-            return
-
-        if version != PROTOCOL_VERSION:
-            log.error(f"Version inconnue : 0x{version:02x}")
-            blink_rgb(30, 0, 0, 0.3, bypass=True)  # rouge — erreur proto
-            return
-
-        signed       = raw[:HMAC_OFFSET]
-        mac_received = raw[HMAC_OFFSET:HMAC_OFFSET + HMAC_LEN]
-        mac_expected = hmaclib.new(HMAC_KEY, signed, hashlib.sha256).digest()[:HMAC_LEN]
-        if not hmaclib.compare_digest(mac_received, mac_expected):
-            log.error(f"HMAC invalide — reçu={mac_received.hex()} attendu={mac_expected.hex()}")
-            blink_rgb(30, 0, 0, 0.3, bypass=True)  # rouge — HMAC
-            return
-
-        (_ver, flags, boot_seq, index_id,
-         index_value, iinst, papp) = struct.unpack("<BBHBIBH", signed)
-
-        active_name = INDEX_NAMES.get(index_id)
-        if active_name is None:
-            if index_id == INDEX_UNKNOWN:
-                log.warning("index_id=0xFF (PTEC inconnu côté Arduino), trame ignorée")
-            else:
-                log.error(f"index_id inconnu : 0x{index_id:02x}")
-            blink_rgb(30, 0, 0, 0.3, bypass=True)
-            return
-
-        demain = DEMAIN_NAMES[flags & 0x03]
-        adps   = bool(flags & FLAG_ADPS)
-        pejp   = bool(flags & FLAG_PEJP)
-
-        log.info(f"OK pdl_index={pdl_index} seq={boot_seq} idx={active_name} "
-                 f"val={index_value} IINST={iinst} PAPP={papp} "
-                 f"demain={demain} adps={adps} pejp={pejp}")
-
-        # Store local : conso (1 index actif par trame LoRa) + qualité radio.
-        if measurements_db is not None:
-            try:
-                db.record_measurement(
-                    measurements_db, pdl_index,
-                    {active_name: index_value, "IINST": iinst, "PAPP": papp},
-                )
-                db.record_lora_link(measurements_db, pdl_index, rssi, snr)
-            except Exception as e:
-                log.warning(f"store: écriture échouée: {e}")
-            if time.time() - last_prune > 3600:
-                try:
-                    deleted = db.prune(measurements_db)
-                    log.info(f"store purge (>{db.RETENTION_DAYS}j): {deleted}")
-                except Exception as e:
-                    log.warning(f"store: purge échouée: {e}")
-                last_prune = time.time()
-
-        event, details = detect_boot_seq_event(boot_seq, time_since_prev)
-        if event:
-            log.info(f"EVENT {event} {details}")
-
-        prev_value = state["indexes"].get(active_name, 0)
-        if index_value < prev_value:
-            log.warning(f"{active_name} en décroissance : {index_value} < {prev_value}")
-            blink_rgb(30, 15, 0, 0.3, bypass=True)  # orange — décroissance
+        ftype = decoded["type"]
+        if ftype == frame_codec.TYPE_CURVE:
+            on_recv_curve(decoded, rssi, snr, pdl_index, now, time_since_prev)
+        elif ftype == frame_codec.TYPE_BOOT:
+            on_recv_boot(decoded, rssi, snr, pdl_index)
         else:
-            blink_rgb(0, 5, 0, 0.05)   # vert court & faible — données valides (HMAC OK)
-
-        if index_value >= prev_value:
-            state["indexes"][active_name] = int(index_value)
-        state["last_active_id"]  = int(index_id)
-        state["last_boot_seq"]   = int(boot_seq)
-        state["last_frame_time"] = now
-        save_state(state)
-
+            log.error(f"type de trame inconnu : 0x{ftype:02x}")
+            blink_rgb(30, 0, 0, 0.3, bypass=True)  # rouge — proto
     except Exception:
         log.error(f"Exception dans on_recv :\n{traceback.format_exc()}")
         blink_rgb(30, 0, 0, 0.5, bypass=True)  # rouge — exception
@@ -465,17 +350,69 @@ def _maybe_prune() -> None:
         last_prune = time.time()
 
 
-def on_recv_curve(raw, rssi, snr, pdl_index, now, time_since_prev) -> None:
-    """Trame courbe v0x05 : HMAC vérifié + courbe PAPP reconstruite par curve_codec,
-    horodatée (ancrage réception en historique), puis insérée EN BATCH dans la même
-    table `measurements` que le wired → /curve et /measurements à l'identique."""
-    try:
-        decoded = curve_codec.decode_v04(raw, HMAC_KEY)
-    except curve_codec.CurveDecodeError as e:
-        log.error(f"v0x05 rejetée : {e}")
-        blink_rgb(30, 0, 0, 0.3, bypass=True)  # rouge — HMAC / proto
-        return
+# Champs collectés mais NON câblés au stockage (DEMAIN/ADPS/PEJP, NJOURF/NJOURF+1 — tous en TLV) :
+# logués À MINIMA, ON-CHANGE en INFO — MÊME format/manière que le lecteur wired (main_uart.py).
+# MSG1/MSG2 = non émis (RAM ATmega328). NB : DEMAIN_NAMES/FLAG_ADPS/FLAG_PEJP en tête de fichier
+# sont MORTS (reliquat des flags v0x02) — DEMAIN passe désormais par TLV, pas par l'octet flags.
+_last_uncabled: dict = {}
 
+
+def log_uncabled(pdl_index, tlvs) -> None:
+    """Logge en INFO les TLV connus-mais-non-stockés quand leur valeur change (aligné wired)."""
+    for _tag, name, val, known, stored in frame_codec.interpret_tlvs(tlvs):
+        if known and not stored:
+            key = (pdl_index, name)
+            if _last_uncabled.get(key) != val:
+                log.info(f"non câblé : {name}={val!r} (collecté, pas stocké) pdl_index={pdl_index}")
+                _last_uncabled[key] = val
+
+
+def on_recv_boot(decoded, rssi, snr, pdl_index) -> None:
+    """Trame BOOT/IDENTITÉ (format cible) : TLV identité (ADCO/ISOUSC/PREF/CONTRAT), MAC déjà
+    vérifié. Reset state si nouveau PDL (ADCO). TLV non câblés → logués."""
+    tlvs = decoded["tlvs"]
+    adco = (frame_codec.interpret_tlv(frame_codec.T_ADCO, tlvs[frame_codec.T_ADCO])
+            if frame_codec.T_ADCO in tlvs else "")
+    if adco and adco != state.get("adco", ""):
+        log.info(f"BOOT pdl_index={pdl_index} ADCO={adco} — NOUVEAU PDL, reset state")
+        state["indexes"] = {}
+        state["last_boot_seq"] = None
+        state["last_active_id"] = None
+        state["adco"] = adco
+        save_state(state)
+    else:
+        log.info(f"BOOT pdl_index={pdl_index} ADCO={adco} (PDL connu)")
+    if measurements_db is not None:
+        isousc = tlvs.get(frame_codec.T_ISOUSC)
+        if isousc:
+            try:
+                if db.record_isousc(measurements_db, pdl_index, isousc[0]):
+                    log.info(f"ISOUSC={isousc[0]} A (maxVa≈{isousc[0]*230}) pdl_index={pdl_index}")
+            except Exception as e:
+                log.warning(f"store: record_isousc échoué: {e}")
+        pref = tlvs.get(frame_codec.T_PREF)
+        if pref:
+            try:
+                if db.record_pref(measurements_db, pdl_index, pref[0]):
+                    log.info(f"PREF={pref[0]} kVA (maxVa≈{pref[0]*1000}) pdl_index={pdl_index}")
+            except Exception as e:
+                log.warning(f"store: record_pref échoué: {e}")
+        contrat = tlvs.get(frame_codec.T_CONTRAT)
+        if contrat:
+            ngtf = frame_codec.interpret_tlv(frame_codec.T_CONTRAT, contrat)
+            try:
+                if db.record_ngtf(measurements_db, pdl_index, ngtf):
+                    log.info(f"CONTRAT={ngtf!r} pdl_index={pdl_index}")
+            except Exception as e:
+                log.warning(f"store: record_ngtf échoué: {e}")
+    log_uncabled(pdl_index, tlvs)                    # TLV connus non stockés → INFO on-change
+    blink_rgb(30, 30, 30, 2.0)   # blanc long = discovery
+
+
+def on_recv_curve(decoded, rssi, snr, pdl_index, now, time_since_prev) -> None:
+    """Trame COURBE (format cible) déjà décodée + MAC vérifié par frame_codec. Reconstruit la
+    courbe PAPP, l'horodate, l'insère EN BATCH dans `measurements` (comme le wired). Décode
+    tous les TLV ; les non câblés (DEMAIN/ADPS/PEJP/NJOURF/MSG) sont LOGUÉS."""
     index_id = decoded["index_id"]
     src_standard = decoded["src_standard"]
 
@@ -499,20 +436,22 @@ def on_recv_curve(raw, rssi, snr, pdl_index, now, time_since_prev) -> None:
             return
 
     papp = decoded["papp"]
-    ts_list = curve_codec.anchor_timestamps(decoded, now)         # ts SYSTÈME (Pi/NTP, approx LoRa)
-    meter_ts_list = curve_codec.meter_timestamps(decoded)         # meter_ts COMPTEUR (standard) ou None
-    flags = decoded["flags"]
-    demain = DEMAIN_NAMES[flags & 0x03]
-    adps = bool(flags & FLAG_ADPS)
-    pejp = bool(flags & FLAG_PEJP)
+    tlvs = decoded["tlvs"]
+    ts_list = frame_codec.anchor_timestamps(decoded, now)         # ts SYSTÈME (Pi/NTP, approx LoRa)
+    meter_ts_list = frame_codec.meter_timestamps(decoded)         # meter_ts COMPTEUR (standard) ou None
     batch_seq = decoded["batch_seq"]
     index_value = decoded["index_value"]
-    inject_total = decoded["inject_total"]
+    # EAIT/LTARF câblés (stockés) ; DEMAIN/ADPS/PEJP/NJOURF/MSG connus mais PAS encore câblés
+    # → décodés et LOGUÉS (visibilité avant câblage), tags inconnus déjà sautés par frame_codec.
+    inject_total = (frame_codec.interpret_tlv(frame_codec.T_EAIT, tlvs[frame_codec.T_EAIT])
+                    if frame_codec.T_EAIT in tlvs else None)
+    ltarf = (frame_codec.interpret_tlv(frame_codec.T_LTARF, tlvs[frame_codec.T_LTARF])
+             if frame_codec.T_LTARF in tlvs else None)
+    log_uncabled(pdl_index, tlvs)                    # DEMAIN/ADPS/PEJP/NJOURF/NJOURF+1 → INFO on-change
 
     mode = "std" if src_standard else "histo"
     idlbl = f"NTARF={index_id}" if src_standard else active_name
-    extra = (f" inject_total={inject_total}" if src_standard
-             else f" demain={demain} adps={adps} pejp={pejp}")
+    extra = f" inject_total={inject_total}" if inject_total is not None else ""
     log.info(f"v0x05 OK [{mode}] pdl_index={pdl_index} batch_seq={batch_seq} {idlbl} "
              f"index={index_value} n={decoded['n']} period_ds={decoded['period_ds']} "
              f"papp[0]={papp[0]} papp[-1]={papp[-1]}" + extra)
@@ -536,21 +475,14 @@ def on_recv_curve(raw, rssi, snr, pdl_index, now, time_since_prev) -> None:
 
     # LTARF (label tarif standard, ext v2) : cache NTARF→LTARF (write-on-change) → alimente
     # la résolution de label serveur (/registers, /live.tariff_label). Chantier labels+index.
-    if decoded.get("ltarf") and measurements_db is not None:
+    if ltarf and measurements_db is not None:
         try:
             ngtf = db.get_ngtf(measurements_db, pdl_index) or ""   # contrat courant → scope du label
             if db.record_tariff_label(measurements_db, pdl_index,
-                                      1 if src_standard else 0, index_id, decoded["ltarf"], ngtf):
-                log.info(f"LTARF NTARF={index_id} → {decoded['ltarf']!r} pdl_index={pdl_index}")
+                                      1 if src_standard else 0, index_id, ltarf, ngtf):
+                log.info(f"LTARF NTARF={index_id} → {ltarf!r} pdl_index={pdl_index}")
         except Exception as e:
             log.warning(f"store: record_tariff_label échoué: {e}")
-
-    # DIAG index=0 (ext v2) : capture Arduino de la ligne EASF brute mal parsée (ce que le
-    # récepteur ne voit PAS). On la logue → confirme/infirme l'edge de découpe HT (n_ht ≠ 2).
-    if decoded.get("diag"):
-        d = decoded["diag"]
-        log.warning(f"INDEX0-DIAG (source Arduino) batch_seq={batch_seq} NTARF={index_id} "
-                    f"n_ht={d['n_ht']} raw={d['raw']!r}")
 
     # Stockage : un row par échantillon. L'index actif est CONSTANT sur le batch (l'Arduino
     # coupe au changement d'index) → estampillé sur CHAQUE row (curve_buckets JOIN ts_max →

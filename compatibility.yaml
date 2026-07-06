@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.0.54"
+        latest: "0.1.0"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -156,9 +156,12 @@ devices:
           - version: "0.0.54"
             released: "2026-07-03"
             notes: "Chantier « unification labels + contrat ». Récepteur LoRa : décode l'EXT COURBE v2 (flag bit7) = EAIT + LTARF (label tarif standard) + DIAG index=0 ; contrat NGTF (standard) / OPTARIF (histo) dans la trame boot v0x01 (octet 15 = longueur, 16.. = ascii ; borne relâchée 15..32 o). Résolution de label UNIFIÉE côté serveur (resolve_label : standard=LTARF autoritatif via tariff_labels / histo=convention statique HISTO_LABELS) + API : /live.tariff_label + /live.contract + nouvel endpoint /registers (registres + index par tarif + contrat). Stockage : table tariff_labels keyée (pdl,src,index_id,ngtf) — segmentée par CONTRAT — + colonne level_profile.ngtf. STRICTEMENT ADDITIF : aucun champ /live retiré ni renommé → app legacy inchangées, wired histo intact. MIGRATION idempotente au 1er db.connect (CREATE tariff_labels avec la nouvelle PK + ALTER level_profile.ngtf ; drop/recreate tariff_labels si ancienne PK). Transition = restart ben-lora-receiver + ben-local-api. NB : les nouveaux champs restent dormants tant que l'émetteur n'émet pas LTARF/contrat (arduino ≥ 0.0.9) — rétro-compatible (trames actuelles décodées à l'identique)."
+          - version: "0.1.0"
+            released: "2026-07-06"
+            notes: "PALIER 0.1.0 (fin des 0.0.x — unification des versions Pi + Arduino). Récepteur LoRa : décodeur de trame EXTRAIT dans frame_codec.py (module pur testable, réutilisé par le banc de test) — main.py délègue à frame_codec.decode. Porté par le codec : DÉCHIFFREMENT ChaCha20 (encrypt-then-MAC, bit7) + décode IINST 2e courbe (histo). ALIGNEMENT du logging avec le lecteur wired : les champs collectés-mais-non-stockés (DEMAIN/ADPS/PEJP, NJOURF/NJOURF+1) sont logués INFO ON-CHANGE via log_uncabled (même format des deux côtés). STRICTEMENT ADDITIF : aucune migration BDD, aucun champ API retiré/renommé. Rétro-compatible : frame_codec décode aussi les trames NON chiffrées (émetteur < arduino 0.1.0). Transition = restart ben-lora-receiver + ben-local-api."
       arduino:
         minimum: "0.0.1"
-        latest: "0.0.9"
+        latest: "0.1.0"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -186,11 +189,14 @@ devices:
           - version: "0.0.9"
             released: "2026-07-03"
             notes: "Contrat mode-agnostique dans la trame boot : contractOf(v) = NGTF en standard / OPTARIF en historique (le champ 'contrat' de la trame boot porte l'un ou l'autre selon le mode) → le récepteur le stocke comme contrat (level_profile.ngtf) quel que soit le mode. Complète 0.0.8 (qui n'envoyait NGTF qu'en standard). Aucun impact sur un émetteur standard (contractOf renvoie NGTF, identique à 0.0.8) — l'ajout OPTARIF ne sert qu'en histo. minimum reste 0.0.1. À flasher avec le Pi ≥ pi-0.0.54."
+          - version: "0.1.0"
+            released: "2026-07-06"
+            notes: "PALIER 0.1.0 (unification des versions — fin du compteur interne 0.5.x du sketch, aligné sur le Pi). tic-reader.ino : garde histo TOLÉRANTE (trame glitchée → skip silencieux, robuste au front-end marginal — corrige le rouge-rouge sur vrai Linky historique) + IINST 2e courbe (histo) + flush courbe 55 s (/live < 60 s) + checksum S1/S2 + CHIFFREMENT ChaCha20 (FRAME_ENCRYPT actif, encrypt-then-MAC). Reflash MANUEL (pas d'OTA sur Pro Mini). À flasher APRÈS avoir déployé le Pi en pi-0.1.0 (qui déchiffre) ; rétro-compat récepteur (trames non chiffrées encore décodées). minimum reste 0.0.1."
 
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.0.54"
+        latest: "0.1.0"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -330,6 +336,9 @@ devices:
           - version: "0.0.54"
             released: "2026-07-03"
             notes: "Chantier « unification labels + contrat », côté WIRED. main_uart lit LTARF + le contrat (NGTF en standard / OPTARIF en historique, mode-agnostique) directement dans la TIC et les stocke (tariff_labels keyée par contrat + level_profile.ngtf). Résolution de label UNIFIÉE côté serveur (resolve_label) + API : /live.tariff_label + /live.contract + nouvel endpoint /registers. STRICTEMENT ADDITIF : aucun champ retiré/renommé → app legacy inchangées ; histo intact (LTARF absent en histo → skip ; OPTARIF capté comme contrat). MIGRATION idempotente au 1er db.connect (CREATE tariff_labels + ALTER level_profile.ngtf). Transition = restart ben-tic-reader + ben-local-api."
+          - version: "0.1.0"
+            released: "2026-07-06"
+            notes: "PALIER 0.1.0 (fin des 0.0.x). Lecteur wired (main_uart.py) : ALIGNEMENT du logging avec le récepteur LoRa — les champs collectés-mais-non-stockés sont logués INFO ON-CHANGE via log_uncabled (même format que le LoRa) : DEMAIN/ADPS/PEJP (histo) + PARSE & log NJOURF/NJOURF+1 (Tempo standard, nouveau — n'étaient pas parsés). STRICTEMENT ADDITIF : aucune migration BDD, aucun champ API retiré/renommé. Transition = restart ben-tic-reader + ben-local-api."
 
 updates:
 
@@ -513,6 +522,10 @@ updates:
       to: "0.0.54"
       tag: "pi-0.0.54"
       script: "updates/pi0-lora/0.0.53_to_0.0.54/update.sh"
+    - from: "0.0.54"
+      to: "0.1.0"
+      tag: "pi-0.1.0"
+      script: "updates/pi0-lora/0.0.54_to_0.1.0/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -687,6 +700,10 @@ updates:
       to: "0.0.54"
       tag: "pi-0.0.54"
       script: "updates/pi0-wired/0.0.53_to_0.0.54/update.sh"
+    - from: "0.0.54"
+      to: "0.1.0"
+      tag: "pi-0.1.0"
+      script: "updates/pi0-wired/0.0.54_to_0.1.0/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet
