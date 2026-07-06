@@ -23,7 +23,14 @@ Endpoints :
         (min/max/avg) au lieu d'être tronqué. `downsampled` indique le cas.
   GET /curve?pdl_index=N[&since=ts&until=ts&buckets=K]
       → courbe agrégée par bucket (min/max/avg, pics préservés). `buckets` =
-        résolution voulue par l'app (défaut 500, max 2000). Endpoint riche.
+        résolution voulue par l'app (défaut 500, max 2000). BRUT uniquement,
+        INTACT (app courante). Ne sert PAS le rollup ni les bandes → cf. /chart.
+  GET /chart?pdl_index=N[&since=ts&until=ts&buckets=K][&raw=1]
+      → courbe RICHE prête-à-tracer : {points, tariff_bands, source}. Le serveur
+        arbitre la source des points (rollup rapide sur vue large / brut au zoom) ;
+        `tariff_bands` = zones HP/HC depuis le rollup (jamais un parcours de points).
+        `raw=1` force le brut (haute fidélité, période bornée). Endpoint de la
+        nouvelle app ; forme /curve + tariff_bands (additif). Cf. rollup-par-index.md.
   GET /consumption?pdl_index=N[&since=ts&until=ts]
       → conso PAR REGISTRE (Wh) sur la plage : {by_register:[{src_standard,
         index_id,wh}],total_wh}. Carry-forward server-side (MAX-MIN par registre,
@@ -117,6 +124,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._measurements(qs)
             if path == "/curve":
                 return self._curve(qs)
+            if path == "/chart":
+                return self._chart(qs)
             if path == "/consumption":
                 return self._consumption(qs)
             if path == "/registers":
@@ -360,6 +369,42 @@ class Handler(BaseHTTPRequestHandler):
             pts = db.curve_buckets(conn, pdl, since, until, bucket_sec)
         self._send({"pdl_index": pdl, "since": since, "until": until,
                     "bucket_sec": bucket_sec, "count": len(pts), "points": pts})
+
+    def _chart(self, qs):
+        """Courbe RICHE prête-à-tracer : `points` + `tariff_bands` (zones HP/HC) — endpoint
+        de la nouvelle app (le rollup + les bandes NE PASSENT PAS par /curve, laissé intact pour
+        l'app courante). Le SERVEUR arbitre la source des points (rollup rapide vs brut fidèle) ;
+        les bandes viennent TOUJOURS du rollup (jamais un parcours de points). Param `raw=1` →
+        force le brut (haute fidélité sur une période bornée). Cf. docs/rollup-par-index.md §5/§6."""
+        pdl = _int(qs, "pdl_index")
+        if pdl is None:
+            return self._send({"error": "pdl_index_required"}, 400)
+        now = int(time.time())
+        since = _int(qs, "since", now - DEFAULT_WINDOW_SEC)
+        until = _int(qs, "until", now)
+        if until <= since:
+            return self._send({"error": "bad_range"}, 400)
+        buckets = _int(qs, "buckets", DEFAULT_CURVE_BUCKETS) or DEFAULT_CURVE_BUCKETS
+        buckets = max(1, min(buckets, MAX_CURVE_BUCKETS))
+        bucket_sec = max(1, (until - since) // buckets)
+        force_raw = qs.get("raw", ["0"])[0] in ("1", "true")
+        with db.connect(read_only=True) as conn:
+            # Arbitrage : rollup si (pas forcé brut) ET tranche demandée ≥ finesse rollup (2 min)
+            # ET la fenêtre est couverte (since ≥ watermark). Sinon → brut (zoom serré, ou zone
+            # pas encore backfillée). Même forme de retour dans les 2 cas → l'app ne voit rien.
+            wm = db.rollup_watermark(conn)
+            use_rollup = (not force_raw and bucket_sec >= db.ROLLUP_BUCKET_SEC
+                          and wm is not None and since >= wm)
+            if use_rollup:
+                pts = db.curve_from_rollup(conn, pdl, since, until, bucket_sec)
+                source = "rollup"
+            else:
+                pts = db.curve_buckets(conn, pdl, since, until, bucket_sec)
+                source = "raw" if force_raw else "brut"
+            bands = db.tariff_bands(conn, pdl, since, until)
+        self._send({"pdl_index": pdl, "since": since, "until": until,
+                    "bucket_sec": bucket_sec, "count": len(pts), "points": pts,
+                    "tariff_bands": bands, "source": source})
 
     def _consumption(self, qs):
         """Conso par registre sur [since, until] — carry-forward server-side

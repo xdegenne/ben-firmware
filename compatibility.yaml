@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.2.0"
+        latest: "0.3.0"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -162,6 +162,9 @@ devices:
           - version: "0.2.0"
             released: "2026-07-06"
             notes: "ROLLUP PAR INDEX — phases 1+2 (côté ÉCRITURE, PUREMENT ADDITIF : aucune lecture ni champ API changé → zéro régression, invisible). Nouvelle table curve_rollup = résumé pré-agrégé par (tranche 2 min, tarif index_id) : min/max/sum/count/index_last. Alimentée AU FIL DE L'EAU à l'ingestion (record_measurement / record_measurements_batch : le paquet LoRa résumé en 1-2 upserts) + BACKFILL progressif de l'historique (newest-first, 1 jour/pas, borné ~2 s, greffé sur prune(), REPRENABLE via curseur watermark persistant rollup_state, idempotent via INSERT OR REPLACE). Prépare la perf /curve + les bandes HP/HC (Phase 3, prochaine release). Schéma créé au 1er db.connect (CREATE TABLE IF NOT EXISTS), aucune migration destructive. Purge du rollup alignée sur la rétention. Cf. docs/rollup-par-index.md. Transition = restart ben-lora-receiver + ben-local-api."
+          - version: "0.3.0"
+            released: "2026-07-06"
+            notes: "ROLLUP PAR INDEX — Phase 3 (côté LECTURE, exploite le rollup de 0.2.0). NOUVEL endpoint GET /chart : courbe RICHE {points, tariff_bands, source} — le serveur arbitre la source des points (rollup rapide sur vue large / brut au zoom, raw=1 force le brut) ; tariff_bands = zones tarifaires AUTO-DESCRIPTIVES {from,to,kind,index_id,src_standard,label} distinguant TOUS les tarifs (HC/HP, Tempo bleu/blanc/rouge, EJP), histo ET standard, jamais un parcours de points (§5). /curve reste INTACT (brut) → app courante inchangée. /consumption et /registers ACCÉLÉRÉS via le rollup (index_last, fallback brut) : mesuré ben-0003 ×85 (/consumption 3574→42 ms) et ×550 (/registers 28 s→52 ms), résultat EXACT au Wh (écart bord ≤ 1 tranche). STRICTEMENT ADDITIF : /curve/consumption/registers gardent leur forme (bascule interne transparente) ; /chart est nouveau. Aucune migration BDD. Cf. docs/rollup-par-index.md §5/§6. Transition = restart ben-lora-receiver + ben-local-api."
       arduino:
         minimum: "0.0.1"
         latest: "0.1.0"
@@ -199,7 +202,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.2.0"
+        latest: "0.3.0"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -345,6 +348,9 @@ devices:
           - version: "0.2.0"
             released: "2026-07-06"
             notes: "ROLLUP PAR INDEX — phases 1+2 (côté ÉCRITURE, PUREMENT ADDITIF : aucune lecture ni champ API changé → zéro régression, invisible). Nouvelle table curve_rollup = résumé pré-agrégé par (tranche 2 min, tarif index_id) : min/max/sum/count/index_last. Alimentée AU FIL DE L'EAU (record_measurement / record_measurements_batch) + BACKFILL progressif de l'historique (newest-first, 1 jour/pas, borné ~2 s, greffé sur prune(), REPRENABLE via curseur watermark persistant rollup_state, idempotent). Prépare la perf /curve + les bandes HP/HC (Phase 3). Schéma créé au 1er db.connect (CREATE TABLE IF NOT EXISTS), aucune migration destructive. Cf. docs/rollup-par-index.md. Transition = restart ben-tic-reader + ben-local-api."
+          - version: "0.3.0"
+            released: "2026-07-06"
+            notes: "ROLLUP PAR INDEX — Phase 3 (côté LECTURE, exploite le rollup de 0.2.0). NOUVEL endpoint GET /chart : courbe RICHE {points, tariff_bands, source} — le serveur arbitre la source des points (rollup rapide sur vue large / brut au zoom, raw=1 force le brut) ; tariff_bands = zones tarifaires AUTO-DESCRIPTIVES {from,to,kind,index_id,src_standard,label} distinguant TOUS les tarifs (HC/HP, Tempo, EJP), histo ET standard, jamais un parcours de points (§5). /curve reste INTACT (brut) → app courante inchangée. /consumption et /registers ACCÉLÉRÉS via le rollup (index_last, fallback brut) : ×85 (/consumption) et ×550 (/registers) mesuré sur ben-0003, résultat EXACT au Wh. STRICTEMENT ADDITIF : /curve/consumption/registers gardent leur forme (bascule interne transparente) ; /chart est nouveau. Aucune migration BDD. Cf. docs/rollup-par-index.md §5/§6. Transition = restart ben-tic-reader + ben-local-api."
 
 updates:
 
@@ -536,6 +542,10 @@ updates:
       to: "0.2.0"
       tag: "pi-0.2.0"
       script: "updates/pi0-lora/0.1.0_to_0.2.0/update.sh"
+    - from: "0.2.0"
+      to: "0.3.0"
+      tag: "pi-0.3.0"
+      script: "updates/pi0-lora/0.2.0_to_0.3.0/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -718,6 +728,10 @@ updates:
       to: "0.2.0"
       tag: "pi-0.2.0"
       script: "updates/pi0-wired/0.1.0_to_0.2.0/update.sh"
+    - from: "0.2.0"
+      to: "0.3.0"
+      tag: "pi-0.3.0"
+      script: "updates/pi0-wired/0.2.0_to_0.3.0/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet

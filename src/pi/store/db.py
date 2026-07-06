@@ -671,6 +671,132 @@ def curve_buckets(
     return out
 
 
+def rollup_watermark(conn: sqlite3.Connection) -> int | None:
+    """Borne basse couverte par le rollup : complet pour [watermark, now]. None = pas encore
+    initialisé (le reader retombe alors sur le brut). Cf. docs/rollup-par-index.md §3bis/§8."""
+    row = conn.execute("SELECT watermark FROM rollup_state WHERE id = 0").fetchone()
+    return row[0] if row else None
+
+
+def curve_from_rollup(conn: sqlite3.Connection, pdl_index: int, since: int, until: int,
+                      bucket_sec: int, *, with_minmax: bool = True) -> list[dict]:
+    """Courbe agrégée DEPUIS LE ROLLUP (résumé 2 min) au lieu du brut — MÊME forme de retour que
+    curve_buckets (l'app ne voit pas la différence). Ré-agrège les tranches de 2 min en buckets
+    d'affichage de `bucket_sec`. `tariff` = index_id en histo (mêmes ids), None en standard (label
+    via resolve_label). `index_value` = index_last de la dernière tranche du bucket. Ne SERT QUE
+    quand la fenêtre est couverte (since ≥ watermark) ET la tranche demandée ≥ 2 min (arbitré par
+    l'appelant). Cf. docs/rollup-par-index.md §2/§6."""
+    bucket_sec = _snap_bucket_sec(bucket_sec)
+    # Le rollup est PETIT (~720 lignes/jour ⇒ ~15 k sur la rétention 3 mois) → on lit les tranches
+    # de la plage et on ré-agrège EN PYTHON. Volontairement PAS de self-JOIN SQL (un JOIN sur
+    # ts_end sans index scannait la table → plus lent que le brut, l'inverse du but ; mesuré sur
+    # ben-0003). Ordonné par ts_start (temps RÉEL) → départage correct des 2 lignes d'une tranche
+    # à bascule tarif (même bucket_ts). Cf. docs/rollup-par-index.md §2.
+    rows = conn.execute(
+        "SELECT bucket_ts, src_standard, index_id, ts_start, ts_end, "
+        "       papp_min, papp_max, papp_sum, papp_count, index_last "
+        "FROM curve_rollup WHERE pdl_index=? AND bucket_ts>=? AND bucket_ts<? "
+        "ORDER BY ts_start",
+        (pdl_index, since, until),
+    ).fetchall()
+    # db_bucket -> agrégat. `last` = (ts_end, src, index_id, index_last) de la tranche la + récente.
+    agg: dict = {}
+    for r in rows:
+        b = (r["bucket_ts"] // bucket_sec) * bucket_sec
+        a = agg.get(b)
+        if a is None:
+            agg[b] = {"ts_sum": r["bucket_ts"], "nb": 1,
+                      "psum": r["papp_sum"] or 0, "pcount": r["papp_count"] or 0,
+                      "pmin": r["papp_min"], "pmax": r["papp_max"],
+                      "last": (r["ts_end"], r["src_standard"], r["index_id"], r["index_last"])}
+        else:
+            a["ts_sum"] += r["bucket_ts"]; a["nb"] += 1
+            a["psum"] += r["papp_sum"] or 0; a["pcount"] += r["papp_count"] or 0
+            if r["papp_min"] is not None and (a["pmin"] is None or r["papp_min"] < a["pmin"]):
+                a["pmin"] = r["papp_min"]
+            if r["papp_max"] is not None and (a["pmax"] is None or r["papp_max"] > a["pmax"]):
+                a["pmax"] = r["papp_max"]
+            if r["ts_end"] >= a["last"][0]:      # tranche la + récente → porte le tarif/index
+                a["last"] = (r["ts_end"], r["src_standard"], r["index_id"], r["index_last"])
+    out = []
+    for b in sorted(agg):
+        a = agg[b]
+        _, std, index_id, index_last = a["last"]
+        pt = {"ts": a["ts_sum"] // a["nb"],
+              "papp": int(round(a["psum"] / a["pcount"])) if a["pcount"] else 0,
+              "tariff": (index_id if not std else None),   # histo: index_id == tariff
+              "base": None, "hchc": None, "hchp": None,     # rollup = générique (comme standard)
+              "n": a["pcount"], "index_id": index_id, "index_value": index_last,
+              "src_standard": std, "inject_total": None}
+        if with_minmax:
+            pt["papp_min"] = a["pmin"]
+            pt["papp_max"] = a["pmax"]
+        out.append(pt)
+    return out
+
+
+def _band_kind(label: str | None) -> str:
+    """Classe un libellé tarifaire en hc / hp / base (pour la couleur des bandes)."""
+    if not label:
+        return "base"
+    l = label.lower()
+    if "creus" in l:
+        return "hc"
+    if "plein" in l:
+        return "hp"
+    return "base"
+
+
+def tariff_bands(conn: sqlite3.Connection, pdl_index: int, since: int, until: int) -> list[dict]:
+    """Bandes tarifaires `[{from, to, kind}]` DEPUIS LE ROLLUP (les zones HP/HC de la courbe) —
+    JAMAIS un parcours de points (§5). Le rollup est déjà découpé par tarif : les tranches
+    CONSÉCUTIVES de même (src_standard, index_id) fusionnent en une bande, bornes `ts_start`/
+    `ts_end` EXACTES. `kind` classé 1 fois par bande via resolve_label (creuse→hc / pleine→hp /
+    base). Quelques lignes pour toute la fenêtre. Ne couvre que la zone rollup-couverte (pendant
+    le backfill, la partie ancienne n'a pas encore de bande — comblé quand le backfill remonte)."""
+    rows = conn.execute(
+        "SELECT ts_start, ts_end, src_standard, index_id FROM curve_rollup "
+        "WHERE pdl_index=? AND ts_end>=? AND ts_start<=? ORDER BY ts_start",
+        (pdl_index, since, until)).fetchall()
+    # Chaque bande est AUTO-DESCRIPTIVE : (src_standard, index_id, label, kind). L'app colore par
+    # `kind` (grossier : hc/hp/base) OU par `label`/`index_id` pour distinguer TOUS les tarifs
+    # (Tempo bleu/blanc/rouge, EJP pointe…) — aucun tarif écrasé, en HISTO comme en STANDARD.
+    # `resolve_label` est mode-agnostique (histo=convention HISTO_LABELS / standard=LTARF capté).
+    meta_cache: dict = {}   # (src, index_id) -> (label, kind) — résolu 1 fois par registre (§5)
+    def meta_of(std, idx):
+        key = (std, idx)
+        if key not in meta_cache:
+            lbl = resolve_label(conn, pdl_index, std, idx)
+            meta_cache[key] = (lbl, _band_kind(lbl))
+        return meta_cache[key]
+    # Fusionne les tranches CONSÉCUTIVES de même REGISTRE (src_standard, index_id) — PAS juste même
+    # kind : deux registres distincts de même couleur (ex. 2 HP Tempo) restent 2 bandes. Ordonné
+    # par ts_start → pas de chevauchement.
+    runs = []   # [(src, idx), from, to]
+    for r in rows:
+        reg = (r["src_standard"], r["index_id"])
+        if runs and runs[-1][0] == reg:
+            runs[-1][2] = max(runs[-1][2], r["ts_end"])
+        else:
+            runs.append([reg, r["ts_start"], r["ts_end"]])
+    # Absorbe les MICRO-bandes de transition (≤ 1 tranche) : à une bascule tarif le compteur peut
+    # osciller 1-2 min → tranches parasites. On les fond dans la bande précédente pour une
+    # coloration propre (~2 bandes/jour, pas un stroboscope).
+    merged = []
+    for run in runs:
+        dur = run[2] - run[1]
+        if merged and (dur <= ROLLUP_BUCKET_SEC or merged[-1][0] == run[0]):
+            merged[-1][2] = max(merged[-1][2], run[2])
+        else:
+            merged.append(run)
+    out = []
+    for (std, idx), t0, t1 in merged:
+        label, kind = meta_of(std, idx)
+        out.append({"from": max(t0, since), "to": min(t1, until),
+                    "src_standard": std, "index_id": idx, "label": label, "kind": kind})
+    return out
+
+
 def consumption(
     conn: sqlite3.Connection, pdl_index: int, since: int, until: int,
 ) -> dict:
@@ -696,16 +822,31 @@ def consumption(
     # (trame LoRa dont l'EASF a sauté / keyframe avant 1re lecture → carry-forward
     # non encore amorcé) polluaient sinon le MIN → `MAX-MIN` = l'index ABSOLU
     # (~15 MWh → coût délirant). Les exclure rend le calcul robuste.
-    rows = conn.execute(
-        "SELECT src_standard, COALESCE(index_id, tariff) AS reg, "
-        "       MAX(COALESCE(index_value, base, hchc, hchp)) - "
-        "       MIN(COALESCE(index_value, base, hchc, hchp)) AS wh "
-        "FROM measurements "
-        "WHERE pdl_index=? AND ts>=? AND ts<=? "
-        "      AND COALESCE(index_value, base, hchc, hchp) > 0 "
-        "GROUP BY src_standard, reg",
-        (pdl_index, since, until),
-    ).fetchall()
+    # PERF : si la fenêtre est ENTIÈREMENT couverte par le rollup (since ≥ watermark), on calcule
+    # MAX-MIN(index_last) par registre sur curve_rollup (~qq k lignes) au lieu de rescanner
+    # measurements (millions). MÊME résultat (index monotone → MAX-MIN identique ; imprécision de
+    # bord ≤ 1 tranche de 2 min, négligeable vs coût). Sinon (zone non backfillée) → brut, exact.
+    wm = rollup_watermark(conn)
+    if wm is not None and since >= wm:
+        rows = conn.execute(
+            "SELECT src_standard, index_id AS reg, "
+            "       MAX(index_last) - MIN(index_last) AS wh "
+            "FROM curve_rollup "
+            "WHERE pdl_index=? AND bucket_ts>=? AND bucket_ts<=? AND index_last > 0 "
+            "GROUP BY src_standard, index_id",
+            (pdl_index, since, until),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT src_standard, COALESCE(index_id, tariff) AS reg, "
+            "       MAX(COALESCE(index_value, base, hchc, hchp)) - "
+            "       MIN(COALESCE(index_value, base, hchc, hchp)) AS wh "
+            "FROM measurements "
+            "WHERE pdl_index=? AND ts>=? AND ts<=? "
+            "      AND COALESCE(index_value, base, hchc, hchp) > 0 "
+            "GROUP BY src_standard, reg",
+            (pdl_index, since, until),
+        ).fetchall()
     by_register = [
         {"src_standard": r["src_standard"], "index_id": r["reg"], "wh": r["wh"]}
         for r in rows if r["wh"] is not None
@@ -795,11 +936,22 @@ def get_ngtf(conn: sqlite3.Connection, pdl_index: int) -> str | None:
 def registers(conn: sqlite3.Connection, pdl_index: int) -> list:
     """Registres tarifaires vus pour un PDL : libellé résolu + dernier index (monotone → MAX).
     Sert la carte réglages de l'app (un registre par tarif : Base / HC / HP…)."""
+    # PERF : le rollup (~qq k lignes) porte le dernier index par registre (index_last) → MAX par
+    # (src_standard, index_id) = le plus récent, en ms au lieu d'un GROUP BY sur measurements
+    # (millions de lignes → ~28 s mesuré sur ben-0003). Fallback brut si le rollup est vide (pas
+    # encore initialisé). Registres actifs (HC/HP/BASE, vus quotidiennement) toujours dans le
+    # rollup [watermark, now] ; MÊME résultat que le brut (index monotone → MAX identique).
     rows = conn.execute(
-        "SELECT src_standard, index_id, MAX(index_value) AS index_value, MAX(ts) AS last_ts "
-        "FROM measurements WHERE pdl_index=? AND index_id IS NOT NULL AND index_value IS NOT NULL "
+        "SELECT src_standard, index_id, MAX(index_last) AS index_value, MAX(ts_end) AS last_ts "
+        "FROM curve_rollup WHERE pdl_index=? AND index_last IS NOT NULL "
         "GROUP BY src_standard, index_id ORDER BY src_standard, index_id",
         (pdl_index,)).fetchall()
+    if not rows:
+        rows = conn.execute(
+            "SELECT src_standard, index_id, MAX(index_value) AS index_value, MAX(ts) AS last_ts "
+            "FROM measurements WHERE pdl_index=? AND index_id IS NOT NULL AND index_value IS NOT NULL "
+            "GROUP BY src_standard, index_id ORDER BY src_standard, index_id",
+            (pdl_index,)).fetchall()
     return [{
         "src_standard": r["src_standard"],
         "index_id": r["index_id"],
@@ -827,10 +979,18 @@ def rollup_backfill_step(conn: sqlite3.Connection) -> dict:
         return {"advanced": False, "watermark": row[0], "done": True}
     watermark = row[0] if row is not None else None
     if watermark is None:
-        # Init : borne = plus vieux bucket DÉJÀ présent (incrémental ≈ déploiement) ; rollup vide
-        # → plus vieille mesure. Le backfill remplit STRICTEMENT en dessous de cette borne.
+        # Init de la borne basse couverte. Le backfill remplit STRICTEMENT en dessous.
+        #  - rollup NON vide (incrémental ≈ déploiement en cours) → plus vieux bucket déjà couvert.
+        #  - rollup VIDE (aucun incrémental encore) → rien n'est couvert : borne = juste au-dessus
+        #    du bucket le PLUS RÉCENT (newest+1 tranche) → le backfill remonte depuis MAINTENANT
+        #    (newest-first). NE PAS init à oldest_bucket : la garde `<= oldest` conclurait done sans
+        #    rien backfiller.
         r = conn.execute("SELECT MIN(bucket_ts) FROM curve_rollup").fetchone()
-        watermark = r[0] if r and r[0] is not None else oldest_bucket
+        if r and r[0] is not None:
+            watermark = r[0]
+        else:
+            newest = conn.execute("SELECT MAX(ts) FROM measurements").fetchone()[0]
+            watermark = ((newest // ROLLUP_BUCKET_SEC) * ROLLUP_BUCKET_SEC) + ROLLUP_BUCKET_SEC
     if watermark <= oldest_bucket:
         conn.execute(
             "INSERT INTO rollup_state (id, watermark, done) VALUES (0, ?, 1) "
