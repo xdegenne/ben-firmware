@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="robots" content="index, follow" />
+  <title>BEN — Passer votre Linky en mode standard (production solaire)</title>
+  <style>
+    :root { --green: #2e7d32; --orange: #ef6c00; --ink: #1b1b1b; --muted: #5a5a5a; --bg: #ffffff; }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      color: var(--ink); background: var(--bg); line-height: 1.65;
+      max-width: 760px; margin: 0 auto; padding: 32px 20px 80px;
+    }
+    h1 { color: var(--green); font-size: 1.7rem; margin-bottom: 4px; }
+    h2 { color: var(--green); font-size: 1.2rem; margin-top: 36px; }
+    .lead { color: var(--muted); font-size: 1.05rem; margin-top: 0; }
+    a { color: var(--green); }
+    code { background: #f0f0f0; padding: 1px 5px; border-radius: 4px; font-size: 0.9em; }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: 8px 0; }
+    .note { background: #f3f8f3; border-left: 4px solid var(--green); padding: 12px 16px; border-radius: 6px; margin: 20px 0; }
+    .warn { background: #fff6ec; border-left: 4px solid var(--orange); padding: 12px 16px; border-radius: 6px; margin: 20px 0; }
+    table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 0.95rem; }
+    th, td { border: 1px solid #e2e2e2; padding: 8px 10px; text-align: left; }
+    th { background: #f6f6f6; }
+    footer { margin-top: 48px; color: var(--muted); font-size: 0.85rem; border-top: 1px solid #eee; padding-top: 16px; }
+  </style>
+</head>
+<body>
+  <h1>Vous produisez de l'électricité ? Passez en mode standard</h1>
+  <p class="lead">
+    Si vous avez des panneaux solaires (ou toute autre production), le mode « standard »
+    de votre compteur Linky permet à BEN de mesurer précisément l'énergie que vous
+    réinjectez sur le réseau. Voici pourquoi, et comment le faire.
+  </p>
+
+  <h2>Pourquoi ça change tout pour la production</h2>
+  <p>
+    Le compteur Linky expose ses données de deux façons — deux « modes » de la sortie
+    télé-information (TIC) :
+  </p>
+  <table>
+    <tr><th>Mode</th><th>Ce que BEN voit quand vous injectez</th></tr>
+    <tr>
+      <td><strong>Historique</strong> (par défaut sur beaucoup de compteurs)</td>
+      <td>La puissance ne descend jamais sous zéro : pendant que vous produisez, elle
+      affiche <strong>0</strong>. BEN ne peut alors qu'<strong>estimer</strong> l'injection
+      à partir du courant qui circule (≈&nbsp;tension × intensité).</td>
+    </tr>
+    <tr>
+      <td><strong>Standard</strong></td>
+      <td>La puissance est <strong>signée</strong> : positive quand vous soutirez du
+      réseau, <strong>négative quand vous injectez</strong>. BEN affiche alors la
+      puissance injectée <strong>réelle et exacte</strong>, ainsi que l'énergie totale
+      réinjectée.</td>
+    </tr>
+  </table>
+  <div class="note">
+    En résumé : en <strong>historique</strong>, votre production est <strong>estimée</strong> ;
+    en <strong>standard</strong>, elle est <strong>mesurée</strong>. Si vous produisez,
+    le mode standard est nettement préférable.
+  </div>
+
+  <h2>Comment passer en mode standard</h2>
+  <p>
+    Le changement de mode se fait par votre <strong>gestionnaire de réseau</strong>
+    (Enedis dans la plupart des cas), pas directement sur le compteur. La démarche est
+    gratuite. Deux chemins possibles :
+  </p>
+  <ol>
+    <li><strong>Via votre espace client Enedis</strong> (<a href="https://mon-compte-client.enedis.fr/" rel="noopener" target="_blank">mon-compte-client.enedis.fr</a>) :
+    dans les options de votre compteur, demandez l'activation de la
+    <strong>« télé-information client en mode standard »</strong>.</li>
+    <li><strong>Par téléphone</strong>, en contactant Enedis (ou votre gestionnaire de
+    réseau si ce n'est pas Enedis) et en demandant le passage de la <strong>TIC en mode
+    standard</strong>.</li>
+  </ol>
+  <p>
+    L'activation est faite à distance : votre compteur bascule en général sous quelques
+    jours. Aucune intervention chez vous n'est nécessaire.
+  </p>
+
+  <div class="warn">
+    <strong>Bon à savoir.</strong> Le mode standard émet davantage d'informations et un peu
+    plus souvent que l'historique. C'est sans conséquence sur votre facture ni sur le
+    fonctionnement de votre installation. BEN s'adapte automatiquement au mode détecté —
+    vous n'avez rien à régler dans l'app après le changement.
+  </div>
+
+  <h2>Et si je ne produis pas ?</h2>
+  <p>
+    Le mode historique convient très bien : BEN mesure votre consommation avec précision
+    dans les deux modes. Le passage en standard n'apporte un vrai plus que pour la
+    <strong>production / l'injection</strong> (et quelques mesures fines).
+  </p>
+
+  <footer>
+    BEN — assistant de maîtrise de la consommation électrique. Cette page fait partie de
+    la documentation publique du projet.
+  </footer>
+</body>
+</html>
