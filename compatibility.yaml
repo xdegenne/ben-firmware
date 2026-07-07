@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.3.0"
+        latest: "0.4.0"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -165,6 +165,9 @@ devices:
           - version: "0.3.0"
             released: "2026-07-06"
             notes: "ROLLUP PAR INDEX — Phase 3 (côté LECTURE, exploite le rollup de 0.2.0). NOUVEL endpoint GET /chart : courbe RICHE {points, tariff_bands, source} — le serveur arbitre la source des points (rollup rapide sur vue large / brut au zoom, raw=1 force le brut) ; tariff_bands = zones tarifaires AUTO-DESCRIPTIVES {from,to,kind,index_id,src_standard,label} distinguant TOUS les tarifs (HC/HP, Tempo bleu/blanc/rouge, EJP), histo ET standard, jamais un parcours de points (§5). /curve reste INTACT (brut) → app courante inchangée. /consumption et /registers ACCÉLÉRÉS via le rollup (index_last, fallback brut) : mesuré ben-0003 ×85 (/consumption 3574→42 ms) et ×550 (/registers 28 s→52 ms), résultat EXACT au Wh (écart bord ≤ 1 tranche). STRICTEMENT ADDITIF : /curve/consumption/registers gardent leur forme (bascule interne transparente) ; /chart est nouveau. Aucune migration BDD. Cf. docs/rollup-par-index.md §5/§6. Transition = restart ben-lora-receiver + ben-local-api."
+          - version: "0.4.0"
+            released: "2026-07-07"
+            notes: "Jauge bidirectionnelle CALÉE SUR L'OBSERVÉ + garde-fou raw. High-water mark d'INJECTION (level_profile.papp_inject_max_alltime) par PDL, symétrique du plafond conso : standard = -papp net (MESURÉ), histo = 230×IINST (ESTIMÉ, papp plancher à 0), maintenu au fil de l'eau (record_measurement/_batch) + BACKFILL one-shot À LA MIGRATION (reconstruit depuis ~3 mois de measurements — une requête gardée par l'existence de la colonne → jauge calibrée immédiatement, sans attendre l'accumulation). /live expose plafond + injectMax → l'app cale CHAQUE CÔTÉ de la jauge sur son propre max observé (échelle linéaire -injectMax→+plafond, 0 à sa vraie place ; courbe d'injection négative côté standard). /chart?raw=1 BORNÉ à 24 h (garde-fou perf : pas de scan brut multi-jours). ADD COLUMN idempotent, aucune migration destructive. Transition = restart ben-lora-receiver + ben-local-api."
       arduino:
         minimum: "0.0.1"
         latest: "0.1.0"
@@ -202,7 +205,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.3.0"
+        latest: "0.4.0"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -351,6 +354,9 @@ devices:
           - version: "0.3.0"
             released: "2026-07-06"
             notes: "ROLLUP PAR INDEX — Phase 3 (côté LECTURE, exploite le rollup de 0.2.0). NOUVEL endpoint GET /chart : courbe RICHE {points, tariff_bands, source} — le serveur arbitre la source des points (rollup rapide sur vue large / brut au zoom, raw=1 force le brut) ; tariff_bands = zones tarifaires AUTO-DESCRIPTIVES {from,to,kind,index_id,src_standard,label} distinguant TOUS les tarifs (HC/HP, Tempo, EJP), histo ET standard, jamais un parcours de points (§5). /curve reste INTACT (brut) → app courante inchangée. /consumption et /registers ACCÉLÉRÉS via le rollup (index_last, fallback brut) : ×85 (/consumption) et ×550 (/registers) mesuré sur ben-0003, résultat EXACT au Wh. STRICTEMENT ADDITIF : /curve/consumption/registers gardent leur forme (bascule interne transparente) ; /chart est nouveau. Aucune migration BDD. Cf. docs/rollup-par-index.md §5/§6. Transition = restart ben-tic-reader + ben-local-api."
+          - version: "0.4.0"
+            released: "2026-07-07"
+            notes: "Jauge bidirectionnelle CALÉE SUR L'OBSERVÉ + garde-fou raw. High-water mark d'INJECTION (level_profile.papp_inject_max_alltime) par PDL, symétrique du plafond conso : standard = -papp net (MESURÉ), histo = 230×IINST (ESTIMÉ, papp plancher à 0), maintenu au fil de l'eau (record_measurement/_batch) + BACKFILL one-shot À LA MIGRATION (reconstruit depuis ~3 mois de measurements — une requête gardée par l'existence de la colonne → jauge calibrée immédiatement, sans attendre l'accumulation). /live expose plafond + injectMax → l'app cale CHAQUE CÔTÉ de la jauge sur son propre max observé (échelle linéaire -injectMax→+plafond, 0 à sa vraie place ; courbe d'injection négative côté standard). /chart?raw=1 BORNÉ à 24 h (garde-fou perf : pas de scan brut multi-jours). ADD COLUMN idempotent, aucune migration destructive. Transition = restart ben-tic-reader + ben-local-api."
 
 updates:
 
@@ -546,6 +552,10 @@ updates:
       to: "0.3.0"
       tag: "pi-0.3.0"
       script: "updates/pi0-lora/0.2.0_to_0.3.0/update.sh"
+    - from: "0.3.0"
+      to: "0.4.0"
+      tag: "pi-0.4.0"
+      script: "updates/pi0-lora/0.3.0_to_0.4.0/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -732,6 +742,10 @@ updates:
       to: "0.3.0"
       tag: "pi-0.3.0"
       script: "updates/pi0-wired/0.2.0_to_0.3.0/update.sh"
+    - from: "0.3.0"
+      to: "0.4.0"
+      tag: "pi-0.4.0"
+      script: "updates/pi0-wired/0.3.0_to_0.4.0/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet

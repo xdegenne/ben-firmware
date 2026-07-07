@@ -174,6 +174,27 @@ def connect(path: str = DB_PATH, *, read_only: bool = False) -> sqlite3.Connecti
         if "papp_max_alltime" not in lvl_cols:
             conn.execute(
                 "ALTER TABLE level_profile ADD COLUMN papp_max_alltime INTEGER")
+        # High-water mark d'INJECTION (VA) — symétrique du plafond conso, pour la jauge
+        # bidirectionnelle calée sur l'observé (chaque côté = son propre max). Standard :
+        # -papp net ; histo : estimation 230×IINST (papp plancher à 0). Monotone, survit au prune.
+        if "papp_inject_max_alltime" not in lvl_cols:
+            conn.execute(
+                "ALTER TABLE level_profile ADD COLUMN papp_inject_max_alltime INTEGER")
+            # BACKFILL one-shot (à la création de la colonne) : reconstruit le HWM injection
+            # depuis l'historique `measurements` (~3 mois) — sinon un device déjà en service
+            # repartirait de zéro et la jauge mettrait des jours à se calibrer. Même règle que
+            # _inject_va : standard = -papp (papp<0), histo = 230×IINST (papp==0 & iinst>0).
+            conn.execute(
+                "INSERT INTO level_profile (pdl_index, computed_ts, papp_inject_max_alltime) "
+                "SELECT pdl_index, 0, MAX(iva) FROM ("
+                "  SELECT pdl_index, CASE "
+                "    WHEN papp < 0 THEN -papp "
+                "    WHEN papp = 0 AND iinst > 0 THEN 230 * iinst "
+                "    ELSE 0 END AS iva "
+                "  FROM measurements"
+                ") GROUP BY pdl_index HAVING MAX(iva) > 0 "
+                "ON CONFLICT(pdl_index) DO UPDATE SET papp_inject_max_alltime = "
+                "  MAX(COALESCE(papp_inject_max_alltime, 0), excluded.papp_inject_max_alltime)")
         # Chantier ISOUSC : intensité souscrite (A) par PDL, sert à l'étalonnage
         # de la jauge (maxVa = isousc×230) + borne du plafond. Statique → écrite
         # sur changement uniquement (cf. record_isousc).
@@ -280,6 +301,23 @@ def _generic_cols(labels: dict) -> tuple:
     )
 
 
+NOMINAL_V = 230   # tension nominale (V) pour l'estimation histo P ≈ U×I
+
+
+def _inject_va(labels: dict) -> int:
+    """Puissance INJECTÉE estimée (VA, positive) sur cette mesure ; 0 si pas d'injection.
+    Standard : `papp` est net signé → `-papp` si papp < 0. Histo : `papp` plancher à 0 →
+    estimation 230×IINST quand un courant circule sans soutirage (papp==0 et iinst>0).
+    Sert le high-water mark d'injection (jauge bidirectionnelle calée sur l'observé)."""
+    papp = labels.get("PAPP")
+    if papp is not None and papp < 0:
+        return -papp
+    iinst = labels.get("IINST")
+    if papp == 0 and iinst is not None and iinst > 0:
+        return NOMINAL_V * iinst
+    return 0
+
+
 ROLLUP_BUCKET_SEC = 120   # tranche de résumé = 2 min (compromis finesse bandes / volume rollup)
 
 
@@ -358,17 +396,20 @@ def record_measurement(
             *gcols,
         ),
     )
-    # High-water mark monotone de la PAPP (plafond du modèle de niveau). Mis à
-    # jour ICI (au fil de l'eau) et JAMAIS via un SELECT MAX sur measurements,
-    # qui sont prunées à 3 mois → on perdrait les vieux pics. SoC : le reader ne
-    # touche QUE cette colonne ; le profiler (refresh) possède talon/percentiles.
-    if papp is not None:
+    # High-water marks monotones : plafond conso (PAPP soutirée) + max INJECTION. Mis à
+    # jour ICI (au fil de l'eau) et JAMAIS via un SELECT MAX sur measurements, qui sont
+    # prunées à 3 mois → on perdrait les vieux pics. Alimentent la jauge (plafond + injectMax).
+    inject_va = _inject_va(labels)
+    if papp is not None or inject_va > 0:
         conn.execute(
-            "INSERT INTO level_profile (pdl_index, computed_ts, papp_max_alltime) "
-            "VALUES (?, 0, ?) "
+            "INSERT INTO level_profile "
+            "(pdl_index, computed_ts, papp_max_alltime, papp_inject_max_alltime) "
+            "VALUES (?, 0, ?, ?) "
             "ON CONFLICT(pdl_index) DO UPDATE SET "
-            "papp_max_alltime = MAX(COALESCE(papp_max_alltime, 0), excluded.papp_max_alltime)",
-            (pdl_index, papp),
+            "papp_max_alltime = MAX(COALESCE(papp_max_alltime, 0), excluded.papp_max_alltime), "
+            "papp_inject_max_alltime = "
+            "  MAX(COALESCE(papp_inject_max_alltime, 0), excluded.papp_inject_max_alltime)",
+            (pdl_index, papp if (papp is not None and papp > 0) else 0, inject_va),
         )
     # Rollup incrémental (fil de l'eau) — cette mesure unique.
     _rollup_ingest(conn, pdl_index, [(ts, gcols[0], gcols[1], papp, gcols[2])])
@@ -391,7 +432,8 @@ def record_measurements_batch(
     if not rows:
         return 0
     params = []
-    maxima: dict[int, int] = {}  # pdl_index -> max PAPP du lot
+    maxima: dict[int, int] = {}         # pdl_index -> max PAPP soutirée du lot
+    inject_maxima: dict[int, int] = {}  # pdl_index -> max INJECTION (VA) du lot
     rollup_pts: dict = {}        # pdl_index -> [(ts, src, idx, papp, index_value)] pour le rollup
     for pdl_index, labels, ts in rows:
         papp = labels.get("PAPP")
@@ -410,6 +452,9 @@ def record_measurements_batch(
         ))
         if papp is not None and papp > maxima.get(pdl_index, -1):
             maxima[pdl_index] = papp
+        iva = _inject_va(labels)
+        if iva > inject_maxima.get(pdl_index, -1):
+            inject_maxima[pdl_index] = iva
         rollup_pts.setdefault(pdl_index, []).append((ts, gcols[0], gcols[1], papp, gcols[2]))
     conn.executemany(
         "INSERT INTO measurements "
@@ -418,15 +463,18 @@ def record_measurements_batch(
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params,
     )
-    # High-water mark par PDL : même logique monotone que record_measurement,
-    # mais une fois par PDL pour tout le lot (le max du lot suffit).
-    for pdl_index, papp in maxima.items():
+    # High-water marks par PDL (plafond conso + max injection) : même logique monotone que
+    # record_measurement, mais une fois par PDL pour tout le lot (le max du lot suffit).
+    for pdl_index in set(maxima) | set(inject_maxima):
         conn.execute(
-            "INSERT INTO level_profile (pdl_index, computed_ts, papp_max_alltime) "
-            "VALUES (?, 0, ?) "
+            "INSERT INTO level_profile "
+            "(pdl_index, computed_ts, papp_max_alltime, papp_inject_max_alltime) "
+            "VALUES (?, 0, ?, ?) "
             "ON CONFLICT(pdl_index) DO UPDATE SET "
-            "papp_max_alltime = MAX(COALESCE(papp_max_alltime, 0), excluded.papp_max_alltime)",
-            (pdl_index, papp),
+            "papp_max_alltime = MAX(COALESCE(papp_max_alltime, 0), excluded.papp_max_alltime), "
+            "papp_inject_max_alltime = "
+            "  MAX(COALESCE(papp_inject_max_alltime, 0), excluded.papp_inject_max_alltime)",
+            (pdl_index, maxima.get(pdl_index, 0), inject_maxima.get(pdl_index, 0)),
         )
     # Rollup incrémental : chaque paquet résumé en 1-2 tranches (bien moins d'écritures que N).
     for pdl_index, pts in rollup_pts.items():
@@ -560,6 +608,22 @@ def get_pref(conn: sqlite3.Connection, pdl_index: int) -> int | None:
     except sqlite3.OperationalError:
         return None
     return row["pref"] if row and row["pref"] else None
+
+
+def gauge_bounds(conn: sqlite3.Connection, pdl_index: int) -> tuple:
+    """High-water marks observés pour la jauge : `(plafond, inject_max)` en VA — max PAPP
+    soutirée et max injection constatés (monotones, survivent au prune). None si absents.
+    Chaque côté de la jauge bidirectionnelle se cale sur SON propre max (chantier jauge observée)."""
+    try:
+        row = conn.execute(
+            "SELECT papp_max_alltime, papp_inject_max_alltime "
+            "FROM level_profile WHERE pdl_index=?", (pdl_index,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return (None, None)
+    if not row:
+        return (None, None)
+    return (row["papp_max_alltime"], row["papp_inject_max_alltime"])
 
 
 # Échelle de bucket QUANTIFIÉE : on snappe `bucket_sec` sur des paliers fixes pour

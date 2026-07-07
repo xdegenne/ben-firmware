@@ -304,6 +304,11 @@ class Handler(BaseHTTPRequestHandler):
                     row["maxVa"] = from_pref or from_isousc
                 else:
                     row["maxVa"] = from_isousc or from_pref
+                # Jauge bidirectionnelle calée sur l'OBSERVÉ : plafond conso + max injection
+                # (high-water marks). L'app scale chaque côté sur son propre max (repli maxVa).
+                plafond, inject_max = db.gauge_bounds(conn, row["pdl_index"])
+                row["plafond"] = plafond
+                row["injectMax"] = inject_max
                 # Libellé tarifaire EN COURS (jauge HP/HC) — résolu côté serveur :
                 # standard→LTARF autoritatif, histo→convention PTEC. None → l'app garde
                 # sa propre convention (rétro-compat). Cf. chantier unification labels.
@@ -375,7 +380,10 @@ class Handler(BaseHTTPRequestHandler):
         de la nouvelle app (le rollup + les bandes NE PASSENT PAS par /curve, laissé intact pour
         l'app courante). Le SERVEUR arbitre la source des points (rollup rapide vs brut fidèle) ;
         les bandes viennent TOUJOURS du rollup (jamais un parcours de points). Param `raw=1` →
-        force le brut (haute fidélité sur une période bornée). Cf. docs/rollup-par-index.md §5/§6."""
+        force le brut (haute fidélité), MAIS **garde-fou serveur : ignoré au-delà de 24 h**
+        (un scan brut sur 7j/30j écroulerait le Pi — c'est justement ce que le rollup évite).
+        Au-delà, `raw` est silencieusement ignoré (arbitrage normal → rollup) ; l'app le voit
+        via `source` ≠ `raw`. Cf. docs/rollup-par-index.md §5/§6."""
         pdl = _int(qs, "pdl_index")
         if pdl is None:
             return self._send({"error": "pdl_index_required"}, 400)
@@ -387,7 +395,11 @@ class Handler(BaseHTTPRequestHandler):
         buckets = _int(qs, "buckets", DEFAULT_CURVE_BUCKETS) or DEFAULT_CURVE_BUCKETS
         buckets = max(1, min(buckets, MAX_CURVE_BUCKETS))
         bucket_sec = max(1, (until - since) // buckets)
-        force_raw = qs.get("raw", ["0"])[0] in ("1", "true")
+        # Garde-fou SERVEUR : `raw=1` n'est honoré que sur une fenêtre BORNÉE (≤ 24 h).
+        # Au-delà, on l'ignore (le brut y serait un scan lourd → le rollup existe pour ça).
+        RAW_MAX_WINDOW_SEC = 86400
+        force_raw = (qs.get("raw", ["0"])[0] in ("1", "true")
+                     and (until - since) <= RAW_MAX_WINDOW_SEC)
         with db.connect(read_only=True) as conn:
             # Arbitrage : rollup si (pas forcé brut) ET tranche demandée ≥ finesse rollup (2 min)
             # ET la fenêtre est couverte (since ≥ watermark). Sinon → brut (zoom serré, ou zone
