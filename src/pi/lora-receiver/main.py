@@ -29,6 +29,7 @@ import hmac as hmaclib
 import json
 import logging
 import os
+import socket
 import struct
 import sys
 import time
@@ -529,13 +530,46 @@ def on_recv_curve(decoded, rssi, snr, pdl_index, now, time_since_prev) -> None:
 # ---------------------------------------------------------------------------
 # Watchdog + Heartbeat
 # ---------------------------------------------------------------------------
-# Pas de watchdog « relance si pas de trame » côté récepteur LoRa : contrairement au
-# wired (où l'absence de TIC peut signaler un port série bloqué qu'un restart resynchronise),
-# ici « pas de trame » est NORMAL (émetteur éteint, hors portée, supercap en recharge). Un
-# restart ne reçoit pas plus et perd l'état (indexes/seq). La fraîcheur LoRa reste signalée
-# par le heartbeat (flash orange si rien depuis >90 s) — informatif, sans relance.
-# (Si un jour la radio se fige vraiment, ajouter un vrai self-test radio plutôt qu'un
-#  timeout sur l'absence de trafic, qui confond « radio HS » et « rien à recevoir ».)
+# Watchdog SELF-TEST RADIO (pas un timeout sur l'absence de trafic — ça confondrait « radio
+# HS » et « rien à recevoir » : un émetteur éteint / hors portée / supercap en recharge est
+# NORMAL). On lit périodiquement REG_VERSION du SX127x (0x42 doit valoir 0x12) : si le SPI/radio
+# est réellement figé (incident ben-0001), la lecture échoue → on CESSE de pinguer le watchdog
+# systemd → systemd restart le service (ré-init radio, l'état indexes/seq est persisté donc le
+# restart est sûr). Si le restart ne suffit pas (SPI figé au niveau NOYAU, kernel tainted par un
+# Oops), les restarts s'enchaînent → StartLimitAction=reboot dans l'unit → reboot complet.
+# Le silence de trames, lui, reste juste signalé par le heartbeat (orange > 90 s), sans relance.
+
+SX127X_REG_VERSION = 0x42
+SX127X_VERSION     = 0x12   # SX1276/77/78/79
+WATCHDOG_PING_S    = 30     # intervalle de ping systemd (WatchdogSec unit = 90 s → 3 pings/fenêtre)
+RADIO_FAIL_MAX     = 2      # échecs self-test consécutifs avant de cesser le ping (anti-contention SPI transitoire)
+
+
+def sd_notify(msg: str) -> None:
+    """Notifie systemd (WATCHDOG=1 / READY=1) via NOTIFY_SOCKET. No-op hors systemd."""
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr[0] == "@":                       # namespace abstrait
+        addr = "\0" + addr[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.connect(addr)
+            s.sendall(msg.encode())
+    except Exception:
+        pass
+
+
+def radio_alive() -> bool:
+    """True si le SX127x répond (REG_VERSION == 0x12). Lecture SPI brève ; une collision avec le
+    thread d'interruption RX est possible mais rare → débouncée par RADIO_FAIL_MAX (une lecture
+    corrompue = 1 échec toléré ; une trame RX corrompue serait de toute façon rejetée au HMAC)."""
+    if not lora_ok or lora is None:
+        return False
+    try:
+        return lora._spi_read(SX127X_REG_VERSION) == SX127X_VERSION
+    except Exception:
+        return False
 
 def is_wifi_up() -> bool:
     try:
@@ -605,11 +639,26 @@ log.info(f"Index connus : {state['indexes']}")
 log.info(f"Last boot_seq : {state.get('last_boot_seq')}")
 
 Thread(target=heartbeat_loop, daemon=True, name="heartbeat").start()
-log.info(f"Heartbeat démarré ({RECEPTION_TIMEOUT_S}s) — pas de watchdog restart-sur-silence")
+log.info(f"Heartbeat démarré ({RECEPTION_TIMEOUT_S}s) + watchdog self-test radio ({WATCHDOG_PING_S}s)")
+log.info(f"systemd NOTIFY_SOCKET : {'présent (watchdog armé)' if os.environ.get('NOTIFY_SOCKET') else 'ABSENT (watchdog inactif)'}")
 
+sd_notify("READY=1")
+radio_fails = 0
 try:
     while True:
-        sleep(0.1)
+        if radio_alive():
+            radio_fails = 0
+            sd_notify("WATCHDOG=1")            # radio OK → on rassure systemd (le silence de trames est normal)
+        else:
+            radio_fails += 1
+            if radio_fails < RADIO_FAIL_MAX:
+                sd_notify("WATCHDOG=1")        # 1er échec = probable contention SPI transitoire → on tolère
+                log.warning(f"self-test radio KO ({radio_fails}/{RADIO_FAIL_MAX}) — REG_VERSION != 0x{SX127X_VERSION:02x}")
+            else:
+                log.error("radio figée (self-test KO) → arrêt du ping watchdog → systemd restart le service")
+                blink_rgb(30, 0, 0, 0.3, bypass=True)   # rouge = radio KO
+                # on NE pingue PAS → WatchdogSec expire → restart (→ escalade reboot si récidive noyau)
+        sleep(WATCHDOG_PING_S)
 except KeyboardInterrupt:
     log.info("Arrêt.")
 finally:

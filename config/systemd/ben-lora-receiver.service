@@ -1,9 +1,17 @@
 [Unit]
 Description=BEN LoRa Receiver
 After=basic.target
+# Watchdog restart : le service se relance à l'infini si le self-test radio échoue
+# (StartLimitIntervalSec=0 = pas de rate-limit → Restart=always jamais bloqué). Le soft-hang
+# SPI (incident ben-0001 09/07) est récupéré par ce restart. NB : l'escalade REBOOT (cas rare
+# Oops noyau tainted que le restart ne récupère pas) est VOLONTAIREMENT différée — à ajouter
+# (StartLimitBurst + StartLimitAction=reboot) une fois le watchdog prouvé en vrai sur ben-0001.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+# WATCHDOG=1 envoyé par le process (self-test radio) → NotifyAccess=main pour l'accepter.
+NotifyAccess=main
 User=ben
 # WorkingDirectory writable par `ben` requis : rpi-lgpio (drop-in replacement de
 # RPi.GPIO pour kernel Trixie 6.12+) crée un FIFO de notification `.lgd-nfy*`
@@ -13,6 +21,9 @@ WorkingDirectory=/opt/ben/repo/src/pi/lora-receiver
 ExecStart=/usr/bin/python3 /opt/ben/repo/src/pi/lora-receiver/main.py
 Restart=always
 RestartSec=10
+# Le process pingue sd_notify(WATCHDOG=1) tant que le self-test radio (REG_VERSION==0x12)
+# passe. S'il cesse (radio figée), systemd restart après WatchdogSec. > intervalle ping (30 s).
+WatchdogSec=90
 
 # PAS d'[Install]/WantedBy : démarré uniquement par ben-network-check.service
 # quand le réseau est up. Voir l'explication dans ben-tic-reader.service.

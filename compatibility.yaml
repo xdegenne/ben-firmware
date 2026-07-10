@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.4.0"
+        latest: "0.5.0"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -168,6 +168,9 @@ devices:
           - version: "0.4.0"
             released: "2026-07-07"
             notes: "Jauge bidirectionnelle CALÉE SUR L'OBSERVÉ + garde-fou raw. High-water mark d'INJECTION (level_profile.papp_inject_max_alltime) par PDL, symétrique du plafond conso : standard = -papp net (MESURÉ), histo = 230×IINST (ESTIMÉ, papp plancher à 0), maintenu au fil de l'eau (record_measurement/_batch) + BACKFILL one-shot À LA MIGRATION (reconstruit depuis ~3 mois de measurements — une requête gardée par l'existence de la colonne → jauge calibrée immédiatement, sans attendre l'accumulation). /live expose plafond + injectMax → l'app cale CHAQUE CÔTÉ de la jauge sur son propre max observé (échelle linéaire -injectMax→+plafond, 0 à sa vraie place ; courbe d'injection négative côté standard). /chart?raw=1 BORNÉ à 24 h (garde-fou perf : pas de scan brut multi-jours). ADD COLUMN idempotent, aucune migration destructive. Transition = restart ben-lora-receiver + ben-local-api."
+          - version: "0.5.0"
+            released: "2026-07-10"
+            notes: "Watchdog SELF-TEST RADIO (récepteur LoRa). Lecture périodique de REG_VERSION du SX127x (0x42 doit valoir 0x12) : si le SPI/radio est figé (incident ben-0001 09/07), le process cesse de pinguer sd_notify(WATCHDOG=1) → systemd restart le service (WatchdogSec=90 s). Distingue « radio HS » de « rien à recevoir » : le silence de trames (émetteur off) ne déclenche PAS de restart — VALIDÉ sur ben-0001 (émetteur-off 3,5 min, NRestarts=0 ; + test d'isolation du mécanisme sd_notify). État indexes/seq persisté → restart sûr. Unit : NotifyAccess=main, WatchdogSec=90, StartLimitIntervalSec=0 (restart infini, escalade reboot DIFFÉRÉE à un prochain palier). AUCUNE migration BDD. Transition = install unit + daemon-reload + restart ben-lora-receiver."
       arduino:
         minimum: "0.0.1"
         latest: "0.1.0"
@@ -205,7 +208,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.4.0"
+        latest: "0.5.0"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -357,6 +360,9 @@ devices:
           - version: "0.4.0"
             released: "2026-07-07"
             notes: "Jauge bidirectionnelle CALÉE SUR L'OBSERVÉ + garde-fou raw. High-water mark d'INJECTION (level_profile.papp_inject_max_alltime) par PDL, symétrique du plafond conso : standard = -papp net (MESURÉ), histo = 230×IINST (ESTIMÉ, papp plancher à 0), maintenu au fil de l'eau (record_measurement/_batch) + BACKFILL one-shot À LA MIGRATION (reconstruit depuis ~3 mois de measurements — une requête gardée par l'existence de la colonne → jauge calibrée immédiatement, sans attendre l'accumulation). /live expose plafond + injectMax → l'app cale CHAQUE CÔTÉ de la jauge sur son propre max observé (échelle linéaire -injectMax→+plafond, 0 à sa vraie place ; courbe d'injection négative côté standard). /chart?raw=1 BORNÉ à 24 h (garde-fou perf : pas de scan brut multi-jours). ADD COLUMN idempotent, aucune migration destructive. Transition = restart ben-tic-reader + ben-local-api."
+          - version: "0.5.0"
+            released: "2026-07-10"
+            notes: "Alignement no-op avec pi0-lora 0.5.0 (watchdog self-test radio du récepteur LoRa). Le wired ne fait PAS tourner ben-lora-receiver (lecture TIC directe) → l'unit modifiée est réinstallée mais reste inerte. Bump pour garder les deux modèles + INITIAL_TAG alignés. AUCUNE migration. Transition = install unit + daemon-reload."
 
 updates:
 
@@ -556,6 +562,10 @@ updates:
       to: "0.4.0"
       tag: "pi-0.4.0"
       script: "updates/pi0-lora/0.3.0_to_0.4.0/update.sh"
+    - from: "0.4.0"
+      to: "0.5.0"
+      tag: "pi-0.5.0"
+      script: "updates/pi0-lora/0.4.0_to_0.5.0/update.sh"
 
   pi0-wired:
     - from: "0.0.2"
@@ -746,6 +756,10 @@ updates:
       to: "0.4.0"
       tag: "pi-0.4.0"
       script: "updates/pi0-wired/0.3.0_to_0.4.0/update.sh"
+    - from: "0.4.0"
+      to: "0.5.0"
+      tag: "pi-0.5.0"
+      script: "updates/pi0-wired/0.4.0_to_0.5.0/update.sh"
 
   pi0-lora-wired:
     []                  # no in-field transitions yet
