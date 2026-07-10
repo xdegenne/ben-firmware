@@ -173,7 +173,7 @@ devices:
             notes: "Watchdog SELF-TEST RADIO (récepteur LoRa). Lecture périodique de REG_VERSION du SX127x (0x42 doit valoir 0x12) : si le SPI/radio est figé (incident ben-0001 09/07), le process cesse de pinguer sd_notify(WATCHDOG=1) → systemd restart le service (WatchdogSec=90 s). Distingue « radio HS » de « rien à recevoir » : le silence de trames (émetteur off) ne déclenche PAS de restart — VALIDÉ sur ben-0001 (émetteur-off 3,5 min, NRestarts=0 ; + test d'isolation du mécanisme sd_notify). État indexes/seq persisté → restart sûr. Unit : NotifyAccess=main, WatchdogSec=90, StartLimitIntervalSec=0 (restart infini, escalade reboot DIFFÉRÉE à un prochain palier). AUCUNE migration BDD. Transition = install unit + daemon-reload + restart ben-lora-receiver."
       arduino:
         minimum: "0.0.1"
-        latest: "0.1.0"
+        latest: "0.1.2"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -204,6 +204,9 @@ devices:
           - version: "0.1.0"
             released: "2026-07-06"
             notes: "PALIER 0.1.0 (unification des versions — fin du compteur interne 0.5.x du sketch, aligné sur le Pi). tic-reader.ino : garde histo TOLÉRANTE (trame glitchée → skip silencieux, robuste au front-end marginal — corrige le rouge-rouge sur vrai Linky historique) + IINST 2e courbe (histo) + flush courbe 55 s (/live < 60 s) + checksum S1/S2 + CHIFFREMENT ChaCha20 (FRAME_ENCRYPT actif, encrypt-then-MAC). Reflash MANUEL (pas d'OTA sur Pro Mini). À flasher APRÈS avoir déployé le Pi en pi-0.1.0 (qui déchiffre) ; rétro-compat récepteur (trames non chiffrées encore décodées). minimum reste 0.0.1."
+          - version: "0.1.2"
+            released: "2026-07-10"
+            notes: "Découplage émetteur↔récepteur (incident ben-0001 09/07) + refonte LED. sendtoWait : setTimeout(600) + setRetries(1). MACHINE À ÉTATS REGISTERING/STREAMING : la trame de boot (petit paquet) sert de probe de vivacité — tant qu'elle n'est pas ACK, AUCUNE mesure émise ; retry boot à la cadence batch (v frais → identité jamais périmée) ; mesure non-ACK → retour REGISTERING → outage = 1 TX/~40 s, plus de brownout couplé. LED : couleur = quelle trame (magenta=boot, blanc=courbe), vert = ACK commun ; conso réduite (intensités ~10-40 vs 255, séquences boot ~7 s→<1 s, brownout=tick) ; codes erreur morts supprimés. Reflash MANUEL (pas d'OTA Pro Mini). minimum reste 0.0.1. (0.1.1 non publié : setTimeout/setRetries + machine à états regroupés en 0.1.2.)"
 
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
