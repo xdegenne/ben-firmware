@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
-# update.sh — pi-0.5.0 → pi-0.6.0   (_shared, per-model : MIGRATION model → capabilities)
+# update.sh — MIGRATION model → capabilities   (_shared, per-model → pi-0.6.1)
 #
-# Dernière release en mode PER-MODEL (l'ancien agent la trouve dans updates.pi0-wired /
-# updates.pi0-lora). Elle bascule le device vers le modèle CAPABILITIES :
-#   1. écrit `capabilities` dans device.json, DÉRIVÉ du `model` connu (pas de sonde) ;
-#   2. le nouvel agent + le module capabilities + l'orchestrateur sont déjà sur disque (checkout) ;
-#   3. redémarre les readers via les capabilities ;
-#   4. NE redémarre PAS ben-update.service (l'agent) → le nouvel agent prend effet au prochain tick.
-# Idempotent + GARDÉ : n'écrit capabilities QUE si device.json reste valide (increvable pour le
-# parc dans la nature). `model` est CONSERVÉ dans device.json (sécurité rollback vers l'ancien agent).
+# Utilisé par 0.5.0→0.6.1 (migration) ET 0.6.0→0.6.1 (récup d'un device migré). pi-0.6.1 = BUG FIX
+# de pi-0.6.0 : cette version écrivait device.json en sudo → root-owned → l'agent (ben) ne pouvait
+# plus bumper softwareVersion (PermissionError, retry en boucle → device cassé). FIX = chown ben:ben
+# INCONDITIONNEL en fin de script → restaure l'ownership, y compris sur le chemin « déjà migré »
+# (AUTO-RÉPARE un device cassé par 0.6.0). Sinon inchangé : écrit capabilities (dérivées du model,
+# model CONSERVÉ), idempotent, redémarre les readers, NE restart PAS l'agent (nouvel agent au tick suivant).
 set -euo pipefail
-TR="pi-0.5.0 → pi-0.6.0 (migration capabilities)"
+TR="→ pi-0.6.1 (migration/fix capabilities)"
 log()  { echo "[update $TR] $*"; }
 fail() { echo "[update $TR] ✗ ERREUR : $*" >&2; exit 1; }
 REPO="${REPO_PATH:-/opt/ben/repo}"
@@ -41,6 +39,11 @@ os.replace(tmp, p)
 print("  capabilities:", list(caps))
 PY
 [ $? -eq 0 ] || fail "écriture capabilities échouée — device.json inchangé"
+
+# CRUCIAL (fix pi-0.6.1) : l'écriture sudo ci-dessus rootifie device.json → sans ça l'agent (ben)
+# ne peut plus bumper softwareVersion (PermissionError). chown INCONDITIONNEL → répare aussi un
+# device déjà cassé par 0.6.0 (chemin « déjà migré » : le python no-op, ce chown restaure l'owner).
+sudo chown ben:ben "$DJ" || fail "chown device.json"
 
 log "daemon-reload + démarrage des readers via capabilities"
 sudo systemctl daemon-reload || fail "daemon-reload"
