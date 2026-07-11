@@ -560,10 +560,25 @@ def sd_notify(msg: str) -> None:
         pass
 
 
+TAINT_DIE = 0x80   # bit 7 de /proc/sys/kernel/tainted : un Oops noyau a eu lieu
+
+
+def kernel_died() -> bool:
+    """True si le noyau est tainted par un Oops (bit DIE). Incident ben-0001 10/07 : Oops dans
+    l'IRQ GPIO de la radio (irq/160-lg) → réception MORTE mais SPI encore lisible → le self-test
+    REG_VERSION passait à tort (récepteur sourd non détecté). Le taint DIE, lui, révèle l'Oops."""
+    try:
+        return bool(int(open("/proc/sys/kernel/tainted").read()) & TAINT_DIE)
+    except Exception:
+        return False
+
+
 def radio_alive() -> bool:
-    """True si le SX127x répond (REG_VERSION == 0x12). Lecture SPI brève ; une collision avec le
-    thread d'interruption RX est possible mais rare → débouncée par RADIO_FAIL_MAX (une lecture
-    corrompue = 1 échec toléré ; une trame RX corrompue serait de toute façon rejetée au HMAC)."""
+    """True si la radio est fiable : (1) pas d'Oops noyau (sinon l'IRQ RX peut être morte alors que
+    le SPI reste lisible — cf. incident 10/07), ET (2) le SX127x répond (REG_VERSION == 0x12).
+    Débounce RADIO_FAIL_MAX contre une collision SPI transitoire avec le thread d'interruption RX."""
+    if kernel_died():
+        return False
     if not lora_ok or lora is None:
         return False
     try:

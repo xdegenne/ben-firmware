@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.6.1"
+        latest: "0.7.0"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -211,7 +211,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.6.1"
+        latest: "0.7.0"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -788,4 +788,7 @@ updates:
 # features vont ICI : un seul flux keyé sur softwareVersion, plus de clé par modèle.
 # L'update.sh de chaque transition est capability-aware (has_cap / cap_hw). Vide au départ.
 updates_caps:
-  []
+  - from: "0.6.1"
+    to:   "0.7.0"
+    tag:  "pi-0.7.0"
+    script: "updates/0.6.1_to_0.7.0/update.sh"   # durcissement watchdog LoRa (capability-aware : has_cap lora ; wired skip)

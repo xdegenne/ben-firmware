@@ -13,10 +13,10 @@ set -euo pipefail
 
 REPO_URL="https://github.com/xdegenne/ben-firmware.git"
 REPO_PATH="/opt/ben/repo"
-# == latest (0.6.0). §8 écrit un device.json CAPABILITIES-based (via caps_for_model) → un device
-# neuf naît directement en capabilities, comme un device migré. Le parc EXISTANT migre par OTA
-# (transition 0.5.0→0.6.0). Le chantier ben-ops (workflow opérateur) reste à part.
-INITIAL_TAG="pi-0.6.1"
+# == latest. §8 écrit un device.json CAPABILITIES-based (via caps_for_model) → un device neuf naît
+# directement en capabilities (+ watchdog durci pour un lora). Le parc EXISTANT migre par OTA
+# (0.5.0/0.6.0 → 0.6.1 → 0.7.0). Le chantier ben-ops (workflow opérateur) reste à part.
+INITIAL_TAG="pi-0.7.0"
 # Version écrite dans device.json — DOIT correspondre au tag checkout, sinon
 # l'OTA re-grimpe depuis une version périmée. Dérivée de INITIAL_TAG pour
 # qu'elles ne puissent jamais diverger (ex. pi-0.0.28 → 0.0.28).

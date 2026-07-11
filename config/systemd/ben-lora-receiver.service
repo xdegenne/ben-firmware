@@ -1,12 +1,13 @@
 [Unit]
 Description=BEN LoRa Receiver
 After=basic.target
-# Watchdog restart : le service se relance à l'infini si le self-test radio échoue
-# (StartLimitIntervalSec=0 = pas de rate-limit → Restart=always jamais bloqué). Le soft-hang
-# SPI (incident ben-0001 09/07) est récupéré par ce restart. NB : l'escalade REBOOT (cas rare
-# Oops noyau tainted que le restart ne récupère pas) est VOLONTAIREMENT différée — à ajouter
-# (StartLimitBurst + StartLimitAction=reboot) une fois le watchdog prouvé en vrai sur ben-0001.
-StartLimitIntervalSec=0
+# Watchdog : le service se relance si le self-test radio échoue (radio figée OU Oops noyau détecté).
+# ESCALADE REBOOT : si le restart ne suffit pas — Oops noyau (kernel tainted DIE) → IRQ RX morte,
+# ré-init radio « GPIO busy » → restart-loop sans fin — seul un REBOOT clear l'IRQ. 3 restarts en
+# 300 s → reboot. PROUVÉ NÉCESSAIRE par l'incident ben-0001 10/07 (Oops irq/160-lg, restart KO).
+StartLimitIntervalSec=300
+StartLimitBurst=3
+StartLimitAction=reboot
 
 [Service]
 Type=simple
