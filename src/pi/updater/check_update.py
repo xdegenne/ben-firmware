@@ -18,6 +18,16 @@ from pathlib import Path
 
 import update_lib
 
+# capabilities.py vit dans src/pi/ (parent) — source de vérité model technique → libellé.
+# Import défensif : l'agent OTA ne doit JAMAIS hard-crasher sur un import (sinon plus d'OTA
+# pour se réparer). Fallback no-op si absent (checkout partiel improbable).
+try:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from capabilities import label_for_model
+except Exception:
+    def label_for_model(_model):
+        return None
+
 LOCK_PATH = "/var/lib/ben-firmware/update.lock"  # /var/lib/ben-firmware/ owned ben
 DEVICE_JSON = "/etc/ben-firmware/device.json"
 REPO_PATH = "/opt/ben/repo"
@@ -59,6 +69,17 @@ def main() -> None:
             list(device.get("capabilities", {})) or "-",
         )
 
+        # 2b. Self-heal : normalise device.json.model → libellé commercial (Filaire/Radio/
+        #     Mixte). Rétroactif pour les devices bumpés à 0.8.0 sous le bug de clobber
+        #     (l'agent réécrivait une copie mémoire d'AVANT update.sh → relabel annulé).
+        #     Idempotent : label_for_model=None si déjà relabellé → aucune écriture.
+        #     Tourne à CHAQUE tick, indépendamment des transitions → pas besoin d'une 2e release.
+        label = label_for_model(device.get("model"))
+        if label is not None:
+            log.info("Self-heal: relabel model %s → %s", device.get("model"), label)
+            device["model"] = label
+            update_lib.save_device_json(device, DEVICE_JSON)
+
         # 3. Fetch origin (tags + main branch)
         log.info("Fetching origin...")
         update_lib.fetch_origin(REPO_PATH)
@@ -97,7 +118,11 @@ def main() -> None:
         update_lib.run_update_script(script)
         log.info("Update script completed")
 
-        # 9. Commit the new version — only on success
+        # 9. Commit the new version — only on success.
+        #    Re-lire device.json depuis le DISQUE : update.sh a pu le modifier (relabel,
+        #    capabilities, …). Réutiliser la copie mémoire d'AVANT update.sh écraserait ces
+        #    edits — c'est le bug qui annulait le relabel 0.8.0 (corrigé en 0.8.1).
+        device = update_lib.load_device_json(DEVICE_JSON)
         device["softwareVersion"] = transition["to"]
         update_lib.save_device_json(device, DEVICE_JSON)
         log.info("device.json updated: softwareVersion = %s", transition["to"])
