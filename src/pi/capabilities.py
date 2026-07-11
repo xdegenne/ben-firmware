@@ -56,6 +56,13 @@ def caps_for_model(model: str, hw: str = "rev01") -> dict:
     }.get(model)
 
 
+# model technique → label COMMERCIAL affiché (device.json.model, exposé par /info à l'app).
+# Source de vérité unique, utilisée par le provisioning ET la migration 0.8.0. None = pas un
+# model technique connu (ex. déjà relabellé) → l'appelant ne touche pas.
+def label_for_model(model: str) -> str:
+    return {"pi0-wired": "Filaire", "pi0-lora": "Radio", "pi0-lora-wired": "Mixte"}.get(model)
+
+
 def load_device(path: str = None) -> dict:
     try:
         with open(path or DEVICE_JSON) as f:
@@ -139,8 +146,9 @@ def _cli(argv) -> int:
         if caps is None:
             print(f"model inconnu: {model}", file=sys.stderr)
             return 1
-        # `model`/`hardwareRevision` CONSERVÉS le temps de la transition (code encore model-based).
-        print(json.dumps({"deviceId": did, "model": model, "hardwareRevision": hw,
+        # `model` = LABEL commercial (Filaire/Radio) affiché par l'app ; `hardwareRevision`
+        # conservé le temps de la transition. Le model TECHNIQUE ne sert qu'ici (dérivation caps).
+        print(json.dumps({"deviceId": did, "model": label_for_model(model), "hardwareRevision": hw,
                           "softwareVersion": ver, "capabilities": caps}, indent=2))
         return 0
     print(f"commande inconnue: {cmd}", file=sys.stderr)
