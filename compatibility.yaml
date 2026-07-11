@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.5.0"
+        latest: "0.6.0"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -211,7 +211,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.5.0"
+        latest: "0.6.0"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -569,6 +569,10 @@ updates:
       to: "0.5.0"
       tag: "pi-0.5.0"
       script: "updates/pi0-lora/0.4.0_to_0.5.0/update.sh"
+    - from: "0.5.0"
+      to: "0.6.0"
+      tag: "pi-0.6.0"
+      script: "updates/_shared/0.5.0_to_0.6.0/update.sh"   # MIGRATION model → capabilities (dernière release per-model)
 
   pi0-wired:
     - from: "0.0.2"
@@ -763,6 +767,17 @@ updates:
       to: "0.5.0"
       tag: "pi-0.5.0"
       script: "updates/pi0-wired/0.4.0_to_0.5.0/update.sh"
+    - from: "0.5.0"
+      to: "0.6.0"
+      tag: "pi-0.6.0"
+      script: "updates/_shared/0.5.0_to_0.6.0/update.sh"   # MIGRATION model → capabilities
 
   pi0-lora-wired:
     []                  # no in-field transitions yet
+
+# ── MONO-FLUX capabilities ───────────────────────────────────────────────────
+# Lu par le NOUVEL agent (après migration pi-0.6.0). À partir de là, les nouvelles
+# features vont ICI : un seul flux keyé sur softwareVersion, plus de clé par modèle.
+# L'update.sh de chaque transition est capability-aware (has_cap / cap_hw). Vide au départ.
+updates_caps:
+  []

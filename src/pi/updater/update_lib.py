@@ -59,27 +59,36 @@ def find_next_transition(compat: dict, device: dict) -> Optional[dict]:
     """
     Return the first applicable transition for this device, or None.
 
-    A transition is applicable when:
-    - model matches
-    - `from` equals the current softwareVersion
-    - hardwareRevision satisfies the minimum requirement
+    Deux flux, dans l'ordre (backward-compatible pendant la bascule capabilities) :
+      1. `updates_caps` — MONO-FLUX keyé sur softwareVersion (device migré : plus de model).
+      2. `updates.<model>` — ANCIEN flux per-model (device pas encore migré : device.json a
+         encore `model` + `hardwareRevision`).
+    Le device migré est en `updates_caps` (qui démarre à la version de migration) → il ne matche
+    jamais le fallback. Le device pas migré n'a pas de match `updates_caps` → il prend le fallback.
     """
-    model = device["model"]
-    hw_rev = device["hardwareRevision"]
     current = device["softwareVersion"]
 
-    transitions = compat.get("updates", {}).get(model) or []
-    for t in transitions:
-        if t["from"] != current:
-            continue
-        min_rev = t.get("requires", {}).get("hardwareRevision", {}).get("minimum")
-        if min_rev and _rev_num(hw_rev) < _rev_num(min_rev):
-            log.warning(
-                "Transition %s→%s skipped: hardware %s below required %s",
-                t["from"], t["to"], hw_rev, min_rev,
-            )
-            continue
-        return t
+    # 1. Flux capabilities (mono-flux). Pas de model, pas de gating HW ici (l'update.sh est
+    #    capability-aware et gère lui-même les cas HW via has_cap/cap_hw).
+    for t in (compat.get("updates_caps") or []):
+        if t.get("from") == current:
+            return t
+
+    # 2. Fallback per-model (device pas encore migré).
+    model = device.get("model")
+    if model:
+        hw_rev = device.get("hardwareRevision", "")
+        for t in (compat.get("updates", {}).get(model) or []):
+            if t.get("from") != current:
+                continue
+            min_rev = t.get("requires", {}).get("hardwareRevision", {}).get("minimum")
+            if min_rev and hw_rev and _rev_num(hw_rev) < _rev_num(min_rev):
+                log.warning(
+                    "Transition %s→%s skipped: hardware %s below required %s",
+                    t["from"], t["to"], hw_rev, min_rev,
+                )
+                continue
+            return t
     return None
 
 

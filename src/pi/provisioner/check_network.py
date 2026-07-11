@@ -18,6 +18,7 @@ import logging
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import led
 
@@ -83,8 +84,25 @@ def _start_provisioning() -> None:
 
 
 def _start_readers() -> None:
-    """Démarre les agents normaux selon le modèle (device provisionné + réseau up).
-    Ces services n'ont pas d'autostart : ils ne tournent QUE par cet appel."""
+    """Démarre les agents normaux (device provisionné + réseau up). Ces services n'ont
+    pas d'autostart : ils ne tournent QUE par cet appel.
+
+    PRIORITÉ au device.json CAPABILITIES (source de vérité = capabilities.py) ; FALLBACK
+    sur le mapping par modèle pour un device pas encore migré."""
+    # Nouveau modèle : capabilities → services.
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # src/pi
+        import capabilities as caps
+        declared = caps.capabilities()
+        if declared:
+            for cap in declared:
+                caps.start(cap)
+            log.info("readers démarrés via capabilities: %s", list(declared))
+            return
+    except Exception as e:
+        log.warning("capabilities indisponible (%s) — fallback modèle", e)
+
+    # Fallback (device pas encore migré : device.json a `model`, pas `capabilities`).
     model = ""
     try:
         with open(DEVICE_JSON) as f:

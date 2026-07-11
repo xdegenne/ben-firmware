@@ -13,7 +13,10 @@ set -euo pipefail
 
 REPO_URL="https://github.com/xdegenne/ben-firmware.git"
 REPO_PATH="/opt/ben/repo"
-INITIAL_TAG="pi-0.5.0"
+# == latest (0.6.0). §8 écrit un device.json CAPABILITIES-based (via caps_for_model) → un device
+# neuf naît directement en capabilities, comme un device migré. Le parc EXISTANT migre par OTA
+# (transition 0.5.0→0.6.0). Le chantier ben-ops (workflow opérateur) reste à part.
+INITIAL_TAG="pi-0.6.0"
 # Version écrite dans device.json — DOIT correspondre au tag checkout, sinon
 # l'OTA re-grimpe depuis une version périmée. Dérivée de INITIAL_TAG pour
 # qu'elles ne puissent jamais diverger (ex. pi-0.0.28 → 0.0.28).
@@ -147,28 +150,16 @@ chmod 600 /etc/ben-firmware/hmac.key
 echo "[7/13] Certificates and HMAC key installed"
 
 # --------------------------------------------------------------------------
-# 8. Write device.json
+# 8. Write device.json — CAPABILITIES-based (dérivé du MODEL)
 # --------------------------------------------------------------------------
-if [ "$MODEL" = "pi0-lora" ] || [ "$MODEL" = "pi0-lora-wired" ]; then
-    cat > /etc/ben-firmware/device.json <<EOF
-{
-  "deviceId": "$DEVICE_ID",
-  "model": "$MODEL",
-  "hardwareRevision": "$HW_REV",
-  "softwareVersion": "$INITIAL_VERSION",
-  "arduinoFirmwareVersion": "0.0.1"
-}
-EOF
-else
-    cat > /etc/ben-firmware/device.json <<EOF
-{
-  "deviceId": "$DEVICE_ID",
-  "model": "$MODEL",
-  "hardwareRevision": "$HW_REV",
-  "softwareVersion": "$INITIAL_VERSION"
-}
-EOF
-fi
+# Le device naît en capabilities, comme un device migré : source de vérité UNIQUE
+# model→caps = src/pi/capabilities.py (idem migration OTA). `model`/`hardwareRevision`
+# conservés le temps de la transition (code local_api/db encore model-based). Le fw de
+# l'émetteur est porté par la capa lora-tic-receiver (fini le champ arduinoFirmwareVersion).
+DJ_TMP=$(mktemp)
+python3 "$REPO_PATH/src/pi/capabilities.py" device-json \
+    "$DEVICE_ID" "$MODEL" "$HW_REV" "$INITIAL_VERSION" > "$DJ_TMP"
+mv "$DJ_TMP" /etc/ben-firmware/device.json
 chown ben:ben /etc/ben-firmware/device.json
 
 # sources.json — PDL source routing (lora_address → pdl_index)

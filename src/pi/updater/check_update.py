@@ -53,9 +53,10 @@ def main() -> None:
         # 2. Read device identity
         device = update_lib.load_device_json(DEVICE_JSON)
         log.info(
-            "Device: %s  model=%s  hw=%s  version=%s",
-            device["deviceId"], device["model"],
-            device["hardwareRevision"], device["softwareVersion"],
+            "Device: %s  model=%s  hw=%s  version=%s  caps=%s",
+            device["deviceId"], device.get("model", "-"),
+            device.get("hardwareRevision", "-"), device["softwareVersion"],
+            list(device.get("capabilities", {})) or "-",
         )
 
         # 3. Fetch origin (tags + main branch)
