@@ -173,7 +173,7 @@ devices:
             notes: "Watchdog SELF-TEST RADIO (récepteur LoRa). Lecture périodique de REG_VERSION du SX127x (0x42 doit valoir 0x12) : si le SPI/radio est figé (incident ben-0001 09/07), le process cesse de pinguer sd_notify(WATCHDOG=1) → systemd restart le service (WatchdogSec=90 s). Distingue « radio HS » de « rien à recevoir » : le silence de trames (émetteur off) ne déclenche PAS de restart — VALIDÉ sur ben-0001 (émetteur-off 3,5 min, NRestarts=0 ; + test d'isolation du mécanisme sd_notify). État indexes/seq persisté → restart sûr. Unit : NotifyAccess=main, WatchdogSec=90, StartLimitIntervalSec=0 (restart infini, escalade reboot DIFFÉRÉE à un prochain palier). AUCUNE migration BDD. Transition = install unit + daemon-reload + restart ben-lora-receiver."
       arduino:
         minimum: "0.0.1"
-        latest: "0.1.2"
+        latest: "0.1.3"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -207,6 +207,9 @@ devices:
           - version: "0.1.2"
             released: "2026-07-10"
             notes: "Découplage émetteur↔récepteur (incident ben-0001 09/07) + refonte LED. sendtoWait : setTimeout(600) + setRetries(1). MACHINE À ÉTATS REGISTERING/STREAMING : la trame de boot (petit paquet) sert de probe de vivacité — tant qu'elle n'est pas ACK, AUCUNE mesure émise ; retry boot à la cadence batch (v frais → identité jamais périmée) ; mesure non-ACK → retour REGISTERING → outage = 1 TX/~40 s, plus de brownout couplé. LED : couleur = quelle trame (magenta=boot, blanc=courbe), vert = ACK commun ; conso réduite (intensités ~10-40 vs 255, séquences boot ~7 s→<1 s, brownout=tick) ; codes erreur morts supprimés. Reflash MANUEL (pas d'OTA Pro Mini). minimum reste 0.0.1. (0.1.1 non publié : setTimeout/setRetries + machine à états regroupés en 0.1.2.)"
+          - version: "0.1.3"
+            released: "2026-07-13"
+            notes: "FIX ACK/gate (nuit 12→13/07). La trame de boot écrivait dans un buffer sur la PILE (uint8_t buf[BOOT_MAX_LEN]) : pendant frameSeal (ChaCha20 ~128 o de pile + SHA256), à ~74 % de RAM, la pile débordait et corrompait l'état RadioHead → sendtoWait ne reconnaissait plus l'ACK de la trame de boot → bootAcked jamais posé → gate REGISTERING bloquée (aucune courbe émise). La trame COURBE utilisait déjà curveBuf (GLOBAL) → son ACK passait, d'où l'asymétrie boot(rouge)/courbe(vert) à la LED. Fix = la trame de boot écrit aussi dans curveBuf (global) → plus d'overflow → ACK reconnu → gate s'ouvre → STREAMING. Validé ben-0001 : courbes v0x05 AVEC la gate ; récepteur éteint = REGISTERING sans courbe, rallumé = reprise. LED blinks courts (magenta=boot, blanc=courbe, vert=ACK, rouge=non). Enquête complète : ~/work/ben/docs/enquete-ack-boot-gate.md. Reflash MANUEL (pas d'OTA Pro Mini). minimum reste 0.0.1."
 
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
