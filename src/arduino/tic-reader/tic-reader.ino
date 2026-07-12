@@ -90,7 +90,7 @@
 // ---------------------------------------------------------------------------
 #define PROTOCOL_VERSION_BOOT  0x01   // trame d'identité (ADCO)
 #define PROTOCOL_VERSION_CURVE 0x05   // trame courbe batchée (v0x05 : dt par point)
-#define FW_VERSION             "0.1.2"   // 0.1.2 : découplage émetteur↔récepteur (incident ben-0001 09/07). setTimeout 600ms + setRetries 1. MACHINE À ÉTATS REGISTERING/STREAMING : tant que la trame de boot (petit paquet = probe de vivacité) n'est pas ACK, AUCUNE mesure émise ; retry boot à la cadence batch (v frais) ; mesure non-ACK → retour REGISTERING. Base 0.1.0 : garde histo tolérante + IINST 2e courbe + flush 55s + chiffrement ChaCha20 + logging aligné
+#define FW_VERSION             "0.1.3"   // 0.1.3 : FIX trame boot dans buffer GLOBAL curveBuf (le buffer pile buf[64] débordait pendant le ChaCha et corrompait l ACK -> gate bloquée). 0.1.2 : découplage émetteur↔récepteur (incident ben-0001 09/07). setTimeout 600ms + setRetries 1. MACHINE À ÉTATS REGISTERING/STREAMING : tant que la trame de boot (petit paquet = probe de vivacité) n'est pas ACK, AUCUNE mesure émise ; retry boot à la cadence batch (v frais) ; mesure non-ACK → retour REGISTERING. Base 0.1.0 : garde histo tolérante + IINST 2e courbe + flush 55s + chiffrement ChaCha20 + logging aligné
 #define BOOT_PAYLOAD_LEN       20     // v0x01 : version + ADCO(12) + ISOUSC + PREF, padding jusqu'à 20 (rétro)
 #define BOOT_MAX_LEN           64     // format cible : header(7) + TLV (ADCO/ISOUSC/PREF/CONTRAT) + MAC(8)
 
@@ -772,7 +772,7 @@ static const char* contractOf(const TICValues& v) {
 // (même robustesse que le LTARF de courbe). Sans ça, l'identité/config (ADCO/ISOUSC/PREF/
 // NGTF) reste inconnue du récepteur jusqu'au prochain reboot → jauge non calibrée, labels faux.
 bool sendBootFrame(const char* adco, uint8_t isousc, uint8_t pref, const char* ngtf) {
-  uint8_t buf[BOOT_MAX_LEN];
+  uint8_t* buf = curveBuf;   // FIX 0.1.3 : buffer GLOBAL (le buffer pile debordait pendant frameSeal/ChaCha -> corruption ACK)
   msg_count++;                                       // nonce lo (+1 par trame émise)
   uint16_t pos = writeHeader(buf, TYPE_BOOT);        // [0-6] header clair
   pos = writeTLV(buf, pos, T_ADCO, (const uint8_t*)adco, 12);
@@ -786,9 +786,10 @@ bool sendBootFrame(const char* adco, uint8_t isousc, uint8_t pref, const char* n
 
   bool acked = false;
   if (loraOk) {
+    blinkRGB(30, 0, 30, 40);   // magenta bref = trame BOOT envoyee
     driver.setModeIdle();
     acked = manager.sendtoWait(buf, len, SERVER_ADDRESS);
-    blinkTx(14, 0, 14, acked);           // magenta = TX trame de boot (+ vert si ACK ; magenta seul = pas d'ACK)
+    if (acked) blinkRGB(0, 40, 0, 40); else blinkRGB(40, 0, 0, 40);  // vert=ACK / rouge=pas d ACK
     driver.sleep();
   }
   return acked;
@@ -942,8 +943,9 @@ void curveFlush() {
 
   if (loraOk) {
     driver.setModeIdle();
+    blinkRGB(30, 30, 30, 40);   // blanc bref = trame COURBE envoyee
     bool acked = manager.sendtoWait(curveBuf, len, SERVER_ADDRESS);
-    blinkTx(10, 10, 10, acked);        // blanc = TX trame de courbe (+ vert si ACK)
+    if (acked) blinkRGB(0, 40, 0, 40); else blinkRGB(40, 0, 0, 40);  // vert=ACK / rouge=pas d ACK
     // LTARF confirmé livré pour ce NTARF → on ne le re-transmet plus (jusqu'à changement de
     // NTARF). Pas d'ACK → curveSendLtarf reste vrai au prochain batch = re-transmission (robuste).
     if (curveSendLtarf && acked) ltarfSentForNtarf = curveIndexId;
