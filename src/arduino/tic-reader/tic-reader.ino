@@ -90,7 +90,7 @@
 // ---------------------------------------------------------------------------
 #define PROTOCOL_VERSION_BOOT  0x01   // trame d'identité (ADCO)
 #define PROTOCOL_VERSION_CURVE 0x05   // trame courbe batchée (v0x05 : dt par point)
-#define FW_VERSION             "0.1.2"   // 0.1.2 : découplage émetteur↔récepteur (incident ben-0001 09/07). setTimeout 600ms + setRetries 1. MACHINE À ÉTATS REGISTERING/STREAMING : tant que la trame de boot (petit paquet = probe de vivacité) n'est pas ACK, AUCUNE mesure émise ; retry boot à la cadence batch (v frais) ; mesure non-ACK → retour REGISTERING. Base 0.1.0 : garde histo tolérante + IINST 2e courbe + flush 55s + chiffrement ChaCha20 + logging aligné
+#define FW_VERSION             "0.5.2"   // + garde histo TOLÉRANTE (trame glitchée = skip silencieux, plus de rouge rouge sur 1 glitch) → robuste front-end marginal
 #define BOOT_PAYLOAD_LEN       20     // v0x01 : version + ADCO(12) + ISOUSC + PREF, padding jusqu'à 20 (rétro)
 #define BOOT_MAX_LEN           64     // format cible : header(7) + TLV (ADCO/ISOUSC/PREF/CONTRAT) + MAC(8)
 
@@ -221,7 +221,6 @@ static uint8_t  curveNjourf1 = 0xFF;         // std : n° profil lendemain → T
 static uint8_t  lastSentIsousc = 0;          // dernier ISOUSC émis (v0x01) → ré-émet sur changement
 static uint8_t  lastSentPref   = 0;          // dernier PREF émis (v0x01, standard) → ré-émet sur changement
 static uint16_t lastSentNgtfHash = 0;        // hash du dernier NGTF émis (v0x01) → détecte le changement fournisseur (économe RAM vs stocker la chaîne)
-static bool     bootAcked      = false;      // false = REGISTERING (on n'émet AUCUNE mesure tant que la trame de boot n'est pas ACK), true = STREAMING. Une trame boot minuscule est le meilleur probe de vivacité : si elle ne passe/n'ACK pas, la grosse trame courbe non plus.
 static uint16_t batch_seq    = 0;     // RAM, reset au boot, +1/batch
 static unsigned long curveT0 = 0;     // millis() du début de batch (flush périodique)
 static uint32_t curveLastOffSec = 0;  // histo : offset cumulé (s) du dernier point vs curveT0 (dt v0x05)
@@ -387,34 +386,29 @@ static void blinkRGB(uint8_t r, uint8_t g, uint8_t b, uint16_t ms = 80) {
   setRGB(r, g, b); delay(ms); ledOff();
 }
 
-// --- Langage LED (basse intensite = conso supercap). Couleur = quelle trame ; vert = ACK commun. ---
-//   magenta = TX trame boot · blanc = TX trame courbe · vert = ACK · bleu = lecture TIC
-//   orange = discovery · rouge = erreur
-#define LED_ACK_G   16       // intensite vert ACK
-#define LED_ERR_R   40       // intensite rouge erreur
-// Envoi de trame : couleur de trame (30 ms) puis vert bref si ACK. Absence de vert = pas d'ACK.
-static void blinkTx(uint8_t r, uint8_t g, uint8_t b, bool acked) {
-  blinkRGB(r, g, b, 30);
-  if (acked) blinkRGB(0, LED_ACK_G, 0, 30);
-}
-
-// erreur rouge : code x flashs (dim). 2x = pas de TIC / compteur muet.
-// (Vcc bas = tick rouge dedie plus leger ; LoRa KO = sequence boot ledLoraKO.)
+// 1=Vcc bas  2=TIC KO  3=LoRa KO  4=PTEC inconnu
 static void blinkErr(uint8_t code) {
   for (uint8_t i = 0; i < code; i++) {
-    setRGB(LED_ERR_R, 0, 0); delay(50);
-    ledOff();                delay(120);
+    setRGB(255, 0, 0); delay(60);
+    ledOff();          delay(120);
+  }
+  delay(400);
+}
+
+static void ledBootHello() {
+  setRGB(255, 255, 255); delay(1000); ledOff(); delay(300);
+}
+
+static void ledLoraOK() {
+  for (uint8_t i = 0; i < 3; i++) {
+    setRGB(0, 255, 0); delay(2000); ledOff(); delay(300);
   }
 }
 
-static void ledBootHello() { blinkRGB(20, 20, 20, 150); }   // blanc bref = hello boot
-
-static void ledLoraOK() {                                    // 2x vert bref = init LoRa OK
-  for (uint8_t i = 0; i < 2; i++) { setRGB(0, LED_ACK_G, 0); delay(80); ledOff(); delay(120); }
-}
-
-static void ledLoraKO() {                                    // 4x rouge bref = init LoRa KO (fatal)
-  for (uint8_t i = 0; i < 4; i++) { setRGB(LED_ERR_R, 0, 0); delay(80); ledOff(); delay(120); }
+static void ledLoraKO() {
+  for (uint8_t i = 0; i < 3; i++) {
+    setRGB(255, 0, 0); delay(2000); ledOff(); delay(300);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -766,12 +760,7 @@ static const char* contractOf(const TICValues& v) {
   return (ticMode == MODE_STANDARD) ? v.ngtf : v.optarif;
 }
 
-// Retourne true si la trame de boot a été ACQUITTÉE. L'appelant ne fige les marqueurs
-// `lastSent*` QUE sur ACK → une trame de boot perdue (récepteur sourd au démarrage) est
-// automatiquement ré-émise par la logique on-change au tour suivant, jusqu'à confirmation
-// (même robustesse que le LTARF de courbe). Sans ça, l'identité/config (ADCO/ISOUSC/PREF/
-// NGTF) reste inconnue du récepteur jusqu'au prochain reboot → jauge non calibrée, labels faux.
-bool sendBootFrame(const char* adco, uint8_t isousc, uint8_t pref, const char* ngtf) {
+void sendBootFrame(const char* adco, uint8_t isousc, uint8_t pref, const char* ngtf) {
   uint8_t buf[BOOT_MAX_LEN];
   msg_count++;                                       // nonce lo (+1 par trame émise)
   uint16_t pos = writeHeader(buf, TYPE_BOOT);        // [0-6] header clair
@@ -784,14 +773,12 @@ bool sendBootFrame(const char* adco, uint8_t isousc, uint8_t pref, const char* n
   }
   uint16_t len = frameSeal(buf, pos, FRAME_ENCRYPT);   // chiffre (si activé) + MAC → longueur totale
 
-  bool acked = false;
   if (loraOk) {
     driver.setModeIdle();
-    acked = manager.sendtoWait(buf, len, SERVER_ADDRESS);
-    blinkTx(14, 0, 14, acked);           // magenta = TX trame de boot (+ vert si ACK ; magenta seul = pas d'ACK)
+    manager.sendtoWait(buf, len, SERVER_ADDRESS);
+    blinkRGB(0, 0, 255);  // bleu = boot frame envoyee
     driver.sleep();
   }
-  return acked;
 }
 
 // ---------------------------------------------------------------------------
@@ -943,11 +930,11 @@ void curveFlush() {
   if (loraOk) {
     driver.setModeIdle();
     bool acked = manager.sendtoWait(curveBuf, len, SERVER_ADDRESS);
-    blinkTx(10, 10, 10, acked);        // blanc = TX trame de courbe (+ vert si ACK)
+    blinkRGB(40, 40, 40, 30);          // blanc bref = batch courbe ÉMIS en LoRa
+    if (acked) blinkRGB(0, 60, 0, 40); // vert = ACK reçu du récepteur
     // LTARF confirmé livré pour ce NTARF → on ne le re-transmet plus (jusqu'à changement de
     // NTARF). Pas d'ACK → curveSendLtarf reste vrai au prochain batch = re-transmission (robuste).
     if (curveSendLtarf && acked) ltarfSentForNtarf = curveIndexId;
-    if (!acked) bootAcked = false;     // mesure non-ACK → récepteur reparti → retour REGISTERING (on cesse d'émettre des mesures, on reprend le retry boot)
     driver.sleep();
   }
 
@@ -991,18 +978,6 @@ void setup() {
     // Doit rester ISO avec lora-receiver/main.py côté Pi.
     static const RH_RF95::ModemConfig SF9_BW125 = {0x72, 0x94, 0x00};
     driver.setModemRegisters(&SF9_BW125);
-    // ACK/retries : découplage émetteur↔récepteur (cf. incident ben-0001 09/07).
-    // Défauts RadioHead = 3 retries (4 TX) + timeout 200 ms → sur un récepteur lent
-    // OU sourd, 4 × ~600 ms d'airtime SF9 (~2,4 s de TX cumulée à 120 mA) vident la
-    // supercap 0,47 F → brownout/reset. On corrige les DEUX causes :
-    //  - setTimeout(600) : l'aller-retour d'ACK réel (airtime ACK ~100 ms + retournement
-    //    Pi, pire sous charge type /curve) dépasse souvent 200 ms → on attend assez
-    //    longtemps avant de conclure « pas d'ACK » (l'attente se fait en RX ~10 mA,
-    //    ce qui espace aussi les bursts TX = récup supercap).
-    //  - setRetries(1) : 2 TX max (1+1) au lieu de 4 → borne le pire-cas énergétique.
-    // Budget bloquant sendtoWait ≈ 2×(600 TX + 600 ACK) ≈ 2,4 s < WDT 8 s. OK.
-    manager.setTimeout(600);
-    manager.setRetries(1);
     driver.sleep();
     loraOk = true;
     Serial.begin(9600);
@@ -1026,26 +1001,24 @@ void loop() {
 
   bool vok = isVoltageSufficient();   // ADC seul, plus d'impression (UART TIC laissé ouvert)
   if (!vok) {
-    if (bootAcked && curveActive) curveFlush();  // brownout : sauver le batch (STREAMING only ; REGISTERING = simple horloge → on jette, surtout pas de TX supercap basse)
-    blinkRGB(30, 0, 0, 15);            // tick rouge fugace = Vcc bas (pas de flash fort : supercap basse)
+    if (curveActive) curveFlush();    // brownout imminent : ne pas perdre le batch en cours
+    blinkErr(1);
     return;
   }
 
   // Discovery au boot (1re itération) : sonde histo↔standard, fixe et persiste le mode.
   if (firstFrame) {
-    blinkRGB(30, 12, 0, 60);          // orange att. = discovery histo/std
+    blinkRGB(255, 80, 0);             // orange : discovery
     uint8_t m = discoverMode();
     if (m == 0xFF) { blinkErr(2); return; }   // compteur muet : on retentera au tour suivant
     ticMode = m;
     persistMode(ticMode);
     TICValues v0;                     // une trame du bon mode pour l'identité (ADCO/ADSC + ISOUSC)
     if (readAndParseTIC(v0, ticMode) && v0.adco[0] != 0) {
-      if (sendBootFrame(v0.adco, v0.isousc, v0.pref, contractOf(v0))) {
-        bootAcked = true;                    // enregistré → STREAMING
-        lastSentIsousc = v0.isousc;
-        lastSentPref = v0.pref;
-        lastSentNgtfHash = strhash16(contractOf(v0));
-      }
+      sendBootFrame(v0.adco, v0.isousc, v0.pref, contractOf(v0));
+      lastSentIsousc = v0.isousc;
+      lastSentPref = v0.pref;
+      lastSentNgtfHash = strhash16(contractOf(v0));
     }
     firstFrame = false;
     return;
@@ -1056,7 +1029,7 @@ void loop() {
   if (!readAndParseTIC(v, ticMode)) {
     // Échec lecture : Enedis a peut-être rebasculé le mode → re-discovery après N échecs.
     if (++consecFail >= REDISCOVER_FAILS) {
-      if (bootAcked && curveActive) curveFlush();  // STREAMING only (REGISTERING : batch = horloge, jeté)
+      if (curveActive) curveFlush();
       uint8_t m = discoverMode();
       if (m != 0xFF) { ticMode = m; persistMode(ticMode); }
       consecFail = 0;
@@ -1065,23 +1038,19 @@ void loop() {
     return;
   }
   consecFail = 0;
-  blinkRGB(0, 0, 12, 6);               // bleu faible bref = trame TIC lue (heartbeat lecture)
+  blinkRGB(0, 0, 40, 8);               // bleu bref = trame TIC lue (heartbeat lecture)
 
   // Métadonnées contrat (statiques) : ré-émettre la trame d'identité v0x01 si ISOUSC (histo, A)
   // OU PREF (standard, kVA) OU le CONTRAT (NGTF en standard / OPTARIF en histo) change. Un
   // changement de contrat = nouvelle époque tarifaire côté serveur (segmentation des registres).
-  // STREAMING uniquement : ré-émettre l'identité v0x01 si ISOUSC/PREF/CONTRAT change en cours de
-  // route. En REGISTERING on ne passe PAS par ici (sinon on ré-émettrait à CHAQUE tour puisque
-  // lastSent* reste figé tant que pas d'ACK) → le retry boot est géré à la cadence batch plus bas.
-  if (bootAcked && v.adco[0] != 0 &&
+  if (v.adco[0] != 0 &&
       ((v.isousc != 0 && v.isousc != lastSentIsousc) ||
        (v.pref   != 0 && v.pref   != lastSentPref) ||
        (contractOf(v)[0] && strhash16(contractOf(v)) != lastSentNgtfHash))) {
-    if (sendBootFrame(v.adco, v.isousc, v.pref, contractOf(v))) {
-      lastSentIsousc = v.isousc;
-      lastSentPref = v.pref;
-      lastSentNgtfHash = strhash16(contractOf(v));
-    }
+    sendBootFrame(v.adco, v.isousc, v.pref, contractOf(v));
+    lastSentIsousc = v.isousc;
+    lastSentPref = v.pref;
+    lastSentNgtfHash = strhash16(contractOf(v));
   }
 
   // --- Sélection index + garde, par mode -----------------------------------------------
@@ -1132,21 +1101,6 @@ void loop() {
   // Flush périodique → fraîcheur /live ~60 s.
   if (curveActive && curveN > 1 && (millis() - curveT0) >= CURVE_FLUSH_MS)
     curveFlushPending = true;
-
-  // REGISTERING : tant que la trame de boot n'est pas ACQUITTÉE, on n'émet AUCUNE mesure. On
-  // retente la boot à la CADENCE BATCH (curveFlushPending = ~40 s / ou périodique 55 s), avec le
-  // `v` FRAIS → identité/config toujours à jour, jamais un snapshot périmé. Le batch accumulé n'a
-  // servi que d'horloge → on le jette (le récepteur n'est pas confirmé, la courbe serait perdue).
-  if (!bootAcked && curveFlushPending) {
-    if (sendBootFrame(v.adco, v.isousc, v.pref, contractOf(v))) {
-      bootAcked = true;                      // enregistré → STREAMING au prochain point
-      lastSentIsousc = v.isousc;
-      lastSentPref = v.pref;
-      lastSentNgtfHash = strhash16(contractOf(v));
-    }
-    curveActive = false; curveN = 0;         // jeter le batch-horloge
-    curveFlushPending = false;               // → pas de flush courbe différé ci-dessous
-  }
   }  // --- fin bloc v : TICValues détruit, pile dégagée ---
   // Flush DIFFÉRÉ (+ flush-on-message) : ici v n'est plus sur la pile → chiffrement au large.
   if (curveFlushPending) { curveFlush(); curveFlushPending = false; }
