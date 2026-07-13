@@ -50,9 +50,9 @@ def caps_for_model(model: str, hw: str = "rev01") -> dict:
     return {
         "pi0-wired":      {"rgb-led-indicator": {"hw": hw}, "tic-uart": {"hw": hw}},
         "pi0-lora":       {"rgb-led-indicator": {"hw": hw}, "lora": {"hw": hw},
-                           "lora-tic-receiver": {"hw": hw, "fw": "0.1.2"}},
+                           "lora-tic-receiver": {"hw": hw, "fw": "0.1.3"}},
         "pi0-lora-wired": {"rgb-led-indicator": {"hw": hw}, "lora": {"hw": hw},
-                           "lora-tic-receiver": {"hw": hw, "fw": "0.1.2"}, "tic-uart": {"hw": hw}},
+                           "lora-tic-receiver": {"hw": hw, "fw": "0.1.3"}, "tic-uart": {"hw": hw}},
     }.get(model)
 
 
