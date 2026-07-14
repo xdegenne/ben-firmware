@@ -46,9 +46,6 @@ import time
 
 from bluezero import adapter, peripheral
 
-import dbus
-import dbus.service
-
 import led
 from wifi_config import configure_wifi
 
@@ -213,12 +210,16 @@ def on_preview_cmd_write(value, options):
                      VERIFY_AFTER_PREVIEW_SEC)
         _preview_active = False
         # Arrête la boucle d'apprentissage et éteint, PUIS lance le code de test
-        # après un délai (le temps d'arriver sur l'écran de test).
-        try:
-            led.stop_blink()
-            led.off()
-        except Exception:
-            pass
+        # après un délai (le temps d'arriver sur l'écran de test). LED en thread :
+        # stop_blink() fait un join(timeout=2) qui BLOQUERAIT le callback GATT (boucle
+        # BLE) → réponse ATT au « Suivant » retardée. On ne bloque jamais le callback.
+        def _led_off():
+            try:
+                led.stop_blink()
+                led.off()
+            except Exception:
+                pass
+        threading.Thread(target=_led_off, daemon=True).start()
         threading.Timer(VERIFY_AFTER_PREVIEW_SEC, _new_verify_code).start()
 
 
@@ -428,17 +429,19 @@ def on_verify_write(value, options):
     if guess == _verify_code:
         _verified = True
         log.info("vérification couleur OK")
-        try:
-            led.stop_blink()
-            # 3 blinks verts rapides = vérifié (puis éteint, plus de vert permanent).
-            # En thread : ne pas bloquer le callback GATT pendant les flashs.
-            threading.Thread(
-                target=led.flash_pattern, args=(led.VERT,),
-                kwargs={"n": 3, "flash_sec": 0.12, "hold_after": False, "bypass": True},
-                daemon=True,
-            ).start()
-        except Exception:
-            pass
+        # TOUT le travail LED en thread : `led.stop_blink()` fait un join(timeout=2)
+        # qui BLOQUERAIT le callback GATT (= la boucle BLE bluezero) → la réponse ATT
+        # à l'app est retardée → GEL de l'écran de vérif côté iOS. On ne bloque JAMAIS
+        # le callback : la notif VERIFY_STATUS part tout de suite, la LED suit en async.
+        def _led_verified():
+            try:
+                led.stop_blink()  # stoppe la séquence du code de test
+                # 3 blinks verts rapides = vérifié (puis éteint).
+                led.flash_pattern(led.VERT, n=3, flash_sec=0.12,
+                                  hold_after=False, bypass=True)
+            except Exception:
+                pass
+        threading.Thread(target=_led_verified, daemon=True).start()
         set_verify_status(VS_VERIFIED)
         return
 
@@ -492,76 +495,6 @@ def _apply_wifi_config(ssid: str, password: str) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Agent de pairing « Just Works » (auto-accept)
-# ---------------------------------------------------------------------------
-# BlueZ >= 5.x exige une connexion chiffrée pour la caractéristique standard
-# Service Changed, à laquelle iOS s'abonne SYSTÉMATIQUEMENT à la connexion.
-# BlueZ envoie alors une SMP Security Request → iOS lance un pairing. Sans agent
-# de pairing enregistré, le pairing échoue (Numeric Comparison sans personne pour
-# confirmer) et iOS COUPE la connexion → l'app tombe en « erreur inattendue ».
-# On enregistre donc un agent qui accepte tout (Just Works), pour que le pairing
-# aboutisse et qu'iOS poursuive ses lectures. (Le POC ne chiffre pas les données ;
-# ce pairing ne sert qu'à satisfaire iOS/Service Changed.)
-AGENT_PATH = "/ben/agent"
-AGENT_CAPABILITY = "NoInputNoOutput"  # → Just Works, sans prompt côté iOS
-
-
-class PairingAgent(dbus.service.Object):
-    _IFACE = "org.bluez.Agent1"
-
-    @dbus.service.method(_IFACE, in_signature="", out_signature="")
-    def Release(self):
-        pass
-
-    @dbus.service.method(_IFACE, in_signature="os", out_signature="")
-    def AuthorizeService(self, device, uuid):
-        return  # auto-autorise tout service
-
-    @dbus.service.method(_IFACE, in_signature="o", out_signature="s")
-    def RequestPinCode(self, device):
-        return "0000"
-
-    @dbus.service.method(_IFACE, in_signature="o", out_signature="u")
-    def RequestPasskey(self, device):
-        return dbus.UInt32(0)
-
-    @dbus.service.method(_IFACE, in_signature="ouq", out_signature="")
-    def DisplayPasskey(self, device, passkey, entered):
-        pass
-
-    @dbus.service.method(_IFACE, in_signature="os", out_signature="")
-    def DisplayPinCode(self, device, pincode):
-        pass
-
-    @dbus.service.method(_IFACE, in_signature="ou", out_signature="")
-    def RequestConfirmation(self, device, passkey):
-        return  # auto-confirme (numeric comparison) → accepté
-
-    @dbus.service.method(_IFACE, in_signature="o", out_signature="")
-    def RequestAuthorization(self, device):
-        return  # auto-autorise
-
-    @dbus.service.method(_IFACE, in_signature="", out_signature="")
-    def Cancel(self):
-        pass
-
-
-def _register_pairing_agent(bus):
-    """Enregistre l'agent Just Works et le rend agent par défaut."""
-    try:
-        PairingAgent(bus, AGENT_PATH)
-        mgr = dbus.Interface(
-            bus.get_object("org.bluez", "/org/bluez"),
-            "org.bluez.AgentManager1",
-        )
-        mgr.RegisterAgent(AGENT_PATH, AGENT_CAPABILITY)
-        mgr.RequestDefaultAgent(AGENT_PATH)
-        log.info("agent de pairing Just Works enregistré (%s)", AGENT_CAPABILITY)
-    except Exception as e:
-        log.warning("enregistrement agent pairing impossible: %s", e)
-
-
 def main() -> int:
     device_id = read_device_id()
     log.info("démarrage BLE provisioner — deviceId=%s", device_id)
@@ -592,11 +525,6 @@ def main() -> int:
         adapter_obj.pairable = True
     except Exception as e:
         log.warning("set pairable: %s", e)
-
-    # Agent de pairing Just Works : indispensable pour iOS (cf. PairingAgent).
-    # bluezero a déjà posé le DBusGMainLoop par défaut à l'import, donc SystemBus()
-    # est branché sur la même boucle GLib que ben.publish().
-    _register_pairing_agent(dbus.SystemBus())
 
     # Peuple le cache WiFi scan (UN seul scan, cf. _wifi_scan_once — pas de
     # rafraîchissement périodique pour ne jamais affamer le lien BLE).
