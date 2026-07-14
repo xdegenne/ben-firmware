@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.8.1"
+        latest: "0.8.2"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -211,7 +211,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.8.1"
+        latest: "0.8.2"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -800,3 +800,7 @@ updates_caps:
     to:   "0.8.1"
     tag:  "pi-0.8.1"
     script: "updates/0.8.0_to_0.8.1/update.sh"   # fix agent OTA : clobber device.json (self-heal relabel + re-read avant bump)
+  - from: "0.8.1"
+    to:   "0.8.2"
+    tag:  "pi-0.8.2"
+    script: "updates/0.8.1_to_0.8.2/update.sh"   # fixes unboxing BLE (provisioner) : DEVICE_INFO compact (device.json>MTU iOS tronqué → app iOS KO), scan WiFi unique (rescan 30s affamait le lien BLE → décrochage Android), agent pairing Just Works (BlueZ 5.x/Service Changed). No-op pour un device en service (provisioner off) ; effet au prochain provisioning.
