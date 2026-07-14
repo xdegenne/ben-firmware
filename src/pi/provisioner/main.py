@@ -46,6 +46,9 @@ import time
 
 from bluezero import adapter, peripheral
 
+import dbus
+import dbus.service
+
 import led
 from wifi_config import configure_wifi
 
@@ -370,10 +373,15 @@ def _refresh_wifi_scan() -> None:
         log.warning("refresh wifi scan: %s", e)
 
 
-def _wifi_scan_loop() -> None:
-    while True:
-        _refresh_wifi_scan()
-        time.sleep(WIFI_SCAN_REFRESH_SEC)
+def _wifi_scan_once() -> None:
+    # UN SEUL scan au démarrage du mode provisioning, pour peupler la liste SSID
+    # que l'app lit une fois à la connexion. On NE rescanne PAS ensuite : sur le
+    # Pi Zero W la radio WiFi+BLE est PARTAGÉE, et un `nmcli device wifi rescan`
+    # pendant une connexion BLE affame le lien → décrochage (un téléphone à
+    # supervision timeout court, ~5 s, le perd → « erreur »/reset pendant la reco
+    # couleurs). La liste d'un device fraîchement booté reste fraîche le temps de
+    # l'unboxing, et l'app permet une saisie SSID manuelle en secours.
+    _refresh_wifi_scan()
 
 
 # ---------------------------------------------------------------------------
@@ -389,7 +397,15 @@ def on_wifi_scan_read() -> bytes:
 
 
 def on_device_info_read() -> bytes:
-    return json.dumps(read_device_info()).encode("utf-8")
+    # On ne renvoie que les champs utiles à l'app, en JSON compact. Le device.json
+    # complet (avec `capabilities`) dépasse 184 octets, or iOS négocie une MTU BLE
+    # de ~185 → la lecture ATT est tronquée (bluezero ne gère pas Read Long, donc
+    # la valeur DOIT tenir dans un seul PDU) → l'app échoue au parse JSON. Android
+    # (MTU 512) ne voyait pas le problème. Compact = ~100 octets, safe partout.
+    info = read_device_info()
+    keys = ("deviceId", "model", "hardwareRevision", "softwareVersion")
+    compact = {k: info[k] for k in keys if k in info}
+    return json.dumps(compact, separators=(",", ":")).encode("utf-8")
 
 
 def on_verify_status_read() -> bytes:
@@ -476,6 +492,76 @@ def _apply_wifi_config(ssid: str, password: str) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Agent de pairing « Just Works » (auto-accept)
+# ---------------------------------------------------------------------------
+# BlueZ >= 5.x exige une connexion chiffrée pour la caractéristique standard
+# Service Changed, à laquelle iOS s'abonne SYSTÉMATIQUEMENT à la connexion.
+# BlueZ envoie alors une SMP Security Request → iOS lance un pairing. Sans agent
+# de pairing enregistré, le pairing échoue (Numeric Comparison sans personne pour
+# confirmer) et iOS COUPE la connexion → l'app tombe en « erreur inattendue ».
+# On enregistre donc un agent qui accepte tout (Just Works), pour que le pairing
+# aboutisse et qu'iOS poursuive ses lectures. (Le POC ne chiffre pas les données ;
+# ce pairing ne sert qu'à satisfaire iOS/Service Changed.)
+AGENT_PATH = "/ben/agent"
+AGENT_CAPABILITY = "NoInputNoOutput"  # → Just Works, sans prompt côté iOS
+
+
+class PairingAgent(dbus.service.Object):
+    _IFACE = "org.bluez.Agent1"
+
+    @dbus.service.method(_IFACE, in_signature="", out_signature="")
+    def Release(self):
+        pass
+
+    @dbus.service.method(_IFACE, in_signature="os", out_signature="")
+    def AuthorizeService(self, device, uuid):
+        return  # auto-autorise tout service
+
+    @dbus.service.method(_IFACE, in_signature="o", out_signature="s")
+    def RequestPinCode(self, device):
+        return "0000"
+
+    @dbus.service.method(_IFACE, in_signature="o", out_signature="u")
+    def RequestPasskey(self, device):
+        return dbus.UInt32(0)
+
+    @dbus.service.method(_IFACE, in_signature="ouq", out_signature="")
+    def DisplayPasskey(self, device, passkey, entered):
+        pass
+
+    @dbus.service.method(_IFACE, in_signature="os", out_signature="")
+    def DisplayPinCode(self, device, pincode):
+        pass
+
+    @dbus.service.method(_IFACE, in_signature="ou", out_signature="")
+    def RequestConfirmation(self, device, passkey):
+        return  # auto-confirme (numeric comparison) → accepté
+
+    @dbus.service.method(_IFACE, in_signature="o", out_signature="")
+    def RequestAuthorization(self, device):
+        return  # auto-autorise
+
+    @dbus.service.method(_IFACE, in_signature="", out_signature="")
+    def Cancel(self):
+        pass
+
+
+def _register_pairing_agent(bus):
+    """Enregistre l'agent Just Works et le rend agent par défaut."""
+    try:
+        PairingAgent(bus, AGENT_PATH)
+        mgr = dbus.Interface(
+            bus.get_object("org.bluez", "/org/bluez"),
+            "org.bluez.AgentManager1",
+        )
+        mgr.RegisterAgent(AGENT_PATH, AGENT_CAPABILITY)
+        mgr.RequestDefaultAgent(AGENT_PATH)
+        log.info("agent de pairing Just Works enregistré (%s)", AGENT_CAPABILITY)
+    except Exception as e:
+        log.warning("enregistrement agent pairing impossible: %s", e)
+
+
 def main() -> int:
     device_id = read_device_id()
     log.info("démarrage BLE provisioner — deviceId=%s", device_id)
@@ -507,8 +593,14 @@ def main() -> int:
     except Exception as e:
         log.warning("set pairable: %s", e)
 
-    # Pré-remplit le cache WiFi scan + démarre le rafraîchissement périodique.
-    threading.Thread(target=_wifi_scan_loop, daemon=True).start()
+    # Agent de pairing Just Works : indispensable pour iOS (cf. PairingAgent).
+    # bluezero a déjà posé le DBusGMainLoop par défaut à l'import, donc SystemBus()
+    # est branché sur la même boucle GLib que ben.publish().
+    _register_pairing_agent(dbus.SystemBus())
+
+    # Peuple le cache WiFi scan (UN seul scan, cf. _wifi_scan_once — pas de
+    # rafraîchissement périodique pour ne jamais affamer le lien BLE).
+    threading.Thread(target=_wifi_scan_once, daemon=True).start()
 
     ben = peripheral.Peripheral(adapter_addr, local_name=device_id)
     ben.add_service(srv_id=1, uuid=SERVICE_UUID, primary=True)
