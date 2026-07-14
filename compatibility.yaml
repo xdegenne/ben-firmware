@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.8.2"
+        latest: "0.8.3"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -211,7 +211,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.8.2"
+        latest: "0.8.3"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -804,3 +804,7 @@ updates_caps:
     to:   "0.8.2"
     tag:  "pi-0.8.2"
     script: "updates/0.8.1_to_0.8.2/update.sh"   # fixes unboxing BLE (provisioner) : DEVICE_INFO compact (device.json>MTU iOS tronqué → app iOS KO), scan WiFi unique (rescan 30s affamait le lien BLE → décrochage Android), agent pairing Just Works (BlueZ 5.x/Service Changed). No-op pour un device en service (provisioner off) ; effet au prochain provisioning.
+  - from: "0.8.2"
+    to:   "0.8.3"
+    tag:  "pi-0.8.3"
+    script: "updates/0.8.2_to_0.8.3/update.sh"   # RETRAIT de l'agent de pairing (leurre) : il faisait bonder iOS → re-découverte post-bond → gel couleurs/verify au 1er unboxing + « Peer removed » au re-provisioning. Le vrai fix iOS = la MTU (0.8.2). No-op ; effet au prochain provisioning.
