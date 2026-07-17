@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.8.4"
+        latest: "0.8.5"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -211,7 +211,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.8.4"
+        latest: "0.8.5"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -812,3 +812,7 @@ updates_caps:
     to:   "0.8.4"
     tag:  "pi-0.8.4"
     script: "updates/0.8.3_to_0.8.4/update.sh"   # 2 fixes terrain : (1) lora-receiver — watchdog de SILENCE (RX vivant mais sourd : IRQ RX morte, SPI lisible → self-test aveugle), restart à backoff exponentiel 5min→×2→plafond 1h, persisté, reset à la 1re trame (incident ben-0010 17/07, 55 min de silence sans relance) ; (2) provisioner — garde anti-doublon on_connect (bluezero l'appelle 2× Connected+ServicesResolved sur tél lent → écrasait la reco couleurs → échec unboxing MIUI). Restart ben-lora-receiver sur les devices lora ; provisioner : effet au prochain unboxing.
+  - from: "0.8.4"
+    to:   "0.8.5"
+    tag:  "pi-0.8.5"
+    script: "updates/0.8.4_to_0.8.5/update.sh"   # échelle de jauge RÉSOLUE CÔTÉ BOÎTIER : /live ne renvoyait le plafond OBSERVÉ (high-water mark) qu'inconditionnellement → juste après l'unboxing ce max ≈ conso courante → conso faible affichée ROUGE dans l'app. Fix local_api.py : plafond observé UNIQUEMENT si le foyer est CONNU (même gate que le niveau, levels.is_known : ≥200 pts, ≥2j, dynamique), sinon l'ABONNEMENT (PREF/ISOUSC, sinon 9000). L'app affiche le plafond tel quel (n'arbitre plus). Redémarre ben-local-api sur tous les modèles.
