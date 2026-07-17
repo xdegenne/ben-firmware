@@ -138,6 +138,9 @@ PREVIEW_LOOP_GAP_SEC = 0.9
 _preview_color_char = None  # set after publish()
 _preview_active = False
 _test_displayed = False   # le code de test est-il déjà à l'écran ? (anti-double)
+_connected = False        # garde anti-doublon : bluezero peut appeler on_connect 2x
+                          # (Connected PUIS ServicesResolved) — le 2e appel écraserait
+                          # l'état de la reco couleurs en cours → on l'ignore.
 
 VS_PENDING  = "pending"
 VS_VERIFIED = "verified"
@@ -603,7 +606,15 @@ def main() -> int:
     # Au connect d'un central : on génère un code couleur frais et on l'affiche.
     # C'est le moment où la vérification visuelle a un sens (un téléphone est là).
     def _on_connect(*_args, **_kwargs):
-        global _verified, _verify_attempts, _preview_active, _test_displayed
+        global _verified, _verify_attempts, _preview_active, _test_displayed, _connected
+        # bluezero peut appeler on_connect 2x sur la MÊME connexion (Connected puis
+        # ServicesResolved ~5s plus tard sur un tél lent). Le 2e appel écraserait
+        # l'état de la reco couleurs déjà démarrée → corruption → échec. On l'ignore.
+        # (on_disconnect fait os._exit → process relancé avec _connected=False.)
+        if _connected:
+            log.info("on_connect doublon (ServicesResolved) ignoré")
+            return
+        _connected = True
         _verified = False
         _verify_attempts = 0
         _preview_active = False
