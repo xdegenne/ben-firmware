@@ -55,6 +55,33 @@ ripple résiduel et mettre en forme**.
 Le **BS170** en source commune (drain tiré à 3,3 V par R3) **inverse** et fournit un UART
 logique 3,3 V propre sur GPIO15 (RXD, `ttyAMA0`).
 
+### Vu à l'oscilloscope
+
+**La porteuse 50 kHz** au point d'entrée (TIC / LED opto), capturée en base rapide (50 MSa/s) :
+
+![Porteuse 50 kHz réelle au point TIC, période 20 µs](images/tic-carrier-real.png)
+
+Le vrai 50 kHz (période **20 µs**). La forme n'est **pas une sinusoïde pure** : elle est écrêtée /
+mise en forme par le front-end (LED de l'opto). C'est la porteuse **présente** (une bouffée « ON »).
+
+**Toute la chaîne** sur 320 ms (TIC → opto → BS) :
+
+![Démodulation le long de la chaîne : TIC → sortie opto → drain BS](images/tic-chain-demod.png)
+
+- **① TIC** : ⚠️ les cycles visibles sont un **artefact d'aliasing** (ce panneau est échantillonné
+  à 25 kSa/s ≪ 50 kHz → fausse onde lente) → **ignorer leur forme**, regarder l'**enveloppe** :
+  bouffées pleines = porteuse **ON** (un bit), creux effondrés = porteuse **OFF** (l'autre) = les données.
+- **② sortie opto** (grille BS) : **enveloppe démodulée, 0/3 V, plus de porteuse**.
+- **③ drain BS** (→ GPIO15) : **logique 0/3,3 V, inversée**.
+
+**Zoom simultané opto vs BS** (2 voies, alignées dans le temps, 200 µs/div) :
+
+<p align="center"><img alt="CH1 jaune = sortie opto, CH2 bleu = drain BS" src="images/tic-opto-bs-2ch.png" width="440"></p>
+
+**CH1 (jaune) = sortie opto** (enveloppe démodulée, fronts arrondis par le RC) ; **CH2 (bleu) =
+drain BS** (logique **inversée**). Capturées **ensemble** → on voit l'inversion du BS170 en direct :
+jaune haut ⇄ bleu bas.
+
 ## 4. Le rôle de l'opto (récap, par ordre d'importance)
 
 1. **Isolation galvanique** (rôle fondamental) — seule la lumière traverse la barrière : pas de
@@ -66,7 +93,25 @@ logique 3,3 V propre sur GPIO15 (RXD, `ttyAMA0`).
    en entrée (une LED d'opto standard ne conduirait qu'une polarité).
 4. **Détecteur d'enveloppe** — par sa bande passante finie (cf. §3).
 
-## 5. Le vrai enjeu de dimensionnement
+## 5. Le rôle du BS170
+
+Le BS170 (N-MOS, montage **source commune**) n'est pas qu'un inverseur — il fait **4** choses :
+
+1. **Mise en forme (seuillage)** — la sortie de l'opto est une enveloppe **molle** (fronts
+   arrondis par le RC, ripple résiduel de porteuse). Le BS170 la **remet au carré** : au-dessus
+   de son seuil de grille (Vgs(th) ≈ 2 V) il conduit à fond (drain → 0 V), en dessous il bloque
+   (drain → 3,3 V). C'est le **comparateur** du montage → créneaux nets, fronts raides (cf. la
+   voie bleue vs jaune de la capture 2-voies ci-dessus).
+2. **Adaptation 3,3 V + protection du GPIO** — le côté opto est référencé **+5 V** (collecteur
+   sur +5 V), mais le drain est tiré à **+3,3 V** par R3. La sortie vers le Pi ne dépasse donc
+   **jamais 3,3 V** → compatible et **sûre** pour GPIO15 (les entrées du Pi ne sont **pas**
+   5 V-tolérantes). Sans le BS, on enverrait du ~5 V dans le Pi = casse.
+3. **Inversion** — source commune → grille haute = drain bas. Le sens final (idle UART = niveau
+   haut) tombe juste avec la convention TIC + le sens de la modulation.
+4. **Buffer haute impédance** — la grille MOS ne tire aucun courant → elle **ne charge pas** le
+   détecteur d'enveloppe (R2 // Cgrille) → ne perturbe pas la démodulation en amont.
+
+## 6. Le vrai enjeu de dimensionnement
 
 La bande passante effective de l'opto doit tomber dans une **fenêtre étroite** :
 
