@@ -64,6 +64,14 @@ def _read_profile(conn, pdl):
     return (talon, plafond)
 
 
+def is_known(conn, pdl_index):
+    """True si le foyer est CONNU (profil représentatif : ≥ MIN_SAMPLES, ≥ MIN_SPAN_SEC
+    et dynamique plafond>talon) — EXACTEMENT le même gate que le niveau. L'API s'en sert
+    pour décider si la jauge peut se caler sur le plafond OBSERVÉ (foyer connu) ou doit
+    retomber sur l'abonnement (phase d'apprentissage → pas de faux rouge à l'unboxing)."""
+    return _read_profile(conn, pdl_index) is not None
+
+
 def _boundaries(talon, plafond):
     """Convertit les bandes de ratio en 3 seuils PAPP absolus, pour réutiliser
     _classify / _with_hysteresis tels quels."""

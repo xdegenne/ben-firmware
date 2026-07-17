@@ -63,6 +63,7 @@ DEFAULT_WINDOW_SEC = 24 * 3600
 MAX_LIMIT = 10000
 DEFAULT_CURVE_BUCKETS = 500   # points servis par défaut (≈ largeur écran)
 MAX_CURVE_BUCKETS = 2000      # plafond : au-delà, inutile (densité > pixels)
+DEFAULT_MAXVA = 9000          # échelle jauge par défaut (≈ 45 A × 230 V) tant qu'aucun abonnement lu
 
 
 def _device_info() -> dict:
@@ -304,9 +305,17 @@ class Handler(BaseHTTPRequestHandler):
                     row["maxVa"] = from_pref or from_isousc
                 else:
                     row["maxVa"] = from_isousc or from_pref
-                # Jauge bidirectionnelle calée sur l'OBSERVÉ : plafond conso + max injection
-                # (high-water marks). L'app scale chaque côté sur son propre max (repli maxVa).
+                # Jauge : ÉCHELLE RÉSOLUE CÔTÉ BOÎTIER (autoritatif, comme level/tariff_label).
+                # Tant que le foyer n'est pas CONNU (même gate que le niveau : ≥ MIN_SAMPLES,
+                # ≥ 2 j, dynamique), le high-water mark observé ≈ la conso courante → une conso
+                # faible apparaîtrait ROUGE juste après l'unboxing. On renvoie donc l'ABONNEMENT
+                # (maxVa PREF/ISOUSC, sinon DEFAULT_MAXVA) comme échelle pendant l'apprentissage,
+                # et le plafond OBSERVÉ (auto-calibré) une fois le foyer connu. L'app n'arbitre
+                # plus : elle affiche `plafond` tel quel.
                 plafond, inject_max = db.gauge_bounds(conn, row["pdl_index"])
+                if not levels.is_known(conn, row["pdl_index"]):
+                    plafond = row["maxVa"] or DEFAULT_MAXVA
+                    inject_max = inject_max or row["maxVa"] or DEFAULT_MAXVA
                 row["plafond"] = plafond
                 row["injectMax"] = inject_max
                 # Libellé tarifaire EN COURS (jauge HP/HC) — résolu côté serveur :
