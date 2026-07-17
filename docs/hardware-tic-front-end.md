@@ -17,6 +17,10 @@ de ces bouffées.
 
 ## 2. La chaîne (montage filaire)
 
+![Schéma du décodeur TIC filaire (Linky → opto → BS170 → GPIO15)](images/schematic-tic-reader.png)
+
+Tracé équivalent :
+
 ```
 J1 (Linky I1) ──[R1 750Ω]──► U1 pin1 (LED)
 J1 (Linky I2) ─────────────► U1 pin2 (LED)      ◄── DOMAINE PORTEUSE 50 kHz (isolé du Pi)
