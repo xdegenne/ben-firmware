@@ -219,6 +219,7 @@ def load_state() -> dict:
         "last_batch_seq":  raw.get("last_batch_seq"),  # v0x05
         "adco":            raw.get("adco", ""),
         "last_frame_time": raw.get("last_frame_time", 0),
+        "silence_restart_count": int(raw.get("silence_restart_count", 0)),
     }
 
 def save_state(state: dict) -> None:
@@ -230,6 +231,10 @@ state = load_state()
 # Restauré depuis le state file → survit aux watchdog-restarts (process execv).
 # 0 = aucune trame jamais reçue → heartbeat YELLOW honnête + watchdog désactivé.
 last_frame_time = state.get("last_frame_time", 0)
+# Niveau de backoff du watchdog de silence : PERSISTE au restart (le seuil grandit tant que le
+# récepteur reste sourd), remis à 0 dès qu'une trame RF revient (cf. on_recv).
+silence_restarts = state.get("silence_restart_count", 0)
+RECEIVER_BOOT_TIME = time.time()   # laisse à CETTE instance le temps de recevoir avant un nouveau restart
 
 # Store SQLite local (conso + qualité LoRa + outbox cloud). Non bloquant.
 try:
@@ -293,11 +298,15 @@ def detect_batch_seq_event(current: int, time_since_prev: float):
 # Réception
 # ---------------------------------------------------------------------------
 def on_recv(payload) -> None:
-    global last_frame_time, last_prune
+    global last_frame_time, last_prune, silence_restarts
     try:
         now = time.time()
         time_since_prev = now - last_frame_time
         last_frame_time = now
+        if silence_restarts:                # une trame RF reçue = RX vivant → on réarme le backoff de silence
+            silence_restarts = 0
+            state["silence_restart_count"] = 0
+            save_state(state)
         blink_rgb(5, 5, 0, 0.05)  # jaune court & faible — trame reçue (RF only, avant validation)
         sleep(0.4)                # délai pour distinguer du flash suivant
 
@@ -537,12 +546,23 @@ def on_recv_curve(decoded, rssi, snr, pdl_index, now, time_since_prev) -> None:
 # systemd → systemd restart le service (ré-init radio, l'état indexes/seq est persisté donc le
 # restart est sûr). Si le restart ne suffit pas (SPI figé au niveau NOYAU, kernel tainted par un
 # Oops), les restarts s'enchaînent → StartLimitAction=reboot dans l'unit → reboot complet.
-# Le silence de trames, lui, reste juste signalé par le heartbeat (orange > 90 s), sans relance.
+# Le silence de TRAFIC (RX vivant mais SOURD — IRQ RX morte alors que le SPI reste lisible, donc
+# self-test AVEUGLE) est géré séparément ci-dessous par un watchdog de silence (cf. SILENCE_RESTART_*).
 
 SX127X_REG_VERSION = 0x42
 SX127X_VERSION     = 0x12   # SX1276/77/78/79
 WATCHDOG_PING_S    = 30     # intervalle de ping systemd (WatchdogSec unit = 90 s → 3 pings/fenêtre)
 RADIO_FAIL_MAX     = 2      # échecs self-test consécutifs avant de cesser le ping (anti-contention SPI transitoire)
+
+# Watchdog de SILENCE (RX vivant mais SOURD) : le self-test radio ne détecte PAS une IRQ RX morte
+# quand le SPI reste lisible (incident ben-0010 17/07 : 55 min de silence sans relance auto). On
+# ajoute un timeout de TRAFIC, à BACKOFF EXPONENTIEL persisté : 5 min, puis ×2 à chaque échec,
+# plafonné à 1 h → on réessaie « de plus en plus rarement », jamais en boucle serrée (sinon
+# StartLimitBurst=3/300s ferait rebooter). Remis à 0 dès qu'une trame RF revient (cf. on_recv).
+# last_frame_time == 0 (jamais reçu → device neuf / pas d'émetteur) → silence NORMAL, désactivé.
+SILENCE_RESTART_BASE_S  = 300    # 5 min sans trame → 1er restart récepteur
+SILENCE_RESTART_MAX_S   = 3600   # plafond du backoff (1 h)
+SILENCE_BACKOFF_EXP_MAX = 4      # borne l'exposant (300×2^4 = 4800 s dépasse déjà le plafond)
 
 
 def sd_notify(msg: str) -> None:
@@ -661,6 +681,28 @@ sd_notify("READY=1")
 radio_fails = 0
 try:
     while True:
+        now = time.time()
+        # --- Watchdog de SILENCE : RX vivant mais sourd (non vu par le self-test) → restart à
+        #     backoff exponentiel persisté. Désactivé tant qu'aucune trame n'a JAMAIS été reçue. ---
+        if last_frame_time > 0:
+            threshold = min(
+                SILENCE_RESTART_BASE_S * (2 ** min(silence_restarts, SILENCE_BACKOFF_EXP_MAX)),
+                SILENCE_RESTART_MAX_S)
+            silence = now - last_frame_time
+            # `now - RECEIVER_BOOT_TIME > threshold` : on laisse à CETTE instance une fenêtre pleine
+            # pour recevoir avant de re-restart → l'espacement grandit à chaque niveau de backoff.
+            if silence > threshold and now - RECEIVER_BOOT_TIME > threshold:
+                silence_restarts += 1
+                state["silence_restart_count"] = silence_restarts
+                save_state(state)
+                nxt = min(
+                    SILENCE_RESTART_BASE_S * (2 ** min(silence_restarts, SILENCE_BACKOFF_EXP_MAX)),
+                    SILENCE_RESTART_MAX_S)
+                log.error(f"SILENCE LoRa {int(silence)}s > seuil {int(threshold)}s → restart récepteur "
+                          f"(backoff niveau {silence_restarts}, prochain seuil {int(nxt)}s)")
+                blink_rgb(30, 8, 0, 0.3, bypass=True)   # orange soutenu = restart pour silence
+                sd_notify("STOPPING=1")
+                sys.exit(1)   # Restart=always → relance + ré-init radio (close() dans finally). Espacé >5 min → pas de reboot StartLimit
         if radio_alive():
             radio_fails = 0
             sd_notify("WATCHDOG=1")            # radio OK → on rassure systemd (le silence de trames est normal)
