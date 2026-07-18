@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.8.5"
+        latest: "0.8.6"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -211,7 +211,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.8.5"
+        latest: "0.8.6"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -816,3 +816,7 @@ updates_caps:
     to:   "0.8.5"
     tag:  "pi-0.8.5"
     script: "updates/0.8.4_to_0.8.5/update.sh"   # échelle de jauge RÉSOLUE CÔTÉ BOÎTIER : /live ne renvoyait le plafond OBSERVÉ (high-water mark) qu'inconditionnellement → juste après l'unboxing ce max ≈ conso courante → conso faible affichée ROUGE dans l'app. Fix local_api.py : plafond observé UNIQUEMENT si le foyer est CONNU (même gate que le niveau, levels.is_known : ≥200 pts, ≥2j, dynamique), sinon l'ABONNEMENT (PREF/ISOUSC, sinon 9000). L'app affiche le plafond tel quel (n'arbitre plus). Redémarre ben-local-api sur tous les modèles.
+  - from: "0.8.5"
+    to:   "0.8.6"
+    tag:  "pi-0.8.6"
+    script: "updates/0.8.5_to_0.8.6/update.sh"   # FIX récepteur : l'IINST (2e courbe histo) était ENVOYÉE par l'émetteur ET décodée par frame_codec, mais on_recv_curve ne la rangeait pas en base (boucle sur PAPP seulement) → colonne iinst NULL en histo/LoRa. On ajoute labels["IINST"]=iinst[i] dans la boucle de stockage. Redémarre ben-lora-receiver sur les devices lora. Sans effet en standard (pas de 2e courbe IINST).
