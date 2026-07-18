@@ -66,6 +66,29 @@ MAX_CURVE_BUCKETS = 2000      # plafond : au-delà, inutile (densité > pixels)
 DEFAULT_MAXVA = 9000          # échelle jauge par défaut (≈ 45 A × 230 V) tant qu'aucun abonnement lu
 
 
+def _goodbye_flash() -> None:
+    """« Au revoir » : 3 flashs VIOLETS sur la LED RGB avant l'extinction (désappairage).
+    LED à cathode commune, R=GPIO12 / G=GPIO13 / B=GPIO16 → violet = R+B (12+16), G éteint.
+    Les readers (qui tiennent ces pins) doivent avoir été stoppés juste avant. Best-effort :
+    jamais bloquant, une exception (pins occupés, GPIO indispo) est simplement loguée."""
+    try:
+        import RPi.GPIO as GPIO
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setwarnings(False)
+        for pin in (12, 13, 16):
+            GPIO.setup(pin, GPIO.OUT)
+            GPIO.output(pin, GPIO.LOW)
+        for _ in range(3):
+            GPIO.output(12, GPIO.HIGH); GPIO.output(16, GPIO.HIGH)   # violet = rouge + bleu
+            time.sleep(0.18)
+            GPIO.output(12, GPIO.LOW); GPIO.output(16, GPIO.LOW)
+            time.sleep(0.18)
+        GPIO.cleanup([12, 13, 16])
+        print("[unprovision] au revoir (3 flashs violets)", flush=True)
+    except Exception as e:
+        print(f"[unprovision] flash « au revoir » ignoré: {e}", flush=True)
+
+
 def _device_info() -> dict:
     try:
         with open(DEVICE_JSON) as f:
@@ -213,24 +236,25 @@ class Handler(BaseHTTPRequestHandler):
                         capture_output=True, text=True)
                     print(f"[unprovision] delete '{name}' rc={r.returncode} "
                           f"{r.stderr.strip()}", flush=True)
+            # Stop les readers TOUJOURS : (1) ils tiennent les pins de la LED RGB → il faut
+            # les libérer pour le flash « au revoir » ci-dessous ; (2) si wipe, ça ferme la
+            # base (WAL) AVANT le rm → wipe propre. On NE touche PAS ben-local-api (c'est lui
+            # qui exécute _teardown). Service absent selon le modèle → ignoré.
+            subprocess.run(
+                ["sudo", "systemctl", "stop", "ben-tic-reader", "ben-lora-receiver"],
+                stderr=subprocess.DEVNULL)
             if wipe:
-                # Stop le(s) reader(s) AVANT le rm : la base n'est alors plus ouverte (WAL)
-                # → wipe propre (pas d'écriture dans un inode supprimé, pas de -wal recréé).
-                # On NE touche PAS ben-local-api : c'est lui qui exécute _teardown.
-                subprocess.run(
-                    ["sudo", "systemctl", "stop", "ben-tic-reader", "ben-lora-receiver"],
-                    stderr=subprocess.DEVNULL)  # le service absent selon le modèle → ignoré
                 for suffix in ("", "-wal", "-shm"):
                     try:
                         os.remove(db.DB_PATH + suffix)
-                        print(f"[unprovision] wipe {db.DB_PATH}{suffix}",
-                              flush=True)
+                        print(f"[unprovision] wipe {db.DB_PATH}{suffix}", flush=True)
                     except OSError:
                         pass
-            # Désappairage → le boîtier S'ÉTEINT TOUJOURS (poweroff), avec ou sans
-            # wipe : il part hors tension. Au prochain allumage, plus de WiFi →
-            # démarrage en mode configuration (BLE). (Avant : reboot quand pas de
-            # wipe ; on éteint désormais dans tous les cas pour un signal clair.)
+            # « Au revoir » : 3 flashs VIOLETS avant l'extinction (signal clair de désappairage).
+            time.sleep(0.3)          # laisse les readers relâcher les pins GPIO de la LED
+            _goodbye_flash()
+            # Désappairage → le boîtier S'ÉTEINT TOUJOURS (poweroff), avec ou sans wipe : il part
+            # hors tension. Au prochain allumage, plus de WiFi → mode configuration (BLE).
             print(f"[unprovision] poweroff (wipe={wipe})", flush=True)
             subprocess.Popen(["sudo", "systemctl", "poweroff"])
 
