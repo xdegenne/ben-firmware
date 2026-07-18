@@ -446,6 +446,7 @@ def on_recv_curve(decoded, rssi, snr, pdl_index, now, time_since_prev) -> None:
             return
 
     papp = decoded["papp"]
+    iinst = decoded.get("iinst")          # 2e courbe IINST (histo) : liste par point, ou None (standard)
     tlvs = decoded["tlvs"]
     ts_list = frame_codec.anchor_timestamps(decoded, now)         # ts SYSTÈME (Pi/NTP, approx LoRa)
     meter_ts_list = frame_codec.meter_timestamps(decoded)         # meter_ts COMPTEUR (standard) ou None
@@ -508,6 +509,8 @@ def on_recv_curve(decoded, rssi, snr, pdl_index, now, time_since_prev) -> None:
                     "_index_id": index_id,
                     "_index_value": index_value,
                 }
+                if iinst is not None and i < len(iinst):   # 2e courbe IINST (histo) — décodée mais
+                    labels["IINST"] = iinst[i]              #   PAS stockée avant ce fix → colonne iinst NULL
                 if active_name is not None:                # double-écriture histo
                     labels[active_name] = index_value
                 if inject_total is not None:
