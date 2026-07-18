@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.8.6"
+        latest: "0.8.7"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -211,7 +211,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.8.6"
+        latest: "0.8.7"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -820,3 +820,7 @@ updates_caps:
     to:   "0.8.6"
     tag:  "pi-0.8.6"
     script: "updates/0.8.5_to_0.8.6/update.sh"   # FIX récepteur : l'IINST (2e courbe histo) était ENVOYÉE par l'émetteur ET décodée par frame_codec, mais on_recv_curve ne la rangeait pas en base (boucle sur PAPP seulement) → colonne iinst NULL en histo/LoRa. On ajoute labels["IINST"]=iinst[i] dans la boucle de stockage. Redémarre ben-lora-receiver sur les devices lora. Sans effet en standard (pas de 2e courbe IINST).
+  - from: "0.8.6"
+    to:   "0.8.7"
+    tag:  "pi-0.8.7"
+    script: "updates/0.8.6_to_0.8.7/update.sh"   # « Au revoir » au désappairage : /unprovision fait 3 flashs VIOLETS sur la LED RGB juste avant le poweroff (signal clair de départ). local_api._unprovision stoppe désormais les readers TOUJOURS (libère les pins LED + ferme la base) puis flash. Redémarre ben-local-api (tous modèles). Effet au prochain /unprovision.
