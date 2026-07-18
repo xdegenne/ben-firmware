@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="robots" content="index, follow" />
   <title>BEN — Installer votre boîtier</title>
-  <meta name="description" content="Installer BEN sur votre compteur Linky : 5 minutes, sans risque. Branchez le boîtier, téléchargez l'app, laissez-vous guider." />
+  <meta name="description" content="Installer BEN sur votre compteur Linky. Choisissez votre kit : filaire (un boîtier, 2 fils) ou radio (émetteur + récepteur à antenne)." />
   <style>
     :root {
       --green:#2e7d32; --green-soft:#f3f8f3; --navy:#1b2a52;
@@ -23,46 +23,30 @@
     .hero .mascot { width:108px; height:auto; }
     h1 { color:var(--green); font-size:1.55rem; line-height:1.25; margin:6px 0; }
     .lead { color:var(--muted); font-size:1.02rem; margin:6px auto 0; }
-    h2 { color:var(--green); font-size:1.2rem; margin:34px 0 10px; display:flex; align-items:center; gap:10px; }
-    .num { flex:none; width:30px; height:30px; border-radius:50%; background:var(--green);
-      color:#fff; font-size:1rem; font-weight:700; display:inline-flex; align-items:center; justify-content:center; }
     p { margin:10px 0; }
     .note { background:var(--green-soft); border-left:4px solid var(--green);
       padding:14px 16px; border-radius:8px; margin:20px 0; }
     .note strong { color:var(--green); }
-
-    /* App download : bouton + QR par plateforme */
-    .apps { display:flex; flex-wrap:wrap; gap:14px; margin:14px 0; }
-    .app { flex:1 1 220px; border:1px solid var(--line); border-radius:14px;
-      padding:16px 14px; text-align:center; background:#fff; }
-    .app .plat { display:flex; align-items:center; justify-content:center; gap:8px;
-      font-weight:700; font-size:1.05rem; margin-bottom:12px; }
-    .app .plat .ic { width:20px; height:20px; fill:var(--ink); }
-    .btn { display:flex; align-items:center; justify-content:center; gap:9px;
-      text-decoration:none; color:#fff; font-weight:600; font-size:1rem;
-      padding:13px 14px; border-radius:11px; }
-    .btn .ic { width:20px; height:20px; fill:#fff; }
-    .app.ios .btn { background:var(--navy); }
-    .app.android .btn { background:var(--green); }
-    .qr { width:160px; height:160px; margin:14px auto 4px; display:block; }
-    .qr-cap { color:var(--muted); font-size:.85rem; }
-
-    figure { margin:16px 0; text-align:center; }
-    figure img { width:100%; border-radius:12px; box-shadow:0 2px 12px rgba(0,0,0,.12); }
-    figcaption { color:var(--muted); font-size:.9rem; margin-top:8px; }
-    .duo { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:16px 0; }
-    .duo figure { margin:0; }
-    .duo figcaption { font-size:.82rem; margin-top:6px; }
     .wire { font-weight:700; }
-    .wire.j { color:#cf9e00; } .wire.g { color:#777; }
-    ul { padding-left:1.2rem; } li { margin:8px 0; }
-    .share { text-align:center; margin:40px 0 0; }
-    .share img { width:140px; height:140px; }
-    .share p { color:var(--muted); font-size:.88rem; margin-top:6px; }
+    .wire.j { color:#cf9e00; } .wire.g { color:#777; } .wire.r { color:#d32f2f; }
+
+    /* Cartes de choix (filaire / radio) */
+    .choice { display:block; text-decoration:none; color:inherit;
+      border:1px solid var(--line); border-radius:16px; overflow:hidden;
+      margin:18px 0; background:#fff; box-shadow:0 2px 12px rgba(0,0,0,.06);
+      transition:box-shadow .15s ease, transform .15s ease; }
+    .choice:hover { box-shadow:0 8px 24px rgba(0,0,0,.14); transform:translateY(-2px); }
+    .choice figure { margin:0; }
+    .choice figure img { width:100%; display:block; }
+    .choice-txt { padding:16px 18px 18px; }
+    .choice-h { display:block; color:var(--green); font-size:1.22rem; font-weight:700; margin:0 0 6px; }
+    .choice-txt p { margin:6px 0 14px; }
+    .go { display:inline-block; color:#fff; background:var(--green);
+      font-weight:600; font-size:1rem; padding:11px 18px; border-radius:11px; }
+
     footer { margin-top:36px; color:var(--muted); font-size:.84rem;
       border-top:1px solid var(--line); padding-top:14px; text-align:center; }
     footer a { color:var(--green); }
-
     @media (max-width:380px) { body { padding:18px 14px 56px; } h1 { font-size:1.4rem; } }
   </style>
 </head>
@@ -73,93 +57,32 @@
   <div class="hero">
     <img class="mascot" src="assets/ben_bonjour.png" alt="La mascotte BEN dit bonjour" />
     <h1>On installe BEN ensemble&nbsp;!</h1>
-    <p class="lead">Comptez <strong>5 minutes</strong>, une seule chose à brancher. 🙂</p>
+    <p class="lead">D'abord, regardez votre kit&nbsp;: vous avez quel BEN&nbsp;?</p>
   </div>
 
-  <div class="note">
-    <strong>Aucun risque, promis.</strong> On se branche seulement sur la petite <strong>sortie téléinfo</strong>
-    du Linky&nbsp;: du <strong>courant faible, en très basse tension</strong>. Rien à voir avec le 230&nbsp;V —
-    pas de courant fort, rien de dangereux. 👍
-  </div>
-
-  <h2><span class="num">1</span> Branchez le boîtier</h2>
-
-  <p><strong>a.</strong> Retirez le capot vert du Linky (il se clipse, ça vient tout seul).</p>
-  <div class="duo">
-    <figure>
-      <img src="assets/1000006973.jpg" alt="Compteur Linky avec son capot vert fermé" />
-      <figcaption>Avant&nbsp;: capot fermé.</figcaption>
-    </figure>
-    <figure>
-      <img src="assets/1000006974.jpg" alt="Compteur Linky avec le capot retiré" />
-      <figcaption>Après&nbsp;: capot retiré, bornier en bas à droite.</figcaption>
-    </figure>
-  </div>
-
-  <p><strong>b.</strong> Branchez les 2 fils du boîtier sur les bornes <strong>téléinfo</strong>&nbsp;:</p>
-  <ul>
-    <li>le <span class="wire j">fil jaune</span> sur la borne <strong>I1</strong></li>
-    <li>le <span class="wire g">fil gris</span> sur la borne <strong>I2</strong></li>
-  </ul>
-  <div class="note">
-    <strong>Le geste&nbsp;:</strong> enfoncez simplement chaque fil dans sa borne
-    (<span class="wire j">jaune dans I1</span>, <span class="wire g">gris dans I2</span>) — il se
-    clipse et reste bien serré. <strong>Pas besoin d'appuyer sur le bouton pour brancher.</strong>
-    Le petit <strong>bouton à ressort</strong> juste au-dessus (commun aux deux bornes) sert surtout
-    à <strong>retirer</strong> un fil&nbsp;: on appuie dessus pour le libérer.
-    <br /><strong>Vérif&nbsp;:</strong> tirez doucement sur chaque fil — il doit rester bien bloqué.
-  </div>
-  <figure>
-    <img src="assets/1000006975.jpg" alt="Fil jaune sur la borne I1, fil gris sur la borne I2" />
-    <figcaption><span class="wire j">Jaune → I1</span> &nbsp;·&nbsp; <span class="wire g">Gris → I2</span>. La borne <strong>A</strong> reste libre.</figcaption>
-  </figure>
-  <div class="note">
-    <strong>On ne touche qu'à I1 et I2.</strong> Laissez les autres bornes telles quelles — en
-    particulier <strong>C1 et C2</strong>&nbsp;: c'est le <strong>« contact sec »</strong> du Linky, un
-    petit relais interne piloté par le compteur selon votre contrat (souvent utilisé pour commander un
-    <strong>contacteur de chauffe-eau en heures creuses</strong>). <strong>BEN ne s'en sert pas</strong>,
-    n'y touchez pas.
-  </div>
-
-  <p><strong>c.</strong> Branchez le boîtier sur le secteur (sa petite alim) et remettez le capot.</p>
-
-  <h2><span class="num">2</span> Téléchargez l'app</h2>
-  <p>Scannez le QR code de votre téléphone (ou touchez le bouton)&nbsp;:</p>
-  <div class="apps">
-    <div class="app ios">
-      <div class="plat">
-        <svg class="ic" viewBox="0 0 384 512" aria-hidden="true"><path d="M318.7 268.7c-.2-36.7 16.4-64.4 50-84.8-18.8-26.9-47.2-41.7-84.7-44.6-35.5-2.8-74.3 20.7-88.5 20.7-15 0-49.4-19.7-76.4-19.7C63.3 141.2 4 184.8 4 273.5q0 39.3 14.4 81.2c12.8 36.7 59 126.7 107.2 125.2 25.2-.6 43-17.9 75.8-17.9 31.8 0 48.3 17.9 76.4 17.9 48.6-.7 90.4-82.5 102.6-119.3-65.2-30.7-61.7-90-61.7-91.9zm-56.6-164.2c27.3-32.4 24.8-61.9 24-72.5-24.1 1.4-52 16.4-67.9 34.9-17.5 19.8-27.8 44.3-25.6 71.9 26.1 2 49.9-11.4 69.5-34.3z"/></svg>
-        iPhone
-      </div>
-      <a class="btn" href="https://apps.apple.com/fr/app/ben-pilote/id6781197795">Ouvrir l'App Store</a>
-      <img class="qr" src="assets/appstore-ben-ios.png" alt="QR code App Store pour iPhone" />
-      <div class="qr-cap">Scannez avec l'appareil photo</div>
+  <a class="choice" href="install_wired.html">
+    <div class="choice-txt">
+      <span class="choice-h">🧊 BEN filaire</span>
+      <p>Un <strong>seul boîtier cubique</strong>, avec <strong>2 fils</strong>
+         (<span class="wire j">jaune</span> et <span class="wire g">gris</span>) et son
+         <strong>câble d'alimentation</strong>. Pas d'antenne.</p>
+      <span class="go">Installer le filaire →</span>
     </div>
-    <div class="app android">
-      <div class="plat">
-        <svg class="ic" viewBox="0 0 576 512" aria-hidden="true"><path d="M420.55 301.93a24 24 0 1 1 24-24 24 24 0 0 1-24 24m-265.1 0a24 24 0 1 1 24-24 24 24 0 0 1-24 24m273.7-144.48 47.94-83a10 10 0 1 0-17.27-10l-48.54 84.07a301.25 301.25 0 0 0-246.56 0L116.18 64.45a10 10 0 1 0-17.27 10l47.94 83C64.53 202.22 8.24 285.55 0 384h576c-8.24-98.45-64.54-181.78-146.85-226.55"/></svg>
-        Android
-      </div>
-      <a class="btn" href="https://play.google.com/store/apps/details?id=com.xdegenne.ben">Ouvrir Play Store</a>
-      <img class="qr" src="assets/playstore-ben-android.png" alt="QR code Play Store pour Android" />
-      <div class="qr-cap">Scannez avec l'appareil photo</div>
-    </div>
-  </div>
+  </a>
 
-  <h2><span class="num">3</span> Ouvrez l'app, laissez-vous guider</h2>
-  <p>
-    L'app trouve votre boîtier toute seule, vous demande votre <strong>Wi-Fi</strong>, puis vérifie
-    que tout est bon avec un petit <strong>code couleur</strong> qui clignote sur le boîtier.
-    Suivez l'écran — quelques tapotements et c'est fini. ✨
-  </p>
+  <a class="choice" href="install_radio.html">
+    <div class="choice-txt">
+      <span class="choice-h">📡 BEN radio</span>
+      <p><strong>Deux boîtiers</strong>&nbsp;: un <strong>cube avec une antenne</strong>
+         (le récepteur) et un <strong>boîtier rectangulaire avec 3 fils</strong>
+         (<span class="wire j">jaune</span>, <span class="wire g">gris</span> et
+         <span class="wire r">rouge</span>) — l'émetteur.</p>
+      <span class="go">Installer le radio →</span>
+    </div>
+  </a>
 
   <div class="note">
-    Une question, un souci&nbsp;? <a href="../contact/">Écrivez-nous</a> — on est là pour vous aider.
-  </div>
-
-  <div class="share">
-    <img src="assets/page-qr.png" alt="QR code vers cette page d'installation" />
-    <p>Cette page&nbsp;: scannez pour la rouvrir sur votre téléphone.</p>
+    Un doute&nbsp;? <strong>Une antenne = c'est le radio.</strong> Un seul boîtier sans antenne = le filaire. 🙂
   </div>
 
   <footer>
