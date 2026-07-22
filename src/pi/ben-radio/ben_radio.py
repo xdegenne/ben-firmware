@@ -214,6 +214,29 @@ def send_acked(to: int, frame: bytes, hid: int, timeout: float = 0.5, retries: i
     return None                              # vraie perte RF après retries
 
 
+def send_app_ack(to: int, clear: bytes, key: bytes) -> None:
+    """ACK APPLICATIF crypto-vérifié d'une trame BOOT : renvoie HMAC(K_mac, nonce)[:8] à l'émetteur.
+
+    Anti cross-talk MULTI-LOGEMENT : plusieurs centrales partagent SERVER_ADDRESS=0x20, et RadioHead
+    ACK au niveau LIAISON toute trame adressée à 0x20 AVANT toute vérif de clé → une centrale VOISINE
+    « vole » le link-ACK du boot et l'émetteur croit être enregistré chez elle (il émettrait ADCO,
+    OPTARIF, abonnement… à côté). Parade : la centrale ne renvoie cet ACK QUE si le MAC montant est
+    valide (elle détient donc la clé du device) ET l'ACK est lui-même un HMAC(K_mac, nonce) que SEUL
+    le détenteur de la clé peut produire. L'émetteur (recvfromAckTimeout) ne se déclare `bootAcked`
+    que sur un ACK applicatif valide → il ignore le voisin. Le nonce = header clair de SA trame boot
+    (boot_count‖msg_count), unique → pas rejouable. Émis depuis le callback RX : `radio_lock` sérialise
+    contre un TX concurrent ; `header_id` frais → pas de dédup RadioHead côté émetteur."""
+    _, k_mac = frame_codec.derive_keys(key)
+    ack = frame_codec._mac(k_mac, clear[1:7])            # HMAC(K_mac, boot_count(3)‖msg_count(3))[:8]
+    global _tx_hid
+    _tx_hid = (_tx_hid + 1) & 0xFF
+    with radio_lock:
+        lora.send(ack, to, header_id=_tx_hid)
+        lora.wait_packet_sent()                          # émission complète avant de rendre la main
+        lora.set_mode_rx()                               # retour écoute (ne PAS rester en TX)
+    log.info(f"boot 0x{to:02x} MAC OK → ACK applicatif émis (hid={_tx_hid})")
+
+
 # --------------------------------------------------------------------------- #
 # LED                                                                          #
 # --------------------------------------------------------------------------- #
@@ -356,6 +379,15 @@ def on_recv(payload) -> None:
         log.warning(f"trame rejetée à la façade (MAC/format) de 0x{int(sender):02x} : {e}")
         blink_rgb(30, 0, 0, 0.2, bypass=True)   # rouge = rejet MAC
         return
+
+    # MAC montant OK → si c'est un BOOT, prouver à l'émetteur qu'on détient SA clé (anti cross-talk
+    # multi-logement). Émis AVANT le publish (fenêtre d'écoute émetteur ~800 ms). Seul le BOOT attend
+    # cet ACK ; les trames courbe (0x05) non → on ne répond qu'au BOOT.
+    if clear and (clear[0] & 0x7F) == frame_codec.TYPE_BOOT:
+        try:
+            send_app_ack(int(sender), clear, key)
+        except Exception as e:
+            log.error(f"ACK applicatif boot 0x{int(sender):02x} échec : {e}")
 
     if mqttc is not None:
         mqttc.publish(TOPIC_RX, json.dumps({

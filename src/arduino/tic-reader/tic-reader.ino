@@ -114,6 +114,7 @@
 #define T_MSG1    0x40
 #define T_MSG2    0x41
 #define HMAC_LEN                8
+#define APP_ACK_MS            800   // attente de l'ACK APPLICATIF crypto-vérifié après le boot
 
 // Courbe v0x04
 // CURVE_BUF_LEN dimensionné pour l'HISTORIQUE v1 (flush ~60 s ≈ 30 éch. ≈ ~110 o).
@@ -797,8 +798,31 @@ bool sendBootFrame(const char* adco, uint8_t isousc, uint8_t pref, const char* n
   if (loraOk) {
     blinkRGB(30, 0, 30, 40);   // magenta bref = trame BOOT envoyee
     driver.setModeIdle();
-    acked = manager.sendtoWait(buf, len, SERVER_ADDRESS);
-    if (acked) blinkRGB(0, 40, 0, 40); else blinkRGB(40, 0, 0, 40);  // vert=ACK / rouge=pas d ACK
+    // Le link-ACK RadioHead ne suffit PAS : n'importe quel central en 0x20 l'émet, y compris un
+    // voisin qui ne peut pas nous déchiffrer (cross-talk multi-logement). On exige donc un ACK
+    // APPLICATIF crypto-vérifié : le BON central renvoie HMAC(k_mac, nonce) — nonce = boot_count‖
+    // msg_count de CETTE trame. Seul le détenteur de notre clé peut le produire.
+    if (manager.sendtoWait(buf, len, SERVER_ADDRESS)) {
+      uint8_t ab[HMAC_LEN]; uint8_t al = sizeof(ab); uint8_t from;
+      if (manager.recvfromAckTimeout(ab, &al, APP_ACK_MS, &from) && al >= HMAC_LEN) {
+        uint8_t dev[HMAC_KEY_LEN], km[HMAC_KEY_LEN], exp[32];
+        readKeyFromEEPROM(dev);
+        sha256.resetHMAC(dev, HMAC_KEY_LEN);
+        sha256.update((const uint8_t*)"ben-lora-mac", 12);
+        sha256.finalizeHMAC(dev, HMAC_KEY_LEN, km, 32);
+        uint8_t n6[6] = { (uint8_t)boot_count, (uint8_t)(boot_count >> 8), (uint8_t)(boot_count >> 16),
+                          (uint8_t)msg_count,  (uint8_t)(msg_count >> 8),  (uint8_t)(msg_count >> 16) };
+        sha256.resetHMAC(km, HMAC_KEY_LEN);
+        sha256.update(n6, 6);
+        sha256.finalizeHMAC(km, HMAC_KEY_LEN, exp, 32);
+        acked = (memcmp(ab, exp, HMAC_LEN) == 0);   // registration CRYPTO-vérifiée
+      }
+    }
+    // Signal RECONNAISSABLE de registration : ACK crypto boot validé = triple pulse vert lent
+    // (« enregistré chez MA centrale »), distinct du vert bref 40 ms de l'ACK courbe. Sinon
+    // (REGISTERING : pas d'ACK applicatif valide) double pulse orange = « je cherche encore ».
+    if (acked) { for (uint8_t i = 0; i < 3; i++) { blinkRGB(0, 50, 0, 150); delay(130); } }
+    else       { for (uint8_t i = 0; i < 2; i++) { blinkRGB(45, 18, 0, 120); delay(130); } }
     driver.sleep();
   }
   return acked;

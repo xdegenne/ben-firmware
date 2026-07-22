@@ -1,0 +1,349 @@
+# Changelog — BEN Firmware
+
+Toutes les versions notables du firmware BEN (Raspberry Pi + émetteur Arduino).
+Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ;
+versionnage [SemVer](https://semver.org/lang/fr/).
+
+Deux pistes indépendantes :
+
+- **Pi** (`pi-x.y.z`) — récepteur / façade radio. Déployé par **OTA** (tags Git signés GPG,
+  transitions `updates_caps` dans [`compatibility.yaml`](./compatibility.yaml)).
+- **Émetteur Arduino** (`x.y.z`) — lecteur TIC (Pro Mini). **Reflash MANUEL** (pas d'OTA sur AVR).
+
+> Détail machine des chemins d'update : `compatibility.yaml` (`updates_caps`).
+> Ancienne matrice pré-ménage (history par-modèle + fallback `updates:`, figée au 2026-07-22) :
+> `git show pi-0.9.1:compatibility.yaml`.
+
+---
+
+## Pi (récepteur / façade radio)
+
+### [0.9.2] — 2026-07-23
+
+**ACK applicatif crypto-vérifié des trames boot** (`ben-radio.send_app_ack`). Anti cross-talk multi-logement : plusieurs centrales partagent l'adresse LoRa serveur `0x20` et RadioHead ACK au niveau LIAISON toute trame adressée à `0x20` *avant* toute vérif de clé → une centrale voisine « volait » le boot et l'émetteur se croyait enregistré chez elle (il aurait émis ADCO/OPTARIF/abonnement à côté). Désormais la façade ne renvoie un ACK (`HMAC(K_mac, nonce)`) QUE si le MAC montant est valide (elle détient donc la clé du device), et cet ACK est lui-même un HMAC que seul le détenteur de la clé peut produire → l'émetteur (≥ arduino 0.1.3) ne s'enregistre QUE chez SA centrale. Purement code (`ben_radio.py`) : aucune dépendance/migration/unit. Rétro-compatible (émetteur < 0.1.3 non impacté). Validé multi-centrales (ben-0011 ACK / ben-0001 refus MAC), 2026-07-22. Gated `lora-tic-receiver`. ⚠️ Ordre : central 0.9.2 AVANT reflash émetteur 0.1.3.
+
+### [0.9.1] — 2026-07-22
+
+FACADE RADIO + FIX paho. La 0.9.0 (facade) oubliait python3-paho-mqtt (lib cliente MQTT) -> ben-radio crashe a l import -> crash-loop -> boucle reboot (incident ben-0011/ben-0003). Tag 0.9.0 immuable -> on corrige en 0.9.1 = MEME facade AVEC paho + garde-fou (abort AVANT cutover si paho absent -> monolithe preserve, pas de boucle). On REDIRIGE 0.8.7 direct vers 0.9.1 (plus par la 0.9.0 cassee). Decoupe monolithe -> ben-radio + ben-telemetry via bus MQTT local, canal commande volet chiffre, derivation cle par-device, adresse LoRa EEPROM, topic LED ben/led. GATED lora-tic-receiver.
+
+### [0.8.7] — 2026-07-18
+
+« Au revoir » au désappairage : /unprovision fait 3 flashs VIOLETS sur la LED RGB juste avant le poweroff (signal clair de départ). local_api._unprovision stoppe désormais les readers TOUJOURS (libère les pins LED + ferme la base) puis flash. Redémarre ben-local-api (tous modèles). Effet au prochain /unprovision.
+
+### [0.8.6] — 2026-07-18
+
+FIX récepteur : l'IINST (2e courbe histo) était ENVOYÉE par l'émetteur ET décodée par frame_codec, mais on_recv_curve ne la rangeait pas en base (boucle sur PAPP seulement) → colonne iinst NULL en histo/LoRa. On ajoute labels["IINST"]=iinst[i] dans la boucle de stockage. Redémarre ben-lora-receiver sur les devices lora. Sans effet en standard (pas de 2e courbe IINST).
+
+### [0.8.5] — 2026-07-17
+
+échelle de jauge RÉSOLUE CÔTÉ BOÎTIER : /live ne renvoyait le plafond OBSERVÉ (high-water mark) qu'inconditionnellement → juste après l'unboxing ce max ≈ conso courante → conso faible affichée ROUGE dans l'app. Fix local_api.py : plafond observé UNIQUEMENT si le foyer est CONNU (même gate que le niveau, levels.is_known : ≥200 pts, ≥2j, dynamique), sinon l'ABONNEMENT (PREF/ISOUSC, sinon 9000). L'app affiche le plafond tel quel (n'arbitre plus). Redémarre ben-local-api sur tous les modèles.
+
+### [0.8.4] — 2026-07-17
+
+2 fixes terrain : (1) lora-receiver — watchdog de SILENCE (RX vivant mais sourd : IRQ RX morte, SPI lisible → self-test aveugle), restart à backoff exponentiel 5min→×2→plafond 1h, persisté, reset à la 1re trame (incident ben-0010 17/07, 55 min de silence sans relance) ; (2) provisioner — garde anti-doublon on_connect (bluezero l'appelle 2× Connected+ServicesResolved sur tél lent → écrasait la reco couleurs → échec unboxing MIUI). Restart ben-lora-receiver sur les devices lora ; provisioner : effet au prochain unboxing.
+
+### [0.8.3] — 2026-07-14
+
+RETRAIT de l'agent de pairing (leurre) : il faisait bonder iOS → re-découverte post-bond → gel couleurs/verify au 1er unboxing + « Peer removed » au re-provisioning. Le vrai fix iOS = la MTU (0.8.2). No-op ; effet au prochain provisioning.
+
+### [0.8.2] — 2026-07-14
+
+fixes unboxing BLE (provisioner) : DEVICE_INFO compact (device.json>MTU iOS tronqué → app iOS KO), scan WiFi unique (rescan 30s affamait le lien BLE → décrochage Android), agent pairing Just Works (BlueZ 5.x/Service Changed). No-op pour un device en service (provisioner off) ; effet au prochain provisioning.
+
+### [0.8.1] — 2026-07-11
+
+fix agent OTA : clobber device.json (self-heal relabel + re-read avant bump)
+
+### [0.8.0] — 2026-07-11
+
+relabel model → commercial (Filaire/Radio) — TOUS les devices
+
+### [0.7.0] — 2026-07-11
+
+durcissement watchdog LoRa (capability-aware : has_cap lora ; wired skip)
+
+### [0.6.1] — 2026-07-11
+
+MIGRATION model → caps (0.6.1 = fix ownership du 0.6.0 buggé)
+
+### [0.6.0] — 2026-07-11
+
+Migration vers le flux d'update unique (`updates_caps`, keyé sur softwareVersion) — fin des chemins d'update par-modèle. Nouvel agent OTA capability-aware.
+
+### [0.5.0] — 2026-07-10
+
+Watchdog SELF-TEST RADIO (récepteur LoRa). Lecture périodique de REG_VERSION du SX127x (0x42 doit valoir 0x12) : si le SPI/radio est figé (incident ben-0001 09/07), le process cesse de pinguer sd_notify(WATCHDOG=1) → systemd restart le service (WatchdogSec=90 s). Distingue « radio HS » de « rien à recevoir » : le silence de trames (émetteur off) ne déclenche PAS de restart — VALIDÉ sur ben-0001 (émetteur-off 3,5 min, NRestarts=0 ; + test d'isolation du mécanisme sd_notify). État indexes/seq persisté → restart sûr. Unit : NotifyAccess=main, WatchdogSec=90, StartLimitIntervalSec=0 (restart infini, escalade reboot DIFFÉRÉE à un prochain palier). AUCUNE migration BDD. Transition = install unit + daemon-reload + restart ben-lora-receiver.
+
+### [0.4.0] — 2026-07-07
+
+Jauge bidirectionnelle CALÉE SUR L'OBSERVÉ + garde-fou raw. High-water mark d'INJECTION (level_profile.papp_inject_max_alltime) par PDL, symétrique du plafond conso : standard = -papp net (MESURÉ), histo = 230×IINST (ESTIMÉ, papp plancher à 0), maintenu au fil de l'eau (record_measurement/_batch) + BACKFILL one-shot À LA MIGRATION (reconstruit depuis ~3 mois de measurements — une requête gardée par l'existence de la colonne → jauge calibrée immédiatement, sans attendre l'accumulation). /live expose plafond + injectMax → l'app cale CHAQUE CÔTÉ de la jauge sur son propre max observé (échelle linéaire -injectMax→+plafond, 0 à sa vraie place ; courbe d'injection négative côté standard). /chart?raw=1 BORNÉ à 24 h (garde-fou perf : pas de scan brut multi-jours). ADD COLUMN idempotent, aucune migration destructive. Transition = restart ben-lora-receiver + ben-local-api.
+
+### [0.3.0] — 2026-07-06
+
+ROLLUP PAR INDEX — Phase 3 (côté LECTURE, exploite le rollup de 0.2.0). NOUVEL endpoint GET /chart : courbe RICHE {points, tariff_bands, source} — le serveur arbitre la source des points (rollup rapide sur vue large / brut au zoom, raw=1 force le brut) ; tariff_bands = zones tarifaires AUTO-DESCRIPTIVES {from,to,kind,index_id,src_standard,label} distinguant TOUS les tarifs (HC/HP, Tempo bleu/blanc/rouge, EJP), histo ET standard, jamais un parcours de points (§5). /curve reste INTACT (brut) → app courante inchangée. /consumption et /registers ACCÉLÉRÉS via le rollup (index_last, fallback brut) : mesuré ben-0003 ×85 (/consumption 3574→42 ms) et ×550 (/registers 28 s→52 ms), résultat EXACT au Wh (écart bord ≤ 1 tranche). STRICTEMENT ADDITIF : /curve/consumption/registers gardent leur forme (bascule interne transparente) ; /chart est nouveau. Aucune migration BDD. Cf. docs/rollup-par-index.md §5/§6. Transition = restart ben-lora-receiver + ben-local-api.
+
+### [0.2.0] — 2026-07-06
+
+ROLLUP PAR INDEX — phases 1+2 (côté ÉCRITURE, PUREMENT ADDITIF : aucune lecture ni champ API changé → zéro régression, invisible). Nouvelle table curve_rollup = résumé pré-agrégé par (tranche 2 min, tarif index_id) : min/max/sum/count/index_last. Alimentée AU FIL DE L'EAU (record_measurement / record_measurements_batch) + BACKFILL progressif de l'historique (newest-first, 1 jour/pas, borné ~2 s, greffé sur prune(), REPRENABLE via curseur watermark persistant rollup_state, idempotent). Prépare la perf /curve + les bandes HP/HC (Phase 3). Schéma créé au 1er db.connect (CREATE TABLE IF NOT EXISTS), aucune migration destructive. Cf. docs/rollup-par-index.md. Transition = restart ben-tic-reader + ben-local-api.
+
+### [0.1.0] — 2026-07-06
+
+PALIER 0.1.0 (fin des 0.0.x — unification des versions Pi + Arduino). Récepteur LoRa : décodeur de trame EXTRAIT dans frame_codec.py (module pur testable, réutilisé par le banc de test) — main.py délègue à frame_codec.decode. Porté par le codec : DÉCHIFFREMENT ChaCha20 (encrypt-then-MAC, bit7) + décode IINST 2e courbe (histo). ALIGNEMENT du logging avec le lecteur wired : les champs collectés-mais-non-stockés (DEMAIN/ADPS/PEJP, NJOURF/NJOURF+1) sont logués INFO ON-CHANGE via log_uncabled (même format des deux côtés). STRICTEMENT ADDITIF : aucune migration BDD, aucun champ API retiré/renommé. Rétro-compatible : frame_codec décode aussi les trames NON chiffrées (émetteur < arduino 0.1.0). Transition = restart ben-lora-receiver + ben-local-api.
+
+### [0.0.54] — 2026-07-03
+
+Chantier « unification labels + contrat ». Récepteur LoRa : décode l'EXT COURBE v2 (flag bit7) = EAIT + LTARF (label tarif standard) + DIAG index=0 ; contrat NGTF (standard) / OPTARIF (histo) dans la trame boot v0x01 (octet 15 = longueur, 16.. = ascii ; borne relâchée 15..32 o). Résolution de label UNIFIÉE côté serveur (resolve_label : standard=LTARF autoritatif via tariff_labels / histo=convention statique HISTO_LABELS) + API : /live.tariff_label + /live.contract + nouvel endpoint /registers (registres + index par tarif + contrat). Stockage : table tariff_labels keyée (pdl,src,index_id,ngtf) — segmentée par CONTRAT — + colonne level_profile.ngtf. STRICTEMENT ADDITIF : aucun champ /live retiré ni renommé → app legacy inchangées, wired histo intact. MIGRATION idempotente au 1er db.connect (CREATE tariff_labels avec la nouvelle PK + ALTER level_profile.ngtf ; drop/recreate tariff_labels si ancienne PK). Transition = restart ben-lora-receiver + ben-local-api. NB : les nouveaux champs restent dormants tant que l'émetteur n'émet pas LTARF/contrat (arduino ≥ 0.0.9) — rétro-compatible (trames actuelles décodées à l'identique).
+
+### [0.0.53] — 2026-07-02
+
+MIGRATION backfill index générique legacy. db.connect() dérive index_id/index_value de tariff + base/hchc/hchp pour les vieilles lignes histo (index_value NULL, d'avant que le reader ne peuple la générique en pi-0.0.43). Sans ça /consumption fait COALESCE(index_value,base,hchc,hchp) qui écrase HC et HP dans une seule colonne → sur-comptage (~+30 % mesuré sur legacy HC/HP, ben-0003 : 43486 au lieu de 33252 Wh sur 7j). ONE-SHOT via user_version, idempotent. UPDATE en masse au 1er db.connect du reader après MAJ (~qq s ; ben-0001 ~315k lignes) → démarrage un peu plus lent cette fois-là. Données non perdues, index_value peuplé. Transition = restart ben-lora-receiver + ben-local-api.
+
+### [0.0.52] — 2026-07-02
+
+Deux ajouts Pi-side, low-risk. (1) CHECKPOINT WAL périodique : db.prune() fait PRAGMA wal_checkpoint(TRUNCATE) (~1×/h) → le fichier -wal, qui ne se tronque jamais seul (observé 392 Mo sur ben-0001 → ralentit toutes les lectures), reste borné. Maintenance pure, aucune donnée modifiée. (2) INSTRUMENTATION index=0 : le récepteur logge un WARNING greppable INDEX0 (batch_seq/NTARF/rssi/snr/gap) quand l'émetteur envoie un keyframe index_value=0 → capture le contexte de la cause racine (carry-forward EASF empoisonné côté Arduino, à corréler). AUCUNE migration. Transition = restart ben-local-api + ben-lora-receiver.
+
+### [0.0.51] — 2026-07-01
+
+Robustesse aux index_value=0 parasites. Un index compteur cumulatif n'est JAMAIS 0 ; des index_value=0 (carry-forward EASF empoisonné côté émetteur — cause racine à confirmer, cf. chantier Arduino) faisaient renvoyer par /consumption l'index ABSOLU (MAX-MIN, ~15 MWh → coût délirant, ex. 2957 €/jour). db.py : /consumption filtre COALESCE(...) > 0 (au lieu de IS NOT NULL) ; écriture (_generic_cols) normalise index_value=0 → NULL (donnée BRUTE propre : courbe, /measurements, futur cloud). AUCUNE migration (garde en lecture + normalisation des nouvelles écritures ; les 0 déjà stockés restent mais /consumption les ignore). Transition = restart ben-local-api + ben-lora-receiver.
+
+### [0.0.50] — 2026-07-01
+
+Chantier index énergie bi-mode, Lot B (suite) : endpoint /consumption. Le carry-forward (conso PAR REGISTRE sur une plage) est calculé SERVER-SIDE — Pi maintenant, cloud plus tard, MÊME contrat → l'app est agnostique du backend, logique non dupliquée. db.py : consumption(pdl,since,until) → {by_register:[{src_standard,index_id,wh}],total_wh} ; par registre MAX(index)-MIN(index) (index monotone → exact, immunisé au saut de registre ; COALESCE index_value/base/hchc/hchp → bi-mode + legacy histo). local_api : GET /consumption?pdl_index&since&until. L'app applique le prix (Σ wh×prix moyen aujourd'hui ; par registre à terme = coût à l'euro près, rétroactif, sans changer le contrat). AUCUNE migration (lecture seule sur colonnes existantes). Endpoint ADDITIF (app pas-à-jour intacte). Transition = restart ben-local-api + ben-lora-receiver.
+
+### [0.0.49] — 2026-07-01
+
+Chantier index énergie bi-mode, Lot B (exposition API). /live, /measurements et curve_buckets exposent désormais l'index GÉNÉRIQUE (index_id, index_value, src_standard, inject_total) : le coût/conso manquait en mode STANDARD où base/hchc/hchp sont NULL et l'index vit dans index_value. /live ajoute le flag producer (injection constatée → jauge bidir soutirage/injection de l'app). PERF : index COUVRANT idx_meas_pdl_ts_papp (pdl_index,ts,papp) remplace idx_meas_pdl_ts → l'agrégation /curve se résout depuis l'index (point chaud du 7j). MIGRATION = création index couvrant + DROP ancien au 1er db.connect (schéma, idempotent ; ~qq s one-shot sur grosse base, NON destructif, aucune perte). Exposition API purement ADDITIVE (app pas-à-jour intacte). Transition = restart ben-local-api + ben-lora-receiver.
+
+### [0.0.48] — 2026-06-26
+
+Chantier ISOUSC STANDARD : calibrage de la jauge en mode standard via PREF (puiss. de réf., kVA — le standard ne fournit pas ISOUSC en A). db.py : colonne level_profile.pref (ALTER conditionnel idempotent) + record_pref/get_pref. lora-receiver : lit l'octet 14 de la trame boot v0x01 → record_pref (émetteur ≥ arduino 0.0.7 ; < 0.0.7 → octet 14 = 0, ignoré, rétro-compat). local_api : /live arbitre maxVa = standard ? pref×1000 : isousc×230 (+ expose pref). MIGRATION = ALTER pref (idempotente, non bloquante). Transition = restart ben-local-api + ben-lora-receiver. ⚠️ jauge LoRa standard nécessite AUSSI arduino 0.0.7.
+
+### [0.0.47] — 2026-06-25
+
+Désappairage : POST /unprovision ÉTEINT TOUJOURS le boîtier (poweroff), avec ou sans wipe (avant : reboot quand pas de wipe). Au prochain allumage, sans WiFi → mode configuration (BLE). Signal d'extinction uniforme. Modif local_api.py. AUCUNE migration. Transition = restart ben-local-api + ben-lora-receiver.
+
+### [0.0.46] — 2026-06-24
+
+Trame courbe LoRa v0x05 : HORODATAGE PAR POINT. Chaque point porte son intervalle réel (dt en secondes, varint) depuis le précédent au lieu d'un period_ds uniforme supposé → le récepteur reconstruit t[i] = t0 + Σdt (courbe fidèle quelle que soit la cadence, trames ratées incluses). En standard le dt vient de l'horodate compteur (instant de mesure, sans dérive) → meter_ts exact ; en historique de millis(). Décodeur curve_codec.py expose sample_dt_s ; anchor_timestamps/meter_timestamps cumulent les dt. period_ds conservé comme moyenne/hint. Compat v0x04 RETIRÉE (un seul émetteur en service). AUCUNE migration BDD (ts/meter_ts déjà présents). Transition = restart ben-local-api + ben-lora-receiver. ⚠️ déployer le Pi AVANT de flasher l'Arduino 0.0.6 (un récepteur < 0.0.46 rejette le v0x05 → « 20 attendus »).
+
+### [0.0.45] — 2026-06-23
+
+Unpair « supprimer les données » (POST /unprovision?wipe=1) : on STOPPE le reader avant le rm de la base (wipe propre, plus de base ouverte en WAL) puis on ÉTEINT le boîtier (poweroff) au lieu de reboot → prépa livraison béta (part hors tension, rallumé par le testeur pour provisionner via l'app). Unpair simple (sans suppression) → reboot (re-pairing BLE) inchangé. Modif local_api.py. AUCUNE migration. Transition = restart ben-local-api + ben-lora-receiver.
+
+### [0.0.44] — 2026-06-23
+
+LED de boot : remplace la séquence arc-en-ciel « disco » (~5 s, 9 couleurs) par 3 flashs bleus brefs au démarrage (aligné avec le wired). Cosmétique pur, AUCUNE migration. Transition = restart ben-local-api + ben-lora-receiver.
+
+### [0.0.43] — 2026-06-23
+
+Mode TIC STANDARD (Enedis-NOI-CPT_54E) bout-en-bout + dorsale stockage index bi-mode. Récepteur LoRa décode le v0x04 standard (papp NET SIGNÉ via src_standard, − = injection ; bloc ext EAIT ; horodate compteur → meter_ts, immunisée au délai radio) ; NTARF standard non mappé sur INDEX_NAMES (opaque) → clé générique (src_standard, index_id, index_value). Suppression du watchdog restart-sur-silence (inutile côté récepteur ; fraîcheur via heartbeat). MIGRATION BDD : ALTER ×5 (src_standard/index_id/index_value/inject_total/meter_ts), idempotente, NON bloquante, double-écriture base/hchc/hchp. /live expose tic_mode (standard/historique). Transition = restart ben-local-api + ben-lora-receiver. ⚠️ déployer le Pi AVANT de flasher l'Arduino standard (arduino 0.0.4).
+
+### [0.0.42] — 2026-06-18
+
+Chantier ISOUSC : le récepteur (wired ET lora) lit l'intensité souscrite et la stocke par PDL (level_profile.isousc, write-on-change). LoRa : ISOUSC dans la trame d'identité v0x01 (octet 13). /live expose isousc + maxVa (=ISOUSC×230) pour les réglages app + l'étalonnage de la jauge. Migration BDD = ALTER conditionnel (colonne isousc), idempotent. Transition = restart ben-local-api + ben-lora-receiver.
+
+### [0.0.41] — 2026-06-18
+
+Courbe LoRa v0x04 : le récepteur décode la trame v0x04 (courbe PAPP batchée ~2 s, keyframe + deltas varint, HMAC-8) en plus de v0x02/v0x01. Réutilise db.py/local_api.py de 0.0.40 (curve_buckets + /curve agrégé) → /curve et /measurements identiques au wired. Saut 0.0.39→0.0.41 (0.0.40 = tag wired). Transition = restart ben-local-api + ben-lora-receiver, AUCUNE migration BDD. ⚠️ déployer le Pi AVANT de reflasher l'Arduino en 0.0.2 (un Pi 0.0.39 rejette le v0x04).
+
+### [0.0.40] — 2026-06-13
+
+Courbe temps réel (pi-wired). Lecture TIC AU FIL DE L'EAU (suppression du sleep 15s, event-driven sur la trame → courbe fine ~1,5s au lieu de 1/15s) + écritures BDD BATCHÉES (1 commit/15s via executemany → ménage la SD malgré ~7× plus de points). API : nouvel endpoint /curve (agrégé min/max/avg, bucketing ABSOLU + quantifié pour stabilité au pan, centroïde temporel, index porté) ; /measurements degrade-safe (agrège au lieu de tronquer) ; /pdls expose first_ts. db.py/local_api.py partagés mais ADDITIFS (pas de changement de schéma, reader LoRa intact) → seuls les wired bumpent. AUCUNE migration. update.sh = restart ben-tic-reader + ben-local-api.
+
+### [0.0.39] — 2026-06-08
+
+Provisioning BLE — 2 corrections UX de la LED. (1) Échec WiFi (ex. mauvais mot de passe) : le BLE reste connecté et l'utilisateur peut re-saisir → set_status() ne rejoue PLUS le blink violet/jaune (« aucun téléphone, à configurer ») qui laissait croire à un reset ; on garde les 3 flashs rouges (échec) puis on ÉTEINT (état « connecté, en attente de saisie »). (2) Fin de l'apprentissage des couleurs (PREVIEW_CMD='0') : on arrête la boucle + éteint, puis on attend VERIFY_AFTER_PREVIEW_SEC (3 s) avant de démarrer le code de test, le temps d'arriver sur l'écran de test sans rater le début. Provisioner on-demand → rien à redémarrer, pas de reboot.
+
+### [0.0.38] — 2026-06-08
+
+Provisioning BLE — phase d'APPRENTISSAGE des couleurs avant le test d'association. led.py : la boucle de séquence accepte un callback (on_show + tokens) qui notifie la couleur affichée. main.py : 2 caracs GATT — PREVIEW_CMD (…0007, write '1'/'0') et PREVIEW_COLOR (…0008, read|notify B|Y|W|R|-). '1' joue les 4 couleurs en boucle (ordre fixe BYWR) en notifiant la couleur courante (l'app surligne la pastille en synchro) ; '0' (bouton Suivant) arrête et enchaîne sur le code de test. Repli : si l'app ne pilote pas PREVIEW, le code de test s'affiche après VERIFY_DISPLAY_DELAY_SEC comme avant. Durée d'affichage de chaque couleur du CODE de test allongée (VERIFY_ON_SEC=1.3 s) pour laisser le temps de lire. Provisioner on-demand → pris au prochain mode BLE, rien à redémarrer, pas de reboot. Côté app : nouvel écran « Repérez les couleurs » entre le scan et le test.
+
+### [0.0.37] — 2026-06-08
+
+API locale : POST /unprovision corrigé. Bug : on supprimait la connexion WiFi AVANT de répondre → couper `ben-provisioned` tue le lien TCP, l'app ne recevait jamais l'ack (et le diagnostic était aveugle car l'API silence log_message par défaut). Fix : on répond d'abord, PUIS désappairage + reboot en ASYNCHRONE (threading.Timer 2 s) ; on oublie TOUTES les connexions WiFi (ben-provisioned + éventuel profil opérateur `wifi` du golden, qui sinon reconnectait en autoconnect) ; ajout de logs « [unprovision] … ». update.sh : restart ben-local-api ; pas de reboot.
+
+### [0.0.36] — 2026-06-08
+
+(1) Palette LED de vérif BLE recalibrée (led.py) : BLANC CHAUD (canal bleu écrasé, B≈0,25×R) car la LED bleue est perceptuellement plus vive → le blanc virait au bleu (confusion blanc/bleu constatée au provisioning). Palette daltonien conservée (axe bleu↔jaune + luminosité, sans vert). Provisioner on-demand → pris au prochain provisioning. (2) API locale : POST /unprovision (désappairage) — supprime la connexion WiFi `ben-provisioned` (→ provisioning BLE au reboot), efface optionnellement les données (?wipe=1), puis reboot ; garde l'identité (certs, deviceId). SANS auth (raccourci assumé : LAN + confirmation app). update.sh : restart ben-local-api ; pas de reboot. L'app ajoute une carte « Désappairer » (Avancé) avec option wipe.
+
+### [0.0.35] — 2026-06-08
+
+/health expose lastUpdateTs (epoch s) = date de la dernière MAJ firmware, lue via la mtime de device.json (réécrit seulement à un changement de version OTA ou au provisioning). local_api.py : _device_info() ajoute le champ. Pas de champ stocké, pas de migration, aucun reader touché. update.sh : restart ben-local-api ; pas de reboot. Permet à l'app d'afficher « Mis à jour le … » et de repérer un device en retard.
+
+### [0.0.34] — 2026-06-08
+
+Modèle de niveau « course [talon, plafond] » (remplace les percentiles P30/P70/P90, qui dégénéraient sur les foyers à faible base : un frigo seul ~150 W était sur-noté niveau 3, vu en prod sur ben-0003/Neuville). niveau = position de la PAPP entre le talon (P15, ancrage bas) et le plafond = papp_max_alltime (high-water mark MONOTONE de la PAPP, jamais décrémenté, survit au prune 3 mois ; « si c'est arrivé ça arrivera encore »). ratio=(PAPP−talon)/(plafond−talon), bandes 0,10/0,40/0,70. db.py : colonnes level_profile.talon + .papp_max_alltime (maintenu par record_measurement) + index idx_meas_pdl_papp (ALTER/index auto). levels.py : talon en SQL, cold-start (ou plafond<=talon) → niveau 2. Plus aucun seuil absolu en watts : bornes tirées des données du foyer → adaptatif ET non-dégénéré. update.sh : backfill one-shot du plafond depuis l'historique + restart ben-local-api + reader + recalcul talon ; pas de reboot. Firmware only (l'app lit déjà reading.level).
+
+### [0.0.33] — 2026-06-07
+
+Provisioner BLE — feedback succès connexion réseau : sur succès WiFi, 2 flashs verts rapides au lieu de 3 flashs + vert tenu permanent (cohérence UX, plus de vert fixe). N'impacte que le provisioning BLE ; rien à redémarrer (provisioner on-demand).
+
+### [0.0.32] — 2026-06-07
+
+Provisioner BLE — feedback connexion : à la connexion Bluetooth, arrêt du blink d'attente violet/jaune + 2 flashs verts rapides (= connecté), puis délai 10s, puis boucle du code couleur. N'impacte que le provisioning BLE ; rien à redémarrer (provisioner on-demand).
+
+### [0.0.31] — 2026-06-07
+
+Provisioner BLE — UX vérif couleur : code correct → 3 blinks verts rapides (au lieu du vert fixe permanent) ; délai de 10s avant d'afficher le code couleur à la connexion (blink violet/jaune d'attente pendant le délai, puis le code se répète au rythme normal ~1,5s). + ben-led-release.service : flash blanc 'welcome' rendu atomique (3 canaux R/G/B en une seule commande pinctrl) — avant, 3 commandes séparées faisaient voir un balayage rouge→jaune→blanc→cyan→bleu au boot. Migration : réinstalle ben-led-release.service + daemon-reload (effet au prochain boot) ; provisioner on-demand donc rien d'autre à redémarrer.
+
+### [0.0.30] — 2026-06-07
+
+cf. note pi0-wired 0.0.30 — tic-reader wired (PERIOD 15s + wake-up bleu) ; sur lora pur = no-op (try-restart d'un service inactif).
+
+### [0.0.29] — 2026-06-07
+
+Fix race de services au provisioning. ben-tic-reader / ben-lora-receiver perdent leur autostart (WantedBy retiré) : ils sont désormais lancés UNIQUEMENT par check_network.py quand le réseau est up. Avant, ils démarraient au boot en doublon et tuaient ben-ble-provisioner via Conflicts → bug 'code couleur affiché puis ré-écoute BLE en boucle', provisioning impossible (vu en démo sans Linky). De plus check_network détecte 'jamais provisionné' (absence de connexion ben-provisioned) → bascule BLE directe sans pinguer 30s au premier boot. Migration : réinstalle les units + systemctl disable des readers. N'impacte pas un device en service (le reader tourne jusqu'au prochain reboot où check_network le relance).
+
+### [0.0.28] — 2026-06-05
+
+Vérification couleur au provisioning BLE (confirme le bon boîtier). led.py : palette daltonien (B/J/Blanc/Rouge, sans vert) + start_sequence. main.py : GATT VERIFY/VERIFY_STATUS, hook on_connect qui génère un code couleur affiché sur la LED, WIFI_CONFIG refusé tant que non vérifié. ⚠ CASSANT : nécessite l'app avec l'étape VERIFY pour provisionner ; n'impacte QUE le provisioning BLE (un device en service en mode normal n'est pas affecté). Code en place via checkout ; aucun service à redémarrer. Cf. docs/ble-color-verification.md. (NB : pi-0.0.27 avait été taggé sans son update.sh.sha256 → OTA en échec, jamais appliqué ; 0.0.28 = même contenu + checksum, transition directe 0.0.26→0.0.28.)
+
+### [0.0.26] — 2026-06-05
+
+Tarif HC/HP exposé par l'API. Colonne `tariff` sur measurements (index tarifaire actif : 0=BASE, 1=HC, 2=HP, 3+=EJP/Tempo ; migration ALTER auto au prochain connect écriture) remplie par record_measurement (PTEC côté wired, index actif de la trame côté LoRa). /live et /measurements ajoutent `tariff`. L'app affiche HC/HP : chip sous la jauge (🌙 indigo / ☀️ orange) + zones de fond pastel dans la courbe avec pointillé aux transitions. update.sh redémarre ben-local-api + le reader ; pas de reboot.
+
+### [0.0.25] — 2026-06-05
+
+Niveau de consommation 1..4 exposé par /live (visuel app). Nouveau module store/levels.py : percentiles PAPP du foyer (P30/P70/P90 sur 7 j glissants) → niveau 1..4, lissé sur 2 min + hystérésis ; défaut 2 en cold-start (< 2 j d'historique). Table level_profile (auto-créée par db.connect). Service planifié ben-level-profiler.{service,timer} : recalcul des seuils 1×/jour (SoC : seul ce job écrit, l'API reste read-only). update.sh installe les 2 units + redémarre ben-local-api + arme le timer & 1er calcul ; pas de reboot.
+
+### [0.0.24] — 2026-06-04
+
+FIX MAJEUR sink SQLite multi-thread (db.py check_same_thread=False) : le récepteur LoRa ouvrait la connexion dans le thread principal mais écrivait depuis le thread RX → CHAQUE écriture échouait silencieusement (avalée en WARNING), le store LoRa n'avait JAMAIS écrit une ligne (constaté sur ben-0001 : frames reçues OK, /pdls /live /lora-link vides). Le wired n'était pas touché (écrit depuis son thread principal). + API locale : GET /ping → {ben:true} (zéro I/O, polling régulier / voyant app) et /health renvoie `last_tic_ts` (ts dernière trame TIC). update.sh redémarre ben-local-api + le reader, pas de reboot.
+
+### [0.0.23] — 2026-06-04
+
+Réglages utilisateur via l'API locale : luminosité LED par crans (led_level 0-5, 0=éteinte), mapping perceptuel gamma. settings.py (store partagé) + GET/POST /settings ; la couche LED (led.py + blink_rgb readers) applique le cran. bypass=True (décidé par l'appelant) pour erreurs + provisioning → toujours visibles même LED éteinte. Résilient à l'absence de settings.json (defaults en code). Inclut le RATTRAPAGE de l'annonce mDNS avahi _ben._tcp (avait raté la 0.0.22 publiée — commit amendé après push) : update.sh l'installe.
+
+### [0.0.22] — 2026-06-03
+
+Phase 1 — store local SQLite (rétention 3 mois glissants) : les readers écrivent chaque trame (conso + qualité LoRa rssi/snr dans une table à part lora_link). Nouvelle API locale read-only :8087 (ben-local-api.service) lue par l'app via l'IP du device. Colonne `sent` = outbox prête pour le futur push cloud.
+
+### [0.0.21] — 2026-06-03
+
+BLE provisioner remonte l'IP locale du device en suffixe du statut (connected:<ip>) → l'app peut se connecter directement sur le LAN après le provisioning (mode proto). Code provisioner uniquement, transition no-op.
+
+### [0.0.20] — 2026-06-01
+
+restaure gpio=13=op,dh dans config.txt (pi-0.0.17 l'avait stripé) → boot indicator vert revient. ben-led-release.service modifié : éteint le boot indicator puis fait un flash blanc 150ms de welcome avant de release les pins.
+
+### [0.0.19] — 2026-06-01
+
+fix 0.0.18 : retire Before=basic.target de ben-led-release.service (cassait le cycle multi-user.target ↔ basic.target). Service tourne enfin au boot, LED check_network fonctionne.
+
+### [0.0.18] — 2026-06-01
+
+fix 0.0.17 : installe ben-led-release.service (oneshot Before= tous les services BEN qui libère les pins via pinctrl). Transition 0.0.17 → 0.0.18. Bug latent : Before=basic.target dans l'unit crée un ordering cycle → systemd skip silencieusement le job au boot.
+
+### [0.0.17] — 2026-06-01
+
+tag pi-0.0.17 PUBLIÉ avec un update.sh foireux (strip gpio=13=op,dh du config.txt + reboot, perte du boot indicator). ben-0001 a effectivement OTA'd à 0.0.17 et a perdu le boot indicator. Voir 0.0.18 pour la fix.
+
+### [0.0.16] — 2026-06-01
+
+fix update.sh : suppression du redirect bash `> /var/log/...` qui faisait fail le script tournant comme `ben`. Transitions ajoutées 0.0.15 → 0.0.16 (no-op) pour aligner ben-0003.
+
+### [0.0.15] — 2026-06-01
+
+tag pi-0.0.15 publié avec .sha256 fix. La transition no-op 0.0.14 → 0.0.15 a réussi sur ben-0003. La transition 0.0.13 → 0.0.15 contenait un bug d'apt redirect (sudo n'élève pas le `>` shell, script tournait comme `ben`) → ben-0001 stuck à 0.0.13. Voir 0.0.16.
+
+### [0.0.14] — 2026-06-01
+
+BLE WiFi provisioning + boot-time network check — NEVER DEPLOYED (tag pi-0.0.14 publié mais update.sh.sha256 manquant).
+
+### [0.0.13] — 2026-05-31
+
+flashs RX jaune + HMAC OK vert discrets 50ms × 5/255 ; heartbeat rapproché (sleep 0.5s)
+
+### [0.0.12] — 2026-05-31
+
+heartbeat UX-driven : OK très court (50ms × 5/255), erreur visible (300ms × 8/255)
+
+### [0.0.11] — 2026-05-31
+
+SNR_MAX_PLAUSIBLE 12 → 20 pour tolérer les SNR close-range valides
+
+### [0.0.10] — 2026-05-31
+
+heartbeat LED encore plus discret (0.1s × intensité 5/255, séparés de 1s)
+
+### [0.0.9] — 2026-05-31
+
+heartbeat LED présence calme (0.4s × intensité 10/255)
+
+### [0.0.8] — 2026-05-31
+
+fix SPI + rpi-lgpio + WorkingDirectory + RPi.GPIO transitive uninstall + raspi_lora SNR sign
+
+### [0.0.6] — 2026-05-31
+
+LED 5% partout : jaune wake / vert trame OK / rouge trame KO
+
+### [0.0.5] — 2026-05-31
+
+LED silence radio — plus aucun blink (for sleeping operators)
+
+### [0.0.4] — 2026-05-31
+
+LED bonk-bonk : 2 flashs violet par cycle raté (remplace single-violet stale)
+
+### [0.0.3] — 2026-05-31
+
+agent LED: dim yellow wake (30%), violet stale alert (>5min); WATCHDOG 5min→10min
+
+### [0.0.2] — 2026-05-30
+
+log-only baseline (Influx stripped, hostname rename)
+
+### [0.0.1] — 2026-05-30
+
+first dev release (published, no devices in field)
+
+## Émetteur Arduino (tic-reader)
+
+### [0.1.3] — 2026-07-23
+
+**ACK applicatif crypto-vérifié côté émetteur** : après la trame boot, l'émetteur attend `HMAC(K_mac, nonce)` de la centrale (`recvfromAckTimeout`) et ne se déclare `bootAcked` QUE si le MAC est valide → immunité cross-talk multi-logement (le link-ACK RadioHead d'un voisin ne suffit plus). **Signal LED de registration** : triple pulse vert lent = enregistré chez SA centrale / double pulse orange = REGISTERING (cherche encore). **Fix** : la trame boot est sérialisée dans le buffer GLOBAL `curveBuf` (le buffer pile `buf[64]` débordait pendant le ChaCha/HMAC et corrompait l'ACK → gate bloquée). Reflash MANUEL. À flasher APRÈS avoir déployé la centrale en pi-0.9.2.
+
+### [0.1.2] — 2026-07-10
+
+Découplage émetteur↔récepteur (incident ben-0001 09/07) + refonte LED. sendtoWait : setTimeout(600) + setRetries(1). MACHINE À ÉTATS REGISTERING/STREAMING : la trame de boot (petit paquet) sert de probe de vivacité — tant qu'elle n'est pas ACK, AUCUNE mesure émise ; retry boot à la cadence batch (v frais → identité jamais périmée) ; mesure non-ACK → retour REGISTERING → outage = 1 TX/~40 s, plus de brownout couplé. LED : couleur = quelle trame (magenta=boot, blanc=courbe), vert = ACK commun ; conso réduite (intensités ~10-40 vs 255, séquences boot ~7 s→<1 s, brownout=tick) ; codes erreur morts supprimés. Reflash MANUEL (pas d'OTA Pro Mini). minimum reste 0.0.1. (0.1.1 non publié : setTimeout/setRetries + machine à états regroupés en 0.1.2.)
+
+### [0.1.0] — 2026-07-06
+
+PALIER 0.1.0 (unification des versions — fin du compteur interne 0.5.x du sketch, aligné sur le Pi). tic-reader.ino : garde histo TOLÉRANTE (trame glitchée → skip silencieux, robuste au front-end marginal — corrige le rouge-rouge sur vrai Linky historique) + IINST 2e courbe (histo) + flush courbe 55 s (/live < 60 s) + checksum S1/S2 + CHIFFREMENT ChaCha20 (FRAME_ENCRYPT actif, encrypt-then-MAC). Reflash MANUEL (pas d'OTA sur Pro Mini). À flasher APRÈS avoir déployé le Pi en pi-0.1.0 (qui déchiffre) ; rétro-compat récepteur (trames non chiffrées encore décodées). minimum reste 0.0.1.
+
+### [0.0.9] — 2026-07-03
+
+Contrat mode-agnostique dans la trame boot : contractOf(v) = NGTF en standard / OPTARIF en historique (le champ 'contrat' de la trame boot porte l'un ou l'autre selon le mode) → le récepteur le stocke comme contrat (level_profile.ngtf) quel que soit le mode. Complète 0.0.8 (qui n'envoyait NGTF qu'en standard). Aucun impact sur un émetteur standard (contractOf renvoie NGTF, identique à 0.0.8) — l'ajout OPTARIF ne sert qu'en histo. minimum reste 0.0.1. À flasher avec le Pi ≥ pi-0.0.54.
+
+### [0.0.8] — 2026-07-02
+
+Chantier labels + fix index=0. (1) GARDE index=0 : en standard, ne pas démarrer la courbe tant que lastStdIndex==0 (cold-start post-reboot : NTARF vu mais EASF pas encore capté → keyframe figée à 0 sur tout le batch) → on saute la trame, le batch démarre à la suivante avec le vrai index (au pire 1 point perdu). Cause confirmée par l'instrumentation INDEX0 (pi-0.0.52). (2) LTARF : parsé + transporté dans l'ext courbe v2 (flag bit7, ext_fields bit1), on-change de NTARF, dédup + re-tx jusqu'à ACK → label tarif standard autoritatif. (3) NGTF : parsé + ajouté à la trame boot v0x01 (octet 15 = len, 16.. = ascii). minimum reste 0.0.1. ⚠️ flasher APRÈS avoir déployé le Pi récepteur en pi-0.0.54 (qui décode l'ext v2 + la trame boot étendue). Rétro-compatible : un récepteur < pi-0.0.54 ignore l'ext v2 (frames décodées à l'identique).
+
+### [0.0.7] — 2026-06-26
+
+Chantier ISOUSC standard : l'émetteur parse PREF (puiss. de réf., kVA, mode standard) et le place dans la trame d'identité v0x01 (octet 14 ; octet 13 reste ISOUSC histo). Ré-émet le boot frame au démarrage ET sur changement d'abonnement (ISOUSC ou PREF). Rétro-compatible (octet de padding réservé ; récepteur < pi-0.0.48 ignore l'octet 14). minimum reste 0.0.1. À flasher avec le Pi en pi-0.0.48 (qui lit l'octet 14).
+
+### [0.0.6] — 2026-06-24
+
+Émetteur v0x05 : horodatage PAR POINT. curveAdd envoie un dt (secondes, varint) par échantillon — en standard l'écart d'horodate compteur (todSeconds), en historique l'écart millis() sans dérive cumulative. period_ds devient la moyenne réelle du batch (hint). FIX DÉBIT : UART TIC ouvert en continu (ticSerialBegin begin-once) au lieu de Serial.begin/end par trame → fini la fenêtre aveugle, ~1 trame/s (n≈58/batch au lieu de ~30). Carry-forward NTARF+EASF (index quasi-statique → un drop de ligne ne jette plus le point). Garde standard = PAPP + horodate valide ; drop de ligne = skip SILENCIEUX (plus de rouge). LED : bleu=lecture trame, blanc=émission LoRa, vert=ACK, rouge réservé Vcc(1×)/pas-de-TIC(2×). Debug Serial par trame retiré. minimum reste 0.0.1. ⚠️ flasher APRÈS avoir déployé le Pi en pi-0.0.46 (un récepteur < 0.0.46 rejette le v0x05).
+
+### [0.0.5] — 2026-06-23
+
+Echo de la version firmware au boot (Serial : « tic-reader boot v0.0.5 ») pour confirmer au debug quelle version est flashée. Aucun changement fonctionnel (FW_VERSION + 1 println). minimum reste 0.0.1.
+
+### [0.0.4] — 2026-06-23
+
+Mode TIC STANDARD : décodage 9600 + auto-détection historique↔standard (mode persisté EEPROM 0x20, re-discovery sur échec prolongé) + parseur standard (séparateur HT, checksum HT-de-queue inclus). Trame v0x04 standard : papp NET SIGNÉ (SINSTS + / SINSTI − ; flag src_standard), horodate compteur DATE → ts (flag ts_valid), EAIT → bloc extension (flag has_ext). Identité v0x01 inchangée (ADCO ← ADSC ; ISOUSC=0 en standard, calibrage PREF différé). minimum reste 0.0.1. ⚠️ flasher APRÈS avoir déployé le Pi récepteur en pi-0.0.43 (un récepteur < 0.0.43 misread le papp signé).
+
+### [0.0.3] — 2026-06-18
+
+Chantier ISOUSC : l'émetteur parse ISOUSC et le place dans la trame d'identité v0x01 (octet 13). Ré-émet le boot frame au démarrage ET sur changement d'abonnement. Rétro-compatible (octet de padding réservé). minimum reste 0.0.1.
+
+### [0.0.2] — 2026-06-18
+
+Émetteur v0x04 : courbe PAPP fine batchée (capture continue, flush 60 s, LowPower retiré). Parseur TIC réécrit char-based (corrige une corruption de heap String qui rendait PTEC vide → trames courbe jamais émises). Remplace v0x02 (l'émetteur n'émet plus de v0x02). minimum reste 0.0.1 : les anciens émetteurs v0x02 restent décodés par le Pi 0.0.41 (rétro-compat récepteur).
+
+### [0.0.1] — 2026-05-30
+
+_(pas de note)_
