@@ -16,7 +16,7 @@ REPO_PATH="/opt/ben/repo"
 # == latest. §8 écrit un device.json CAPABILITIES-based (via caps_for_model) → un device neuf naît
 # directement en capabilities (+ watchdog durci pour un lora). Le parc EXISTANT migre par OTA
 # (0.5.0/0.6.0 → 0.6.1 → 0.7.0). Le chantier ben-ops (workflow opérateur) reste à part.
-INITIAL_TAG="pi-0.9.0"
+INITIAL_TAG="pi-0.9.1"
 # Version écrite dans device.json — DOIT correspondre au tag checkout, sinon
 # l'OTA re-grimpe depuis une version périmée. Dérivée de INITIAL_TAG pour
 # qu'elles ne puissent jamais diverger (ex. pi-0.0.28 → 0.0.28).
@@ -53,11 +53,13 @@ echo "[1/13] Arguments: $DEVICE_ID  model=$MODEL  hw=$HW_REV"
 # 2. Install system dependencies + locale
 # --------------------------------------------------------------------------
 apt-get update -qq
-# mosquitto : broker MQTT LOCAL du bus façade radio (ben-radio ↔ ben-telemetry). Inoffensif
-# (idle) sur un modèle wired ; requis dès qu'il y a la capability lora-tic-receiver.
-apt-get install -y git python3 python3-pip python3-dbus python3-gi mosquitto
+# mosquitto : broker MQTT LOCAL du bus façade radio (ben-radio ↔ ben-telemetry).
+# python3-paho-mqtt : lib CLIENTE MQTT dont ben-radio ET ben-telemetry ont besoin (import paho).
+#   SANS elle → ben-radio crashe à l'import → crash-loop → escalade reboot → BOUCLE INFERNALE
+#   (incident device-neuf ben-0011, 2026-07-22). Les deux sont requis dès qu'il y a lora-tic-receiver.
+apt-get install -y git python3 python3-pip python3-dbus python3-gi mosquitto python3-paho-mqtt
 timedatectl set-timezone Europe/Paris
-echo "[2/13] System dependencies installed (incl. BLE provisioning + mosquitto), timezone=Europe/Paris"
+echo "[2/13] System dependencies installed (incl. BLE provisioning + mosquitto + paho-mqtt), timezone=Europe/Paris"
 
 # --------------------------------------------------------------------------
 # 2b. Configure UART (models with wired TIC) + LED RGB boot indicator

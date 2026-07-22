@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.9.0"
+        latest: "0.9.1"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -211,7 +211,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.9.0"
+        latest: "0.9.1"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -825,6 +825,10 @@ updates_caps:
     tag:  "pi-0.8.7"
     script: "updates/0.8.6_to_0.8.7/update.sh"   # « Au revoir » au désappairage : /unprovision fait 3 flashs VIOLETS sur la LED RGB juste avant le poweroff (signal clair de départ). local_api._unprovision stoppe désormais les readers TOUJOURS (libère les pins LED + ferme la base) puis flash. Redémarre ben-local-api (tous modèles). Effet au prochain /unprovision.
   - from: "0.8.7"
-    to:   "0.9.0"
-    tag:  "pi-0.9.0"
-    script: "updates/0.8.7_to_0.9.0/update.sh"   # FAÇADE RADIO : découpe le monolithe ben-lora-receiver en ben-radio (seul maître RFM95 : RX/TX + LED + watchdogs, escalade reboot réactivée) + ben-telemetry (décode/vérifie/stocke, sans radio) reliés par un bus MQTT LOCAL (mosquitto, 127.0.0.1, persistence off → zéro écriture SD). Résout le SPI-freeze/Oops noyau qu'on provoquait en stoppant le récepteur pour émettre une commande. Apporte le canal de commande DESCENDANT chiffré (volets, secure_link) + dérivation de clé PAR-DEVICE (registre /etc/ben-firmware/devices.yaml) + adresse LoRa en EEPROM (1 binaire/type). Topic LED transverse → ben/led. update.sh GATED (has lora-tic-receiver → no-op sur wired pur) : install mosquitto + ben.conf + les 2 units + /var/lib/ben-firmware + seed registre + stop monolithe + start façade. Monolithe conservé en fallback. Cf. docs/canal-commande-lora-descendant.md.
+    to:   "0.9.1"
+    tag:  "pi-0.9.1"
+    script: "updates/0.8.7_to_0.9.1/update.sh"   # FACADE RADIO + FIX paho. La 0.9.0 (facade) oubliait python3-paho-mqtt (lib cliente MQTT) -> ben-radio crashe a l import -> crash-loop -> boucle reboot (incident ben-0011/ben-0003). Tag 0.9.0 immuable -> on corrige en 0.9.1 = MEME facade AVEC paho + garde-fou (abort AVANT cutover si paho absent -> monolithe preserve, pas de boucle). On REDIRIGE 0.8.7 direct vers 0.9.1 (plus par la 0.9.0 cassee). Decoupe monolithe -> ben-radio + ben-telemetry via bus MQTT local, canal commande volet chiffre, derivation cle par-device, adresse LoRa EEPROM, topic LED ben/led. GATED lora-tic-receiver.
+  - from: "0.9.0"
+    to:   "0.9.1"
+    tag:  "pi-0.9.1"
+    script: "updates/0.8.7_to_0.9.1/update.sh"   # RATTRAPAGE des devices qui ont REUSSI 0.9.0 (avaient paho) : meme script idempotent -> installe paho si besoin, re-restart facade, RE-ARME l escalade (le meme nom de drop-in ota-cutover-no-reboot.conf est nettoye au §7).
