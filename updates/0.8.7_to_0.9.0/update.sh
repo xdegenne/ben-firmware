@@ -63,26 +63,42 @@ else
     log "  registre déjà présent → conservé"
 fi
 
-# ── 4. Install des 2 units de la façade (ben-radio réactive l'escalade reboot) ─
-log "[4/6] install ben-radio.service + ben-telemetry.service"
+# ── 4. Install des 2 units de la façade (ben-radio porte l'escalade reboot) ────
+log "[4/7] install ben-radio.service + ben-telemetry.service"
 sudo install -m 644 -o root -g root "$REPO/config/systemd/ben-radio.service" \
     /etc/systemd/system/ben-radio.service || fail "install ben-radio.service"
 sudo install -m 644 -o root -g root "$REPO/config/systemd/ben-telemetry.service" \
     /etc/systemd/system/ben-telemetry.service || fail "install ben-telemetry.service"
 sudo systemctl daemon-reload || fail "daemon-reload"
 
-# ── 5. Cutover runtime : stop monolithe → start façade (sans reboot) ──────────
+# ── 5. SÉCURITÉ : neutraliser TEMPORAIREMENT l'escalade reboot de ben-radio ───
+# Le cutover (stop monolithe → start ben-radio) est le moment À RISQUE : si l'init radio échoue
+# transitoirement (GPIO/SPI pas encore relâché par le monolithe qu'on vient de stopper), l'escalade
+# « 3 crashs en 300 s → reboot » pourrait REBOOTER le device EN PLEIN OTA. On la neutralise le temps
+# du cutover, on la RESTAURE (§7) une fois la façade confirmée saine. En cas d'ÉCHEC, le drop-in
+# RESTE volontairement → pas de reboot-loop sur une façade cassée, device joignable/diagnosticable.
+log "[5/7] neutralisation temporaire de l'escalade reboot (le temps du cutover)"
+sudo mkdir -p /etc/systemd/system/ben-radio.service.d
+printf '[Unit]\n# Posé par update.sh 0.9.0 le temps du cutover, retiré après vérif (§7).\nStartLimitIntervalSec=0\n' \
+    | sudo tee /etc/systemd/system/ben-radio.service.d/ota-cutover-no-reboot.conf >/dev/null
+sudo systemctl daemon-reload || fail "daemon-reload (drop-in no-reboot)"
+
+# ── 6. Cutover runtime : stop monolithe → start façade + vérif ────────────────
 # Le câblage BOOT a déjà basculé dans capabilities.py (checkout) → prochain boot = façade.
 # Le monolithe reste INSTALLÉ (fallback) mais n'est plus ni démarré ni câblé. Idempotent.
-log "[5/6] cutover : stop ben-lora-receiver → start ben-radio + ben-telemetry"
+log "[6/7] cutover : stop ben-lora-receiver → start ben-radio + ben-telemetry"
 sudo systemctl stop ben-lora-receiver.service 2>/dev/null || true
 sudo systemctl restart ben-radio.service     || fail "start ben-radio"
 sudo systemctl restart ben-telemetry.service || fail "start ben-telemetry"
-
-# ── 6. Vérification ───────────────────────────────────────────────────────────
-log "[6/6] vérification"
 sleep 3
 systemctl is-active ben-radio.service     >/dev/null || fail "ben-radio inactif après start"
 systemctl is-active ben-telemetry.service >/dev/null || fail "ben-telemetry inactif après start"
-log "✓ façade active (ben-radio + ben-telemetry) · monolithe en fallback · mosquitto local"
+
+# ── 7. Façade CONFIRMÉE saine → RESTAURER l'escalade reboot (retrait du drop-in) ─
+log "[7/7] restauration de l'escalade reboot (façade saine)"
+sudo rm -f /etc/systemd/system/ben-radio.service.d/ota-cutover-no-reboot.conf
+sudo rmdir /etc/systemd/system/ben-radio.service.d 2>/dev/null || true
+sudo systemctl daemon-reload || fail "daemon-reload (restore escalade)"
+
+log "✓ façade active (ben-radio + ben-telemetry) · monolithe en fallback · mosquitto local · escalade reboot armée"
 log "✓ update OK"
