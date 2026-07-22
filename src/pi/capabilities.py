@@ -31,11 +31,15 @@ DEVICE_JSON = os.environ.get("BEN_DEVICE_JSON", "/etc/ben-firmware/device.json")
 # ── Source de vérité : capability → service(s) systemd ────────────────────────
 # En CODE (pas dans le registre-data) : une capa peut mapper 0..N services, ou une
 # logique conditionnelle. `lora` (radio SX127x) n'a PAS de service dédié — c'est du
-# HW utilisé par les services des capas `kind: lora` (ex. ben-lora-receiver pour
-# lora-tic-receiver). Étendre ici quand on ajoute une capability.
+# HW utilisé par les services des capas `kind: lora`. Étendre ici quand on ajoute une capability.
+#
+# 0.9.0 : `lora-tic-receiver` = façade radio DÉCOUPLÉE en 2 services (via bus MQTT local) au lieu
+# du monolithe `ben-lora-receiver` : ben-radio (seul maître RFM95, RX/TX + LED) + ben-telemetry
+# (décode/stocke, sans radio). Résout le SPI-freeze quand on émettait une commande (cf.
+# docs/canal-commande-lora-descendant.md). L'ORDRE compte : ben-radio d'abord (possède le GPIO).
 CAP_SERVICES = {
     "tic-uart":          ["ben-tic-reader.service"],
-    "lora-tic-receiver": ["ben-lora-receiver.service"],
+    "lora-tic-receiver": ["ben-radio.service", "ben-telemetry.service"],   # ex-ben-lora-receiver (monolithe)
     "lora":              [],   # radio SX127x — HW partagé, pas de service dédié
     "rgb-led-indicator": [],   # LED RGB — HW partagé (check_network, ben-led-release, readers)
     # à venir : "pilot-wire": ["ben-pilot-wire.service"], "lora-plug": [...], ...

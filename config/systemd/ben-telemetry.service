@@ -1,0 +1,20 @@
+[Unit]
+Description=BEN Telemetry — décode LoRa + stockage (consomme ben/lora/rx)
+After=basic.target mosquitto.service
+Wants=mosquitto.service
+
+[Service]
+Type=simple
+User=ben
+# WorkingDirectory writable par `ben` : cohérence + accès base /var/lib/ben-firmware.
+# (Pas de GPIO ici — la radio et la LED sont à ben-radio.)
+WorkingDirectory=/opt/ben/repo/src/pi/ben-telemetry
+ExecStart=/usr/bin/python3 /opt/ben/repo/src/pi/ben-telemetry/ben_telemetry.py
+Restart=always
+RestartSec=10
+
+# PAS de WatchdogSec ni StartLimitAction=reboot : un crash de la télémétrie (décode/DB) ne doit
+# PAS rebooter le Pi (contrairement à la radio). Simple Restart=always. Le décode est sans état
+# radio → un restart repart proprement (état indexes/seq persisté).
+
+# PAS d'[Install]/WantedBy : démarré par ben-network-check.service (comme les autres services BEN).

@@ -234,25 +234,54 @@ def encode_boot(key: bytes, *, boot_count: int, msg_count: int, tlvs, encrypt: b
 # --------------------------------------------------------------------------- #
 # Decode                                                                       #
 # --------------------------------------------------------------------------- #
-def decode(payload: bytes, key: bytes) -> dict:
-    """Vérifie le MAC et décode une trame (BOOT ou COURBE). Lève FrameError si invalide."""
+def _verify_decrypt(payload: bytes, key: bytes):
+    """Cœur 'secure-link' MONTANT : vérifie le MAC (lève FrameError) + déchiffre le corps si bit7.
+    Renvoie (ver, encrypted, boot_count, msg_count, body_clair)."""
     if len(payload) < HEADER_LEN + MAC_LEN:
         raise FrameError(f"trame trop courte ({len(payload)} o)")
     k_enc, k_mac = derive_keys(key)
     signed_part, mac = payload[:-MAC_LEN], payload[-MAC_LEN:]
     if not hmac.compare_digest(_mac(k_mac, signed_part), mac):
         raise FrameError("MAC invalide")
-
     ver = payload[0]
     encrypted = bool(ver & FLAG_ENC)
-    ftype = ver & 0x7F
     boot_count = int.from_bytes(payload[1:4], "little")
     msg_count = int.from_bytes(payload[4:7], "little")
-
     body = payload[HEADER_LEN:-MAC_LEN]
     if encrypted:                                    # MAC déjà vérifié (encrypt-then-MAC)
         body = _chacha20(k_enc, _nonce(boot_count, msg_count), body)
+    return ver, encrypted, boot_count, msg_count, body
 
+
+def open_frame(payload: bytes, key: bytes) -> bytes:
+    """MONTANT façade : vérifie le MAC + déchiffre → renvoie la trame EN CLAIR (header avec bit7
+    retiré + corps déchiffré, SANS MAC). Lève FrameError si MAC invalide. `ben-radio` publie ce
+    clair sur le bus ; le consommateur (`ben-telemetry`) fait parse() — plus de clé côté conso."""
+    ver, _enc, boot_count, msg_count, body = _verify_decrypt(payload, key)
+    header = struct.pack("<B", ver & 0x7F) + boot_count.to_bytes(3, "little") + msg_count.to_bytes(3, "little")
+    return header + body
+
+
+def parse(clear: bytes) -> dict:
+    """Parse une trame DÉJÀ EN CLAIR (MAC vérifié + déchiffré en amont par open_frame). PAS de clé."""
+    if len(clear) < HEADER_LEN:
+        raise FrameError(f"trame claire trop courte ({len(clear)} o)")
+    ver = clear[0]
+    return _parse_body(ver & 0x7F, bool(ver & FLAG_ENC),
+                       int.from_bytes(clear[1:4], "little"),
+                       int.from_bytes(clear[4:7], "little"),
+                       clear[HEADER_LEN:])
+
+
+def decode(payload: bytes, key: bytes) -> dict:
+    """Vérifie le MAC + déchiffre + parse (BOOT/COURBE). Lève FrameError si invalide. Conservé
+    pour compat (main.py fallback, tests) ; la façade radio utilise open_frame()+parse()."""
+    ver, encrypted, boot_count, msg_count, body = _verify_decrypt(payload, key)
+    return _parse_body(ver & 0x7F, encrypted, boot_count, msg_count, body)
+
+
+def _parse_body(ftype: int, encrypted: bool, boot_count: int, msg_count: int, body: bytes) -> dict:
+    """Parse le CORPS (déjà en clair) d'une trame BOOT/COURBE → dict. Partagé par decode() et parse()."""
     out = {"type": ftype, "encrypted": encrypted,
            "boot_count": boot_count, "msg_count": msg_count}
 

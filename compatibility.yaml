@@ -11,7 +11,7 @@ devices:
   pi0-lora:             # Arduino Pro Mini (TIC reader) + Raspberry Pi Zero W (LoRa receiver + publisher)
     rev01:
       pi:
-        latest: "0.8.7"
+        latest: "0.9.0"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -211,7 +211,7 @@ devices:
   pi0-wired:            # Raspberry Pi Zero W only (direct TIC reader + publisher)
     rev01:
       pi:
-        latest: "0.8.7"
+        latest: "0.9.0"
         history:
           - version: "0.0.1"
             released: "2026-05-30"
@@ -824,3 +824,7 @@ updates_caps:
     to:   "0.8.7"
     tag:  "pi-0.8.7"
     script: "updates/0.8.6_to_0.8.7/update.sh"   # « Au revoir » au désappairage : /unprovision fait 3 flashs VIOLETS sur la LED RGB juste avant le poweroff (signal clair de départ). local_api._unprovision stoppe désormais les readers TOUJOURS (libère les pins LED + ferme la base) puis flash. Redémarre ben-local-api (tous modèles). Effet au prochain /unprovision.
+  - from: "0.8.7"
+    to:   "0.9.0"
+    tag:  "pi-0.9.0"
+    script: "updates/0.8.7_to_0.9.0/update.sh"   # FAÇADE RADIO : découpe le monolithe ben-lora-receiver en ben-radio (seul maître RFM95 : RX/TX + LED + watchdogs, escalade reboot réactivée) + ben-telemetry (décode/vérifie/stocke, sans radio) reliés par un bus MQTT LOCAL (mosquitto, 127.0.0.1, persistence off → zéro écriture SD). Résout le SPI-freeze/Oops noyau qu'on provoquait en stoppant le récepteur pour émettre une commande. Apporte le canal de commande DESCENDANT chiffré (volets, secure_link) + dérivation de clé PAR-DEVICE (registre /etc/ben-firmware/devices.yaml) + adresse LoRa en EEPROM (1 binaire/type). Topic LED transverse → ben/led. update.sh GATED (has lora-tic-receiver → no-op sur wired pur) : install mosquitto + ben.conf + les 2 units + /var/lib/ben-firmware + seed registre + stop monolithe + start façade. Monolithe conservé en fallback. Cf. docs/canal-commande-lora-descendant.md.

@@ -1,0 +1,30 @@
+[Unit]
+Description=BEN Radio — façade RFM95 (RX/TX ↔ MQTT)
+After=basic.target mosquitto.service
+Wants=mosquitto.service
+# Escalade reboot (radio figée / Oops noyau → seul un reboot clear l'IRQ) : NÉCESSAIRE en prod
+# (incident ben-0001 10/07). Réactivée pour la 0.9.0 (code stabilisé) — ISO monolithe. Les restarts
+# du watchdog SILENCE sont espacés ≥5 min (backoff persisté) → ne déclenchent JAMAIS 3-en-300 s ;
+# seul un crash-loop RAPIDE (oops → init radio KO) escalade au reboot. Compromis assumé (= monolithe) :
+# un bug de code crash-loopant reboote aussi.
+StartLimitIntervalSec=300
+StartLimitBurst=3
+StartLimitAction=reboot
+
+[Service]
+Type=simple
+# WATCHDOG=1 envoyé par le process (self-test radio) → NotifyAccess=main pour l'accepter.
+NotifyAccess=main
+User=ben
+# WorkingDirectory writable par `ben` : rpi-lgpio crée un FIFO relatif `.lgd-nfy*` dans le CWD
+# (ben-radio possède le GPIO : LED + RST radio). Sans ça → FileNotFoundError → crash-loop.
+WorkingDirectory=/opt/ben/repo/src/pi/ben-radio
+ExecStart=/usr/bin/python3 /opt/ben/repo/src/pi/ben-radio/ben_radio.py
+Restart=always
+RestartSec=10
+# Le process pingue sd_notify(WATCHDOG=1) tant que le self-test radio passe. S'il cesse (radio
+# figée), systemd restart après WatchdogSec (> intervalle ping 30 s).
+WatchdogSec=90
+
+# PAS d'[Install]/WantedBy : démarré par ben-network-check.service quand le réseau est up
+# (même pattern que l'ancien récepteur). mosquitto doit être up (After/Wants ci-dessus).

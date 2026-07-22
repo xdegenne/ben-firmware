@@ -177,6 +177,8 @@
 #define HMAC_KEY_ADDR 0x00
 #define HMAC_KEY_LEN  32
 #define MODE_ADDR     0x20   // mode TIC auto-détecté persisté (reboot rapide)
+#define LORA_ADDR_ADDR 0x21  // adresse LoRa du device (1 octet) — provisionnée en EEPROM (1 seul
+                             // binaire pour tous les émetteurs). 0xFF/0x00 (EEPROM vierge) → défaut CLIENT_ADDRESS.
 #define BOOT_COUNT_ADDR 0x30 // compteur de boot (3 octets EEPROM) — nonce format cible + reboot
 
 // ---------------------------------------------------------------------------
@@ -431,6 +433,13 @@ static void readKeyFromEEPROM(uint8_t *key) {
   for (uint8_t i = 0; i < HMAC_KEY_LEN; i++) {
     key[i] = EEPROM.read(HMAC_KEY_ADDR + i);
   }
+}
+
+// Adresse LoRa provisionnée en EEPROM (1 seul binaire pour tous les émetteurs).
+// EEPROM vierge (0xFF) ou non provisionnée (0x00) → défaut CLIENT_ADDRESS (compat émetteur historique).
+static uint8_t loraAddrFromEEPROM() {
+  uint8_t a = EEPROM.read(LORA_ADDR_ADDR);
+  return (a == 0xFF || a == 0x00) ? CLIENT_ADDRESS : a;
 }
 
 static void writeKeyToEEPROM(const uint8_t *key) {
@@ -985,6 +994,7 @@ void setup() {
   digitalWrite(RFM95_RST, HIGH); delay(10);
 
   if (manager.init()) {
+    manager.setThisAddress(loraAddrFromEEPROM());   // adresse provisionnée EEPROM (override le défaut du constructeur)
     driver.setFrequency(RF95_FREQ);
     driver.setTxPower(RF95_TXPOWER, false);  // 20 dBm — supercap 0.47F requis (pic ~120 mA)
     // SF9 BW125 — pas de constante RadioHead pour cette combinaison.

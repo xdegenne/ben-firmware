@@ -53,9 +53,11 @@ echo "[1/13] Arguments: $DEVICE_ID  model=$MODEL  hw=$HW_REV"
 # 2. Install system dependencies + locale
 # --------------------------------------------------------------------------
 apt-get update -qq
-apt-get install -y git python3 python3-pip python3-dbus python3-gi
+# mosquitto : broker MQTT LOCAL du bus façade radio (ben-radio ↔ ben-telemetry). Inoffensif
+# (idle) sur un modèle wired ; requis dès qu'il y a la capability lora-tic-receiver.
+apt-get install -y git python3 python3-pip python3-dbus python3-gi mosquitto
 timedatectl set-timezone Europe/Paris
-echo "[2/13] System dependencies installed (incl. BLE provisioning deps), timezone=Europe/Paris"
+echo "[2/13] System dependencies installed (incl. BLE provisioning + mosquitto), timezone=Europe/Paris"
 
 # --------------------------------------------------------------------------
 # 2b. Configure UART (models with wired TIC) + LED RGB boot indicator
@@ -261,6 +263,12 @@ echo "[12/13] Hostname renamed: $DEVICE_ID"
 # --------------------------------------------------------------------------
 systemctl enable ben-update.timer
 systemctl start  ben-update.timer
+
+# Broker MQTT LOCAL (bus façade radio ben-radio ↔ ben-telemetry) — 127.0.0.1, persistence off
+# (zéro écriture SD). Ordering au boot géré par After=/Wants=mosquitto dans ben-radio.service.
+install -m 644 "$REPO_PATH/config/mosquitto/ben.conf" /etc/mosquitto/conf.d/ben.conf
+systemctl enable mosquitto
+systemctl restart mosquitto || true
 
 # Libération des pins LED RGB (12/13/16) du firmware au boot, avant tous les
 # autres services BEN. Sans ça check_network rate son PWM setup.
