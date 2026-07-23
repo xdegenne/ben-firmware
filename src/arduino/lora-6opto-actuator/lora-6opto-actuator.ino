@@ -1,6 +1,13 @@
-// bensat.ino — satellite VOLET (1-3). Corps=[volet,action]. Impulsion NON-BLOQUANTE (millis).
+// lora-6opto-actuator.ino — actuateur BEN "actuator-01".
+//   PREND : une commande LoRa DESCENDANTE scellée (chiffrée + MAC), corps [cible, action].
+//   FAIT  : pulse une des 6 sorties OPTO (3 cibles × 2 sens ouvre/ferme) pour tapoter le moteur
+//           (tap start/stop, impulsion NON-BLOQUANTE millis()).
+//   CAS D'USAGE ACTUEL : commande de VOLETS ROULANTS (volets 1-3, ouvre/ferme). Le nom reste
+//           générique (actuateur 6-opto) car l'abstraction ne se limite pas aux volets.
 // Clé K_DEVICE lue en EEPROM (0x00, 32 o) — provisionnée par avrdude (dérivée par-device).
-// LED : boot=bleu bref. Reception valide = VERT -> N blinks (couleur action)=n volet -> ordre.
+// LED : boot=bleu bref. Commande valide -> couleur d'action fixe (orange=ouvre / bleu=ferme)
+// pendant le pulse. File FIFO : les commandes sont sérialisées (chacune son tap complet de 500ms
+// + gap), même reçues en rafale ; réception continue pendant un pulse (non-bloquant).
 #include <SPI.h>
 #include <RH_RF95.h>
 #include <RHReliableDatagram.h>
@@ -8,6 +15,7 @@
 #include <SHA256.h>
 #include <EEPROM.h>
 #include <string.h>
+#include <avr/wdt.h>
 #define RFM95_CS 10
 #define RFM95_INT 2
 #define RFM95_RST 9
@@ -30,6 +38,15 @@ SHA256 sha256;
 static uint8_t K_DEVICE[32];         // lue depuis l'EEPROM au boot (agnostique à la clé → re-key sans reflash)
 uint32_t last_hi=0,last_lo=0; bool have_last=false;
 uint8_t active_pin=0; unsigned long pulse_end=0;   // impulsion en cours (non-bloquante)
+// File FIFO de commandes : sérialise les pulses (chacun son tap complet), même en rafale.
+#define QLEN 8
+#define GAP_MS 150                                 // gap inter-pulse (taps distincts pour le moteur)
+static uint8_t q_volet[QLEN], q_action[QLEN], q_head=0, q_tail=0, q_count=0;
+static unsigned long next_ready=0;                 // millis() mini pour démarrer le prochain (gap)
+// Self-test radio : un soft-hang du RFM95 ne bloque PAS la loop (elle tourne, radio sourde) → le
+// WDT MCU seul est aveugle. On lit REG_VERSION (0x42 doit valoir 0x12) périodiquement (comme le Pi).
+#define RADIOCHECK_MS 30000
+static unsigned long next_radiocheck=0;
 static inline uint32_t rotl32(uint32_t x,int n){return (x<<n)|(x>>(32-n));}
 #define CHACHA_QR(a,b,c,d) a+=b;d^=a;d=rotl32(d,16);c+=d;b^=c;b=rotl32(b,12);a+=b;d^=a;d=rotl32(d,8);c+=d;b^=c;b=rotl32(b,7);
 #define CHACHA_LE32(p) ((uint32_t)(p)[0]|((uint32_t)(p)[1]<<8)|((uint32_t)(p)[2]<<16)|((uint32_t)(p)[3]<<24))
@@ -46,17 +63,21 @@ static void chacha20_xor(const uint8_t* key,const uint8_t* nonce,uint8_t* buf,ui
 }
 static void setRGB(uint8_t r,uint8_t g,uint8_t b){analogWrite(RGB_R,r);analogWrite(RGB_G,g);analogWrite(RGB_B,b);}
 static void blinkN(uint8_t n,uint8_t r,uint8_t g,uint8_t b){for(uint8_t i=0;i<n;i++){setRGB(r,g,b);delay(220);setRGB(0,0,0);delay(220);}}
-static void doVolet(uint8_t volet,uint8_t action){
-  if(volet<1||volet>NVOLETS||(action!=1&&action!=2)){
-    Serial.print(F("  invalide v="));Serial.print(volet);Serial.print(F(" a="));Serial.println(action);
-    blinkN(2,80,40,0); return;
-  }
+static void startPulse(uint8_t volet,uint8_t action){   // démarre le tap (appelé UNIQUEMENT quand idle)
   uint8_t pin=(action==1)?OUVRE[volet-1]:FERME[volet-1];
   uint8_t r,g,b; if(action==1){r=255;g=180;b=0;}else{r=0;g=0;b=255;}
   Serial.print(F("  VOLET "));Serial.print(volet);Serial.println(action==1?F(" OUVRE"):F(" FERME"));
-  if(active_pin){ digitalWrite(active_pin,LOW); active_pin=0; }   // termine une impulsion en cours
-  setRGB(r,g,b);                                                  // couleur d'action FIXE (pas de blinks bloquants)
+  setRGB(r,g,b);                                                  // couleur d'action FIXE
   digitalWrite(pin,HIGH); active_pin=pin; pulse_end=millis()+PULSE_MS;   // NON-BLOQUANT (fin dans loop)
+}
+static void enqueueCmd(uint8_t volet,uint8_t action){  // enfile ; la loop dépile (sérialise, jamais de préemption)
+  if(volet<1||volet>NVOLETS||(action!=1&&action!=2)){
+    Serial.print(F("  invalide v="));Serial.print(volet);Serial.print(F(" a="));Serial.println(action);return;
+  }
+  if(q_count>=QLEN){ Serial.println(F("  FILE PLEINE -> drop")); return; }
+  q_volet[q_tail]=volet; q_action[q_tail]=action; q_tail=(q_tail+1)%QLEN; q_count++;
+  Serial.print(F("  enfile v"));Serial.print(volet);Serial.print(action==1?F(" OUVRE"):F(" FERME"));
+  Serial.print(F(" file="));Serial.println(q_count);
 }
 static void handleFrame(uint8_t* frame,uint8_t flen){
   if(flen<17){Serial.println(F("  courte"));return;}
@@ -73,22 +94,27 @@ static void handleFrame(uint8_t* frame,uint8_t flen){
     chacha20_xor(k_enc,nonce,frame+7,flen-7-8);
   }
   Serial.println(F("RX OK"));
-  setRGB(0,255,0); delay(80);                               // flash vert bref = reçu (bloque ~80 ms seulement)
-  doVolet(frame[7],frame[8]);
+  enqueueCmd(frame[7],frame[8]);   // enfile (démarrage géré par la loop) → RX 100% non-bloquant
+}
+static bool radioReset(){   // RST matériel + init + (ré)config — utilisé au boot ET par le self-test
+  pinMode(RFM95_RST,OUTPUT);
+  digitalWrite(RFM95_RST,HIGH);delay(10);digitalWrite(RFM95_RST,LOW);delay(10);digitalWrite(RFM95_RST,HIGH);delay(10);
+  if(!manager.init()) return false;
+  { uint8_t a=EEPROM.read(LORA_ADDR_ADDR); manager.setThisAddress((a==0xFF||a==0x00)?MY_ADDRESS:a); }  // adresse EEPROM
+  driver.setFrequency(RF95_FREQ);driver.setTxPower(RF95_TXPOWER,false);
+  static const RH_RF95::ModemConfig SF9={0x72,0x94,0x00};driver.setModemRegisters(&SF9);
+  return true;
 }
 void setup(){
   pinMode(RGB_R,OUTPUT);pinMode(RGB_G,OUTPUT);pinMode(RGB_B,OUTPUT);
   for(uint8_t i=0;i<NVOLETS;i++){pinMode(OUVRE[i],OUTPUT);digitalWrite(OUVRE[i],LOW);pinMode(FERME[i],OUTPUT);digitalWrite(FERME[i],LOW);}
   setRGB(0,0,0);
   for(uint8_t i=0;i<32;i++) K_DEVICE[i]=EEPROM.read(i);       // clé provisionnée en EEPROM (0x00)
-  Serial.begin(9600);Serial.println(F("=== satellite VOLET 0x2a @868 (v1-3, EEPROM-key, non-bloquant) ==="));
-  pinMode(RFM95_RST,OUTPUT);digitalWrite(RFM95_RST,HIGH);delay(10);digitalWrite(RFM95_RST,LOW);delay(10);digitalWrite(RFM95_RST,HIGH);delay(10);
-  if(manager.init()){
-    { uint8_t a=EEPROM.read(LORA_ADDR_ADDR); manager.setThisAddress((a==0xFF||a==0x00)?MY_ADDRESS:a); }  // adresse EEPROM (override défaut)
-    driver.setFrequency(RF95_FREQ);driver.setTxPower(RF95_TXPOWER,false);
-    static const RH_RF95::ModemConfig SF9={0x72,0x94,0x00};driver.setModemRegisters(&SF9);
+  Serial.begin(9600);Serial.println(F("=== actuator-01 (lora-6opto) 0x2a @868 (cibles 1-3, EEPROM-key, file+watchdog) ==="));
+  if(radioReset()){
     Serial.println(F("LoRa OK @868"));setRGB(0,0,80);delay(300);setRGB(0,0,0);   // boot = bleu bref
   } else {Serial.println(F("LoRa FAIL"));blinkN(3,255,0,0);}
+  wdt_enable(WDTO_8S);   // filet MCU ; le self-test radio (loop) couvre le soft-hang RFM95
 }
 void loop(){
   if(manager.available()){
@@ -98,5 +124,21 @@ void loop(){
   // fin d'impulsion NON-BLOQUANTE : le satellite reste à l'écoute pendant l'impulsion
   if(active_pin && (long)(millis()-pulse_end)>=0){
     digitalWrite(active_pin,LOW); active_pin=0; setRGB(0,0,0);
+    next_ready=millis()+GAP_MS;                     // impose un gap avant la commande suivante
   }
+  // dépile la commande suivante quand idle ET gap écoulé (chaque tap complet, taps distincts)
+  if(!active_pin && q_count>0 && (long)(millis()-next_ready)>=0){
+    uint8_t v=q_volet[q_head], a=q_action[q_head]; q_head=(q_head+1)%QLEN; q_count--;
+    startPulse(v,a);
+  }
+  // Self-test radio : REG_VERSION (0x42) doit valoir 0x12 ; sinon RFM95 figé → re-init en place
+  // (garde file + anti-rejeu). Si la re-init échoue → on laisse le WDT resetter le MCU (fallback dur).
+  if((long)(millis()-next_radiocheck)>=0){
+    next_radiocheck=millis()+RADIOCHECK_MS;
+    if(driver.spiRead(0x42)!=0x12){
+      Serial.println(F("RADIO FIGEE -> re-init"));
+      if(!radioReset()){ Serial.println(F("re-init KO -> WDT reset")); while(1){} }  // plus de wdt_reset → reset 8s
+    }
+  }
+  wdt_reset();   // ré-armé chaque tour (la loop ne bloque jamais > 8s hors fallback volontaire)
 }
