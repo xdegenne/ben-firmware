@@ -90,7 +90,7 @@
 // ---------------------------------------------------------------------------
 #define PROTOCOL_VERSION_BOOT  0x01   // trame d'identité (ADCO)
 #define PROTOCOL_VERSION_CURVE 0x05   // trame courbe batchée (v0x05 : dt par point)
-#define FW_VERSION             "0.1.3"   // 0.1.3 : FIX trame boot dans buffer GLOBAL curveBuf (le buffer pile buf[64] débordait pendant le ChaCha et corrompait l ACK -> gate bloquée). 0.1.2 : découplage émetteur↔récepteur (incident ben-0001 09/07). setTimeout 600ms + setRetries 1. MACHINE À ÉTATS REGISTERING/STREAMING : tant que la trame de boot (petit paquet = probe de vivacité) n'est pas ACK, AUCUNE mesure émise ; retry boot à la cadence batch (v frais) ; mesure non-ACK → retour REGISTERING. Base 0.1.0 : garde histo tolérante + IINST 2e courbe + flush 55s + chiffrement ChaCha20 + logging aligné
+#define FW_VERSION             "0.1.4"   // 0.1.4 : APP_ACK_MS 800→2000 ms (Pi Zero chargé : crypto Python > 800 ms → l'émetteur ratait l'ACK → boots en boucle + flashs blancs discovery côté central). 0.1.3 : FIX trame boot dans buffer GLOBAL curveBuf (le buffer pile buf[64] débordait pendant le ChaCha et corrompait l ACK -> gate bloquée). 0.1.2 : découplage émetteur↔récepteur (incident ben-0001 09/07). setTimeout 600ms + setRetries 1. MACHINE À ÉTATS REGISTERING/STREAMING : tant que la trame de boot (petit paquet = probe de vivacité) n'est pas ACK, AUCUNE mesure émise ; retry boot à la cadence batch (v frais) ; mesure non-ACK → retour REGISTERING. Base 0.1.0 : garde histo tolérante + IINST 2e courbe + flush 55s + chiffrement ChaCha20 + logging aligné
 #define BOOT_PAYLOAD_LEN       20     // v0x01 : version + ADCO(12) + ISOUSC + PREF, padding jusqu'à 20 (rétro)
 #define BOOT_MAX_LEN           64     // format cible : header(7) + TLV (ADCO/ISOUSC/PREF/CONTRAT) + MAC(8)
 
@@ -114,7 +114,8 @@
 #define T_MSG1    0x40
 #define T_MSG2    0x41
 #define HMAC_LEN                8
-#define APP_ACK_MS            800   // attente de l'ACK APPLICATIF crypto-vérifié après le boot
+#define APP_ACK_MS            2000  // attente de l'ACK APPLICATIF crypto-vérifié après le boot (Pi Zero
+                                    // chargé : déchiffrement ChaCha+HMAC Python peut dépasser 800 ms → 2 s de marge)
 
 // Courbe v0x04
 // CURVE_BUF_LEN dimensionné pour l'HISTORIQUE v1 (flush ~60 s ≈ 30 éch. ≈ ~110 o).
@@ -993,6 +994,27 @@ void curveFlush() {
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
+// --- DIAG PILE (temporaire, à RETIRER après mesure — flash à 97 %) -----------------------------
+// Peint la RAM libre avec 0xC5 au boot, puis compte les 0xC5 restants (= pile libre MINI jamais
+// atteinte, high-water mark) et l'écrit en EEPROM 0x40 (2 o LE, lisible via avrdude). free=0 → la
+// pile a atteint les globals = DÉBORDEMENT. Garde le pire mini across reboots.
+#define STACK_HW_ADDR 0x40
+extern char __heap_start;
+extern char *__brkval;
+static uint8_t* freeBottom() {   // vrai bas de la RAM libre = haut du heap (ou heap_start si pas de malloc)
+  return (uint8_t*)(__brkval == 0 ? (uint16_t)&__heap_start : (uint16_t)__brkval);
+}
+static void paintStack() {
+  uint8_t here;
+  for (uint8_t *p = freeBottom(); p < &here; p++) *p = 0xC5;
+}
+static void reportStackHW() {
+  uint16_t f = 0;
+  for (uint8_t *p = freeBottom(); *p == 0xC5; p++) f++;   // 0xC5 restants depuis le haut du heap = pile libre mini
+  uint16_t prev = (uint16_t)EEPROM.read(STACK_HW_ADDR) | ((uint16_t)EEPROM.read(STACK_HW_ADDR + 1) << 8);
+  if (f < prev) { EEPROM.update(STACK_HW_ADDR, f & 0xFF); EEPROM.update(STACK_HW_ADDR + 1, (f >> 8) & 0xFF); }
+}
+// -----------------------------------------------------------------------------------------------
 void setup() {
   pinMode(TIC_OUT, OUTPUT); digitalWrite(TIC_OUT, LOW);
   pinMode(RGB_R,   OUTPUT);
@@ -1048,6 +1070,7 @@ void setup() {
   } else {
     ledLoraKO();
   }
+  paintStack();          // DIAG PILE : peint la RAM libre pour mesurer le high-water
   wdt_enable(WDTO_8S);
 }
 
@@ -1059,6 +1082,7 @@ void setup() {
 // On lit TOUTES les trames et on accumule la courbe ; flush par batch (§17).
 void loop() {
   wdt_enable(WDTO_8S);  // ré-armé chaque tour ; readTIC() fait wdt_reset() pendant la lecture
+  reportStackHW();      // DIAG PILE : maj du high-water (mini pile libre) en EEPROM 0x40
 
   bool vok = isVoltageSufficient();   // ADC seul, plus d'impression (UART TIC laissé ouvert)
   if (!vok) {
