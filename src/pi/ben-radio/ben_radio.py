@@ -363,7 +363,9 @@ def on_recv(payload) -> None:
     last_frame_time = time.time()
     silence_restarts = 0
     save_silence_state()
-    blink_rgb(8, 8, 0, 0.03)   # flash RF (radio-level) : "trame reçue"
+    # NB : le flash RF est déplacé APRÈS send_app_ack (fin de fonction). blink_rgb fait sleep()
+    # sous _led_lock ; un blink en cours (ex. blanc discovery de ben-telemetry) le tiendrait, et
+    # ce flash bloquerait alors l'ACK applicatif → l'émetteur raterait sa fenêtre. L'ACK d'abord.
 
     if not (RSSI_MIN_PLAUSIBLE <= rssi <= RSSI_MAX_PLAUSIBLE and SNR_MIN_PLAUSIBLE <= snr <= SNR_MAX_PLAUSIBLE):
         log.warning(f"signal invraisemblable rssi={rssi} snr={snr} (bruit ?)")

@@ -339,8 +339,26 @@ def on_recv_boot(decoded, rssi, snr, pdl_index) -> None:
                     log.info(f"CONTRAT={ngtf!r} pdl_index={pdl_index}")
             except Exception as e:
                 log.warning(f"store: record_ngtf échoué: {e}")
+        # PAPP instantané dans le boot → mesure IMMÉDIATE (conso affichée dès le 1er boot, AVANT
+        # tout streaming courbe → unboxing rapide). Une ligne papp-seul (index/base/hchc/hchp NULL) :
+        # `/live` la prend (dernier point), exclue des agrégations d'index. src_standard déduit du
+        # boot : PREF=standard (papp net signé), ISOUSC=historique. Marche en histo ET std.
+        papp_raw = tlvs.get(frame_codec.T_PAPP)
+        if papp_raw is not None:
+            papp = frame_codec.interpret_tlv(frame_codec.T_PAPP, papp_raw)
+            src_std = 1 if frame_codec.T_PREF in tlvs else 0
+            labels = {"PAPP": papp, "_src_standard": src_std}
+            iinst_raw = tlvs.get(frame_codec.T_IINST)   # histo : PAPP=0 en injection → 230×IINST = production
+            if iinst_raw is not None:
+                labels["IINST"] = frame_codec.interpret_tlv(frame_codec.T_IINST, iinst_raw)
+            try:
+                db.record_measurement(measurements_db, pdl_index, labels)
+                log.info(f"PAPP boot={papp} VA IINST={labels.get('IINST')} (src_standard={src_std}) "
+                         f"pdl_index={pdl_index} → measurement instantané (unboxing)")
+            except Exception as e:
+                log.warning(f"store: record_measurement (boot papp) échoué: {e}")
     log_uncabled(pdl_index, tlvs)                    # TLV connus non stockés → INFO on-change
-    blink_rgb(30, 30, 30, 2.0)   # blanc long = discovery
+    blink_rgb(30, 30, 30, 0.2)   # blanc bref = discovery (0.2s : ne bloque plus l'ACK applicatif — cf. bug blink)
 
 
 def on_recv_curve(decoded, rssi, snr, pdl_index, now, time_since_prev) -> None:

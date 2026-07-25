@@ -33,6 +33,8 @@ T_ADCO = 0x01
 T_ISOUSC = 0x02
 T_PREF = 0x03
 T_CONTRAT = 0x04
+T_PAPP = 0x05    # PAPP instantané (int24 LE signé) dans le boot → conso dès le 1er boot (unboxing rapide)
+T_IINST = 0x06   # IINST instantané (uint16 LE) dans le boot → histo : PAPP=0 en injection, 230×IINST = production estimée
 T_EAIT = 0x10
 T_LTARF = 0x11
 T_DEMAIN = 0x20
@@ -387,12 +389,13 @@ def meter_timestamps(decoded: dict):
 # --------------------------------------------------------------------------- #
 TAG_NAMES = {
     T_ADCO: "ADCO", T_ISOUSC: "ISOUSC", T_PREF: "PREF", T_CONTRAT: "CONTRAT",
+    T_PAPP: "PAPP", T_IINST: "IINST",
     T_EAIT: "EAIT", T_LTARF: "LTARF", T_DEMAIN: "DEMAIN", T_NJOURF: "NJOURF",
     T_NJOURF1: "NJOURF+1", T_ADPS: "ADPS", T_PEJP: "PEJP", T_MSG1: "MSG1", T_MSG2: "MSG2",
 }
 # Tags déjà CÂBLÉS au stockage. Les autres tags CONNUS sont décodés + LOGUÉS (pas encore
 # stockés) → visibilité avant câblage (DEMAIN/ADPS/PEJP/NJOURF/MSG).
-TAG_STORED = {T_ADCO, T_ISOUSC, T_PREF, T_CONTRAT, T_EAIT, T_LTARF}
+TAG_STORED = {T_ADCO, T_ISOUSC, T_PREF, T_CONTRAT, T_PAPP, T_IINST, T_EAIT, T_LTARF}
 
 _TLV_STR = {T_ADCO, T_CONTRAT, T_LTARF, T_MSG1, T_MSG2}
 _TLV_U8 = {T_ISOUSC, T_PREF, T_DEMAIN, T_NJOURF, T_NJOURF1}
@@ -402,6 +405,10 @@ def interpret_tlv(tag: int, value: bytes):
     """Valeur typée d'un TLV connu (str / int / présence) ; octets bruts sinon."""
     if tag in _TLV_STR:
         return value.decode("ascii", "replace").strip()
+    if tag == T_PAPP:
+        return _unpack_i24(value, signed=True)     # PAPP int24 LE signé (std net : <0 = injection)
+    if tag == T_IINST:
+        return int.from_bytes(value, "little")     # IINST uint16 LE (histo : 230×IINST = production si PAPP=0)
     if tag == T_EAIT:
         return int.from_bytes(value, "little")
     if tag in _TLV_U8:

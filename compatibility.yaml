@@ -60,3 +60,7 @@ updates_caps:
     to:   "0.9.2"
     tag:  "pi-0.9.2"
     script: "updates/0.9.1_to_0.9.2/update.sh"   # ACK applicatif crypto-vérifié des trames boot (anti cross-talk multi-logement) — cf. CHANGELOG 0.9.2. Pur code ben_radio.py. GATED lora-tic-receiver.
+  - from: "0.9.2"
+    to:   "0.9.3"
+    tag:  "pi-0.9.3"
+    script: "updates/0.9.2_to_0.9.3/update.sh"   # PAPP + IINST dans la trame de boot (conso dès le 1er boot → unboxing rapide ; histo : 230×IINST = production quand PAPP=0) + fix blink blanc BLOQUANT (retardait l'ACK applicatif → boucle de boots). Pur code frame_codec + ben_telemetry + ben_radio. GATED lora-tic-receiver.

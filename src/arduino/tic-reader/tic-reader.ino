@@ -90,7 +90,7 @@
 // ---------------------------------------------------------------------------
 #define PROTOCOL_VERSION_BOOT  0x01   // trame d'identité (ADCO)
 #define PROTOCOL_VERSION_CURVE 0x05   // trame courbe batchée (v0x05 : dt par point)
-#define FW_VERSION             "0.1.4"   // 0.1.4 : APP_ACK_MS 800→2000 ms (Pi Zero chargé : crypto Python > 800 ms → l'émetteur ratait l'ACK → boots en boucle + flashs blancs discovery côté central). 0.1.3 : FIX trame boot dans buffer GLOBAL curveBuf (le buffer pile buf[64] débordait pendant le ChaCha et corrompait l ACK -> gate bloquée). 0.1.2 : découplage émetteur↔récepteur (incident ben-0001 09/07). setTimeout 600ms + setRetries 1. MACHINE À ÉTATS REGISTERING/STREAMING : tant que la trame de boot (petit paquet = probe de vivacité) n'est pas ACK, AUCUNE mesure émise ; retry boot à la cadence batch (v frais) ; mesure non-ACK → retour REGISTERING. Base 0.1.0 : garde histo tolérante + IINST 2e courbe + flush 55s + chiffrement ChaCha20 + logging aligné
+#define FW_VERSION             "0.1.6"   // 0.1.6 : + IINST dans le boot (T_IINST) — histo : PAPP=0 en injection → 230×IINST = production estimée (unboxing producteur). 0.1.5 : PAPP dans le boot (T_PAPP, conso dès le 1er boot → unboxing rapide) + buffer-reuse vérif ACK (-32o pile). (diag pile CONSERVE). 0.1.4 : APP_ACK_MS 800→2000 ms (Pi Zero chargé : crypto Python > 800 ms → l'émetteur ratait l'ACK → boots en boucle + flashs blancs discovery côté central). 0.1.3 : FIX trame boot dans buffer GLOBAL curveBuf (le buffer pile buf[64] débordait pendant le ChaCha et corrompait l ACK -> gate bloquée). 0.1.2 : découplage émetteur↔récepteur (incident ben-0001 09/07). setTimeout 600ms + setRetries 1. MACHINE À ÉTATS REGISTERING/STREAMING : tant que la trame de boot (petit paquet = probe de vivacité) n'est pas ACK, AUCUNE mesure émise ; retry boot à la cadence batch (v frais) ; mesure non-ACK → retour REGISTERING. Base 0.1.0 : garde histo tolérante + IINST 2e courbe + flush 55s + chiffrement ChaCha20 + logging aligné
 #define BOOT_PAYLOAD_LEN       20     // v0x01 : version + ADCO(12) + ISOUSC + PREF, padding jusqu'à 20 (rétro)
 #define BOOT_MAX_LEN           64     // format cible : header(7) + TLV (ADCO/ISOUSC/PREF/CONTRAT) + MAC(8)
 
@@ -104,6 +104,8 @@
 #define T_ISOUSC  0x02
 #define T_PREF    0x03
 #define T_CONTRAT 0x04
+#define T_PAPP    0x05   // PAPP instantané (int24 LE signé) dans le boot → conso affichée dès le 1er boot (unboxing rapide)
+#define T_IINST   0x06   // IINST instantané (uint16 LE) dans le boot → histo : PAPP=0 en injection, 230×IINST = production estimée
 #define T_EAIT    0x10
 #define T_LTARF   0x11
 #define T_DEMAIN  0x20
@@ -782,7 +784,7 @@ static const char* contractOf(const TICValues& v) {
 // automatiquement ré-émise par la logique on-change au tour suivant, jusqu'à confirmation
 // (même robustesse que le LTARF de courbe). Sans ça, l'identité/config (ADCO/ISOUSC/PREF/
 // NGTF) reste inconnue du récepteur jusqu'au prochain reboot → jauge non calibrée, labels faux.
-bool sendBootFrame(const char* adco, uint8_t isousc, uint8_t pref, const char* ngtf) {
+bool sendBootFrame(const char* adco, uint8_t isousc, uint8_t pref, const char* ngtf, int32_t papp, uint16_t iinst) {
   uint8_t* buf = curveBuf;   // FIX 0.1.3 : buffer GLOBAL (le buffer pile debordait pendant frameSeal/ChaCha -> corruption ACK)
   msg_count++;                                       // nonce lo (+1 par trame émise)
   uint16_t pos = writeHeader(buf, TYPE_BOOT);        // [0-6] header clair
@@ -793,6 +795,10 @@ bool sendBootFrame(const char* adco, uint8_t isousc, uint8_t pref, const char* n
     uint8_t l = strlen(ngtf); if (l > 16) l = 16;
     pos = writeTLV(buf, pos, T_CONTRAT, (const uint8_t*)ngtf, l);
   }
+  { uint8_t pb[3] = { (uint8_t)papp, (uint8_t)(papp >> 8), (uint8_t)(papp >> 16) };   // PAPP int24 LE signé
+    pos = writeTLV(buf, pos, T_PAPP, pb, 3); }        // conso instantanée → /live dès le boot (unboxing)
+  if (iinst) { uint8_t ib[2] = { (uint8_t)iinst, (uint8_t)(iinst >> 8) };            // IINST uint16 LE (histo)
+    pos = writeTLV(buf, pos, T_IINST, ib, 2); }       // production estimée (230×IINST) quand PAPP=0 en injection
   uint16_t len = frameSeal(buf, pos, FRAME_ENCRYPT);   // chiffre (si activé) + MAC → longueur totale
 
   bool acked = false;
@@ -806,7 +812,7 @@ bool sendBootFrame(const char* adco, uint8_t isousc, uint8_t pref, const char* n
     if (manager.sendtoWait(buf, len, SERVER_ADDRESS)) {
       uint8_t ab[HMAC_LEN]; uint8_t al = sizeof(ab); uint8_t from;
       if (manager.recvfromAckTimeout(ab, &al, APP_ACK_MS, &from) && al >= HMAC_LEN) {
-        uint8_t dev[HMAC_KEY_LEN], km[HMAC_KEY_LEN], exp[32];
+        uint8_t dev[HMAC_KEY_LEN], km[HMAC_KEY_LEN];   // -32 o pile : `dev` réutilisé pour exp (libre après km)
         readKeyFromEEPROM(dev);
         sha256.resetHMAC(dev, HMAC_KEY_LEN);
         sha256.update((const uint8_t*)"ben-lora-mac", 12);
@@ -815,8 +821,8 @@ bool sendBootFrame(const char* adco, uint8_t isousc, uint8_t pref, const char* n
                           (uint8_t)msg_count,  (uint8_t)(msg_count >> 8),  (uint8_t)(msg_count >> 16) };
         sha256.resetHMAC(km, HMAC_KEY_LEN);
         sha256.update(n6, 6);
-        sha256.finalizeHMAC(km, HMAC_KEY_LEN, exp, 32);
-        acked = (memcmp(ab, exp, HMAC_LEN) == 0);   // registration CRYPTO-vérifiée
+        sha256.finalizeHMAC(km, HMAC_KEY_LEN, dev, 32);   // exp -> réutilise `dev` (plus nécessaire après km)
+        acked = (memcmp(ab, dev, HMAC_LEN) == 0);         // registration CRYPTO-vérifiée
       }
     }
     // Signal RECONNAISSABLE de registration : ACK crypto boot validé = triple pulse vert lent
@@ -1100,7 +1106,7 @@ void loop() {
     persistMode(ticMode);
     TICValues v0;                     // une trame du bon mode pour l'identité (ADCO/ADSC + ISOUSC)
     if (readAndParseTIC(v0, ticMode) && v0.adco[0] != 0) {
-      if (sendBootFrame(v0.adco, v0.isousc, v0.pref, contractOf(v0))) {
+      if (sendBootFrame(v0.adco, v0.isousc, v0.pref, contractOf(v0), pappValue(v0), v0.iinst)) {
         bootAcked = true;                    // enregistré → STREAMING
         lastSentIsousc = v0.isousc;
         lastSentPref = v0.pref;
@@ -1137,7 +1143,7 @@ void loop() {
       ((v.isousc != 0 && v.isousc != lastSentIsousc) ||
        (v.pref   != 0 && v.pref   != lastSentPref) ||
        (contractOf(v)[0] && strhash16(contractOf(v)) != lastSentNgtfHash))) {
-    if (sendBootFrame(v.adco, v.isousc, v.pref, contractOf(v))) {
+    if (sendBootFrame(v.adco, v.isousc, v.pref, contractOf(v), pappValue(v), v.iinst)) {
       lastSentIsousc = v.isousc;
       lastSentPref = v.pref;
       lastSentNgtfHash = strhash16(contractOf(v));
@@ -1198,7 +1204,7 @@ void loop() {
   // `v` FRAIS → identité/config toujours à jour, jamais un snapshot périmé. Le batch accumulé n'a
   // servi que d'horloge → on le jette (le récepteur n'est pas confirmé, la courbe serait perdue).
   if (!bootAcked && curveFlushPending) {
-    if (sendBootFrame(v.adco, v.isousc, v.pref, contractOf(v))) {
+    if (sendBootFrame(v.adco, v.isousc, v.pref, contractOf(v), pappValue(v), v.iinst)) {
       bootAcked = true;                      // enregistré → STREAMING au prochain point
       lastSentIsousc = v.isousc;
       lastSentPref = v.pref;

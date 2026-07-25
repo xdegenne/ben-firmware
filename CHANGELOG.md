@@ -18,6 +18,10 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.9.3] — 2026-07-25
+
+**Unboxing rapide (PAPP/IINST au boot) + fix blink blanc bloquant.** (1) L'émetteur (arduino ≥ 0.1.6) embarque **PAPP + IINST dans la trame de boot** ; `frame_codec` les décode (`T_PAPP` int24 signé, `T_IINST` uint16) et `ben-telemetry` insère une **mesure immédiate dès le boot** (`record_measurement`, index NULL) → `/live` affiche la conso **au 1ᵉʳ boot**, sans attendre le streaming courbe (~40 s). En **standard** la conso/injection sort direct (papp net signé) ; en **historique** PAPP=0 en injection → `IINST` porte la production estimée (230×IINST), comme la courbe. Ligne papp-seul exclue des agrégations d'index (pas de fausse énergie). (2) **Fix blink blanc BLOQUANT** : le blink « discovery » de `ben-telemetry` faisait `sleep(2.0 s)` sous `_led_lock` ; le flash RF de `on_recv` (ben-radio) bloquait dessus **AVANT** `send_app_ack` → l'ACC applicatif partait trop tard → l'émetteur ratait sa fenêtre → **boucle de boots + flashs blancs à répétition**. Fix : blanc **2.0 → 0.2 s** + flash RF déplacé **après** l'ACK. Pur code (frame_codec + ben_telemetry + ben_radio), rétro-compatible (émetteur < 0.1.6 inchangé). Restart ben-radio + ben-telemetry. Gated `lora-tic-receiver`.
+
 ### [0.9.2] — 2026-07-23
 
 **ACK applicatif crypto-vérifié des trames boot** (`ben-radio.send_app_ack`). Anti cross-talk multi-logement : plusieurs centrales partagent l'adresse LoRa serveur `0x20` et RadioHead ACK au niveau LIAISON toute trame adressée à `0x20` *avant* toute vérif de clé → une centrale voisine « volait » le boot et l'émetteur se croyait enregistré chez elle (il aurait émis ADCO/OPTARIF/abonnement à côté). Désormais la façade ne renvoie un ACK (`HMAC(K_mac, nonce)`) QUE si le MAC montant est valide (elle détient donc la clé du device), et cet ACK est lui-même un HMAC que seul le détenteur de la clé peut produire → l'émetteur (≥ arduino 0.1.3) ne s'enregistre QUE chez SA centrale. Purement code (`ben_radio.py`) : aucune dépendance/migration/unit. Rétro-compatible (émetteur < 0.1.3 non impacté). Validé multi-centrales (ben-0011 ACK / ben-0001 refus MAC), 2026-07-22. Gated `lora-tic-receiver`. ⚠️ Ordre : central 0.9.2 AVANT reflash émetteur 0.1.3.
@@ -299,6 +303,14 @@ log-only baseline (Influx stripped, hostname rename)
 first dev release (published, no devices in field)
 
 ## Émetteur Arduino (tic-reader)
+
+### [0.1.6] — 2026-07-25
+
+**PAPP + IINST dans le boot (unboxing) + chantier RAM (débordement de pile résolu) + APP_ACK_MS.**
+- **T_PAPP + T_IINST dans la trame de boot** : conso instantanée émise dès le boot → l'app affiche la conso au 1ᵉʳ contact (cf. pi-0.9.3 côté récepteur). Histo : IINST pour la production quand PAPP=0 en injection.
+- **Chantier RAM — débordement de pile CORRIGÉ.** Diagnostic mesuré (high-water via `__brkval`, écrit en EEPROM 0x40) : la pile débordait (0 o de marge, 111 reboots) pendant `frameSeal` — cause racine **RadioHead surdimensionné** (buffers 255 o pour des trames ≤130). Corrigé côté **lib RadioHead** (⚠️ patchs hors repo, à documenter) : `RH_RF95_MAX_PAYLOAD_LEN 255→160` (−95 o) + `_seenIds[256]→[64]` + masque `& 0x3F` (−192 o, dédup émetteur inutile). Plus **buffer-reuse** dans la vérif ACC (`dev`/`km`/`exp` : exp réutilise dev, −32 o pile). Marge finale : **0 → 64 o** en histo. Reste une **instrumentation pile temporaire** (paintStack/reportStackHW) à retirer.
+- **APP_ACK_MS 800 → 2000 ms** (0.1.4) : le Pi Zero chargé mettait > 800 ms à répondre (crypto Python) → l'émetteur ratait l'ACC applicatif. (Le vrai fix du blink bloquant est côté central pi-0.9.3.)
+- Reflash MANUEL (Pro Mini, pas d'OTA). Flash 97 % / marge pile ~64 o.
 
 ### [0.1.3] — 2026-07-23
 
