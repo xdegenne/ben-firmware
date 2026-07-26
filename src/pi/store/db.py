@@ -257,12 +257,22 @@ def tariff_from_ptec(ptec: str | None) -> int | None:
 
 # Libellés HISTORIQUE par rang PTEC (cf. tariff_from_ptec) — convention (l'histo ne porte
 # pas de LTARF). Le STANDARD, lui, a le LTARF autoritatif capté dans tariff_labels.
+# Les index 5-10 = registres BBR/Tempo (mêmes rangs que INDEX_NAMES de ben-telemetry). Le mot
+# « Creuses »/« Pleines » dans le libellé pilote _band_kind → couleur HC/HP de la courbe ET badge
+# live (sinon None → kind=base → aucune coloration). Le jour Tempo (Bleu/Blanc/Rouge) reste dans
+# le texte seul : le tricolore n'est pas rendu par l'app (chantier couleur Tempo séparé).
 HISTO_LABELS = {
     0: "Base",
     1: "Heures Creuses",
     2: "Heures Pleines",
     3: "EJP Heures Normales",
     4: "EJP Pointe Mobile",
+    5: "Heures Creuses Jours Bleus",    # BBRHCJB
+    6: "Heures Pleines Jours Bleus",    # BBRHPJB
+    7: "Heures Creuses Jours Blancs",   # BBRHCJW
+    8: "Heures Pleines Jours Blancs",   # BBRHPJW
+    9: "Heures Creuses Jours Rouges",   # BBRHCJR
+    10: "Heures Pleines Jours Rouges",  # BBRHPJR
 }
 
 
