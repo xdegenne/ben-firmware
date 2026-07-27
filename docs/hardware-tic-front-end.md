@@ -3,17 +3,22 @@
 Comment le signal télé-info (TIC) du Linky devient un flux série UART lisible par le Pi.
 Montage de référence : `pcb/TIC-Reader-wired/` (schéma `TIC-Reader-wired.net`).
 
+> ℹ️ **Ce doc décrit le montage historique (opto + BS170).** Le nouveau front-end à **trigger de
+> Schmitt 74HC14** (carte `pcb/TIC-Reader-Schmitt/`) est décrit dans
+> [`hardware-tic-front-end-schmitt.md`](hardware-tic-front-end-schmitt.md) — voir son §0 pour
+> *pourquoi* on a remplacé le BS170.
+
 ## 1. Ce que sort le Linky : OOK sur porteuse 50 kHz
 
-La TIC n'est **pas** un UART en bande de base. C'est un **flux série UART asynchrone**
-(format **7E1**, débit **1200 bps** en historique / **9600 bps** en standard) **modulé en
-OOK / ASK** (*On-Off Keying*, tout-ou-rien) sur une **porteuse ~50 kHz** :
+La TIC n'est **pas** un UART en bande de base. C'est un **flux série UART asynchrone** (format
+**7E1**, débit **1200 bps** en historique / **9600 bps** en standard) **modulé en OOK / ASK**
+(*On-Off Keying*, tout-ou-rien) sur une **porteuse ~50 kHz** :
 
 - bit d'un état → **bouffée de sinus 50 kHz** présente,
 - bit de l'autre état → **silence** (pas de porteuse).
 
-C'est de la modulation d'amplitude, pas de la FSK. La donnée utile est **l'enveloppe**
-de ces bouffées.
+C'est de la modulation d'amplitude, pas de la FSK. La donnée utile est **l'enveloppe** de ces
+bouffées.
 
 ## 2. La chaîne (montage filaire)
 
@@ -122,6 +127,8 @@ Soit un facteur **~5** seulement entre les deux → front-end **sensible**. `R1`
 LED (point de fonctionnement / CTR de l'opto), la charge de sortie fixe la bande passante. Trop
 rapide → du 50 kHz bave en sortie ; trop lent → l'enveloppe 9600 bps est écrasée aussi. C'est la
 cause racine des réglages histo↔standard (cf. `docs/tic-standard-mode.md`,
-`MissTIC-wired-rev01`, et les valeurs de ratio R_LED/R_gate du front-end émetteur).
+`MissTIC-wired-rev01`, et les valeurs de ratio R_LED/R_gate du front-end émetteur). **Ce point
+sensible est précisément ce que la v2 (Schmitt) élimine** — cf.
+[`hardware-tic-front-end-schmitt.md`](hardware-tic-front-end-schmitt.md).
 
 > Image du board : `docs/TIC-Reader-wired-rev01.png`.
