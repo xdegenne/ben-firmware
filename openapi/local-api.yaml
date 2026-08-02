@@ -1,0 +1,608 @@
+openapi: 3.1.0
+
+info:
+  title: BEN — API locale du device
+  version: "1.0.0"
+  description: |
+    API HTTP **locale, lecture seule** exposée par chaque boîtier BEN sur le LAN
+    (`src/pi/store/local_api.py`). Sert la consommation stockée par les readers TIC/LoRa
+    dans `measurements.db`. Consommée aujourd'hui par l'app Flutter ; contrat visé aussi
+    pour une intégration Home Assistant / Node-RED et pour le cloud (qui servira le MÊME
+    `/consumption`).
+
+    **Découverte** : l'app récupère l'IP du boîtier au provisioning (statut `connected:<ip>`)
+    puis tape le port 8087.
+
+    **Sécurité (état actuel)** : LAN-only, `Access-Control-Allow-Origin: *`, **aucune auth**.
+    Le durcissement (certificat device / token, TLS via CA BEN) est un chantier prévu, pas
+    encore en place. Ne pas exposer ce port hors du réseau local.
+
+    **Généré par rétro-ingénierie** de `local_api.py` + `db.py`. À régénérer / relire à chaque
+    changement de handler ou de forme de retour.
+
+servers:
+  - url: http://{deviceHost}:8087
+    description: Boîtier BEN sur le LAN
+    variables:
+      deviceHost:
+        default: ben-0010.local
+        description: IP ou nom mDNS du boîtier (obtenu au provisioning)
+
+tags:
+  - name: presence
+    description: Sondes légères de joignabilité / santé
+  - name: live
+    description: Valeur temps réel
+  - name: history
+    description: Courbes et mesures historisées
+  - name: energy
+    description: Index, conso par registre, registres tarifaires
+  - name: radio
+    description: Qualité de lien LoRa (modèles pi0-lora)
+  - name: settings
+    description: Réglages device
+  - name: lifecycle
+    description: Désappairage
+
+paths:
+  /ping:
+    get:
+      tags: [presence]
+      summary: Sonde de présence ultra-légère
+      description: |
+        AUCUNE lecture (ni fichier ni base). Pensé pour du polling régulier
+        (voyant de joignabilité, heartbeat de l'app).
+      responses:
+        "200":
+          description: Le boîtier répond
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ben]
+                properties:
+                  ben:
+                    type: boolean
+                    const: true
+              example: { ben: true }
+
+  /health:
+    get:
+      tags: [presence]
+      summary: Santé du device + dernière trame TIC
+      responses:
+        "200":
+          description: État de santé
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deviceId:  { type: [string, "null"] }
+                  model:     { type: [string, "null"], description: "pi0-wired | pi0-lora | pi0-lora-wired" }
+                  softwareVersion: { type: [string, "null"] }
+                  lastUpdateTs:
+                    type: [integer, "null"]
+                    description: Epoch (s) de la dernière MAJ firmware = mtime de device.json
+                  db:
+                    type: boolean
+                    description: Base accessible (false si aucune trame écrite encore)
+                  last_tic_ts:
+                    type: [integer, "null"]
+                    description: Epoch (s) de la dernière trame TIC reçue, ou null
+                  now:
+                    type: integer
+                    description: Horloge du boîtier (epoch s) — utile pour détecter une dérive
+                example:
+                  deviceId: ben-0010
+                  model: pi0-lora
+                  softwareVersion: pi-0.9.4
+                  lastUpdateTs: 1753531200
+                  db: true
+                  last_tic_ts: 1753617400
+                  now: 1753617412
+
+  /pdls:
+    get:
+      tags: [presence]
+      summary: Liste des PDL connus du boîtier
+      description: |
+        Un boîtier peut porter plusieurs PDL (ex. ben-0001 LoRa + wired sur le même
+        compteur, ou multi-sources). `first_ts` = 1re mesure → l'app en déduit l'âge
+        d'apprentissage `now - first_ts` (dimensionnement du lissage anti-Hawthorne).
+      responses:
+        "200":
+          description: PDL présents en base (ordonnés par `pdl_index`)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    pdl_index: { type: integer }
+                    first_ts:  { type: integer, description: Epoch (s) de la 1re mesure }
+                    last_ts:   { type: integer, description: Epoch (s) de la dernière mesure }
+                    points:    { type: integer, description: Nb de mesures stockées }
+                example:
+                  - { pdl_index: 0, first_ts: 1750000000, last_ts: 1753617400, points: 421337 }
+        "503": { $ref: "#/components/responses/DbUnavailable" }
+
+  /live:
+    get:
+      tags: [live]
+      summary: Dernière mesure (par PDL), enrichie côté serveur
+      description: |
+        Dernière mesure (≤ ~30 s) enrichie de tout ce que le serveur résout de manière
+        autoritative : niveau de conso, jauge (échelle/plafond), mode TIC, statut producteur,
+        libellé tarifaire en cours, contrat. **En mode standard, `papp` est le NET SIGNÉ**
+        (>0 soutiré, <0 surplus injecté).
+
+        Sans `pdl_index` → un objet par PDL. Avec → la dernière mesure de ce PDL.
+      parameters:
+        - $ref: "#/components/parameters/PdlIndexOptional"
+      responses:
+        "200":
+          description: Tableau de mesures live enrichies (une par PDL)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/LiveMeasurement" }
+        "503": { $ref: "#/components/responses/DbUnavailable" }
+
+  /measurements:
+    get:
+      tags: [history]
+      summary: Points de conso bruts (degrade-safe)
+      description: |
+        Points ordonnés par `ts` croissant. **Degrade-safe** : si la plage contient plus de
+        `limit` points fins, la réponse est AGRÉGÉE à ~`limit` buckets (min/max/avg) au lieu
+        d'être tronquée — `downsampled` indique le cas. Pensé pour rester correct même avec une
+        app pas à jour. Les apps récentes préfèrent `/curve` (résolution pilotée) ou `/chart`.
+      parameters:
+        - $ref: "#/components/parameters/PdlIndexRequired"
+        - $ref: "#/components/parameters/Since"
+        - $ref: "#/components/parameters/Until"
+        - name: limit
+          in: query
+          schema: { type: integer, default: 10000, maximum: 10000 }
+          description: Plafond de points fins avant agrégation (max 10000)
+      responses:
+        "200":
+          description: Points bruts, ou agrégés si trop denses
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pdl_index:   { type: integer }
+                  since:       { type: integer }
+                  until:       { type: integer }
+                  count:       { type: integer }
+                  downsampled:
+                    type: boolean
+                    description: true → `points` agrégé en buckets min/max/avg
+                  points:
+                    type: array
+                    items: { $ref: "#/components/schemas/CurvePoint" }
+        "400": { $ref: "#/components/responses/PdlRequired" }
+        "503": { $ref: "#/components/responses/DbUnavailable" }
+
+  /curve:
+    get:
+      tags: [history]
+      summary: Courbe agrégée par bucket (pics préservés)
+      description: |
+        Courbe de PAPP agrégée par bucket temporel. L'app pilote la résolution via `buckets`
+        (= largeur de son viewport) ; le serveur agrège en préservant les pics (min/max/avg),
+        JAMAIS de décimation naïve (tuerait les transitoires NILM). BRUT uniquement — ne sert
+        pas le rollup ni les bandes tarifaires (→ `/chart`). Le lissage anti-Hawthorne est
+        appliqué PAR L'APP par-dessus.
+      parameters:
+        - $ref: "#/components/parameters/PdlIndexRequired"
+        - $ref: "#/components/parameters/Since"
+        - $ref: "#/components/parameters/Until"
+        - $ref: "#/components/parameters/Buckets"
+      responses:
+        "200":
+          description: Courbe bucketisée
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CurveResponse" }
+        "400": { $ref: "#/components/responses/BadRangeOrPdl" }
+        "503": { $ref: "#/components/responses/DbUnavailable" }
+
+  /chart:
+    get:
+      tags: [history]
+      summary: Courbe riche prête-à-tracer (points + bandes tarifaires)
+      description: |
+        Endpoint de la nouvelle app : forme de `/curve` + `tariff_bands` (zones HP/HC) et
+        `source`. Le SERVEUR arbitre la source des points — `rollup` (rapide, vue large) vs
+        `brut`/`raw` (fidèle, au zoom). Les bandes viennent TOUJOURS du rollup.
+
+        `raw=1` force le brut haute-fidélité **mais garde-fou serveur : ignoré au-delà de 24 h**
+        (un scan brut sur 7j/30j écroulerait le Pi). Au-delà, `raw` est silencieusement ignoré ;
+        l'app le détecte via `source` ≠ `raw`.
+      parameters:
+        - $ref: "#/components/parameters/PdlIndexRequired"
+        - $ref: "#/components/parameters/Since"
+        - $ref: "#/components/parameters/Until"
+        - $ref: "#/components/parameters/Buckets"
+        - name: raw
+          in: query
+          schema: { type: string, enum: ["0", "1", "true"], default: "0" }
+          description: Force le brut haute-fidélité (honoré seulement si fenêtre ≤ 24 h)
+      responses:
+        "200":
+          description: Courbe riche
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/CurveResponse"
+                  - type: object
+                    properties:
+                      tariff_bands:
+                        type: array
+                        items: { $ref: "#/components/schemas/TariffBand" }
+                      source:
+                        type: string
+                        enum: [rollup, brut, raw]
+                        description: Source réellement servie pour les points
+        "400": { $ref: "#/components/responses/BadRangeOrPdl" }
+        "503": { $ref: "#/components/responses/DbUnavailable" }
+
+  /consumption:
+    get:
+      tags: [energy]
+      summary: Conso par registre (Wh) sur une plage
+      description: |
+        Consommation PAR REGISTRE en Wh sur `[since, until]`, calculée server-side par
+        carry-forward (`MAX(index) − MIN(index)` par registre — index monotone, immunisé au
+        saut de registre). **Contrat commun Pi-local / cloud** : le carry-forward vit ici, pas
+        dans l'app ; réutilisé par app + cloud + Home Assistant. L'app applique le prix
+        (`Σ wh_r × prix_r`).
+      parameters:
+        - $ref: "#/components/parameters/PdlIndexRequired"
+        - $ref: "#/components/parameters/Since"
+        - $ref: "#/components/parameters/Until"
+      responses:
+        "200":
+          description: Conso ventilée par registre
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pdl_index: { type: integer }
+                  since:     { type: integer }
+                  until:     { type: integer }
+                  total_wh:  { type: number, description: Σ des registres (Wh) }
+                  by_register:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        src_standard: { $ref: "#/components/schemas/SrcStandard" }
+                        index_id:     { $ref: "#/components/schemas/IndexId" }
+                        wh:           { type: number, description: Conso du registre sur la plage (Wh) }
+                example:
+                  pdl_index: 0
+                  since: 1753531200
+                  until: 1753617600
+                  total_wh: 14230
+                  by_register:
+                    - { src_standard: 1, index_id: 1, wh: 5120 }
+                    - { src_standard: 1, index_id: 2, wh: 9110 }
+        "400": { $ref: "#/components/responses/BadRangeOrPdl" }
+        "503": { $ref: "#/components/responses/DbUnavailable" }
+
+  /registers:
+    get:
+      tags: [energy]
+      summary: Registres tarifaires d'un PDL (libellé + dernier index)
+      description: |
+        Un registre par tarif (Base / HC / HP / couleurs Tempo…), avec libellé résolu
+        server-side et dernier index (monotone → MAX). Sert la carte réglages de l'app.
+        `contract` = NGTF (calendrier tarifaire fournisseur).
+      parameters:
+        - $ref: "#/components/parameters/PdlIndexRequired"
+      responses:
+        "200":
+          description: Registres du PDL
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pdl_index: { type: integer }
+                  contract:  { type: [string, "null"], description: "NGTF (ex. BASE, HC, TEMPO)" }
+                  registers:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        src_standard: { $ref: "#/components/schemas/SrcStandard" }
+                        index_id:     { $ref: "#/components/schemas/IndexId" }
+                        label:        { type: [string, "null"], description: Libellé tarifaire résolu }
+                        index_value:  { type: [integer, "null"], description: Dernier index (Wh) }
+                        last_ts:      { type: [integer, "null"], description: Epoch (s) du dernier relevé }
+        "400": { $ref: "#/components/responses/PdlRequired" }
+        "503": { $ref: "#/components/responses/DbUnavailable" }
+
+  /lora-link:
+    get:
+      tags: [radio]
+      summary: Qualité de réception LoRa (rssi/snr)
+      description: Séries `rssi`/`snr` par PDL — pertinent seulement pour les modèles pi0-lora.
+      parameters:
+        - $ref: "#/components/parameters/PdlIndexRequired"
+        - $ref: "#/components/parameters/Since"
+        - name: limit
+          in: query
+          schema: { type: integer, default: 10000, maximum: 10000 }
+      responses:
+        "200":
+          description: Points de qualité radio (ts croissant)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pdl_index: { type: integer }
+                  since:     { type: integer }
+                  count:     { type: integer }
+                  points:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        ts:   { type: integer }
+                        rssi: { type: number }
+                        snr:  { type: number }
+        "400": { $ref: "#/components/responses/PdlRequired" }
+        "503": { $ref: "#/components/responses/DbUnavailable" }
+
+  /settings:
+    get:
+      tags: [settings]
+      summary: Réglages courants du device
+      responses:
+        "200":
+          description: Réglages (defaults si fichier absent)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Settings" }
+    post:
+      tags: [settings]
+      summary: Mettre à jour un sous-ensemble de réglages
+      description: Valide/clamp (ex. `led_level` borné 0..5) et persiste. Renvoie l'état complet à jour.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Settings" }
+            example: { led_level: 2 }
+      responses:
+        "200":
+          description: Réglages à jour
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Settings" }
+        "400":
+          description: Corps invalide (`invalid_json` / `invalid_body`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /unprovision:
+    post:
+      tags: [lifecycle]
+      summary: Désappairer le boîtier (oublie le WiFi, puis s'éteint)
+      description: |
+        Oublie TOUTES les connexions WiFi → repart en provisioning BLE au prochain allumage.
+        `?wipe=1` efface aussi la base. Le boîtier **répond AVANT** de couper le réseau puis
+        s'éteint TOUJOURS (poweroff) en asynchrone. **Aucune auth** (raccourci assumé, hors prod).
+      parameters:
+        - name: wipe
+          in: query
+          schema: { type: string, enum: ["0", "1", "true", "yes"], default: "0" }
+          description: Efface aussi les données locales
+      responses:
+        "200":
+          description: Ack immédiat — le boîtier va se désappairer et s'éteindre
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:        { type: boolean }
+                  wipe:      { type: boolean }
+                  rebooting: { type: boolean, const: true }
+              example: { ok: true, wipe: false, rebooting: true }
+
+components:
+  parameters:
+    PdlIndexOptional:
+      name: pdl_index
+      in: query
+      required: false
+      schema: { type: integer }
+      description: Restreint à un PDL ; absent → tous les PDL
+    PdlIndexRequired:
+      name: pdl_index
+      in: query
+      required: true
+      schema: { type: integer }
+      description: PDL ciblé (obligatoire — 400 `pdl_index_required` sinon)
+    Since:
+      name: since
+      in: query
+      schema: { type: integer }
+      description: Borne basse (epoch s). Défaut = now − 24 h.
+    Until:
+      name: until
+      in: query
+      schema: { type: integer }
+      description: Borne haute (epoch s). Défaut = now.
+    Buckets:
+      name: buckets
+      in: query
+      schema: { type: integer, default: 500, maximum: 2000 }
+      description: Résolution voulue (nb de points ≈ largeur du viewport). Défaut 500, max 2000.
+
+  responses:
+    DbUnavailable:
+      description: Base pas encore créée (aucune trame écrite)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: db_unavailable }
+    PdlRequired:
+      description: "`pdl_index` manquant"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: pdl_index_required }
+    BadRangeOrPdl:
+      description: "`pdl_index` manquant, ou `until <= since` (`bad_range`)"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    SrcStandard:
+      type: [integer, "null"]
+      description: Mode de la source — 1 = standard 9600, 0/null = historique 1200
+      enum: [0, 1, null]
+
+    IndexId:
+      type: [integer, "null"]
+      description: |
+        Registre générique bi-mode. En historique = rang PTEC (0..0x0A) ; en standard =
+        NTARF (1..10). Avec `index_value`, permet à l'app de reconstruire chaque registre
+        (HC vs HP…) par carry-forward.
+
+    CurvePoint:
+      type: object
+      description: |
+        Point de courbe agrégée (min/max/avg par bucket). En standard/rollup `base/hchc/hchp`
+        sont null → seul `(index_id, index_value)` porte la conso.
+      properties:
+        ts:           { type: integer, description: Epoch (s), centroïde du bucket }
+        papp:         { type: integer, description: Puissance apparente moyenne du bucket (VA) }
+        papp_min:     { type: [integer, "null"], description: Pic bas préservé (VA) }
+        papp_max:     { type: [integer, "null"], description: Pic haut préservé (VA) }
+        n:            { type: integer, description: Nb d'échantillons fins dans le bucket }
+        tariff:       { type: [integer, "null"] }
+        base:         { type: [integer, "null"], description: Index Base histo (Wh), null en standard/rollup }
+        hchc:         { type: [integer, "null"], description: Index HC histo (Wh) }
+        hchp:         { type: [integer, "null"], description: Index HP histo (Wh) }
+        index_id:     { $ref: "#/components/schemas/IndexId" }
+        index_value:  { type: [integer, "null"], description: Valeur de l'index générique (Wh) }
+        src_standard: { $ref: "#/components/schemas/SrcStandard" }
+        inject_total: { type: [integer, "null"], description: Index d'injection cumulé (Wh), producteurs }
+
+    CurveResponse:
+      type: object
+      properties:
+        pdl_index:  { type: integer }
+        since:      { type: integer }
+        until:      { type: integer }
+        bucket_sec: { type: integer, description: Largeur temporelle d'un bucket (s) }
+        count:      { type: integer }
+        points:
+          type: array
+          items: { $ref: "#/components/schemas/CurvePoint" }
+
+    TariffBand:
+      type: object
+      description: Zone tarifaire continue (couleur HP/HC de la courbe), issue du rollup
+      properties:
+        from:         { type: integer, description: Début de la bande (epoch s) }
+        to:           { type: integer, description: Fin de la bande (epoch s) }
+        src_standard: { $ref: "#/components/schemas/SrcStandard" }
+        index_id:     { $ref: "#/components/schemas/IndexId" }
+        label:        { type: [string, "null"], description: Libellé tarifaire résolu }
+        kind:
+          type: string
+          enum: [hc, hp, base]
+          description: Classe grossière pour la couleur (creuse→hc / pleine→hp / base)
+
+    LiveMeasurement:
+      type: object
+      description: Dernière mesure d'un PDL, enrichie des champs résolus server-side.
+      properties:
+        ts:           { type: integer, description: Epoch (s) de la mesure }
+        pdl_index:    { type: integer }
+        papp:
+          type: [integer, "null"]
+          description: Puissance apparente (VA). En STANDARD = net SIGNÉ (>0 soutiré, <0 injecté).
+        iinst:        { type: [integer, "null"], description: Courant instantané (A), histo }
+        base:         { type: [integer, "null"] }
+        hchc:         { type: [integer, "null"] }
+        hchp:         { type: [integer, "null"] }
+        tariff:       { type: [integer, "null"] }
+        index_id:     { $ref: "#/components/schemas/IndexId" }
+        index_value:  { type: [integer, "null"] }
+        src_standard: { $ref: "#/components/schemas/SrcStandard" }
+        inject_total: { type: [integer, "null"] }
+        level:
+          type: [integer, "null"]
+          description: Niveau de conso 1..4 (visuel), seuils pré-calculés ; null si foyer pas encore CONNU
+        tic_mode:
+          type: [string, "null"]
+          enum: [standard, historique, null]
+        producer:
+          type: boolean
+          description: Injection CONSTATÉE → l'app affiche la jauge bidir soutirage⇄injection
+        isousc:  { type: [integer, "null"], description: Abonnement histo (A) }
+        pref:    { type: [integer, "null"], description: Puissance de référence standard (kVA) }
+        maxVa:
+          type: [integer, "null"]
+          description: Échelle jauge (VA) dérivée du mode courant (PREF×1000 ou ISOUSC×230)
+        plafond:
+          type: [integer, "null"]
+          description: |
+            Plafond de jauge AUTORITATIF résolu côté boîtier — abonnement pendant l'apprentissage,
+            high-water mark auto-calibré une fois le foyer connu. L'app l'affiche tel quel.
+        injectMax:
+          type: [integer, "null"]
+          description: Plafond de la jauge d'injection (VA), producteurs
+        tariff_label:
+          type: [string, "null"]
+          description: Libellé tarifaire EN COURS (jauge HP/HC), résolu server-side
+        contract:
+          type: [string, "null"]
+          description: Contrat NGTF (quasi-statique), distinct du tarif en cours
+
+    Settings:
+      type: object
+      properties:
+        led_level:
+          type: integer
+          minimum: 0
+          maximum: 5
+          default: 3
+          description: 0 = LED éteinte ; 1..5 = crans de luminosité croissants
+      additionalProperties: false
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          enum:
+            - not_found
+            - db_unavailable
+            - internal
+            - pdl_index_required
+            - bad_range
+            - invalid_json
+            - invalid_body
+        detail:
+          type: string
+          description: Présent seulement pour `internal` (message d'exception)
