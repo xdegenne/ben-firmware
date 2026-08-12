@@ -18,7 +18,7 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
-### [0.9.5] — 2026-08-12
+### [0.9.6] — 2026-08-12
 
 **`pdl_index` identifie un COMPTEUR (ADCO), plus un émetteur — + événements — + performances API.** Trois chantiers, tout en pur code.
 
@@ -37,6 +37,8 @@ Deux pistes indépendantes :
 | charge moyenne du boîtier | 1,96 | **0,16** |
 
 Correctifs : `/live` prend `pdl_index=0` par défaut (**changement de contrat** — il ne renvoie plus un objet par PDL ; un client multi-PDL doit passer le paramètre) ; `/pdls` lit la liste des PDL dans `pdl`/`level_profile` puis fait ses `MIN`/`MAX` **séparés et filtrés**, et `points` (COUNT, cher même filtré, lu par personne) passe sur `?count=1` ; `prune()` supprime par PDL sur les 3 tables ; le talon (P15 de la PAPP sur 30 j) est calculé sur **`curve_rollup`** — ~21 600 tranches de 2 min au lieu de 1,76 M lignes — avec repli sur le brut si le rollup ne couvre pas la fenêtre. **Le talon ne bouge pas** : vérifié sur trois foyers (ben-0001 71→71, ben-0003 0→0, ben-0010 550→556, soit +1,1 % au pire) — un percentile bas ne se déplace pas quand on lisse sur 2 min, les creux durant bien plus longtemps. `n_samples` reste la somme des `papp_count` (échantillons bruts) pour ne pas décaler `MIN_SAMPLES` et le démarrage à froid d'un facteur ~120.
+
+**⚠️ 0.9.5 brûlée.** Le tag `pi-0.9.5` porte exactement ce contenu mais n'a jamais été déployable : son `update.sh.sha256` manquait, et l'agent refuse d'exécuter un script dont il ne peut pas vérifier l'empreinte (`verify_sha256`) — après avoir pourtant validé la signature GPG du tag et fait le checkout. Échec propre et sans dégât (`device.json` non modifié, retry au tick suivant), constaté sur ben-0003. Un tag publié ne se réécrit jamais (les `git fetch --tags` des devices casseraient) → republication à l'identique en 0.9.6, avec la somme de contrôle.
 
 **Divers.** `src/pi/lora-receiver/main.py` est marqué **DÉPRÉCIÉ** et figé à l'état 0.9.4 : remplacé par la façade `ben-radio` + `ben-telemetry` depuis 0.9.0 (cutover), plus aucun boîtier ne l'exécute. Aucune migration destructive : que des créations de tables et une colonne ; l'ancien code ignore les nouvelles. **Universel** (LoRa et filaire) : pas de gate capability, restart du lecteur **puis** de `ben-local-api` — dans cet ordre, l'API étant en lecture seule et incapable de créer le schéma.
 

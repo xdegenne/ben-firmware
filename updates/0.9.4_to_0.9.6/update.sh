@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# update.sh — → pi-0.9.5   : pdl_index = un COMPTEUR (ADCO) + événements + performances API.
+# update.sh — → pi-0.9.6   : pdl_index = un COMPTEUR (ADCO) + événements + performances API.
 #
 # TROIS CHANTIERS, tous PUR CODE (aucune dépendance, aucun changement d'unit).
 #
@@ -25,19 +25,19 @@
 #    (pdl_index, ts, papp) et balayait la table. Mesuré sur ben-0001 (3,1 M lignes) :
 #      /live 28,6 s → 0,10 s   |   /pdls 36,7 s → 0,06 s   |   /health 16,6 s → 0,99 s
 #      levels.refresh_all 199,9 s → 0,55 s  (P15 du talon calculé sur `curve_rollup`)
-#    Charge moyenne du boîtier : 1,96 → 0,16. Détail : ../../CHANGELOG.md (0.9.5).
+#    Charge moyenne du boîtier : 1,96 → 0,16. Détail : ../../CHANGELOG.md (0.9.6).
 #
 # UNIVERSEL (LoRa ET filaire) → pas de gate capability.
-# Code déjà sur disque après `git checkout pi-0.9.5`. Tourne en `ben` + sudo.
+# Code déjà sur disque après `git checkout pi-0.9.6`. Tourne en `ben` + sudo.
 
 set -euo pipefail
-TR="→ pi-0.9.5"
+TR="→ pi-0.9.6"
 log()  { echo "[update $TR] $*"; }
 fail() { echo "[update $TR] ✗ ERREUR : $*" >&2; exit 1; }
 REPO="${REPO_PATH:-/opt/ben/repo}"
 
 # ── Préflight : le code patché doit être présent (checkout du tag en amont) ────────────────────
-grep -q 'def bind_emitter'     "$REPO/src/pi/store/db.py"    || fail "bind_emitter absent (checkout pi-0.9.5 incomplet ?)"
+grep -q 'def bind_emitter'     "$REPO/src/pi/store/db.py"    || fail "bind_emitter absent (checkout pi-0.9.6 incomplet ?)"
 grep -q 'def record_tic_mode'  "$REPO/src/pi/store/db.py"    || fail "record_tic_mode absent"
 grep -q 'def pdl_list'         "$REPO/src/pi/store/db.py"    || fail "pdl_list absent"
 grep -q '_profil_depuis_rollup' "$REPO/src/pi/store/levels.py" || fail "levels.py non patché"
