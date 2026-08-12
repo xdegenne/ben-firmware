@@ -1273,7 +1273,7 @@ def get_events(conn: sqlite3.Connection, limit: int = 50, since_ts: int | None =
     try:
         rows = conn.execute(q, args).fetchall()
     except sqlite3.OperationalError:
-        # Table absente : base antérieure à 0.9.5 ouverte en LECTURE SEULE (l'API ne peut
+        # Table absente : base antérieure à 0.9.6 ouverte en LECTURE SEULE (l'API ne peut
         # pas créer le schéma). Aucun événement ≠ erreur — surtout pas un 500.
         return []
     for r in rows:
@@ -1290,7 +1290,7 @@ def last_event(conn: sqlite3.Connection) -> tuple:
         r = conn.execute(
             "SELECT id, severite FROM event ORDER BY ts DESC, id DESC LIMIT 1").fetchone()
     except sqlite3.OperationalError:
-        return (None, None)      # base pré-0.9.5 en lecture seule — cf. get_events()
+        return (None, None)      # base pré-0.9.6 en lecture seule — cf. get_events()
     return (r[0], r[1]) if r else (None, None)
 
 

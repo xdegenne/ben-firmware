@@ -290,7 +290,7 @@ class Handler(BaseHTTPRequestHandler):
                 pdls = [r[0] for r in conn.execute("SELECT pdl_index FROM pdl")]
                 adcos = {r[0]: r[1] for r in conn.execute("SELECT pdl_index, adco FROM pdl")}
             except sqlite3.OperationalError:
-                pdls, adcos = [], {}          # base antérieure à 0.9.5, lecture seule
+                pdls, adcos = [], {}          # base antérieure à 0.9.6, lecture seule
             if not pdls:
                 pdls = [r[0] for r in conn.execute("SELECT pdl_index FROM level_profile")]
             if not pdls:

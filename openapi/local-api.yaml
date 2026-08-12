@@ -85,7 +85,7 @@ paths:
         l'auto-détection du lecteur). La première observation d'un compteur n'émet RIEN :
         elle amorce l'état.
 
-        Renvoie `[]` — et non une erreur — sur une base antérieure à 0.9.5.
+        Renvoie `[]` — et non une erreur — sur une base antérieure à 0.9.6.
       parameters:
         - name: limit
           in: query
@@ -212,7 +212,7 @@ paths:
         (>0 soutiré, <0 surplus injecté).
 
         Avec `pdl_index` → la dernière mesure de ce PDL. **Sans, le PDL 0** — et non
-        plus « un objet par PDL » (changement 0.9.5). Motif : une requête non filtrée est
+        plus « un objet par PDL » (changement 0.9.6). Motif : une requête non filtrée est
         aveugle à l'index `(pdl_index, ts, papp)` et balayait toute la table — 28,6 s
         mesurées sur ben-0001 (3,1 M lignes) contre 0,10 s filtrée, alors que l'app
         interroge cet endpoint toutes les 10 s. Un client multi-PDL doit passer
