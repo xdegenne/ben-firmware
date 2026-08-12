@@ -77,7 +77,17 @@ TIC_TIMEOUT_S     = 12      # max pour lire une trame complète (~4s à 1200 bau
 DETECT_WINDOW_S    = 6
 DETECT_MIN_GROUPS  = 5
 
-PDL_INDEX         = 0       # source câblée — toujours index 0 par convention
+# ⚠️ VARIABLES DE RUNTIME, plus des constantes. Assignées UNIQUEMENT dans la boucle
+# principale, qui est au niveau module → pas de `global` nécessaire aujourd'hui.
+# Si on déplace un jour ce bloc dans une fonction, il FAUDRA y déclarer
+# `global PDL_INDEX, _pdl_source_adco` : sans ça Python en fait des locales, la valeur
+# du module ne bouge jamais et le boîtier écrit tout sous l'index 0 — en silence.
+# Le cache est assumé : la boucle tourne à ~1 trame/s sur un Pi Zero mono-cœur, on ne
+# veut pas d'une lecture SQLite par trame. Le chemin LoRa, lui, n'a pas de global :
+# il résout par trame et passe le PDL en paramètre.
+PDL_INDEX         = 0       # résolu depuis l'ADCO dès la 1re trame (0 = valeur d'amorce,
+                            # et index du 1er compteur vu — cf. docs/chantier-pdl-adco.md)
+_pdl_source_adco  = ""      # ADCO ayant servi à résoudre PDL_INDEX ci-dessus
 
 # Lecture au fil de l'eau (volet A) : plus de PERIOD_S — on suit la cadence des
 # trames du compteur (~1,7 s historique, ~1 s standard).
@@ -571,6 +581,23 @@ batch: list = []          # (pdl_index, labels, ts)
 last_flush = time.time()
 last_heartbeat = 0.0
 last_isousc: int | None = None  # garde RAM : record_isousc seulement sur changement
+last_src_std: int | None = None  # garde RAM : record_tic_mode seulement sur changement
+
+
+def note_tic_mode(mode_std: int) -> None:
+    """Signale le mode observé. Garde RAM d'abord : la boucle tourne à ~1 trame/s, on ne
+    veut pas d'une lecture SQLite par trame (même raison que le cache pdl_index)."""
+    global last_src_std
+    if mode_std == last_src_std or measurements_db is None:
+        return
+    try:
+        if db.record_tic_mode(measurements_db, PDL_INDEX, mode_std, db.device_id()):
+            log.info(f"MODE TIC → {'standard' if mode_std else 'historique'} — événement émis")
+        last_src_std = mode_std
+    except Exception as e:
+        log.warning(f"store: record_tic_mode échoué: {e}")
+
+
 last_pref: int | None = None    # garde RAM : record_pref (abonnement standard, kVA) sur changement
 last_ltarf: tuple | None = None # garde RAM : record_tariff_label (NTARF, LTARF) sur changement
 last_ngtf: str | None = None    # garde RAM : record_ngtf (calendrier fournisseur) sur changement
@@ -624,6 +651,22 @@ try:
                         log.info(f"NOUVEAU PDL détecté : ADCO={adco} (précédent={prev_adco or 'aucun'})")
                         state["adco"] = adco
                         save_state(state)
+                    # Résolution ADCO → pdl_index. Plus simple qu'en LoRa : l'ADCO est
+                    # dans CHAQUE trame, donc ni table `emitter`, ni attente d'une trame
+                    # de boot, ni fenêtre de repli. On résout à la première trame de
+                    # chaque exécution (pas seulement au changement) : sinon un boîtier
+                    # déplacé puis redémarré retomberait sur l'index 0, celui de son
+                    # ancien compteur. `graine=0` = convention de la source câblée.
+                    if adco != _pdl_source_adco and measurements_db is not None:
+                        try:
+                            pdl = db.resolve_pdl(measurements_db, adco, graine=0)
+                            if pdl is not None:
+                                if pdl != PDL_INDEX:
+                                    log.info(f"pdl_index : {PDL_INDEX} → {pdl} (ADCO={adco})")
+                                PDL_INDEX = pdl
+                                _pdl_source_adco = adco
+                        except Exception as e:
+                            log.warning(f"store: resolve_pdl échoué: {e}")
 
                 # ISOUSC (abonnement) — écrit SUR CHANGEMENT seulement (garde RAM
                 # + record_isousc fait aussi sa garde DB). Indépendant de la
@@ -691,6 +734,7 @@ try:
                         log_uncabled({"DEMAIN": demain, "ADPS": adps or None, "PEJP": pejp or None})
                         # Clé générique (chantier index bi-mode) : index_id = rang PTEC.
                         labels["_src_standard"] = 0
+                        note_tic_mode(0)
                         labels["_index_id"] = active_id
                         labels["_index_value"] = active_value
                         log.debug(f"OK pdl_index={PDL_INDEX} PTEC={ptec} {active_name}={active_value} "
@@ -721,6 +765,7 @@ try:
                         # index_id/index_value seulement si l'index actif a été vu (sinon NULL
                         # sur cette ligne → carry-forward au calcul conso, pas de point perdu).
                         labels["_src_standard"] = 1
+                        note_tic_mode(1)
                         if ntarf is not None and active_value is not None:
                             labels["_index_id"] = ntarf
                             labels["_index_value"] = active_value

@@ -39,6 +39,8 @@ tags:
     description: Index, conso par registre, registres tarifaires
   - name: radio
     description: Qualité de lien LoRa (modèles pi0-lora)
+  - name: events
+    description: Événements notables du compteur (bascules d'offre / de mode)
   - name: settings
     description: Réglages device
   - name: lifecycle
@@ -65,6 +67,65 @@ paths:
                     type: boolean
                     const: true
               example: { ben: true }
+
+  /events:
+    get:
+      tags: [events]
+      summary: Événements notables du compteur
+      description: |
+        Faits CONSTATÉS par le boîtier, du plus récent au plus ancien. L'identifiant est
+        **frappé par le boîtier** (`<deviceId>:<UUIDv7>`) et jamais recalculé en aval : un
+        futur backend le relaie tel quel, ce qui rend l'événement adressable de bout en bout
+        (une notification peut le désigner). UUIDv7 = 48 bits d'horodatage ms + aléatoire,
+        donc trié par le temps sans compteur — un compteur repartirait à zéro après une
+        corruption de carte SD et provoquerait des collisions SILENCIEUSES.
+
+        Types actuels : `changement_offre` (OPTARIF/NGTF — l'offre est lue DIRECTEMENT dans
+        la trame TIC) et `changement_mode` (bascule historique ↔ standard, détectée par
+        l'auto-détection du lecteur). La première observation d'un compteur n'émet RIEN :
+        elle amorce l'état.
+
+        Renvoie `[]` — et non une erreur — sur une base antérieure à 0.9.5.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, default: 50, minimum: 1, maximum: 500 }
+        - name: since
+          in: query
+          required: false
+          description: Epoch (s). Ne renvoie que les événements postérieurs.
+          schema: { type: integer }
+      responses:
+        "200":
+          description: Événements, du plus récent au plus ancien
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:        { type: string, description: "`<deviceId>:<UUIDv7>` — frappé par le boîtier" }
+                    ts:        { type: integer, description: Epoch (s) }
+                    pdl_index: { type: integer, nullable: true, description: PDL concerné }
+                    type:      { type: string, enum: [changement_offre, changement_mode] }
+                    severite:  { type: string, default: info }
+                    titre:     { type: string }
+                    corps:     { type: string }
+                    donnees:   { type: object, description: "Contexte, ex. `{avant, apres}`" }
+                    action:    { type: object, nullable: true, description: "Renvoi dans l'app, ex. `{libelle, route}`" }
+                example:
+                  - id: "ben-0001:0198c2f1-7e3a-7c21-9f4b-2d5e8a1c3b09"
+                    ts: 1786563383
+                    pdl_index: 0
+                    type: changement_offre
+                    severite: info
+                    titre: "Changement d'offre"
+                    corps: "C'est fait : votre contrat est passé de « BASE » à « TEMPO »."
+                    donnees: { avant: "BASE", apres: "TEMPO" }
+                    action: { libelle: "Voir les tarifs", route: "/dashboard" }
+        "503": { $ref: "#/components/responses/DbUnavailable" }
 
   /health:
     get:
@@ -107,9 +168,13 @@ paths:
       tags: [presence]
       summary: Liste des PDL connus du boîtier
       description: |
-        Un boîtier peut porter plusieurs PDL (ex. ben-0001 LoRa + wired sur le même
-        compteur, ou multi-sources). `first_ts` = 1re mesure → l'app en déduit l'âge
-        d'apprentissage `now - first_ts` (dimensionnement du lissage anti-Hawthorne).
+        Un PDL = un COMPTEUR, identifié par son `adco`. Un boîtier en porte plusieurs
+        s'il lit plusieurs compteurs — pas s'il a plusieurs sources : deux lecteurs
+        (LoRa + câblé) branchés sur le MÊME compteur convergent sur un seul
+        `pdl_index`. Cf. `docs/chantier-pdl-adco.md`.
+
+        `first_ts` = 1re mesure → l'app en déduit l'âge d'apprentissage
+        `now - first_ts` (dimensionnement du lissage anti-Hawthorne).
       responses:
         "200":
           description: PDL présents en base (ordonnés par `pdl_index`)
@@ -120,30 +185,55 @@ paths:
                 items:
                   type: object
                   properties:
-                    pdl_index: { type: integer }
+                    pdl_index: { type: integer, description: Index local du PDL. Le 1er vaut toujours 0 }
+                    adco:
+                      type: string
+                      description: >-
+                        Adresse du compteur (ADCO/ADSC) : c'est elle qui identifie le PDL.
+                        Chaîne VIDE tant qu'aucun ADCO n'est lié — cas d'un PDL antérieur à
+                        la migration, ou d'un récepteur LoRa redémarré dont l'émetteur n'a
+                        pas encore réémis sa trame de boot. Ne jamais s'en servir comme clé
+                        d'affichage tant qu'elle est vide.
                     first_ts:  { type: integer, description: Epoch (s) de la 1re mesure }
                     last_ts:   { type: integer, description: Epoch (s) de la dernière mesure }
                     points:    { type: integer, description: Nb de mesures stockées }
                 example:
-                  - { pdl_index: 0, first_ts: 1750000000, last_ts: 1753617400, points: 421337 }
+                  - { pdl_index: 0, adco: "021728123456", first_ts: 1750000000, last_ts: 1753617400, points: 421337 }
         "503": { $ref: "#/components/responses/DbUnavailable" }
 
   /live:
     get:
       tags: [live]
-      summary: Dernière mesure (par PDL), enrichie côté serveur
+      summary: Dernière mesure d'un PDL, enrichie côté serveur
       description: |
         Dernière mesure (≤ ~30 s) enrichie de tout ce que le serveur résout de manière
         autoritative : niveau de conso, jauge (échelle/plafond), mode TIC, statut producteur,
         libellé tarifaire en cours, contrat. **En mode standard, `papp` est le NET SIGNÉ**
         (>0 soutiré, <0 surplus injecté).
 
-        Sans `pdl_index` → un objet par PDL. Avec → la dernière mesure de ce PDL.
+        Avec `pdl_index` → la dernière mesure de ce PDL. **Sans, le PDL 0** — et non
+        plus « un objet par PDL » (changement 0.9.5). Motif : une requête non filtrée est
+        aveugle à l'index `(pdl_index, ts, papp)` et balayait toute la table — 28,6 s
+        mesurées sur ben-0001 (3,1 M lignes) contre 0,10 s filtrée, alors que l'app
+        interroge cet endpoint toutes les 10 s. Un client multi-PDL doit passer
+        `pdl_index` explicitement.
       parameters:
         - $ref: "#/components/parameters/PdlIndexOptional"
       responses:
         "200":
           description: Tableau de mesures live enrichies (une par PDL)
+          headers:
+            X-Ben-Last-Event:
+              description: |
+                Id du dernier événement du BOÎTIER (pas un par PDL), ou vide s'il n'y en a
+                aucun. `/live` étant déjà polé en continu, la « cloche » de l'app s'y adosse
+                plutôt que d'ajouter un second appel périodique — un Pi Zero est mono-cœur.
+                En-tête et non champ : `/live` renvoie un tableau nu, l'envelopper casserait
+                le contrat pour une fonctionnalité pas encore éprouvée.
+              schema: { type: string }
+            X-Ben-Last-Event-Severity:
+              description: Sévérité de cet événement (`info`…).
+              schema: { type: string }
           content:
             application/json:
               schema:

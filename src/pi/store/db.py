@@ -26,6 +26,7 @@ Conventions :
 Mode WAL : le reader écrit, l'API lit en concurrence sans verrou bloquant.
 """
 
+import json
 import sqlite3
 import time
 from pathlib import Path
@@ -121,6 +122,46 @@ CREATE TABLE IF NOT EXISTS rollup_state (
     watermark  INTEGER,
     done       INTEGER NOT NULL DEFAULT 0
 );
+
+-- Événements : des FAITS constatés par le boîtier, destinés à l'app (cloche) puis au
+-- backend qui les relaiera tels quels. Cf. docs/chantier-events-et-notifications.md.
+-- L'`id` est frappé UNE SEULE FOIS ici, à la détection : une réémission ultérieure
+-- (reprise après coupure) doit réutiliser le même, sinon le fait apparaît deux fois.
+CREATE TABLE IF NOT EXISTS event (
+    id        TEXT PRIMARY KEY,          -- <deviceId>:<UUIDv7>
+    ts        INTEGER NOT NULL,
+    pdl_index INTEGER,                   -- un événement concerne UN PDL (⚠️ cf. chantier-pdl-adco)
+    type      TEXT NOT NULL,             -- changement_offre | changement_mode | ...
+    severite  TEXT NOT NULL DEFAULT 'info',
+    titre     TEXT NOT NULL,
+    corps     TEXT NOT NULL DEFAULT '',
+    donnees   TEXT NOT NULL DEFAULT '{}',-- JSON libre, dépend du type
+    action    TEXT,                      -- JSON {libelle, route} ou NULL
+    sent      INTEGER NOT NULL DEFAULT 0 -- remonté au backend (Phase 2)
+);
+CREATE INDEX IF NOT EXISTS idx_event_ts ON event(ts DESC);
+
+-- Un COMPTEUR = un PDL, à vie. C'est l'ADCO qui fait foi, pas l'adresse LoRa (qui
+-- identifie l'ÉMETTEUR et le suit s'il change de Linky). Cf. docs/chantier-pdl-adco.md
+-- ⚠️ PAS d'AUTOINCREMENT et jamais d'INSERT avec pdl_index NULL : SQLite commencerait à 1
+-- sur une table vide. Le premier PDL doit TOUJOURS valoir 0 → index calculé explicitement.
+CREATE TABLE IF NOT EXISTS pdl (
+    pdl_index  INTEGER PRIMARY KEY,
+    adco       TEXT NOT NULL UNIQUE,
+    first_seen INTEGER NOT NULL,
+    last_seen  INTEGER NOT NULL
+);
+
+-- Quel compteur se trouve actuellement au bout de quel émetteur. Entretenu à la trame
+-- de boot (seule à porter l'ADCO), consulté à chaque écriture de courbe.
+CREATE TABLE IF NOT EXISTS emitter (
+    lora_addr  INTEGER PRIMARY KEY,
+    adco       TEXT NOT NULL DEFAULT '',
+    pdl_index  INTEGER,
+    updated_ts INTEGER NOT NULL DEFAULT 0
+);
+
+
 """
 
 
@@ -209,6 +250,13 @@ def connect(path: str = DB_PATH, *, read_only: bool = False) -> sqlite3.Connecti
         # fournisseur (cf. CHANTIERS.md « Unification labels + index »).
         if "ngtf" not in lvl_cols:
             conn.execute("ALTER TABLE level_profile ADD COLUMN ngtf TEXT")
+        # Mode TIC observé (0 historique / 1 standard), write-on-change comme `ngtf` :
+        # c'est la mémoire de « ce qui a déjà été annoncé » pour l'événement de bascule.
+        # Sa place est ICI, avec isousc/pref/ngtf — les attributs quasi-statiques du
+        # compteur, une ligne par PDL. (A brièvement vécu dans une table `meter_state`
+        # séparée : doublon pur de cette forme, supprimée avant publication.)
+        if "src_standard" not in lvl_cols:
+            conn.execute("ALTER TABLE level_profile ADD COLUMN src_standard INTEGER")
         # Segmenter les labels par CONTRAT → `ngtf` dans la PK de tariff_labels (un changement
         # de fournisseur crée de nouvelles lignes sans écraser l'historique). SQLite ne peut pas
         # ajouter une colonne à une PK existante → drop + recreate (labels re-captés en direct
@@ -955,9 +1003,21 @@ def record_tariff_label(conn: sqlite3.Connection, pdl_index: int,
     return True
 
 
-def record_ngtf(conn: sqlite3.Connection, pdl_index: int, ngtf: str) -> bool:
+def record_ngtf(conn: sqlite3.Connection, pdl_index: int, ngtf: str,
+                device_id_str: str = "") -> bool:
     """NGTF (nom du calendrier tarifaire fournisseur) par PDL — **write-on-change**.
-    Un changement de `ngtf` = changement de fournisseur/offre → époque tarifaire."""
+    Un changement de `ngtf` = changement de fournisseur/offre → époque tarifaire.
+
+    ÉMET l'événement `changement_offre`. C'est LE bon endroit : l'offre est lue
+    DIRECTEMENT dans la trame TIC (`OPTARIF` en historique, `NGTF` en standard,
+    transportés par le TLV T_CONTRAT), et l'émetteur réémet son identité dès qu'elle
+    change (`tic-reader.ino`, ré-émission sur ISOUSC/PREF/CONTRAT). Pas besoin de la
+    deviner : signal direct, annonce immédiate, et SYMÉTRIQUE dans les deux sens.
+
+    ⚠️ Ne pas réintroduire d'inférence depuis les `index_id` : une fenêtre glissante
+    contient les deux offres pendant la transition, il faut alors un départage — et
+    tout départage par priorité rend le délai dépendant du SENS de la bascule.
+    """
     ngtf = (ngtf or "").strip()
     if not ngtf:
         return False
@@ -965,12 +1025,70 @@ def record_ngtf(conn: sqlite3.Connection, pdl_index: int, ngtf: str) -> bool:
         "SELECT ngtf FROM level_profile WHERE pdl_index=?", (pdl_index,)).fetchone()
     if row is not None and row[0] == ngtf:
         return False
+    avant = (row[0] or "").strip() if row is not None else ""
+    if avant:                       # 1re observation = amorçage, on n'annonce rien
+        try:
+            record_event(
+                conn, device_id_str or device_id(), "changement_offre",
+                "Changement d'offre",
+                "C'est fait : votre contrat est passé de « %s » à « %s »." % (avant, ngtf),
+                {"avant": avant, "apres": ngtf},
+                action={"libelle": "Voir les tarifs", "route": "/dashboard"},
+                pdl_index=pdl_index)
+        except Exception:
+            pass   # L'ÉTAT PRIME, la notif est un bonus. `ngtf` segmente les libellés
+                   # tarifaires et `src_standard` alimente /live : ne jamais empêcher
+                   # leur écriture parce qu'un INSERT d'événement a échoué.
     conn.execute(
         "INSERT INTO level_profile(pdl_index, computed_ts, ngtf) VALUES(?,0,?) "
         "ON CONFLICT(pdl_index) DO UPDATE SET ngtf=excluded.ngtf",
         (pdl_index, ngtf))
     conn.commit()
     return True
+
+
+def record_tic_mode(conn: sqlite3.Connection, pdl_index: int, src_standard: int,
+                    device_id_str: str = "") -> bool:
+    """Mode TIC observé (0 historique / 1 standard) par PDL — **write-on-change**.
+
+    ÉMET l'événement `changement_mode`. Même forme que `record_ngtf()` : le lecteur
+    signale ce qu'il observe, la fonction compare, annonce puis mémorise.
+
+    Contrairement au contrat, le mode n'est écrit NULLE PART dans la trame : c'est la
+    trame elle-même qui est en historique (1200 bauds) ou en standard (9600). Le lecteur
+    le découvre par auto-détection — au démarrage en filaire, côté Arduino en LoRa — et
+    c'est lui qui le signale ici. D'où l'appel depuis les lecteurs, et non un balayage
+    périodique : l'annonce est immédiate, pas différée d'une heure.
+
+    L'écriture de l'état n'est JAMAIS conditionnée à l'émission de l'événement : la
+    notification est un bonus, l'attribut du compteur est le travail principal.
+    """
+    src = 1 if src_standard else 0
+    row = conn.execute(
+        "SELECT src_standard FROM level_profile WHERE pdl_index=?", (pdl_index,)).fetchone()
+    if row is not None and row[0] is not None and int(row[0]) == src:
+        return False
+    connu = row is not None and row[0] is not None
+    if connu:                       # 1re observation = amorçage, on n'annonce rien
+        try:
+            record_event(
+                conn, device_id_str or device_id(), "changement_mode",
+                "Mode de communication du compteur",
+                "C'est fait : votre compteur communique désormais en mode %s."
+                % ("standard" if src else "historique"),
+                {"avant": "historique" if src else "standard",
+                 "apres": "standard" if src else "historique"},
+                pdl_index=pdl_index)
+        except Exception:
+            pass   # L'ÉTAT PRIME, la notif est un bonus. `ngtf` segmente les libellés
+                   # tarifaires et `src_standard` alimente /live : ne jamais empêcher
+                   # leur écriture parce qu'un INSERT d'événement a échoué.
+    conn.execute(
+        "INSERT INTO level_profile(pdl_index, computed_ts, src_standard) VALUES(?,0,?) "
+        "ON CONFLICT(pdl_index) DO UPDATE SET src_standard=excluded.src_standard",
+        (pdl_index, src))
+    conn.commit()
+    return connu
 
 
 def resolve_label(conn: sqlite3.Connection, pdl_index: int,
@@ -1044,7 +1162,7 @@ def rollup_backfill_step(conn: sqlite3.Connection) -> dict:
     `watermark` persistant, survit au brownout). Disjoint de l'incrémental (qui n'écrit que le
     présent). Greffé sur `prune()`. Cf. docs/rollup-par-index.md §3bis.
     Retourne `{advanced, watermark, done}`."""
-    oldest = conn.execute("SELECT MIN(ts) FROM measurements").fetchone()[0]
+    oldest = _ts_global(conn, "MIN")
     if oldest is None:
         return {"advanced": False, "watermark": None, "done": True}
     oldest_bucket = (oldest // ROLLUP_BUCKET_SEC) * ROLLUP_BUCKET_SEC
@@ -1063,7 +1181,7 @@ def rollup_backfill_step(conn: sqlite3.Connection) -> dict:
         if r and r[0] is not None:
             watermark = r[0]
         else:
-            newest = conn.execute("SELECT MAX(ts) FROM measurements").fetchone()[0]
+            newest = _ts_global(conn, "MAX")
             watermark = ((newest // ROLLUP_BUCKET_SEC) * ROLLUP_BUCKET_SEC) + ROLLUP_BUCKET_SEC
     if watermark <= oldest_bucket:
         conn.execute(
@@ -1095,13 +1213,224 @@ def rollup_backfill_step(conn: sqlite3.Connection) -> dict:
     return {"advanced": True, "watermark": start, "done": False}
 
 
+
+# ---------------------------------------------------------------------------
+# Événements — cf. docs/chantier-events-et-notifications.md
+# ---------------------------------------------------------------------------
+
+
+
+def device_id() -> str:
+    """deviceId provisionné (ex. « ben-0001 »), pour préfixer les identifiants d'événement."""
+    try:
+        with open("/etc/ben-firmware/device.json") as f:
+            return (json.load(f).get("deviceId") or "device").strip()
+    except Exception:
+        return "device"
+
+
+def _uuid7() -> str:
+    """UUIDv7 (RFC 9562) : 48 bits d'horodatage ms + aléatoire.
+
+    Pas de `uuid.uuid7()` avant Python 3.14 ; les devices sont en 3.13.
+    On préfère v7 à v4 pour garder le TRI CHRONOLOGIQUE naturel sans état, et
+    un compteur local est exclu : sur un Pi Zero qui brownoute, se reflashe et
+    dont la SD se corrompt, un compteur remis à zéro refrappe des identifiants
+    déjà utilisés — panne silencieuse (l'app croit l'événement déjà lu).
+    """
+    import os
+    ms = int(time.time() * 1000) & ((1 << 48) - 1)
+    rnd = os.urandom(10)
+    b = bytearray(ms.to_bytes(6, "big") + rnd)
+    b[6] = (b[6] & 0x0F) | 0x70          # version 7
+    b[8] = (b[8] & 0x3F) | 0x80          # variant RFC 4122
+    h = b.hex()
+    return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+
+
+def record_event(conn: sqlite3.Connection, device_id: str, type_: str, titre: str,
+                 corps: str = "", donnees: dict | None = None,
+                 severite: str = "info", action: dict | None = None,
+                 pdl_index: int | None = None) -> str:
+    """Enregistre un événement et retourne son id. L'id est frappé ICI, une fois."""
+    ev_id = f"{device_id or 'device'}:{_uuid7()}"
+    conn.execute(
+        "INSERT INTO event(id, ts, pdl_index, type, severite, titre, corps, donnees, action) "
+        "VALUES(?,?,?,?,?,?,?,?,?)",
+        (ev_id, int(time.time()), pdl_index, type_, severite, titre, corps,
+         json.dumps(donnees or {}, ensure_ascii=False),
+         json.dumps(action, ensure_ascii=False) if action else None))
+    conn.commit()
+    return ev_id
+
+
+def get_events(conn: sqlite3.Connection, limit: int = 50, since_ts: int | None = None) -> list:
+    q = ("SELECT id, ts, pdl_index, type, severite, titre, corps, donnees, action FROM event "
+         + ("WHERE ts >= ? " if since_ts else "")
+         + "ORDER BY ts DESC, id DESC LIMIT ?")
+    args = ([since_ts] if since_ts else []) + [max(1, min(limit, 500))]
+    out = []
+    try:
+        rows = conn.execute(q, args).fetchall()
+    except sqlite3.OperationalError:
+        # Table absente : base antérieure à 0.9.5 ouverte en LECTURE SEULE (l'API ne peut
+        # pas créer le schéma). Aucun événement ≠ erreur — surtout pas un 500.
+        return []
+    for r in rows:
+        out.append({"id": r[0], "ts": r[1], "pdl_index": r[2], "type": r[3],
+                    "severite": r[4], "titre": r[5], "corps": r[6],
+                    "donnees": json.loads(r[7] or "{}"),
+                    "action": json.loads(r[8]) if r[8] else None})
+    return out
+
+
+def last_event(conn: sqlite3.Connection) -> tuple:
+    """(id, severite) du plus récent, pour l'en-tête X-Ben-Last-Event de /live."""
+    try:
+        r = conn.execute(
+            "SELECT id, severite FROM event ORDER BY ts DESC, id DESC LIMIT 1").fetchone()
+    except sqlite3.OperationalError:
+        return (None, None)      # base pré-0.9.5 en lecture seule — cf. get_events()
+    return (r[0], r[1]) if r else (None, None)
+
+
+def _ts_global(conn: sqlite3.Connection, agg: str):
+    """MIN(ts) ou MAX(ts) sur TOUTE la base, calculé PAR PDL puis agrégé en Python.
+
+    ⚠️ `SELECT MIN(ts) FROM measurements` sans filtre mesure 15,6 s sur ben-0001 —
+    et `EXPLAIN QUERY PLAN` annonce pourtant `SEARCH`, le plan ment ici. La même
+    requête avec `WHERE pdl_index=?` tombe à 0,00 s. Le rollup couvre tous les PDL,
+    d'où la boucle : quelques requêtes instantanées au lieu d'un parcours complet.
+    """
+    vus = []
+    for pdl in pdl_list(conn):
+        v = conn.execute(f"SELECT {agg}(ts) FROM measurements WHERE pdl_index=?",
+                         (pdl,)).fetchone()[0]
+        if v is not None:
+            vus.append(v)
+    if not vus:
+        return None
+    return min(vus) if agg == "MIN" else max(vus)
+
+
+def pdl_list(conn: sqlite3.Connection) -> list:
+    """PDL connus du boîtier, SANS toucher `measurements`.
+
+    ⚠️ Ne JAMAIS écrire `SELECT DISTINCT pdl_index FROM measurements` : mesuré 16,7 s
+    sur ben-0001 (3,1 M lignes — l'index (pdl_index, ts, papp) ne sert à rien pour un
+    DISTINCT). `pdl` et `level_profile` ont une ligne par PDL et se lisent en 0,01 s.
+    """
+    vus = set()
+    for table in ("pdl", "level_profile"):
+        try:
+            vus |= {r[0] for r in conn.execute(f"SELECT pdl_index FROM {table}")}
+        except sqlite3.OperationalError:
+            pass                      # table absente sur une base pas encore migrée
+    return sorted(x for x in vus if x is not None) or [0]
+
+
+def _prochain_pdl(conn: sqlite3.Connection, reserves=()) -> int:
+    """Premier index libre. Base -1 pour que le TOUT PREMIER PDL vaille 0.
+
+    Les trois sources comptent : si un boîtier a deux émetteurs mappés sur 0 et 1 dans
+    sources.json et que seul le premier a redémarré, allouer 1 à un nouveau compteur
+    écraserait la place réservée au second.
+    """
+    vus = [-1]
+    vus += [r[0] for r in conn.execute("SELECT pdl_index FROM pdl")]
+    # `level_profile` et NON `measurements` : une ligne par PDL vu (isousc/ngtf/mode y
+    # sont écrits dès la 1re trame), donc lecture instantanée. Un
+    # `SELECT DISTINCT pdl_index FROM measurements` coûte 16,7 s sur ben-0001 (3,1 M
+    # lignes, index (pdl_index, ts, papp) inutilisable sans filtre) — et cette fonction
+    # tourne dans le FIL DE RÉCEPTION RADIO, à la trame de boot. 16 s de blocage là,
+    # ce sont des trames perdues. Le cas que le scan couvrait — un PDL présent dans les
+    # mesures, absent de `pdl` ET de sources.json — ne se produit pas : la graine
+    # sources.json couvre l'index de tout boîtier du terrain.
+    try:
+        vus += [r[0] for r in conn.execute(
+            "SELECT pdl_index FROM level_profile WHERE pdl_index IS NOT NULL")]
+    except sqlite3.OperationalError:
+        pass
+    vus += [int(x) for x in reserves]
+    return max(vus) + 1
+
+
+def resolve_pdl(conn: sqlite3.Connection, adco: str, *,
+                graine: int | None = None, reserves=()) -> int | None:
+    """PDL du compteur `adco` — le crée s'il est inconnu.
+
+    `graine` = l'index que sources.json attribuait à cet émetteur. Il sert UNE SEULE
+    FOIS, à l'adoption : sans lui, un boîtier déjà en service verrait ses courbes
+    basculer sur un nouvel index alors que tout son historique est sous l'ancien.
+    """
+    adco = (adco or "").strip()
+    if not adco:
+        return None
+    now = int(time.time())
+    row = conn.execute("SELECT pdl_index FROM pdl WHERE adco=?", (adco,)).fetchone()
+    if row:
+        conn.execute("UPDATE pdl SET last_seen=? WHERE adco=?", (now, adco))
+        conn.commit()
+        return row[0]
+    idx = graine
+    if idx is None or conn.execute(
+            "SELECT 1 FROM pdl WHERE pdl_index=?", (idx,)).fetchone():
+        idx = _prochain_pdl(conn, reserves)          # graine absente ou déjà prise
+    conn.execute("INSERT INTO pdl(pdl_index, adco, first_seen, last_seen) VALUES(?,?,?,?)",
+                 (idx, adco, now, now))
+    conn.commit()
+    return idx
+
+
+def bind_emitter(conn: sqlite3.Connection, lora_addr: int, adco: str, *,
+                 graine: int | None = None, reserves=()) -> tuple:
+    """Lie un émetteur au compteur qu'il lit. Retourne (pdl_index, a_change).
+
+    Appelé à la trame de boot, seule à porter l'ADCO.
+    """
+    pdl = resolve_pdl(conn, adco, graine=graine, reserves=reserves)
+    if pdl is None:
+        return (None, False)
+    prec = conn.execute("SELECT pdl_index FROM emitter WHERE lora_addr=?",
+                        (lora_addr,)).fetchone()
+    change = prec is not None and prec[0] is not None and prec[0] != pdl
+    conn.execute(
+        "INSERT INTO emitter(lora_addr, adco, pdl_index, updated_ts) VALUES(?,?,?,?) "
+        "ON CONFLICT(lora_addr) DO UPDATE SET adco=excluded.adco, "
+        "pdl_index=excluded.pdl_index, updated_ts=excluded.updated_ts",
+        (lora_addr, (adco or "").strip(), pdl, int(time.time())))
+    conn.commit()
+    return (pdl, change)
+
+
+def emitter_pdl(conn: sqlite3.Connection, lora_addr: int) -> int | None:
+    """PDL courant d'un émetteur, ou None si aucun ADCO ne lui est encore lié.
+
+    ⚠️ L'appelant DOIT se replier sur sources.json quand c'est None : après une OTA,
+    l'Arduino ne redémarre pas et ne réémet donc pas sa trame de boot — sans repli, le
+    boîtier cesserait de stocker jusqu'au prochain redémarrage de l'émetteur.
+    """
+    r = conn.execute("SELECT pdl_index FROM emitter WHERE lora_addr=?", (lora_addr,)).fetchone()
+    return r[0] if r else None
+
+
 def prune(conn: sqlite3.Connection, retention_days: int = RETENTION_DAYS) -> dict:
     """Supprime les points plus vieux que la rétention dans les deux tables.
     Retourne le nombre de lignes supprimées par table."""
     cutoff = int(time.time()) - retention_days * 86400
-    m = conn.execute("DELETE FROM measurements WHERE ts < ?", (cutoff,)).rowcount
-    l = conn.execute("DELETE FROM lora_link WHERE ts < ?", (cutoff,)).rowcount
-    r = conn.execute("DELETE FROM curve_rollup WHERE bucket_ts < ?", (cutoff,)).rowcount
+    # PAR PDL : `DELETE ... WHERE ts < ?` seul BALAYE (confirmé par EXPLAIN QUERY PLAN),
+    # alors qu'ajouter `pdl_index=?` attaque directement la plage via l'index —
+    # measurements(pdl_index, ts, papp), lora_link(pdl_index, ts), et la clé primaire
+    # de curve_rollup (pdl_index, bucket_ts, ...). Mêmes lignes supprimées, sans le
+    # parcours des 3,1 M pour les trouver.
+    m = l = r = 0
+    for pdl in pdl_list(conn):
+        m += conn.execute("DELETE FROM measurements WHERE pdl_index=? AND ts < ?",
+                          (pdl, cutoff)).rowcount
+        l += conn.execute("DELETE FROM lora_link WHERE pdl_index=? AND ts < ?",
+                          (pdl, cutoff)).rowcount
+        r += conn.execute("DELETE FROM curve_rollup WHERE pdl_index=? AND bucket_ts < ?",
+                          (pdl, cutoff)).rowcount
     conn.commit()
     # Checkpoint WAL TRUNCATE (maintenance ~horaire via _maybe_prune) : le fichier
     # `-wal` ne se tronque JAMAIS seul (grossit à son high-water mark → observé

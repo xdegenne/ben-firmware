@@ -126,11 +126,43 @@ def level_for(conn, pdl_index, current_papp, now=None):
 
 # ──────────────────── côté job planifié (écriture seule) ────────────────────
 
-def refresh(conn, pdl, now):
-    """Recalcule le `talon` (P15 de la PAPP sur la fenêtre, EN SQL → pas de
-    transfert de lignes) et upsert le profil. Ne touche PAS `papp_max_alltime`
-    (maintenu par le reader). Renvoie True si représentatif, sinon False."""
-    since = now - WINDOW_SEC
+def _profil_depuis_rollup(conn, pdl, since):
+    """(talon, n, span) depuis `curve_rollup` — la PAPP déjà résumée par tranches de 2 min.
+
+    ⚠️ POURQUOI : le P15 sur le BRUT oblige à ordonner ~1,76 M valeurs → **176,9 s**
+    mesurées sur ben-0001. Sur le rollup, ~21 600 tranches → **0,38 s**, soit ×465 —
+    et le talon obtenu est LE MÊME (71 dans les deux cas, vérifié). Lisser sur 2 min
+    ne déplace pas un percentile bas : les creux durent bien plus que deux minutes.
+    C'est un chiffre qui choisit une couleur de jauge, pas une facture.
+
+    `n` reste le nombre d'échantillons BRUTS (somme des `papp_count`), pas le nombre de
+    tranches : sinon `MIN_SAMPLES` et `is_known()` changeraient de sens et le
+    démarrage à froid se décalerait d'un facteur ~120.
+    """
+    agg = conn.execute(
+        "SELECT SUM(papp_count) AS n, MIN(ts_start) AS t0, MAX(ts_end) AS t1, "
+        "       COUNT(*) AS tranches "
+        "FROM curve_rollup WHERE pdl_index=? AND bucket_ts>=? AND papp_count>0",
+        (pdl, since),
+    ).fetchone()
+    n = (agg["n"] if agg else 0) or 0
+    if not n:
+        return (None, 0, 0)                      # rollup vide → l'appelant retombe sur le brut
+    span = (agg["t1"] - agg["t0"]) if agg["t0"] is not None else 0
+    rang = int(TALON_Q * ((agg["tranches"] or 1) - 1))
+    row = conn.execute(
+        "SELECT papp_sum / papp_count AS m FROM curve_rollup "
+        "WHERE pdl_index=? AND bucket_ts>=? AND papp_count>0 "
+        "ORDER BY m LIMIT 1 OFFSET ?",
+        (pdl, since, rang),
+    ).fetchone()
+    return (row["m"] if row else None, n, span)
+
+
+def _profil_depuis_brut(conn, pdl, since):
+    """(talon, n, span) depuis `measurements`. Repli quand le rollup ne couvre pas encore
+    la fenêtre (boîtier neuf, backfill en cours) — cas où le brut est justement peu
+    volumineux, donc peu coûteux."""
     row = conn.execute(
         "WITH d AS ("
         "  SELECT papp, ROW_NUMBER() OVER (ORDER BY papp) AS rn, "
@@ -138,20 +170,32 @@ def refresh(conn, pdl, now):
         "  FROM measurements "
         "  WHERE pdl_index=? AND ts>=? AND papp IS NOT NULL"
         ") "
-        "SELECT MAX(CASE WHEN rn = CAST(? * (n - 1) AS INT) + 1 THEN papp END) "
-        "         AS talon, "
+        "SELECT MAX(CASE WHEN rn = CAST(? * (n - 1) AS INT) + 1 THEN papp END) AS talon, "
         "       MAX(n) AS n "
         "FROM d",
         (pdl, since, TALON_Q),
     ).fetchone()
-    talon = row["talon"] if row else None
     n = (row["n"] if row else 0) or 0
-    span_row = conn.execute(
-        "SELECT IFNULL(MAX(ts) - MIN(ts), 0) AS span FROM measurements "
-        "WHERE pdl_index=? AND ts>=? AND papp IS NOT NULL",
-        (pdl, since),
-    ).fetchone()
-    span = span_row["span"] if span_row else 0
+    # MIN et MAX en DEUX requêtes : ensemble, SQLite désactive son optimisation d'index
+    # (8,6 s contre 0,00 s sur ben-0001). Cf. project_local_api_perf_pdl_index.
+    t0 = conn.execute("SELECT MIN(ts) FROM measurements "
+                      "WHERE pdl_index=? AND ts>=? AND papp IS NOT NULL",
+                      (pdl, since)).fetchone()[0]
+    t1 = conn.execute("SELECT MAX(ts) FROM measurements "
+                      "WHERE pdl_index=? AND ts>=? AND papp IS NOT NULL",
+                      (pdl, since)).fetchone()[0]
+    span = (t1 - t0) if (t0 is not None and t1 is not None) else 0
+    return ((row["talon"] if row else None), n, span)
+
+
+def refresh(conn, pdl, now):
+    """Recalcule le `talon` (P15 de la PAPP sur la fenêtre) et upsert le profil.
+    Ne touche PAS `papp_max_alltime` (maintenu par le reader).
+    Renvoie True si représentatif, sinon False."""
+    since = now - WINDOW_SEC
+    talon, n, span = _profil_depuis_rollup(conn, pdl, since)
+    if not n:
+        talon, n, span = _profil_depuis_brut(conn, pdl, since)
 
     # NB : pas de papp_max_alltime ni p_low/p_mid/p_high dans le DO UPDATE →
     # le high-water mark (reader) et les colonnes legacy sont préservés.
@@ -174,8 +218,9 @@ def refresh_all(now=None):
     now = now or int(time.time())
     conn = db.connect()  # écriture (user `ben`, WAL → concurrence avec le reader)
     try:
-        pdls = [r["pdl_index"] for r in conn.execute(
-            "SELECT DISTINCT pdl_index FROM measurements")]
+        # `db.pdl_list` et non `SELECT DISTINCT pdl_index FROM measurements` : ce
+        # DISTINCT balaye (confirmé par EXPLAIN) et mesure 16,7 s sur ben-0001.
+        pdls = db.pdl_list(conn)
         ok = sum(1 for pdl in pdls if refresh(conn, pdl, now))
     finally:
         conn.close()

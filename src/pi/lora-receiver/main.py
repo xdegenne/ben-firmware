@@ -1,3 +1,21 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ⚠️  DÉPRÉCIÉ — NE PLUS MODIFIER, NE PLUS LIRE COMME RÉFÉRENCE
+#
+#  Ce monolithe est REMPLACÉ depuis pi-0.9.0 par la façade ben-radio + ben-telemetry
+#  (cf. updates/0.8.7_to_0.9.0/update.sh, étape 6 « cutover »). Il avait été conservé
+#  comme filet de sécurité le temps de valider la façade ; celle-ci tourne désormais
+#  en production sur tout le parc (ben-0001, ben-0010).
+#
+#  Plus AUCUN boîtier ne l'exécute. `ben-lora-receiver.service` n'est ni activé au
+#  provisioning (install.sh) ni démarré par check_network.
+#
+#  Le vrai lecteur LoRa est : src/pi/ben-telemetry/ben_telemetry.py
+#
+#  Il est FIGÉ à l'état pi-0.9.4 : les correctifs postérieurs (résolution pdl_index par
+#  ADCO, événements, performances) n'y sont volontairement PAS reportés. Maintenir deux
+#  copies de la même logique garantit qu'elles divergent. À supprimer.
+# ═══════════════════════════════════════════════════════════════════════════════
+
 """
 lora-receiver — BEN Pi LoRa receiver agent (v1: log-only)
 

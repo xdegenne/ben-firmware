@@ -14,7 +14,8 @@ Endpoints :
       → {"deviceId","model","softwareVersion","db":true,
          "last_tic_ts":<ts dernière trame TIC ou null>,"now":...}
   GET /pdls
-      → [{"pdl_index":0,"last_ts":...}, ...]
+      → [{"pdl_index":0,"adco":"0217...","first_ts":...,"last_ts":...,"points":N}, ...]
+        `adco` identifie le COMPTEUR ("" tant qu'aucun ADCO n'est lié).
   GET /live[?pdl_index=N]
       → dernière mesure (≤ ~30 s) par PDL (ou pour un PDL donné)
   GET /measurements?pdl_index=N[&since=ts&until=ts&limit=N]
@@ -122,12 +123,18 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # noqa: D401
         pass
 
-    def _send(self, payload, status=200):
+    def _send(self, payload, status=200, headers=None):
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")  # app mobile LAN
+        # L'app lit ces en-têtes depuis JS/Dart : sans exposition explicite, CORS les masque.
+        self.send_header("Access-Control-Expose-Headers",
+                         "X-Ben-Last-Event, X-Ben-Last-Event-Severity")
+        for k, v in (headers or {}).items():
+            if v is not None:
+                self.send_header(k, str(v))
         self.end_headers()
         self.wfile.write(body)
 
@@ -141,7 +148,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/health":
                 return self._health()
             if path == "/pdls":
-                return self._pdls()
+                return self._pdls(qs)
             if path == "/live":
                 return self._live(qs)
             if path == "/measurements":
@@ -156,6 +163,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._registers(qs)
             if path == "/lora-link":
                 return self._lora_link(qs)
+            if path == "/events":
+                return self._events(qs)
             if path == "/settings":
                 return self._send(settings.load())
             return self._send({"error": "not_found"}, 404)
@@ -197,7 +206,12 @@ class Handler(BaseHTTPRequestHandler):
         last_tic = None
         try:
             with db.connect(read_only=True) as conn:
-                row = conn.execute("SELECT MAX(ts) FROM measurements").fetchone()
+        # ⚠️ NE JAMAIS interroger `measurements` sans filtrer sur `pdl_index` :
+        # l'index est (pdl_index, ts, papp), donc une requête non filtrée y est
+        # AVEUGLE et balaye toute la table. Mesuré sur ben-0001 (3,1 M lignes) :
+        # MAX(ts) 15,6 s sans filtre contre 0,00 s avec.
+                row = conn.execute(
+                    "SELECT MAX(ts) FROM measurements WHERE pdl_index=?", (0,)).fetchone()
                 last_tic = row[0] if row else None
         except sqlite3.OperationalError:
             db_ok = False
@@ -260,45 +274,62 @@ class Handler(BaseHTTPRequestHandler):
 
         threading.Timer(2.0, _teardown).start()
 
-    def _pdls(self):
+    def _pdls(self, qs=None):
+        # ⚠️ NE JAMAIS interroger `measurements` sans filtrer sur `pdl_index` :
+        # l'index est (pdl_index, ts, papp), donc une requête non filtrée y est
+        # AVEUGLE et balaye toute la table. Mesuré sur ben-0001 (3,1 M lignes) :
+        # MIN/MAX/COUNT GROUP BY 37 s. La liste des PDL vient donc de `pdl`
+        # (repli `level_profile`) — quelques lignes, 0,01 s — puis MIN/MAX FILTRÉS
+        # par PDL, à 0,00 s chacun.
+        #
+        # `points` (COUNT) reste cher même filtré (11,8 s) et n'est lu par personne :
+        # l'app ne prend que `first_ts` d'ici. Renvoyé sur `?count=1` seulement.
+        compter = bool(qs and qs.get("count"))
         with db.connect(read_only=True) as conn:
-            rows = _rows(
-                conn,
-                # first_ts = 1re mesure du PDL → l'app en déduit l'âge
-                # d'apprentissage (now - first_ts) pour dimensionner sa fenêtre de
-                # lissage anti-Hawthorne (volet D, présentation côté app).
-                "SELECT pdl_index, MIN(ts) AS first_ts, MAX(ts) AS last_ts, "
-                "COUNT(*) AS points "
-                "FROM measurements GROUP BY pdl_index ORDER BY pdl_index",
-                (),
-            )
+            try:
+                pdls = [r[0] for r in conn.execute("SELECT pdl_index FROM pdl")]
+                adcos = {r[0]: r[1] for r in conn.execute("SELECT pdl_index, adco FROM pdl")}
+            except sqlite3.OperationalError:
+                pdls, adcos = [], {}          # base antérieure à 0.9.5, lecture seule
+            if not pdls:
+                pdls = [r[0] for r in conn.execute("SELECT pdl_index FROM level_profile")]
+            if not pdls:
+                pdls = [0]
+            rows = []
+            for pdl in sorted(set(pdls)):
+                # ⚠️ DEUX requêtes, pas une. SQLite n'applique son optimisation d'index
+                # que s'il y a UN SEUL agrégat : `SELECT MIN(ts), MAX(ts) … WHERE
+                # pdl_index=?` retombe sur un balayage — mesuré 16,55 s sur ben-0001,
+                # contre 0,00 s pour chacune prise séparément.
+                mn = conn.execute("SELECT MIN(ts) FROM measurements WHERE pdl_index=?",
+                                  (pdl,)).fetchone()[0]
+                mx = conn.execute("SELECT MAX(ts) FROM measurements WHERE pdl_index=?",
+                                  (pdl,)).fetchone()[0]
+                if mn is None:
+                    continue                  # PDL déclaré, aucune mesure encore
+                n = conn.execute("SELECT COUNT(*) FROM measurements WHERE pdl_index=?",
+                                 (pdl,)).fetchone()[0] if compter else None
+                rows.append({"pdl_index": pdl, "adco": adcos.get(pdl, ""),
+                             "first_ts": mn, "last_ts": mx, "points": n})
         self._send(rows)
 
     def _live(self, qs):
+        # ⚠️ NE JAMAIS interroger `measurements` sans filtrer sur `pdl_index` :
+        # l'index est (pdl_index, ts, papp), donc une requête non filtrée y est
+        # AVEUGLE et balaye toute la table. Mesuré sur ben-0001 (3,1 M lignes) :
+        # dernier point 114 s sans filtre contre 0,01 s avec.
+        # L'app envoie `pdl_index` ; à défaut on prend 0 (tout le parc n'a qu'un PDL).
         pdl = _int(qs, "pdl_index")
+        if pdl is None:
+            pdl = 0
         with db.connect(read_only=True) as conn:
-            if pdl is not None:
-                rows = _rows(
-                    conn,
-                    "SELECT ts, pdl_index, base, hchc, hchp, papp, iinst, tariff, "
-                    "index_id, index_value, src_standard, inject_total "
-                    "FROM measurements WHERE pdl_index=? ORDER BY ts DESC LIMIT 1",
-                    (pdl,),
-                )
-            else:
-                # Dernière mesure par PDL.
-                rows = _rows(
-                    conn,
-                    "SELECT m.ts, m.pdl_index, m.base, m.hchc, m.hchp, m.papp, "
-                    "m.iinst, m.tariff, m.index_id, m.index_value, m.src_standard, "
-                    "m.inject_total "
-                    "FROM measurements m "
-                    "JOIN (SELECT pdl_index, MAX(ts) mx FROM measurements "
-                    "      GROUP BY pdl_index) g "
-                    "  ON m.pdl_index=g.pdl_index AND m.ts=g.mx "
-                    "ORDER BY m.pdl_index",
-                    (),
-                )
+            rows = _rows(
+                conn,
+                "SELECT ts, pdl_index, base, hchc, hchp, papp, iinst, tariff, "
+                "index_id, index_value, src_standard, inject_total "
+                "FROM measurements WHERE pdl_index=? ORDER BY ts DESC LIMIT 1",
+                (pdl,),
+            )
             # Niveau de conso 1..4 (visuel app), seuils pré-calculés par
             # ben-level-profiler ; ici lecture seule (cf. levels.py).
             now = int(time.time())
@@ -349,7 +380,14 @@ class Handler(BaseHTTPRequestHandler):
                     conn, row["pdl_index"], row.get("src_standard"), row.get("index_id"))
                 # Contrat (NGTF, quasi-statique) — distinct du tarif en cours ci-dessus.
                 row["contract"] = db.get_ngtf(conn, row["pdl_index"])
-        self._send(rows)
+            # Cloche de l'app : /live est DÉJÀ polé en continu, on y adosse donc
+            # « il y a du nouveau » plutôt que d'ajouter un second appel périodique
+            # (Pi Zero mono-cœur). En-tête plutôt que champ : /live renvoie un tableau
+            # nu, l'envelopper casserait le contrat pour une feature pas encore éprouvée.
+            # Un seul dernier événement pour l'INSTALLATION, pas un par PDL.
+            ev_id, ev_sev = db.last_event(conn)
+            self._send(rows, headers={"X-Ben-Last-Event": ev_id,
+                                      "X-Ben-Last-Event-Severity": ev_sev})
 
     def _measurements(self, qs):
         pdl = _int(qs, "pdl_index")
@@ -477,6 +515,18 @@ class Handler(BaseHTTPRequestHandler):
             regs = db.registers(conn, pdl)
             contract = db.get_ngtf(conn, pdl)   # NGTF = le contrat (calendrier fournisseur)
         self._send({"pdl_index": pdl, "contract": contract, "registers": regs})
+
+    def _events(self, qs):
+        """Événements constatés par le boîtier (cf. docs/chantier-events-et-notifications.md).
+
+        Appelé UNIQUEMENT au tap sur la cloche : c'est l'en-tête X-Ben-Last-Event
+        posé sur /live (déjà polé) qui signale qu'il y a du nouveau. Charge nulle
+        sur un Pi Zero mono-cœur tant que l'utilisateur ne demande rien.
+        """
+        limit = min(_int(qs, "limit", 50) or 50, 200)
+        since = _int(qs, "since")
+        with db.connect(read_only=True) as conn:
+            return self._send(db.get_events(conn, limit=limit, since_ts=since))
 
     def _lora_link(self, qs):
         pdl = _int(qs, "pdl_index")

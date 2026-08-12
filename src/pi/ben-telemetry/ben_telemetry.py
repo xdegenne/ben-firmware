@@ -127,10 +127,43 @@ def load_sources(path: str) -> dict:
 sources_map = load_sources(SOURCES_PATH)
 log.info(f"Sources LoRa : {sources_map}")
 
+# Cache RAM adresse LoRa → pdl_index. La résolution ne doit PAS taper SQLite à chaque
+# trame reçue : on est dans le chemin chaud de réception, sur un Pi Zero mono-cœur, et
+# la base est en WAL (un `-wal` gonflé ralentit toutes les lectures — cf. le chantier
+# checkpoint). Le cache est AUTORITAIRE et ne peut pas être périmé : la seule chose qui
+# change l'association est une trame de boot, traitée dans ce même processus, qui met
+# le cache à jour au moment où elle écrit en base.
+_pdl_par_emetteur: dict = {}
+
+# Garde RAM du mode TIC par PDL : record_tic_mode() seulement sur changement,
+# jamais une lecture SQLite par trame reçue.
+_mode_par_pdl: dict = {}
+
 def get_pdl_index(lora_address_int: int) -> int | None:
-    """Résout le pdl_index depuis l'adresse RadioHead source (int)."""
-    key = f"0x{lora_address_int:02x}"
-    return sources_map.get(key)
+    """PDL du COMPTEUR branché au bout de cet émetteur.
+
+    L'adresse LoRa identifie l'ÉMETTEUR, pas le compteur : elle est flashée en EEPROM
+    et le suit s'il est reposé sur un autre Linky. C'est la table `emitter`, entretenue
+    à la trame de boot (seule à porter l'ADCO), qui porte l'association réelle.
+    Cf. docs/chantier-pdl-adco.md
+    """
+    pdl = _pdl_par_emetteur.get(lora_address_int)
+    if pdl is not None:
+        return pdl
+    if measurements_db is not None:
+        try:
+            pdl = db.emitter_pdl(measurements_db, lora_address_int)
+        except Exception as e:
+            log.warning(f"store: emitter_pdl échoué: {e}")
+    if pdl is None:
+        # Repli sources.json — INDISPENSABLE : après une OTA c'est le Pi qui redémarre,
+        # pas l'Arduino, qui reste donc en STREAMING sans réémettre sa trame de boot.
+        # `emitter` est vide alors que les courbes continuent d'arriver ; sans ce repli
+        # le boîtier cesserait de stocker jusqu'au prochain redémarrage de l'émetteur.
+        pdl = sources_map.get(f"0x{lora_address_int:02x}")
+    if pdl is not None:
+        _pdl_par_emetteur[lora_address_int] = pdl   # une lecture DB par émetteur, pas par trame
+    return pdl
 
 # ---------------------------------------------------------------------------
 # État persistant
@@ -263,7 +296,7 @@ def on_recv(raw: bytes, rssi, snr, sender_addr: int) -> None:
         if ftype == frame_codec.TYPE_CURVE:
             on_recv_curve(decoded, rssi, snr, pdl_index, now, time_since_prev)
         elif ftype == frame_codec.TYPE_BOOT:
-            on_recv_boot(decoded, rssi, snr, pdl_index)
+            on_recv_boot(decoded, rssi, snr, pdl_index, sender_addr)
         else:
             log.error(f"type de trame inconnu : 0x{ftype:02x}")
             blink_rgb(30, 0, 0, 0.3, bypass=True)  # rouge — proto
@@ -301,12 +334,32 @@ def log_uncabled(pdl_index, tlvs) -> None:
                 _last_uncabled[key] = val
 
 
-def on_recv_boot(decoded, rssi, snr, pdl_index) -> None:
+def on_recv_boot(decoded, rssi, snr, pdl_index, sender_addr) -> None:
     """Trame BOOT/IDENTITÉ (format cible) : TLV identité (ADCO/ISOUSC/PREF/CONTRAT), MAC déjà
     vérifié. Reset state si nouveau PDL (ADCO). TLV non câblés → logués."""
     tlvs = decoded["tlvs"]
     adco = (frame_codec.interpret_tlv(frame_codec.T_ADCO, tlvs[frame_codec.T_ADCO])
             if frame_codec.T_ADCO in tlvs else "")
+    if adco and measurements_db is not None:
+        # L'ADCO identifie le COMPTEUR, et cette trame est la seule à le porter. On lie
+        # l'émetteur au compteur qu'il lit ; le PDL qui en sort FAIT FOI, même s'il
+        # diffère de celui déduit de l'adresse LoRa (émetteur reposé sur un autre Linky).
+        try:
+            pdl, change = db.bind_emitter(
+                measurements_db, sender_addr, adco,
+                graine=sources_map.get(f"0x{sender_addr:02x}"),
+                reserves=sources_map.values())
+            if pdl is not None:
+                if pdl != pdl_index:
+                    log.info(f"pdl_index 0x{sender_addr:02x} : {pdl_index} → {pdl} "
+                             f"(ADCO={adco})")
+                if change:
+                    log.warning(f"COMPTEUR CHANGÉ sur l'émetteur 0x{sender_addr:02x} "
+                                f"→ pdl_index={pdl}")
+                _pdl_par_emetteur[sender_addr] = pdl   # cache autoritaire
+                pdl_index = pdl
+        except Exception as e:
+            log.warning(f"store: bind_emitter échoué: {e}")
     if adco and adco != state.get("adco", ""):
         log.info(f"BOOT pdl_index={pdl_index} ADCO={adco} — NOUVEAU PDL, reset state")
         state["indexes"] = {}
@@ -367,6 +420,15 @@ def on_recv_curve(decoded, rssi, snr, pdl_index, now, time_since_prev) -> None:
     tous les TLV ; les non câblés (DEMAIN/ADPS/PEJP/NJOURF/MSG) sont LOGUÉS."""
     index_id = decoded["index_id"]
     src_standard = decoded["src_standard"]
+    _std = 1 if src_standard else 0
+    if _mode_par_pdl.get(pdl_index) != _std and measurements_db is not None:
+        try:
+            if db.record_tic_mode(measurements_db, pdl_index, _std, db.device_id()):
+                log.info(f"MODE TIC pdl_index={pdl_index} → "
+                         f"{'standard' if _std else 'historique'} — événement émis")
+            _mode_par_pdl[pdl_index] = _std
+        except Exception as e:
+            log.warning(f"store: record_tic_mode échoué: {e}")
 
     # Index actif : histo → nom canonique (INDEX_NAMES) écrit dans base/hchc/hchp ;
     # standard → index_id = NTARF (1..10), OPAQUE (nom = LTARF fournisseur, pas de table

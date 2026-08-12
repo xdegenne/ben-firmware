@@ -68,3 +68,7 @@ updates_caps:
     to:   "0.9.4"
     tag:  "pi-0.9.4"
     script: "updates/0.9.3_to_0.9.4/update.sh"   # coloration HC/HP en HISTO Tempo/BBR : HISTO_LABELS s'arrêtait à l'index 4 → registres BBR (index 5-10) sans libellé → _band_kind=base → app ne coloriait ni la courbe ni le badge, /live.tariff_label=null (révélé par ben-0010, 1er device Tempo). Complète les 6 registres BBR. Pur code store/db.py. UNIVERSEL (LoRa + filaire, pas de gate) : restart ben-local-api.
+  - from: "0.9.4"
+    to:   "0.9.5"
+    tag:  "pi-0.9.5"
+    script: "updates/0.9.4_to_0.9.5/update.sh"   # (1) pdl_index = un COMPTEUR (ADCO) et non plus l'émetteur : tables pdl/emitter entretenues à la trame de boot ; migration additive, sources.json = graine (1er PDL = 0) ET repli (après OTA le Pi redémarre, pas l'Arduino). (2) Événements : table event, /events, X-Ben-Last-Event sur /live ; bascule d'offre (OPTARIF/NGTF) et de mode TIC. (3) PERFORMANCES : toute requête non filtrée sur pdl_index balayait les 3,1 M lignes — /live 28,6→0,10 s, /pdls 36,7→0,06 s, profileur de niveaux 199,9→0,55 s (P15 sur curve_rollup), charge 1,96→0,16. Pur code (db.py, local_api.py, levels.py, ben_telemetry.py, main_uart.py). UNIVERSEL (LoRa + filaire, pas de gate) : restart lecteur PUIS ben-local-api.
