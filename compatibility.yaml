@@ -81,3 +81,7 @@ updates_caps:
     to:   "0.9.7"
     tag:  "pi-0.9.7"
     script: "updates/0.9.6_to_0.9.7/update.sh"   # (1) COULEUR TEMPO en champ explicite sur /live et /registers (bleu/blanc/rouge) : résolue par le boîtier, déterministe en histo (index_id 5-6/7-8/9-10) et lue une fois par registre dans LTARF en standard — l'app n'a plus à chercher un mot français ni à connaître les 2 conventions. AUCUNE colonne ajoutée : la couleur est une interprétation d'index_id, que le rollup ventile déjà. (2) Les événements n'émettent plus d'ACTION : une route est une notion de l'app, et l'action figée à la naissance casserait au moindre remaniement de navigation. Pur code (db.py, local_api.py). UNIVERSEL (LoRa + filaire, pas de gate) : restart ben-local-api seul, les lecteurs ne sont pas concernés.
+  - from: "0.9.7"
+    to:   "0.9.8"
+    tag:  "pi-0.9.8"
+    script: "updates/0.9.7_to_0.9.8/update.sh"   # BANDES HC/HP EN STANDARD : `_band_kind()` ne reconnaissait que les libellés HISTORIQUES (« creus »/« plein ») ; en standard LTARF est abrégé (« HP  BLEU ») → tout retombait sur `base` → courbe entièrement GRISE et pas de badge HC/HP. Touchait TOUT contrat HC/HP en standard, pas seulement Tempo. Rétroactif sans backfill (les bandes sont recalculées à la lecture depuis le rollup). Pur code store/db.py. UNIVERSEL : restart ben-local-api seul.

@@ -26,6 +26,7 @@ Conventions :
 Mode WAL : le reader écrit, l'API lit en concurrence sans verrou bloquant.
 """
 
+import bisect
 import json
 import sqlite3
 import time
@@ -140,6 +141,24 @@ CREATE TABLE IF NOT EXISTS event (
     sent      INTEGER NOT NULL DEFAULT 0 -- remonté au backend (Phase 2)
 );
 CREATE INDEX IF NOT EXISTS idx_event_ts ON event(ts DESC);
+
+-- ÉPOQUES DE CONTRAT. Un contrat n'est pas une propriété de chaque mesure, c'est une
+-- PÉRIODE — d'où une table de bornes plutôt qu'une colonne sur `measurements` (qui
+-- dupliquerait le contrat des millions de fois).
+--
+-- ⚠️ POURQUOI c'est indispensable en mode STANDARD : `index_id` y vaut `NTARF`, une
+-- POSITION dans le calendrier du contrat, pas une signification absolue. Sur ben-0001,
+-- `index_id=1` valait « BASE » avant le passage en Tempo et « HC BLEU » après — même
+-- numéro, deux tarifs, et l'index ne fait même pas de saut (Enedis reporte le cumul).
+-- Sans les bornes, tout regroupement par registre mélange les époques et fausse les coûts.
+-- (L'HISTORIQUE n'a pas ce problème : le rang PTEC a un sens absolu — 1 = heures creuses
+-- quel que soit le contrat.)
+CREATE TABLE IF NOT EXISTS contract_epoch (
+    pdl_index INTEGER NOT NULL,
+    ts_start  INTEGER NOT NULL,   -- début de validité (epoch s)
+    ngtf      TEXT NOT NULL,      -- contrat en vigueur à partir de ts_start
+    PRIMARY KEY (pdl_index, ts_start)
+);
 
 -- Un COMPTEUR = un PDL, à vie. C'est l'ADCO qui fait foi, pas l'adresse LoRa (qui
 -- identifie l'ÉMETTEUR et le suit s'il change de Linky). Cf. docs/chantier-pdl-adco.md
@@ -279,6 +298,11 @@ def connect(path: str = DB_PATH, *, read_only: bool = False) -> sqlite3.Connecti
                 "                          WHEN 2 THEN hchp END "
                 "WHERE src_standard=0 AND index_value IS NULL AND tariff IS NOT NULL")
             conn.execute("PRAGMA user_version = 1")
+        # Bornes de contrat pour un boîtier déjà en service (one-shot, no-op si présentes).
+        try:
+            bootstrap_contract_epochs(conn)
+        except Exception:
+            pass                # jamais bloquant : sans bornes on retombe sur l'ancien comportement
         conn.commit()
     conn.row_factory = sqlite3.Row
     return conn
@@ -306,7 +330,8 @@ def tariff_from_ptec(ptec: str | None) -> int | None:
 # Libellés HISTORIQUE par rang PTEC (cf. tariff_from_ptec) — convention (l'histo ne porte
 # pas de LTARF). Le STANDARD, lui, a le LTARF autoritatif capté dans tariff_labels.
 # Les index 5-10 = registres BBR/Tempo (mêmes rangs que INDEX_NAMES de ben-telemetry). Le mot
-# « Creuses »/« Pleines » dans le libellé pilote _band_kind → couleur HC/HP de la courbe ET badge
+# « Creuses »/« Pleines » (histo) — ou le préfixe « HC »/« HP » du LTARF en STANDARD — pilote
+# _band_kind → couleur HC/HP de la courbe ET badge
 # live (sinon None → kind=base → aucune coloration). Le jour Tempo (Bleu/Blanc/Rouge) reste dans
 # le texte seul : le tricolore n'est pas rendu par l'app (chantier couleur Tempo séparé).
 HISTO_LABELS = {
@@ -858,13 +883,22 @@ def curve_from_rollup(conn: sqlite3.Connection, pdl_index: int, since: int, unti
 
 
 def _band_kind(label: str | None) -> str:
-    """Classe un libellé tarifaire en hc / hp / base (pour la couleur des bandes)."""
+    """Classe un libellé tarifaire en hc / hp / base (pour la couleur des bandes).
+
+    ⚠️ DEUX CONVENTIONS selon le mode TIC, et il faut les deux :
+      - HISTORIQUE : libellé en toutes lettres — « Heures Creuses Jours Bleus »
+      - STANDARD   : `LTARF` abrégé — « HP  BLEU », « HC  BLANC », « HP  ROUGE »
+    Ne chercher que « creus »/« plein » faisait retomber TOUT le standard sur
+    « base » → aucune bande coloriée sur la courbe, et pas de badge HC/HP.
+    Constaté sur ben-0001 le 13/08, au lendemain de son passage en Tempo, mais le
+    défaut touchait déjà tout contrat HC/HP en standard.
+    """
     if not label:
         return "base"
-    l = label.lower()
-    if "creus" in l:
+    l = label.strip().lower()
+    if "creus" in l or l.startswith("hc"):
         return "hc"
-    if "plein" in l:
+    if "plein" in l or l.startswith("hp"):
         return "hp"
     return "base"
 
@@ -884,19 +918,32 @@ def tariff_bands(conn: sqlite3.Connection, pdl_index: int, since: int, until: in
     # `kind` (grossier : hc/hp/base) OU par `label`/`index_id` pour distinguer TOUS les tarifs
     # (Tempo bleu/blanc/rouge, EJP pointe…) — aucun tarif écrasé, en HISTO comme en STANDARD.
     # `resolve_label` est mode-agnostique (histo=convention HISTO_LABELS / standard=LTARF capté).
-    meta_cache: dict = {}   # (src, index_id) -> (label, kind) — résolu 1 fois par registre (§5)
-    def meta_of(std, idx):
-        key = (std, idx)
+    # Époques de contrat chargées UNE FOIS (poignée de lignes) puis résolues en mémoire :
+    # `index_id` seul est ambigu en standard (NTARF = position dans le calendrier du
+    # contrat), donc le libellé dépend de la DATE de la tranche. Le cache est keyé sur le
+    # contrat en plus du registre — sinon une bande d'avant le changement d'offre
+    # récupérerait le libellé d'après.
+    epochs = contract_epochs(conn, pdl_index)
+    ngtf_courant = get_ngtf(conn, pdl_index)
+    meta_cache: dict = {}   # (ngtf, src, index_id) -> (label, kind) — 1 résolution par couple
+    def meta_of(std, idx, ng):
+        key = (ng, std, idx)
         if key not in meta_cache:
-            lbl = resolve_label(conn, pdl_index, std, idx)
+            lbl = resolve_label(conn, pdl_index, std, idx, ngtf=ng)
             meta_cache[key] = (lbl, _band_kind(lbl))
         return meta_cache[key]
     # Fusionne les tranches CONSÉCUTIVES de même REGISTRE (src_standard, index_id) — PAS juste même
     # kind : deux registres distincts de même couleur (ex. 2 HP Tempo) restent 2 bandes. Ordonné
     # par ts_start → pas de chevauchement.
-    runs = []   # [(src, idx), from, to]
+    # ⚠️ Le CONTRAT entre dans la clé de fusion, sinon une bande enjambe un changement
+    # d'offre : en standard `index_id` est une position (NTARF) qui survit au changement
+    # — sur ben-0001, l'index 1 valait BASE avant minuit et « HC BLEU » après. Fusionner
+    # les deux donnerait UNE bande résolue sous le contrat de son début, effaçant
+    # purement et simplement la période suivante.
+    runs = []   # [(src, idx, ngtf), from, to]
     for r in rows:
-        reg = (r["src_standard"], r["index_id"])
+        reg = (r["src_standard"], r["index_id"],
+               contract_of(epochs, r["ts_start"], ngtf_courant))
         if runs and runs[-1][0] == reg:
             runs[-1][2] = max(runs[-1][2], r["ts_end"])
         else:
@@ -912,8 +959,10 @@ def tariff_bands(conn: sqlite3.Connection, pdl_index: int, since: int, until: in
         else:
             merged.append(run)
     out = []
-    for (std, idx), t0, t1 in merged:
-        label, kind = meta_of(std, idx)
+    for (std, idx, ng), t0, t1 in merged:
+        # Le contrat vient de la CLÉ de la bande (donc de sa propre date), pas du contrat
+        # courant : une bande d'avant un changement d'offre garde le libellé de l'époque.
+        label, kind = meta_of(std, idx, ng)
         out.append({"from": max(t0, since), "to": min(t1, until),
                     "src_standard": std, "index_id": idx, "label": label, "kind": kind})
     return out
@@ -1044,6 +1093,13 @@ def record_ngtf(conn: sqlite3.Connection, pdl_index: int, ngtf: str,
             pass   # L'ÉTAT PRIME, la notif est un bonus. `ngtf` segmente les libellés
                    # tarifaires et `src_standard` alimente /live : ne jamais empêcher
                    # leur écriture parce qu'un INSERT d'événement a échoué.
+    # Ouvre l'ÉPOQUE au moment même où le changement est constaté : c'est la seule
+    # occasion où l'on connaît la borne à la seconde près. Sans elle, `index_id` reste
+    # ambigu en standard (NTARF = position dans le calendrier du contrat).
+    try:
+        record_contract_epoch(conn, pdl_index, ngtf)
+    except Exception:
+        pass                    # une borne manquée ne doit pas bloquer l'écriture du contrat
     conn.execute(
         "INSERT INTO level_profile(pdl_index, computed_ts, ngtf) VALUES(?,0,?) "
         "ON CONFLICT(pdl_index) DO UPDATE SET ngtf=excluded.ngtf",
@@ -1096,8 +1152,112 @@ def record_tic_mode(conn: sqlite3.Connection, pdl_index: int, src_standard: int,
     return connu
 
 
+def contract_epochs(conn: sqlite3.Connection, pdl_index: int) -> list:
+    """Toutes les bornes de contrat, triées — [(ts_start, ngtf), …].
+
+    ⚠️ À charger UNE FOIS par requête, puis à résoudre en mémoire (`contract_of`).
+    Appeler `contract_at()` par tranche de rollup ferait 21 600 requêtes SQL sur une
+    fenêtre de 30 jours. La table compte une poignée de lignes : une par changement
+    de contrat dans la vie du boîtier.
+    """
+    try:
+        return [(r[0], r[1]) for r in conn.execute(
+            "SELECT ts_start, ngtf FROM contract_epoch WHERE pdl_index=? ORDER BY ts_start",
+            (pdl_index,))]
+    except sqlite3.OperationalError:
+        return []                                   # base antérieure à 0.9.9
+
+
+def contract_of(epochs: list, ts: int, defaut: str | None) -> str | None:
+    """Contrat en vigueur à `ts`, par dichotomie sur la liste pré-chargée. Zéro SQL."""
+    if not epochs:
+        return defaut
+    i = bisect.bisect_right(epochs, (ts, "\uffff")) - 1
+    return epochs[i][1] if i >= 0 else defaut
+
+
+def contract_at(conn: sqlite3.Connection, pdl_index: int, ts: int | None) -> str | None:
+    """Contrat (NGTF) en vigueur à l'instant `ts`. `ts=None` → contrat COURANT.
+
+    Sans époque connue, on retombe sur le contrat courant : c'est le comportement
+    d'avant, donc aucune régression sur un boîtier dont l'historique n'a pas de bornes.
+    """
+    if ts is None:
+        return get_ngtf(conn, pdl_index)
+    try:
+        row = conn.execute(
+            "SELECT ngtf FROM contract_epoch WHERE pdl_index=? AND ts_start<=? "
+            "ORDER BY ts_start DESC LIMIT 1", (pdl_index, ts)).fetchone()
+    except sqlite3.OperationalError:
+        return get_ngtf(conn, pdl_index)      # table absente (base pré-0.9.9)
+    return row[0] if row else get_ngtf(conn, pdl_index)
+
+
+def record_contract_epoch(conn: sqlite3.Connection, pdl_index: int, ngtf: str,
+                          ts: int | None = None) -> bool:
+    """Ouvre une époque de contrat. Idempotent : ne fait rien si le contrat en vigueur
+    à `ts` est déjà celui-là."""
+    ngtf = (ngtf or "").strip()
+    if not ngtf:
+        return False
+    ts = int(ts if ts is not None else time.time())
+    if contract_at(conn, pdl_index, ts) == ngtf:
+        return False
+    conn.execute("INSERT OR REPLACE INTO contract_epoch(pdl_index, ts_start, ngtf) "
+                 "VALUES(?,?,?)", (pdl_index, ts, ngtf))
+    conn.commit()
+    return True
+
+
+def bootstrap_contract_epochs(conn: sqlite3.Connection) -> int:
+    """Reconstitue les bornes de contrat d'un boîtier DÉJÀ EN SERVICE. One-shot.
+
+    Deux sources, par ordre de précision :
+      1. les événements `changement_offre` — datés à la seconde, avec `avant`/`apres` :
+         chacun ouvre une époque, et le `avant` du PLUS ANCIEN couvre tout ce qui précède ;
+      2. à défaut, le contrat courant, appliqué à tout l'historique.
+
+    Pour les changements antérieurs aux événements (pi-0.9.6), on ne sait rien : ils sont
+    absorbés par l'époque la plus ancienne. Flou assumé — c'est mieux que l'ambiguïté
+    totale d'aujourd'hui, où `index_id=1` désigne deux tarifs sans qu'on puisse trancher.
+    """
+    if conn.execute("SELECT 1 FROM contract_epoch LIMIT 1").fetchone():
+        return 0                                     # déjà borné
+    pose = 0
+    for pdl in pdl_list(conn):
+        evs = []
+        try:
+            for r in conn.execute(
+                    "SELECT ts, donnees FROM event WHERE type='changement_offre' "
+                    "AND (pdl_index=? OR pdl_index IS NULL) ORDER BY ts", (pdl,)):
+                try:
+                    evs.append((r[0], json.loads(r[1] or "{}")))
+                except Exception:
+                    pass
+        except sqlite3.OperationalError:
+            pass                                     # table event absente
+        if evs:
+            avant = (evs[0][1].get("avant") or "").strip()
+            if avant:
+                conn.execute("INSERT OR REPLACE INTO contract_epoch(pdl_index, ts_start, ngtf) "
+                             "VALUES(?,0,?)", (pdl, avant)); pose += 1
+            for ts, d in evs:
+                ap = (d.get("apres") or "").strip()
+                if ap:
+                    conn.execute("INSERT OR REPLACE INTO contract_epoch(pdl_index, ts_start, ngtf) "
+                                 "VALUES(?,?,?)", (pdl, ts, ap)); pose += 1
+        else:
+            cur = (get_ngtf(conn, pdl) or "").strip()
+            if cur:
+                conn.execute("INSERT OR REPLACE INTO contract_epoch(pdl_index, ts_start, ngtf) "
+                             "VALUES(?,0,?)", (pdl, cur)); pose += 1
+    if pose:
+        conn.commit()
+    return pose
+
+
 def resolve_label(conn: sqlite3.Connection, pdl_index: int,
-                  src_standard: int, index_id) -> str | None:
+                  src_standard: int, index_id, ngtf: str | None = None) -> str | None:
     """Libellé tarifaire d'un registre — résolution **UNIFIÉE côté serveur** (cœur du
     chantier labels). Standard : LTARF autoritatif capté (`tariff_labels`) ; historique :
     convention `HISTO_LABELS` (rang PTEC). None si inconnu → l'app peut retomber sur sa
@@ -1105,16 +1265,29 @@ def resolve_label(conn: sqlite3.Connection, pdl_index: int,
     if index_id is None:
         return None
     if src_standard:
-        # Label du registre SOUS LE CONTRAT COURANT (level_profile.ngtf).
-        ngtf = get_ngtf(conn, pdl_index) or ""
+        # Label du registre SOUS LE CONTRAT DE L'ÉPOQUE du point (`ngtf` fourni par
+        # l'appelant), à défaut sous le contrat COURANT. En standard `index_id` = NTARF,
+        # une position dans le calendrier du CONTRAT : le même numéro désigne des tarifs
+        # différents avant et après un changement d'offre.
+        if ngtf is None:
+            ngtf = get_ngtf(conn, pdl_index) or ""
         row = conn.execute(
             "SELECT label FROM tariff_labels "
             "WHERE pdl_index=? AND src_standard=1 AND index_id=? AND ngtf=?",
             (pdl_index, index_id, ngtf)).fetchone()
         if row and row[0]:
             return row[0]
-        # Repli : label le plus récent pour ce registre, tous contrats (ex. NGTF pas encore
-        # capté au moment où le LTARF est arrivé) → évite un None inutile.
+        # Repli : label le plus récent tous contrats confondus — UNIQUEMENT si le contrat
+        # est INCONNU. C'est le cas que ce repli visait : le NGTF pas encore capté alors
+        # qu'un LTARF est déjà arrivé, au démarrage.
+        #
+        # ⚠️ Ne JAMAIS l'appliquer quand le contrat est connu mais que le libellé de ce
+        # registre manque encore : en standard `index_id` est une position (NTARF) réutilisée
+        # d'un contrat à l'autre, donc on ramènerait le libellé d'une AUTRE offre. Constaté
+        # sur ben-0001 le 13/08 : l'index 1, devenu « HC BLEU » sous Tempo, s'affichait
+        # encore « BASE » — le libellé de l'ancien contrat. Mieux vaut None qu'un mensonge.
+        if ngtf:
+            return None
         row = conn.execute(
             "SELECT label FROM tariff_labels WHERE pdl_index=? AND src_standard=1 AND index_id=? "
             "ORDER BY updated_ts DESC LIMIT 1", (pdl_index, index_id)).fetchone()

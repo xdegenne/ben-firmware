@@ -18,6 +18,25 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.9.8] — 2026-08-13
+
+**Bandes de courbe non coloriées en mode STANDARD.** `_band_kind()` ne reconnaissait que les libellés **historiques** (« creus » / « plein »). En standard, `LTARF` est abrégé — « HP  BLEU », « HC  BLANC » — donc aucun des deux mots : tout retombait sur `base`, et **la courbe restait grise**, badge HC/HP compris. Le commentaire au-dessus de `HISTO_LABELS` annonçait pourtant la règle : *« le mot Creuses/Pleines dans le libellé pilote `_band_kind` »* — vrai en historique, faux en standard. On accepte désormais aussi le préfixe `HC`/`HP`. ⚠️ Ça ne touchait pas que Tempo : **tout contrat HC/HP en mode standard** était concerné. Correction rétroactive — les bandes sont calculées à la lecture depuis le rollup, donc l'historique se colore aussi, sans backfill.
+
+**Bornes de contrat (`contract_epoch`) — un registre ne veut rien dire sans son époque.** En mode standard, `index_id` vaut `NTARF` : une **position dans le calendrier du contrat**, pas une signification absolue. Constaté sur ben-0001 la nuit du 12 au 13/08, à la seconde près : à 23:59:46 `index_id=1` valait « BASE » ; à 00:00:07 une trame d'identité annonce `CONTRAT='TEMPO'` ; à 00:01:11 le **même `index_id=1`** désigne désormais les heures creuses bleues. Et l'index ne fait même pas de saut — Enedis reporte le cumul (15 409 379 → 15 409 381), donc rien ne permet de détecter la rupture dans les valeurs.
+
+Sans borne, la corruption était **imminente et invisible** : dès la capture du `LTARF` des heures creuses bleues, `resolve_label` aurait étiqueté « HC BLEU » **toutes** les bandes portant `index_id=1`, y compris les 2,7 millions de points de l'ère BASE — toute la courbe des mois précédents serait passée en indigo du jour au lendemain.
+
+Nouvelle table `contract_epoch (pdl_index, ts_start, ngtf)` : une ligne par changement d'offre, écrite par `record_ngtf()` au moment où il le constate — la seule occasion de connaître la borne à la seconde. Les bornes existantes sont reconstituées **depuis les événements `changement_offre`** (datés, avec `avant`/`apres`), à défaut depuis le contrat courant. ⚠️ Table séparée et non lecture des événements : **un événement est un message, une borne est un fait** — l'utilisateur peut masquer ou supprimer une notification, ça ne doit pas changer le sens des données.
+
+`resolve_label()` accepte désormais le contrat de l'époque ; `tariff_bands()` charge les bornes **une seule fois** puis résout en mémoire par dichotomie — appeler la base par tranche ferait 21 600 requêtes sur une fenêtre de 30 j — et le **contrat entre dans la clé de fusion** des bandes, sans quoi une bande enjamberait le changement d'offre et effacerait la période suivante. Aucune colonne ajoutée à `measurements` : le contrat est une **période**, pas une propriété de chaque point.
+
+**Repli de libellé restreint.** `resolve_label` retombait sur « le libellé le plus récent tous contrats confondus » quand le registre n'avait pas de libellé sous le contrat courant — d'où un `index_id=1` devenu heures creuses mais affiché « BASE ». Ce repli ne vaut plus que si le contrat est **inconnu**, cas qu'il visait réellement (NGTF pas encore capté au démarrage). Mieux vaut aucun libellé qu'un libellé d'une autre offre.
+
+Pur code (`store/db.py`), migration additive (une table). **Universel**. ⚠️ Redémarre **le lecteur PUIS l'API**, dans cet ordre : `contract_epoch` est créée par `db.connect()` en ÉCRITURE, et c'est cette même ouverture qui reconstitue les bornes — l'API locale, en lecture seule, ne peut ni créer ni amorcer.
+
+> Aurait dû partir dans 0.9.7 — le défaut a été trouvé après la publication du tag, et un tag
+> publié ne se réécrit jamais.
+
 ### [0.9.7] — 2026-08-13
 
 **Couleur Tempo en champ explicite + événements sans action.** Pur code, aucune migration.
