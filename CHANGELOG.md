@@ -18,6 +18,28 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.9.9] — 2026-08-13
+
+**`/registers` montrait des registres d'offres révolues.** `db.registers()` agrégeait **tout** le rollup sans borne temporelle : un registre vu une fois restait affiché à vie. Constaté sur ben-0001 — le registre BASE de l'ère **historique**, muet depuis sept semaines, trônait dans la carte Réglages à côté des registres Tempo, donnant l'impression de deux index « Base » concurrents.
+
+Ce n'est pas un simple problème d'affichage. En mode standard, `index_id` vaut `NTARF` : une **position dans le calendrier du contrat**. Le même numéro désigne un registre **physiquement différent** d'une offre à l'autre — sur ben-0001, la position 1 valait le registre BASE cumulé à 15 409 856 Wh avant la bascule, et les heures creuses bleues après. Agréger par-dessus un changement d'offre, c'est donc fusionner deux compteurs distincts sous une seule ligne.
+
+`registers()` se borne désormais au début de l'époque de contrat en cours (`contract_epoch`, posée en 0.9.8). Pour un boîtier n'ayant jamais vu de changement d'offre, `ts_start = 0` rend le filtre **neutre** — vérifié sans régression sur ben-0003 (historique HP/HC) et ben-0010 (historique Tempo), dont les bases n'ont même pas la table.
+
+⚠️ La valeur affichée reste **brute, celle qui figure sur la facture**. Le Linky ne remet **pas** ses registres `EASF` à zéro en changeant d'offre : un registre fraîchement nommé « HC BLEU » peut donc traîner l'énergie accumulée sous l'offre précédente. C'est la vérité du compteur, pas une anomalie — documenté dans la docstring pour que personne ne « corrige » ça plus tard.
+
+> Conséquence assumée : un registre jamais revu depuis le début du contrat disparaît de la
+> liste. En Tempo, BLANC et ROUGE n'apparaîtront donc qu'à leur premier jour de la couleur.
+> Sans donnée sous ce contrat, il n'y a rien d'honnête à afficher.
+
+**Une trame TIC tronquée n'ouvre plus d'époque tarifaire.** À chaque ré-enregistrement de l'émetteur, ben-0001 recevait `CONTRAT='00'`, puis la vraie valeur sept secondes plus tard. Inoffensif jusqu'en 0.9.4 ; depuis l'arrivée de `contract_epoch` en 0.9.8, **chaque redémarrage d'émetteur** aurait ouvert une époque bidon, émis **deux** `changement_offre` (aller puis retour), et — combiné au correctif ci-dessus — vidé `/registers` : un registre de nuit comme HC BLEU aurait disparu une journée entière.
+
+Cause côté émetteur : `readAndParseTIC()` sort de sa boucle `STX→ETX` sur **timeout** comme sur `ETX`, et rend `kept > 0` dans les deux cas. Une trame coupée après ses premières lignes livre donc un ADCO juste — `ADSC`/`ADCO` est en tête de trame — et un contrat qui ne vaut rien ; or la porte d'émission de la trame de boot ne testait que l'ADCO.
+
+Le récepteur refuse désormais le contrat d'un boot dépourvu à la fois d'`ISOUSC` et de `PREF` : ni l'un ni l'autre signifie que l'émetteur n'a pas lu la TIC. Garde **volontairement redondante** avec celle de l'émetteur — le récepteur ne doit jamais faire confiance à ce qui arrive par radio, et lui part par OTA quand les émetteurs déjà posés garderont leur firmware des mois. Test de non-régression : `src/pi/ben-telemetry/test_boot_contrat.py`.
+
+Pur code (`store/db.py`, `ben-telemetry/ben_telemetry.py`, `lora-receiver/main.py`), **aucune migration** — `contract_epoch` existe depuis 0.9.8. **Universel**. Redémarre le lecteur puis l'API.
+
 ### [0.9.8] — 2026-08-13
 
 **Bandes de courbe non coloriées en mode STANDARD.** `_band_kind()` ne reconnaissait que les libellés **historiques** (« creus » / « plein »). En standard, `LTARF` est abrégé — « HP  BLEU », « HC  BLANC » — donc aucun des deux mots : tout retombait sur `base`, et **la courbe restait grise**, badge HC/HP compris. Le commentaire au-dessus de `HISTO_LABELS` annonçait pourtant la règle : *« le mot Creuses/Pleines dans le libellé pilote `_band_kind` »* — vrai en historique, faux en standard. On accepte désormais aussi le préfixe `HC`/`HP`. ⚠️ Ça ne touchait pas que Tempo : **tout contrat HC/HP en mode standard** était concerné. Correction rétroactive — les bandes sont calculées à la lecture depuis le rollup, donc l'historique se colore aussi, sans backfill.
@@ -362,6 +384,18 @@ log-only baseline (Influx stripped, hostname rename)
 first dev release (published, no devices in field)
 
 ## Émetteur Arduino (tic-reader)
+
+### [0.1.7] — 2026-08-13
+
+**Une trame TIC tronquée n'annonce plus de contrat.** `readAndParseTIC()` sort de sa boucle `STX→ETX` sur **timeout** aussi bien que sur `ETX`, et renvoie `kept > 0` dans les deux cas : une trame coupée après ses premières lignes était donc rendue comme valide. Comme `ADSC`/`ADCO` est en **tête** de trame, elle livrait un ADCO parfaitement juste accompagné d'un contrat qui ne valait rien — et la porte d'émission de la trame de boot ne testait que l'ADCO. Résultat observé sur ben-0001 : `CONTRAT='00'` à chaque ré-enregistrement, suivi sept secondes plus tard de la vraie valeur.
+
+Côté récepteur, depuis pi-0.9.8, ce faux contrat aurait ouvert une époque tarifaire bidon et émis deux `changement_offre` à chaque redémarrage d'émetteur (cf. pi-0.9.9).
+
+Nouveau champ `v.complete` : vrai si la boucle est sortie sur `ETX`, faux si elle a expiré. `contractOf()` ne renvoie plus rien depuis une trame incomplète. La garde est dans `contractOf()` et **non** aux trois points d'émission de la trame de boot (discovery, ré-émission on-change, retry REGISTERING) — un seul endroit produit le contrat, un seul le valide. L'identité part quand même : seul le TLV `T_CONTRAT` est omis (`if (ngtf && ngtf[0])`), la détection de changement ne se déclenche pas (`contractOf(v)[0]`), et le vrai contrat suit à la première trame entière.
+
+Coût mesuré (`arduino-cli`, `arduino:avr:pro:cpu=8MHzatmega328`) : flash **30 100 → 30 096 o**, globals inchangés à 1 239 o, **+1 o** dans une structure de pile (809 o disponibles). Aucun tampon supplémentaire : la lecture reste ligne à ligne dans `char line[40]`.
+
+- Reflash MANUEL (Pro Mini, pas d'OTA). Flash **97 %** — 624 o de marge.
 
 ### [0.1.6] — 2026-07-25
 
