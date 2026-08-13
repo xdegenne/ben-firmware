@@ -385,7 +385,18 @@ def on_recv_boot(decoded, rssi, snr, pdl_index, sender_addr) -> None:
             except Exception as e:
                 log.warning(f"store: record_pref échoué: {e}")
         contrat = tlvs.get(frame_codec.T_CONTRAT)
-        if contrat:
+        # Un émetteur qui vient de démarrer n'a PAS encore lu de trame TIC, et annonce pourtant
+        # un contrat : du bruit. Observé sur ben-0001 à chaque ré-enregistrement — `CONTRAT='00'`
+        # puis, 7 s plus tard, la vraie valeur. Enregistré tel quel il ouvre une époque tarifaire
+        # bidon, émet DEUX `changement_offre` (aller puis retour) et vide `/registers`, qui se
+        # borne à l'époque courante.
+        # Discriminant : `ISOUSC` (historique) et `PREF` (standard) ne sont émis QU'UNE FOIS la
+        # TIC lue (`tic-reader.ino` : `if (isousc)` / `if (pref)`) — c'est d'ailleurs déjà ce qui
+        # sert à déduire `src_standard` plus bas. Ni l'un ni l'autre → contrat non crédible.
+        if contrat and not (pref or isousc):
+            log.info(f"CONTRAT ignoré (boot sans PREF/ISOUSC : TIC pas encore lue) "
+                     f"pdl_index={pdl_index}")
+        elif contrat:
             ngtf = frame_codec.interpret_tlv(frame_codec.T_CONTRAT, contrat)
             try:
                 if db.record_ngtf(measurements_db, pdl_index, ngtf):

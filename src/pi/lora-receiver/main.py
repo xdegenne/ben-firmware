@@ -426,7 +426,12 @@ def on_recv_boot(decoded, rssi, snr, pdl_index) -> None:
             except Exception as e:
                 log.warning(f"store: record_pref échoué: {e}")
         contrat = tlvs.get(frame_codec.T_CONTRAT)
-        if contrat:
+        # Cf. ben_telemetry.py : un boot sans ISOUSC ni PREF vient d'un émetteur qui n'a pas
+        # encore lu la TIC — son contrat est du bruit (`CONTRAT='00'` observé sur ben-0001).
+        if contrat and not (pref or isousc):
+            log.info(f"CONTRAT ignoré (boot sans PREF/ISOUSC : TIC pas encore lue) "
+                     f"pdl_index={pdl_index}")
+        elif contrat:
             ngtf = frame_codec.interpret_tlv(frame_codec.T_CONTRAT, contrat)
             try:
                 if db.record_ngtf(measurements_db, pdl_index, ngtf):

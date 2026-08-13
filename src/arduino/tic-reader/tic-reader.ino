@@ -90,7 +90,7 @@
 // ---------------------------------------------------------------------------
 #define PROTOCOL_VERSION_BOOT  0x01   // trame d'identité (ADCO)
 #define PROTOCOL_VERSION_CURVE 0x05   // trame courbe batchée (v0x05 : dt par point)
-#define FW_VERSION             "0.1.6"   // 0.1.6 : + IINST dans le boot (T_IINST) — histo : PAPP=0 en injection → 230×IINST = production estimée (unboxing producteur). 0.1.5 : PAPP dans le boot (T_PAPP, conso dès le 1er boot → unboxing rapide) + buffer-reuse vérif ACK (-32o pile). (diag pile CONSERVE). 0.1.4 : APP_ACK_MS 800→2000 ms (Pi Zero chargé : crypto Python > 800 ms → l'émetteur ratait l'ACK → boots en boucle + flashs blancs discovery côté central). 0.1.3 : FIX trame boot dans buffer GLOBAL curveBuf (le buffer pile buf[64] débordait pendant le ChaCha et corrompait l ACK -> gate bloquée). 0.1.2 : découplage émetteur↔récepteur (incident ben-0001 09/07). setTimeout 600ms + setRetries 1. MACHINE À ÉTATS REGISTERING/STREAMING : tant que la trame de boot (petit paquet = probe de vivacité) n'est pas ACK, AUCUNE mesure émise ; retry boot à la cadence batch (v frais) ; mesure non-ACK → retour REGISTERING. Base 0.1.0 : garde histo tolérante + IINST 2e courbe + flush 55s + chiffrement ChaCha20 + logging aligné
+#define FW_VERSION             "0.1.7"   // 0.1.7 : trame TRONQUÉE (sortie sur timeout, pas sur ETX) → n'annonce plus de contrat (`v.complete`) : un ADCO juste + un contrat faux ouvrait une époque tarifaire bidon côté serveur (`CONTRAT='00'` sur ben-0001 à chaque ré-enregistrement). 0.1.6 : + IINST dans le boot (T_IINST) — histo : PAPP=0 en injection → 230×IINST = production estimée (unboxing producteur). 0.1.5 : PAPP dans le boot (T_PAPP, conso dès le 1er boot → unboxing rapide) + buffer-reuse vérif ACK (-32o pile). (diag pile CONSERVE). 0.1.4 : APP_ACK_MS 800→2000 ms (Pi Zero chargé : crypto Python > 800 ms → l'émetteur ratait l'ACK → boots en boucle + flashs blancs discovery côté central). 0.1.3 : FIX trame boot dans buffer GLOBAL curveBuf (le buffer pile buf[64] débordait pendant le ChaCha et corrompait l ACK -> gate bloquée). 0.1.2 : découplage émetteur↔récepteur (incident ben-0001 09/07). setTimeout 600ms + setRetries 1. MACHINE À ÉTATS REGISTERING/STREAMING : tant que la trame de boot (petit paquet = probe de vivacité) n'est pas ACK, AUCUNE mesure émise ; retry boot à la cadence batch (v frais) ; mesure non-ACK → retour REGISTERING. Base 0.1.0 : garde histo tolérante + IINST 2e courbe + flush 55s + chiffrement ChaCha20 + logging aligné
 #define BOOT_PAYLOAD_LEN       20     // v0x01 : version + ADCO(12) + ISOUSC + PREF, padding jusqu'à 20 (rétro)
 #define BOOT_MAX_LEN           64     // format cible : header(7) + TLV (ADCO/ISOUSC/PREF/CONTRAT) + MAC(8)
 
@@ -266,6 +266,7 @@ static const uint16_t INDEX_ID_TO_SEEN[] = {
 
 struct TICValues {
   bool valid;
+  bool complete;          // trame lue ENTIÈREMENT (sortie sur ETX, pas sur timeout) — cf. readAndParseTIC
   char adco[13];
   char optarif[5];
   char ptec[5];
@@ -695,6 +696,12 @@ bool readAndParseTIC(TICValues& v, uint8_t mode) {
   }
 
   digitalWrite(TIC_OUT, LOW);   // UART laissé ouvert (begin-once)
+  // Sortie sur ETX = trame ENTIÈRE ; sortie sur timeout = trame TRONQUÉE. La distinction compte :
+  // une trame coupée après ses premières lignes rend un ADCO juste (ADSC/ADCO est en tête) et rien
+  // d'autre — `kept > 0` la déclarait valide, et l'identité partait avec un contrat faux. Observé
+  // sur ben-0001 : `CONTRAT='00'` à chaque ré-enregistrement, 7 s avant la vraie valeur. Coût :
+  // 1 octet dans la structure, aucun tampon supplémentaire (lecture ligne à ligne inchangée).
+  v.complete = (c == ETX);
   // Validité : historique = PTEC vu ; standard = PAPP vu (NTARF/horodate gérés dans la garde).
   if (mode == MODE_STANDARD)
     v.valid = (v.fields_seen & TIC_SEEN_PAPP) != 0;   // PAPP requis ; NTARF/horodate gérés dans la garde
@@ -775,7 +782,17 @@ static uint16_t strhash16(const char* s) {
 
 // Contrat (calendrier tarifaire) mode-agnostique pour la trame boot : NGTF en STANDARD,
 // OPTARIF en HISTORIQUE. Le récepteur le stocke comme « contrat » (level_profile.ngtf).
+//
+// N'annonce RIEN depuis une trame tronquée : le contrat ouvre une époque tarifaire côté
+// serveur (segmentation des registres + notification de changement d'offre), donc une valeur
+// douteuse coûte plus cher que pas de valeur du tout. La garde est ici, et non aux trois
+// points d'émission de la trame boot (discovery, ré-émission on-change, retry REGISTERING) :
+// un seul endroit produit le contrat, un seul endroit le valide. Chaîne « vide » → le TLV
+// T_CONTRAT n'est pas joint (`if (ngtf && ngtf[0])` dans sendBootFrame) et la détection de
+// changement ne se déclenche pas (`contractOf(v)[0]`) : l'identité part quand même, sans
+// contrat, et le vrai contrat suivra à la première trame entière.
 static const char* contractOf(const TICValues& v) {
+  if (!v.complete) return "";
   return (ticMode == MODE_STANDARD) ? v.ngtf : v.optarif;
 }
 
