@@ -90,7 +90,7 @@
 // ---------------------------------------------------------------------------
 #define PROTOCOL_VERSION_BOOT  0x01   // trame d'identité (ADCO)
 #define PROTOCOL_VERSION_CURVE 0x05   // trame courbe batchée (v0x05 : dt par point)
-#define FW_VERSION             "0.1.7"   // 0.1.7 : trame TRONQUÉE (sortie sur timeout, pas sur ETX) → n'annonce plus de contrat (`v.complete`) : un ADCO juste + un contrat faux ouvrait une époque tarifaire bidon côté serveur (`CONTRAT='00'` sur ben-0001 à chaque ré-enregistrement). 0.1.6 : + IINST dans le boot (T_IINST) — histo : PAPP=0 en injection → 230×IINST = production estimée (unboxing producteur). 0.1.5 : PAPP dans le boot (T_PAPP, conso dès le 1er boot → unboxing rapide) + buffer-reuse vérif ACK (-32o pile). (diag pile CONSERVE). 0.1.4 : APP_ACK_MS 800→2000 ms (Pi Zero chargé : crypto Python > 800 ms → l'émetteur ratait l'ACK → boots en boucle + flashs blancs discovery côté central). 0.1.3 : FIX trame boot dans buffer GLOBAL curveBuf (le buffer pile buf[64] débordait pendant le ChaCha et corrompait l ACK -> gate bloquée). 0.1.2 : découplage émetteur↔récepteur (incident ben-0001 09/07). setTimeout 600ms + setRetries 1. MACHINE À ÉTATS REGISTERING/STREAMING : tant que la trame de boot (petit paquet = probe de vivacité) n'est pas ACK, AUCUNE mesure émise ; retry boot à la cadence batch (v frais) ; mesure non-ACK → retour REGISTERING. Base 0.1.0 : garde histo tolérante + IINST 2e courbe + flush 55s + chiffrement ChaCha20 + logging aligné
+#define FW_VERSION             "0.1.7"   // 0.1.7 : la trame de BOOT n'est émise que sur une trame TIC ENTIÈRE (`v.complete` = sortie sur ETX et non sur timeout), aux 3 points d'émission. Une trame coupée livrait un ADCO juste (il est en tête) et rien de fiable après : contrat faux (`CONTRAT='00'` sur ben-0001 à chaque ré-enregistrement → époque tarifaire bidon côté serveur) ET ISOUSC/PREF absents (jauge mal calibrée). 0.1.6 : + IINST dans le boot (T_IINST) — histo : PAPP=0 en injection → 230×IINST = production estimée (unboxing producteur). 0.1.5 : PAPP dans le boot (T_PAPP, conso dès le 1er boot → unboxing rapide) + buffer-reuse vérif ACK (-32o pile). (diag pile CONSERVE). 0.1.4 : APP_ACK_MS 800→2000 ms (Pi Zero chargé : crypto Python > 800 ms → l'émetteur ratait l'ACK → boots en boucle + flashs blancs discovery côté central). 0.1.3 : FIX trame boot dans buffer GLOBAL curveBuf (le buffer pile buf[64] débordait pendant le ChaCha et corrompait l ACK -> gate bloquée). 0.1.2 : découplage émetteur↔récepteur (incident ben-0001 09/07). setTimeout 600ms + setRetries 1. MACHINE À ÉTATS REGISTERING/STREAMING : tant que la trame de boot (petit paquet = probe de vivacité) n'est pas ACK, AUCUNE mesure émise ; retry boot à la cadence batch (v frais) ; mesure non-ACK → retour REGISTERING. Base 0.1.0 : garde histo tolérante + IINST 2e courbe + flush 55s + chiffrement ChaCha20 + logging aligné
 #define BOOT_PAYLOAD_LEN       20     // v0x01 : version + ADCO(12) + ISOUSC + PREF, padding jusqu'à 20 (rétro)
 #define BOOT_MAX_LEN           64     // format cible : header(7) + TLV (ADCO/ISOUSC/PREF/CONTRAT) + MAC(8)
 
@@ -696,11 +696,20 @@ bool readAndParseTIC(TICValues& v, uint8_t mode) {
   }
 
   digitalWrite(TIC_OUT, LOW);   // UART laissé ouvert (begin-once)
-  // Sortie sur ETX = trame ENTIÈRE ; sortie sur timeout = trame TRONQUÉE. La distinction compte :
-  // une trame coupée après ses premières lignes rend un ADCO juste (ADSC/ADCO est en tête) et rien
-  // d'autre — `kept > 0` la déclarait valide, et l'identité partait avec un contrat faux. Observé
-  // sur ben-0001 : `CONTRAT='00'` à chaque ré-enregistrement, 7 s avant la vraie valeur. Coût :
-  // 1 octet dans la structure, aucun tampon supplémentaire (lecture ligne à ligne inchangée).
+  // Sortie sur ETX = trame ENTIÈRE ; sortie sur timeout = trame TRONQUÉE. `kept > 0` ne distingue
+  // pas les deux, alors que tout ce qui suit la coupure manque : une trame coupée rend un ADCO
+  // juste (ADSC/ADCO est en tête de trame) et rien de fiable derrière — ni ISOUSC/PREF, ni le
+  // contrat. Observé sur ben-0001 : `CONTRAT='00'` à chaque ré-enregistrement, 7 s avant la vraie
+  // valeur. C'est la trame de BOOT ENTIÈRE qui est conditionnée à ce drapeau, pas seulement le
+  // contrat — cf. les trois points d'émission.
+  //
+  // Se déclenche uniquement sur une lecture réellement rompue : la spec impose ≤ 33,4 ms entre
+  // deux groupes d'une même trame (§5.3.6), contre 6 s de timeout. Et ce drapeau porte sur le
+  // CADRAGE, pas sur la qualité : une ligne au checksum faux est simplement écartée, l'ETX arrive
+  // quand même — un front-end mal accordé n'est donc pas privé d'enregistrement.
+  //
+  // §5.3.6 est la couche LIAISON, commune aux deux modes : STX/ETX cadre aussi bien l'historique
+  // que le standard. Coût : 1 octet dans la structure, aucun tampon supplémentaire.
   v.complete = (c == ETX);
   // Validité : historique = PTEC vu ; standard = PAPP vu (NTARF/horodate gérés dans la garde).
   if (mode == MODE_STANDARD)
@@ -782,17 +791,7 @@ static uint16_t strhash16(const char* s) {
 
 // Contrat (calendrier tarifaire) mode-agnostique pour la trame boot : NGTF en STANDARD,
 // OPTARIF en HISTORIQUE. Le récepteur le stocke comme « contrat » (level_profile.ngtf).
-//
-// N'annonce RIEN depuis une trame tronquée : le contrat ouvre une époque tarifaire côté
-// serveur (segmentation des registres + notification de changement d'offre), donc une valeur
-// douteuse coûte plus cher que pas de valeur du tout. La garde est ici, et non aux trois
-// points d'émission de la trame boot (discovery, ré-émission on-change, retry REGISTERING) :
-// un seul endroit produit le contrat, un seul endroit le valide. Chaîne « vide » → le TLV
-// T_CONTRAT n'est pas joint (`if (ngtf && ngtf[0])` dans sendBootFrame) et la détection de
-// changement ne se déclenche pas (`contractOf(v)[0]`) : l'identité part quand même, sans
-// contrat, et le vrai contrat suivra à la première trame entière.
 static const char* contractOf(const TICValues& v) {
-  if (!v.complete) return "";
   return (ticMode == MODE_STANDARD) ? v.ngtf : v.optarif;
 }
 
@@ -1122,7 +1121,11 @@ void loop() {
     ticMode = m;
     persistMode(ticMode);
     TICValues v0;                     // une trame du bon mode pour l'identité (ADCO/ADSC + ISOUSC)
-    if (readAndParseTIC(v0, ticMode) && v0.adco[0] != 0) {
+    // `v0.complete` : la trame de boot ne se construit QUE sur une trame TIC ENTIÈRE. Une trame
+    // tronquée livre un ADCO juste (ADSC/ADCO est en tête) et RIEN de fiable après la coupure —
+    // ni ISOUSC/PREF (jauge mal calibrée) ni le contrat (époque tarifaire bidon côté serveur).
+    // On retente au tour suivant : ~2 s, contre une identité fausse qui reste des mois.
+    if (readAndParseTIC(v0, ticMode) && v0.complete && v0.adco[0] != 0) {
       if (sendBootFrame(v0.adco, v0.isousc, v0.pref, contractOf(v0), pappValue(v0), v0.iinst)) {
         bootAcked = true;                    // enregistré → STREAMING
         lastSentIsousc = v0.isousc;
@@ -1156,7 +1159,8 @@ void loop() {
   // STREAMING uniquement : ré-émettre l'identité v0x01 si ISOUSC/PREF/CONTRAT change en cours de
   // route. En REGISTERING on ne passe PAS par ici (sinon on ré-émettrait à CHAQUE tour puisque
   // lastSent* reste figé tant que pas d'ACK) → le retry boot est géré à la cadence batch plus bas.
-  if (bootAcked && v.adco[0] != 0 &&
+  // `v.complete` : jamais de trame d'identité depuis une trame TIC tronquée (cf. discovery).
+  if (bootAcked && v.complete && v.adco[0] != 0 &&
       ((v.isousc != 0 && v.isousc != lastSentIsousc) ||
        (v.pref   != 0 && v.pref   != lastSentPref) ||
        (contractOf(v)[0] && strhash16(contractOf(v)) != lastSentNgtfHash))) {
@@ -1221,7 +1225,11 @@ void loop() {
   // `v` FRAIS → identité/config toujours à jour, jamais un snapshot périmé. Le batch accumulé n'a
   // servi que d'horloge → on le jette (le récepteur n'est pas confirmé, la courbe serait perdue).
   if (!bootAcked && curveFlushPending) {
-    if (sendBootFrame(v.adco, v.isousc, v.pref, contractOf(v), pappValue(v), v.iinst)) {
+    // `v.complete` garde l'ÉMISSION seule, surtout pas le bloc : le rejet du batch-horloge et
+    // la remise à zéro de `curveFlushPending` doivent avoir lieu même sur trame tronquée, sinon
+    // le flush différé plus bas enverrait la courbe alors qu'on est encore en REGISTERING.
+    if (v.complete
+        && sendBootFrame(v.adco, v.isousc, v.pref, contractOf(v), pappValue(v), v.iinst)) {
       bootAcked = true;                      // enregistré → STREAMING au prochain point
       lastSentIsousc = v.isousc;
       lastSentPref = v.pref;

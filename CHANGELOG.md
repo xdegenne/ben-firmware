@@ -391,9 +391,13 @@ first dev release (published, no devices in field)
 
 Côté récepteur, depuis pi-0.9.8, ce faux contrat aurait ouvert une époque tarifaire bidon et émis deux `changement_offre` à chaque redémarrage d'émetteur (cf. pi-0.9.9).
 
-Nouveau champ `v.complete` : vrai si la boucle est sortie sur `ETX`, faux si elle a expiré. `contractOf()` ne renvoie plus rien depuis une trame incomplète. La garde est dans `contractOf()` et **non** aux trois points d'émission de la trame de boot (discovery, ré-émission on-change, retry REGISTERING) — un seul endroit produit le contrat, un seul le valide. L'identité part quand même : seul le TLV `T_CONTRAT` est omis (`if (ngtf && ngtf[0])`), la détection de changement ne se déclenche pas (`contractOf(v)[0]`), et le vrai contrat suit à la première trame entière.
+Nouveau champ `v.complete` : vrai si la boucle est sortie sur `ETX`, faux si elle a expiré. **La trame de boot entière** y est conditionnée, aux trois points d'émission — discovery, ré-émission on-change, retry `REGISTERING`. Ne garder que le contrat aurait traité un symptôme : dans une trame coupée, `ISOUSC`/`PREF` manquent tout autant, et une jauge calibrée sur un abonnement absent est un défaut aussi durable qu'une fausse époque tarifaire. L'émetteur retente au tour suivant, soit environ deux secondes — à comparer à une identité fausse qui, elle, resterait des mois.
 
-Coût mesuré (`arduino-cli`, `arduino:avr:pro:cpu=8MHzatmega328`) : flash **30 100 → 30 096 o**, globals inchangés à 1 239 o, **+1 o** dans une structure de pile (809 o disponibles). Aucun tampon supplémentaire : la lecture reste ligne à ligne dans `char line[40]`.
+⚠️ Au point `REGISTERING`, la garde porte sur **l'émission seule**, pas sur le bloc : le rejet du batch-horloge et la remise à zéro de `curveFlushPending` doivent avoir lieu même sur trame tronquée, sans quoi le flush différé enverrait la courbe alors qu'on est encore en `REGISTERING` — l'invariant « aucune mesure tant que le boot n'est pas acquitté » serait rompu.
+
+Le drapeau porte sur le **cadrage**, pas sur la qualité des données : une ligne au checksum faux est écartée mais l'`ETX` arrive quand même, donc un front-end mal accordé n'est pas privé d'enregistrement. Et il ne peut se déclencher en fonctionnement normal — la spec impose au plus **33,4 ms** entre deux groupes d'une même trame (`§5.3.6`) contre 6 s de timeout. Ce `§5.3.6` est la couche **liaison**, commune : `STX`/`ETX` cadre l'historique comme le standard, la garde vaut donc dans les deux modes.
+
+Coût mesuré (`arduino-cli`, `arduino:avr:pro:cpu=8MHzatmega328`) : flash **30 100 → 30 154 o (98 %)**, soit **566 o de marge**, globals inchangés à 1 239 o, **+1 o** dans une structure de pile (809 o disponibles). Aucun tampon supplémentaire : la lecture reste ligne à ligne dans `char line[40]`.
 
 - Reflash MANUEL (Pro Mini, pas d'OTA). Flash **97 %** — 624 o de marge.
 
