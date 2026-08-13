@@ -1342,8 +1342,22 @@ def get_ngtf(conn: sqlite3.Connection, pdl_index: int) -> str | None:
 
 
 def registers(conn: sqlite3.Connection, pdl_index: int) -> list:
-    """Registres tarifaires vus pour un PDL : libellé résolu + dernier index (monotone → MAX).
-    Sert la carte réglages de l'app (un registre par tarif : Base / HC / HP…)."""
+    """Registres tarifaires DU CONTRAT EN COURS pour un PDL : libellé résolu + dernier index.
+    Sert la carte réglages de l'app (un registre par tarif : Base / HC / HP…).
+
+    La valeur renvoyée est celle que le compteur affiche, BRUTE : c'est ce qui figure sur la
+    facture. Ne pas la ramener à un cumul « depuis le début du contrat » — le Linky ne remet
+    PAS ses registres EASF à zéro en changeant d'offre, donc un registre neuf peut traîner
+    l'énergie d'une offre précédente ; c'est la vérité du compteur, pas une anomalie.
+    """
+    # Borné au CONTRAT EN COURS : sans ça, un registre d'une offre révolue reste affiché à vie
+    # (constaté sur ben-0001 le 13/08 — le registre BASE historique, plus rien renvoyé depuis
+    # sept semaines, trônait à côté des registres Tempo). `index_id` standard = POSITION dans le
+    # calendrier du contrat : le même numéro désigne un autre registre d'une offre à l'autre, donc
+    # agréger par-dessus une bascule mélangerait deux compteurs physiques.
+    # `ts_start = 0` (boîtier n'ayant jamais vu de changement) → filtre neutre, tout est affiché.
+    epochs = contract_epochs(conn, pdl_index)
+    depuis = epochs[-1][0] if epochs else 0
     # PERF : le rollup (~qq k lignes) porte le dernier index par registre (index_last) → MAX par
     # (src_standard, index_id) = le plus récent, en ms au lieu d'un GROUP BY sur measurements
     # (millions de lignes → ~28 s mesuré sur ben-0003). Fallback brut si le rollup est vide (pas
@@ -1351,15 +1365,15 @@ def registers(conn: sqlite3.Connection, pdl_index: int) -> list:
     # rollup [watermark, now] ; MÊME résultat que le brut (index monotone → MAX identique).
     rows = conn.execute(
         "SELECT src_standard, index_id, MAX(index_last) AS index_value, MAX(ts_end) AS last_ts "
-        "FROM curve_rollup WHERE pdl_index=? AND index_last IS NOT NULL "
+        "FROM curve_rollup WHERE pdl_index=? AND index_last IS NOT NULL AND bucket_ts>=? "
         "GROUP BY src_standard, index_id ORDER BY src_standard, index_id",
-        (pdl_index,)).fetchall()
+        (pdl_index, depuis)).fetchall()
     if not rows:
         rows = conn.execute(
             "SELECT src_standard, index_id, MAX(index_value) AS index_value, MAX(ts) AS last_ts "
             "FROM measurements WHERE pdl_index=? AND index_id IS NOT NULL AND index_value IS NOT NULL "
-            "GROUP BY src_standard, index_id ORDER BY src_standard, index_id",
-            (pdl_index,)).fetchall()
+            "AND ts>=? GROUP BY src_standard, index_id ORDER BY src_standard, index_id",
+            (pdl_index, depuis)).fetchall()
     return [{
         "src_standard": r["src_standard"],
         "index_id": r["index_id"],
