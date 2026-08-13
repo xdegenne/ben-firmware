@@ -18,6 +18,18 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.9.7] — 2026-08-13
+
+**Couleur Tempo en champ explicite + événements sans action.** Pur code, aucune migration.
+
+**(1) `tempo_color` sur `/live` et sur chaque ligne de `/registers`** — `bleu` / `blanc` / `rouge`, absent hors Tempo. Jusqu'ici la couleur n'existait **nulle part comme donnée** : elle était enfouie dans le texte de `tariff_label`, et l'app devait la retrouver par recherche de mot FRANÇAIS, en connaissant les **deux conventions** — historique « Heures Pleines Jours Rouges », standard « HP  ROUGE ». C'est exactement ce que la résolution côté serveur existe pour éviter (cf. `resolve_label`, chantier labels). Le boîtier le fait mieux et une seule fois : en **historique c'est purement déterministe** (`index_id` 5-6 bleu, 7-8 blanc, 9-10 rouge — aucun texte analysé), en **standard** c'est lu une fois par registre dans le `LTARF` déjà conservé par `tariff_labels`.
+
+⚠️ **Aucune colonne ajoutée, aucune migration** : la couleur est une **interprétation d'`index_id`**, pas une donnée. La stocker sur `measurements` dupliquerait des millions de fois ce que la colonne voisine porte déjà — et le rollup, dont la clé primaire contient `index_id`, **ventile donc la consommation par couleur depuis le premier jour** ; il ne manquait que le nom à mettre dessus. Sur `/registers`, la couleur rend les index exploitables : « heures pleines — 340 kWh » ne veut rien dire en Tempo, où trois registres HP coexistent du simple au quintuple.
+
+**(2) Les événements n'émettent plus d'`action`.** `record_ngtf()` envoyait `{"libelle": "Voir les tarifs", "route": "/dashboard"}`. Deux destinations essayées puis écartées : `/dashboard` ne montre ni tarif ni contrat, et `/settings` affiche bien la formule mais **l'événement dit déjà « passé de X à Y »**. Au-delà de l'utilité, c'est une question de couche : **une route est une notion de l'APP**, le firmware n'a pas à connaître sa navigation — et l'action étant **figée dans l'événement à sa naissance**, un remaniement des écrans casserait toutes les lignes anciennes. Répartition retenue : le boîtier fournit le FAIT et son texte (ce qui garde la compatibilité ascendante — une vieille app rend correctement un type qu'elle ne connaît pas), l'app déduit l'action du `type`. Le champ reste au contrat pour un futur backend, qui aura de bonnes raisons de pointer ailleurs qu'une route d'app.
+
+**Universel** (LoRa et filaire), pas de gate capability. Seule l'API sert ces champs → restart `ben-local-api` uniquement, les lecteurs ne sont pas redémarrés (pas de trou de mesure).
+
 ### [0.9.6] — 2026-08-12
 
 **`pdl_index` identifie un COMPTEUR (ADCO), plus un émetteur — + événements — + performances API.** Trois chantiers, tout en pur code.

@@ -211,6 +211,12 @@ paths:
         libellé tarifaire en cours, contrat. **En mode standard, `papp` est le NET SIGNÉ**
         (>0 soutiré, <0 surplus injecté).
 
+        `tempo_color` (≥ 0.9.7) : couleur du JOUR en Tempo — `bleu`/`blanc`/`rouge`,
+        absent sinon. **Résolu par le boîtier**, pas déduit du texte par le client :
+        en historique c'est déterministe (`index_id` 5-6 bleu, 7-8 blanc, 9-10 rouge),
+        en standard c'est lu une fois par registre dans `LTARF`. Un client n'a donc pas
+        à connaître les deux conventions de libellé.
+
         Avec `pdl_index` → la dernière mesure de ce PDL. **Sans, le PDL 0** — et non
         plus « un objet par PDL » (changement 0.9.6). Motif : une requête non filtrée est
         aveugle à l'index `(pdl_index, ts, papp)` et balayait toute la table — 28,6 s
@@ -225,8 +231,10 @@ paths:
           headers:
             X-Ben-Last-Event:
               description: |
-                Id du dernier événement du BOÎTIER (pas un par PDL), ou vide s'il n'y en a
-                aucun. `/live` étant déjà polé en continu, la « cloche » de l'app s'y adosse
+                Id du dernier événement du BOÎTIER (pas un par PDL). **En-tête ABSENT**
+                — et non vide — tant qu'aucun événement n'existe : `_send()` n'émet pas
+                les en-têtes à None. Un client doit donc traiter l'absence, pas
+                comparer à la chaîne vide. `/live` étant déjà polé en continu, la « cloche » de l'app s'y adosse
                 plutôt que d'ajouter un second appel périodique — un Pi Zero est mono-cœur.
                 En-tête et non champ : `/live` renvoie un tableau nu, l'envelopper casserait
                 le contrat pour une fonctionnalité pas encore éprouvée.
@@ -399,6 +407,10 @@ paths:
         `contract` = NGTF (calendrier tarifaire fournisseur).
       parameters:
         - $ref: "#/components/parameters/PdlIndexRequired"
+      description: |
+        Chaque registre porte aussi `tempo_color` (≥ 0.9.7). Sans elle, « heures
+        pleines — 340 kWh » est inexploitable en Tempo, où trois registres HP
+        coexistent à des prix allant du simple au quintuple.
       responses:
         "200":
           description: Registres du PDL

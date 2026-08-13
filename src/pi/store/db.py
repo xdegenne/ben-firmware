@@ -1033,7 +1033,12 @@ def record_ngtf(conn: sqlite3.Connection, pdl_index: int, ngtf: str,
                 "Changement d'offre",
                 "C'est fait : votre contrat est passé de « %s » à « %s »." % (avant, ngtf),
                 {"avant": avant, "apres": ngtf},
-                action={"libelle": "Voir les tarifs", "route": "/dashboard"},
+                # PAS d'ACTION. Deux tentatives écartées : « Voir les tarifs » →
+                # /dashboard (qui ne montre que la courbe et la jauge : promesse non
+                # tenue), puis « Voir ma formule » → /settings (qui affiche bien le
+                # contrat, mais l'événement DIT DÉJÀ « passé de X à Y » — le bouton
+                # n'apprend rien). On rebranchera une action le jour où un écran
+                # apportera quelque chose, une grille de prix par exemple.
                 pdl_index=pdl_index)
         except Exception:
             pass   # L'ÉTAT PRIME, la notif est un bonus. `ngtf` segmente les libellés
@@ -1117,6 +1122,44 @@ def resolve_label(conn: sqlite3.Connection, pdl_index: int,
     return HISTO_LABELS.get(index_id)
 
 
+# Couleur Tempo par registre HISTORIQUE — DÉTERMINISTE, aucune analyse de texte :
+# les 6 registres BBR sont ordonnés par couleur (cf. HISTO_LABELS 5→10).
+TEMPO_COLOR_HISTO = {5: "bleu", 6: "bleu", 7: "blanc", 8: "blanc",
+                     9: "rouge", 10: "rouge"}
+
+
+def resolve_tempo_color(conn: sqlite3.Connection, pdl_index: int,
+                        src_standard: int, index_id) -> str | None:
+    """Couleur Tempo du JOUR en cours — 'bleu'/'blanc'/'rouge', None hors Tempo.
+
+    Même principe que `resolve_label` : la résolution appartient au SERVEUR, pas à
+    l'app, qui n'a pas à connaître deux conventions de libellé.
+
+    ⚠️ Ce n'est PAS une donnée à stocker : c'est une interprétation d'`index_id`.
+      - HISTORIQUE : purement déterministe (table ci-dessus), zéro texte analysé.
+      - STANDARD   : lue dans le libellé LTARF déjà conservé par `tariff_labels`
+        (« HP  BLEU », « HC  ROUGE »…), donc une seule fois par registre.
+    Stocker une colonne sur `measurements` dupliquerait 3 M fois ce que la colonne
+    voisine `index_id` porte déjà. Le rollup, keyé sur `index_id`, ventile donc
+    DÉJÀ la consommation par couleur — il ne manquait que le nom.
+
+    ⚠️ Ordre des tests : « BLANC » et « BLEU » commencent tous deux par « BL ».
+    On teste des mots entiers, jamais des préfixes.
+    """
+    if index_id is None:
+        return None
+    if not src_standard:
+        return TEMPO_COLOR_HISTO.get(index_id)
+    lab = (resolve_label(conn, pdl_index, src_standard, index_id) or "").lower()
+    if "rouge" in lab:
+        return "rouge"
+    if "blanc" in lab:
+        return "blanc"
+    if "bleu" in lab:
+        return "bleu"
+    return None
+
+
 def get_ngtf(conn: sqlite3.Connection, pdl_index: int) -> str | None:
     """NGTF = le CONTRAT (nom du calendrier tarifaire fournisseur). None si inconnu.
     À ne pas confondre avec LTARF (tarif EN COURS, dans tariff_labels)."""
@@ -1148,6 +1191,10 @@ def registers(conn: sqlite3.Connection, pdl_index: int) -> list:
         "src_standard": r["src_standard"],
         "index_id": r["index_id"],
         "label": resolve_label(conn, pdl_index, r["src_standard"], r["index_id"]),
+        # Couleur du registre : « heures pleines — 340 kWh » ne veut rien dire en
+        # Tempo, où trois registres HP coexistent du simple au quintuple.
+        "tempo_color": resolve_tempo_color(
+            conn, pdl_index, r["src_standard"], r["index_id"]),
         "index_value": r["index_value"],
         "last_ts": r["last_ts"],
     } for r in rows]

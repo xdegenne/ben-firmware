@@ -378,6 +378,13 @@ class Handler(BaseHTTPRequestHandler):
                 # sa propre convention (rétro-compat). Cf. chantier unification labels.
                 row["tariff_label"] = db.resolve_label(
                     conn, row["pdl_index"], row.get("src_standard"), row.get("index_id"))
+                # Couleur Tempo en CHAMP EXPLICITE, résolue côté serveur comme le
+                # libellé : sans elle, l'app devrait chercher « rouge »/« blanc »/
+                # « bleu » dans un texte français, et connaître les deux conventions
+                # (histo « Heures Pleines Jours Rouges » vs standard « HP  ROUGE »).
+                # None hors Tempo.
+                row["tempo_color"] = db.resolve_tempo_color(
+                    conn, row["pdl_index"], row.get("src_standard"), row.get("index_id"))
                 # Contrat (NGTF, quasi-statique) — distinct du tarif en cours ci-dessus.
                 row["contract"] = db.get_ngtf(conn, row["pdl_index"])
             # Cloche de l'app : /live est DÉJÀ polé en continu, on y adosse donc
