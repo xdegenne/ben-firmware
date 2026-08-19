@@ -40,6 +40,7 @@ T_LTARF = 0x11
 T_DEMAIN = 0x20
 T_NJOURF = 0x21
 T_NJOURF1 = 0x22
+T_STGE = 0x23        # registre de statuts STANDARD, 32 bits BRUTS (uint32 LE), émetteur ≥ 0.1.8
 T_ADPS = 0x30
 T_PEJP = 0x31
 T_MSG1 = 0x40
@@ -392,6 +393,7 @@ TAG_NAMES = {
     T_PAPP: "PAPP", T_IINST: "IINST",
     T_EAIT: "EAIT", T_LTARF: "LTARF", T_DEMAIN: "DEMAIN", T_NJOURF: "NJOURF",
     T_NJOURF1: "NJOURF+1", T_ADPS: "ADPS", T_PEJP: "PEJP", T_MSG1: "MSG1", T_MSG2: "MSG2",
+    T_STGE: "STGE",
 }
 # Tags déjà CÂBLÉS au stockage. Les autres tags CONNUS sont décodés + LOGUÉS (pas encore
 # stockés) → visibilité avant câblage (DEMAIN/ADPS/PEJP/NJOURF/MSG).
@@ -401,8 +403,26 @@ _TLV_STR = {T_ADCO, T_CONTRAT, T_LTARF, T_MSG1, T_MSG2}
 _TLV_U8 = {T_ISOUSC, T_PREF, T_DEMAIN, T_NJOURF, T_NJOURF1}
 
 
+# Couleurs Tempo portées par STGE. Offset VÉRIFIÉ sur trame réelle le 2026-08-14 (capture
+# data/tic-ben0001-20260814-1343.bin) : STGE=013A4401 donnait « jour = BLEU », conforme au
+# terrain, ET tous les autres champs du registre tombaient juste avec cette convention —
+# deux sources publiques se contredisaient d'un bit, c'est la trame qui a tranché.
+STGE_COULEUR = {0: "néant", 1: "bleu", 2: "blanc", 3: "rouge"}
+
+
+def stge_couleurs(v: int):
+    """(couleur du jour, couleur du lendemain) depuis le registre de statuts brut."""
+    return STGE_COULEUR.get((v >> 24) & 3), STGE_COULEUR.get((v >> 26) & 3)
+
+
 def interpret_tlv(tag: int, value: bytes):
     """Valeur typée d'un TLV connu (str / int / présence) ; octets bruts sinon."""
+    if tag == T_STGE:
+        # Rendu LISIBLE et non brut : ce tag n'est pas encore stocké, sa seule sortie est le
+        # journal `log_uncabled`. Un entier décimal y serait indéchiffrable.
+        v = int.from_bytes(value, "little")
+        j, d = stge_couleurs(v)
+        return "0x%08X jour=%s demain=%s" % (v, j, d)
     if tag in _TLV_STR:
         return value.decode("ascii", "replace").strip()
     if tag == T_PAPP:

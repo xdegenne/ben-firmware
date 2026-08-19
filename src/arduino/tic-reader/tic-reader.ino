@@ -27,6 +27,9 @@
                          SECONDES (varint) — standard: écart d'horodate compteur ; histo:
                          écart millis() ; delta PAPP = varint zig-zag signé (1-3 o)
     [ext]   EAIT         uint32 LE (Wh) si has_ext — énergie injectée totale (producteur std)
+    [TLV]   T_STGE 0x23  uint32 LE — registre de statuts STANDARD, brut. Couleur Tempo du jour
+                         bits 24-25, du LENDEMAIN bits 26-27 (0 néant/1 bleu/2 blanc/3 rouge).
+                         Seule source de la couleur de demain : NJOURF+1 vaut 0 en permanence.
     len-8   HMAC         HMAC-SHA256(key, octets 0..len-9) tronqué 8 octets
 
   Un CHANGEMENT D'INDEX (PTEC histo / NTARF std) pendant un batch → flush immédiat +
@@ -90,7 +93,7 @@
 // ---------------------------------------------------------------------------
 #define PROTOCOL_VERSION_BOOT  0x01   // trame d'identité (ADCO)
 #define PROTOCOL_VERSION_CURVE 0x05   // trame courbe batchée (v0x05 : dt par point)
-#define FW_VERSION             "0.1.7"   // 0.1.7 : la trame de BOOT n'est émise que sur une trame TIC ENTIÈRE (`v.complete` = sortie sur ETX et non sur timeout), aux 3 points d'émission. Une trame coupée livrait un ADCO juste (il est en tête) et rien de fiable après : contrat faux (`CONTRAT='00'` sur ben-0001 à chaque ré-enregistrement → époque tarifaire bidon côté serveur) ET ISOUSC/PREF absents (jauge mal calibrée). 0.1.6 : + IINST dans le boot (T_IINST) — histo : PAPP=0 en injection → 230×IINST = production estimée (unboxing producteur). 0.1.5 : PAPP dans le boot (T_PAPP, conso dès le 1er boot → unboxing rapide) + buffer-reuse vérif ACK (-32o pile). (diag pile CONSERVE). 0.1.4 : APP_ACK_MS 800→2000 ms (Pi Zero chargé : crypto Python > 800 ms → l'émetteur ratait l'ACK → boots en boucle + flashs blancs discovery côté central). 0.1.3 : FIX trame boot dans buffer GLOBAL curveBuf (le buffer pile buf[64] débordait pendant le ChaCha et corrompait l ACK -> gate bloquée). 0.1.2 : découplage émetteur↔récepteur (incident ben-0001 09/07). setTimeout 600ms + setRetries 1. MACHINE À ÉTATS REGISTERING/STREAMING : tant que la trame de boot (petit paquet = probe de vivacité) n'est pas ACK, AUCUNE mesure émise ; retry boot à la cadence batch (v frais) ; mesure non-ACK → retour REGISTERING. Base 0.1.0 : garde histo tolérante + IINST 2e courbe + flush 55s + chiffrement ChaCha20 + logging aligné
+#define FW_VERSION             "0.1.8"   // 0.1.8 : + TLV STGE (registre de statuts standard, 32 bits BRUTS) a chaque trame de courbe -> couleur Tempo du JOUR (bits 24-25) et du LENDEMAIN (bits 26-27), plus surtension / depassement de puissance / organe de coupure / mode producteur, sans un octet de plus. Offset des bits verifie sur trame reelle le 14/08 (capture data/tic-ben0001-20260814-1343.bin, doc docs/tic-stge-capture-2026-08-14.md) : la couleur du jour lue = BLEU, conforme au terrain, et TOUS les autres champs du registre tombent juste avec cette convention. En contrepartie NJOURF/NJOURF+1 passent derriere SEND_NJOURF=0 : ils designent le calendrier FOURNISSEUR, qu EDF ne programme pas pour Tempo, et valent 0 en permanence (verifie 12, 13 et 14/08). Bilan : 30 080 o (97%) contre 30 154 (98%) en 0.1.7 -> on AJOUTE STGE en GAGNANT 74 o. Emission systematique et non sur-changement : pas d etat a synchroniser entre emetteur et recepteur, et une trame perdue est reparee 40 s plus tard (ce boitier a perdu 20-25% de ses trames la semaine du 11/08). 0.1.7 : la trame de BOOT n'est émise que sur une trame TIC ENTIÈRE (`v.complete` = sortie sur ETX et non sur timeout), aux 3 points d'émission. Une trame coupée livrait un ADCO juste (il est en tête) et rien de fiable après : contrat faux (`CONTRAT='00'` sur ben-0001 à chaque ré-enregistrement → époque tarifaire bidon côté serveur) ET ISOUSC/PREF absents (jauge mal calibrée). 0.1.6 : + IINST dans le boot (T_IINST) — histo : PAPP=0 en injection → 230×IINST = production estimée (unboxing producteur). 0.1.5 : PAPP dans le boot (T_PAPP, conso dès le 1er boot → unboxing rapide) + buffer-reuse vérif ACK (-32o pile). (diag pile CONSERVE). 0.1.4 : APP_ACK_MS 800→2000 ms (Pi Zero chargé : crypto Python > 800 ms → l'émetteur ratait l'ACK → boots en boucle + flashs blancs discovery côté central). 0.1.3 : FIX trame boot dans buffer GLOBAL curveBuf (le buffer pile buf[64] débordait pendant le ChaCha et corrompait l ACK -> gate bloquée). 0.1.2 : découplage émetteur↔récepteur (incident ben-0001 09/07). setTimeout 600ms + setRetries 1. MACHINE À ÉTATS REGISTERING/STREAMING : tant que la trame de boot (petit paquet = probe de vivacité) n'est pas ACK, AUCUNE mesure émise ; retry boot à la cadence batch (v frais) ; mesure non-ACK → retour REGISTERING. Base 0.1.0 : garde histo tolérante + IINST 2e courbe + flush 55s + chiffrement ChaCha20 + logging aligné
 #define BOOT_PAYLOAD_LEN       20     // v0x01 : version + ADCO(12) + ISOUSC + PREF, padding jusqu'à 20 (rétro)
 #define BOOT_MAX_LEN           64     // format cible : header(7) + TLV (ADCO/ISOUSC/PREF/CONTRAT) + MAC(8)
 
@@ -111,6 +114,14 @@
 #define T_DEMAIN  0x20
 #define T_NJOURF  0x21
 #define T_NJOURF1 0x22
+#define T_STGE    0x23   // STGE brut (uint32 LE) : couleur jour bits 24-25, LENDEMAIN bits 26-27,
+                         // + surtension, depassement Pref, organe de coupure, mode producteur.
+                         // Emis TEL QUEL : interpreter ici couterait de la flash et ne rapporterait rien,
+                         // le Pi a la place. Cf. docs/tic-stge-capture-2026-08-14.md pour la table des bits.
+
+// NJOURF/NJOURF+1 : calendrier FOURNISSEUR, qu EDF ne programme PAS pour Tempo -> 0 en permanence.
+// DESACTIVES, pas supprimes : ils redeviennent valides chez un fournisseur qui declare un calendrier.
+#define SEND_NJOURF 0
 #define T_ADPS    0x30
 #define T_PEJP    0x31
 #define T_MSG1    0x40
@@ -224,6 +235,7 @@ static bool     curveAdps   = false;         // histo : dépassement puissance �
 static bool     curvePejp   = false;         // histo : préavis EJP → TLV présence
 static uint8_t  curveNjourf  = 0xFF;         // std : n° profil jour (Tempo) → TLV (0xFF = absent)
 static uint8_t  curveNjourf1 = 0xFF;         // std : n° profil lendemain → TLV (0xFF = absent)
+static uint32_t curveStge    = 0;            // std : registre de statuts brut → TLV (0 = absent)
 static uint8_t  lastSentIsousc = 0;          // dernier ISOUSC émis (v0x01) → ré-émet sur changement
 static uint8_t  lastSentPref   = 0;          // dernier PREF émis (v0x01, standard) → ré-émet sur changement
 static uint16_t lastSentNgtfHash = 0;        // hash du dernier NGTF émis (v0x01) → détecte le changement fournisseur (économe RAM vs stocker la chaîne)
@@ -285,6 +297,7 @@ struct TICValues {
   uint8_t  ntarf;         // n° index tarifaire actif (1..10)
   uint8_t  njourf;        // n° profil jour courant (Tempo standard, 0-9)
   uint8_t  njourf1;       // n° profil lendemain (NJOURF+1)
+  uint32_t stge;          // STGE : registre de statuts, 8 caracteres HEXA dans la TIC (0 = absent)
   uint32_t easf_active;      // TRIM : index fournisseur ACTIF (Wh) — capté au parse via lastNtarf reporté
   bool     easf_active_seen; // true = EASF actif vu (checksum OK) cette trame
   uint32_t eait;          // énergie active injectée totale (Wh) — producteur
@@ -631,8 +644,11 @@ static void parseTICLineStd(char* line, uint8_t len, TICValues& v) {
   else if (!strcmp(name, "PREF")) v.pref = (uint8_t)strtoul(val, 0, 10);  // abonnement std (kVA)
   else if (!strcmp(name, "LTARF")) strncpy(v.ltarf, val, sizeof(v.ltarf) - 1);  // libellé tarif courant
   else if (!strcmp(name, "NGTF"))  strncpy(v.ngtf,  val, sizeof(v.ngtf)  - 1);  // calendrier tarifaire fournisseur
+#if SEND_NJOURF
   else if (!strcmp(name, "NJOURF"))   v.njourf  = (uint8_t)strtoul(val, 0, 10);  // n° profil jour (Tempo std)
   else if (!strcmp(name, "NJOURF+1")) v.njourf1 = (uint8_t)strtoul(val, 0, 10);  // n° profil lendemain
+#endif
+  else if (!strcmp(name, "STGE")) v.stge = strtoul(val, 0, 16);   // BASE 16 — STGE est en hexa
   else if (!strcmp(name, "DATE")) {              // horodatée, donnée vide → horodate = champ 2
     if (n >= 3) { line[ht[1]] = 0; strncpy(v.ts, line + ht[0] + 1, sizeof(v.ts) - 1); }
   }
@@ -908,6 +924,7 @@ void curveStart(const TICValues& v, uint8_t id, uint32_t value) {
     curvePejp = v.pejp_present;
   } else { curveDemain = 0xFF; curveAdps = false; curvePejp = false; }
   curveNjourf = v.njourf; curveNjourf1 = v.njourf1;   // std Tempo (0xFF = absent) → TLV au flush
+  curveStge   = v.stge;                               // std : statuts bruts → TLV au flush
   curveT0         = millis();
   curveLastOffSec = 0;                                                 // histo : origine des dt (millis)
   curveLastTod    = (ticMode == MODE_STANDARD) ? todSeconds(v.ts) : 0; // standard : tod du keyframe (point 0)
@@ -992,8 +1009,14 @@ void curveFlush() {
   if (curveDemain != 0xFF) curvePos = writeTLV(curveBuf, curvePos, T_DEMAIN, &curveDemain, 1);
   if (curveAdps)  curvePos = writeTLV(curveBuf, curvePos, T_ADPS, &curveDemain, 0);  // présence (len 0)
   if (curvePejp)  curvePos = writeTLV(curveBuf, curvePos, T_PEJP, &curveDemain, 0);  // présence (len 0)
+#if SEND_NJOURF
   if (ticMode == MODE_STANDARD && curveNjourf  != 0xFF) curvePos = writeTLV(curveBuf, curvePos, T_NJOURF,  &curveNjourf,  1);
   if (ticMode == MODE_STANDARD && curveNjourf1 != 0xFF) curvePos = writeTLV(curveBuf, curvePos, T_NJOURF1, &curveNjourf1, 1);
+#endif
+  // A CHAQUE trame, pas sur-changement : pas d etat a synchroniser avec le recepteur (un Pi
+  // redemarre ne peut pas redemander la valeur courante), et une trame perdue est reparee au
+  // flush suivant. 6 o sur 117, soit +5%, exactement ce que couvraient les NJOURF desactives.
+  if (ticMode == MODE_STANDARD && curveStge) { uint8_t sb[4]; memcpy(sb, &curveStge, 4); curvePos = writeTLV(curveBuf, curvePos, T_STGE, sb, 4); }
 
   uint16_t len = frameSeal(curveBuf, curvePos, FRAME_ENCRYPT);  // chiffre (si activé) + MAC → longueur totale
 

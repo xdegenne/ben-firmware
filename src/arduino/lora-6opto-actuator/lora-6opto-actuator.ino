@@ -26,7 +26,8 @@
 #define RGB_R 5
 #define RGB_G 3
 #define RGB_B 6
-#define PULSE_MS 500             // brève impulsion (tap) : déclenche le moteur qui s'auto-maintient
+#define PULSE_MS 1000            // impulsion (tap) 1 s : appui plus franc → registration plus fiable
+                                 //   (500 ms était marginal sur certains taps ; cf. intermittence terrain)
 #define NVOLETS 3
 // index = volet-1.  V1: ouvre D7(orange)/ferme D4(gris) | V2: ouvre D8(blanc)/ferme A2(vert)
 //                   V3: ouvre A0(violet)/ferme A1(jaune)
@@ -47,6 +48,15 @@ static unsigned long next_ready=0;                 // millis() mini pour démarr
 // WDT MCU seul est aveugle. On lit REG_VERSION (0x42 doit valoir 0x12) périodiquement (comme le Pi).
 #define RADIOCHECK_MS 30000
 static unsigned long next_radiocheck=0;
+// SILENCE RADIO — le self-test REG_VERSION ci-dessous ne prouve QUE la vivacite du bus SPI,
+// pas celle de la RECEPTION. Panne du 14/08 : le satellite est reste muet jusqu'a 9 h avec
+// watchdog ET self-test actifs, le module repondant 0x12 tout en etant SOURD (mauvais mode,
+// FIFO corrompue ou DIO0 perdue). Aucun des deux filets ne pouvait la voir.
+// On surveille donc le TRAFIC ATTENDU : le Pi envoie un ping toutes les 10 min, donc 20 min
+// de silence est anormal et justifie une re-init forcee. Seul critere qui teste la chaine
+// COMPLETE (antenne -> RFM95 -> SPI -> MCU) plutot qu'un registre.
+#define SILENCE_MS 1200000UL
+static unsigned long last_rx=0;
 static inline uint32_t rotl32(uint32_t x,int n){return (x<<n)|(x>>(32-n));}
 #define CHACHA_QR(a,b,c,d) a+=b;d^=a;d=rotl32(d,16);c+=d;b^=c;b=rotl32(b,12);a+=b;d^=a;d=rotl32(d,8);c+=d;b^=c;b=rotl32(b,7);
 #define CHACHA_LE32(p) ((uint32_t)(p)[0]|((uint32_t)(p)[1]<<8)|((uint32_t)(p)[2]<<16)|((uint32_t)(p)[3]<<24))
@@ -111,6 +121,7 @@ void setup(){
   setRGB(0,0,0);
   for(uint8_t i=0;i<32;i++) K_DEVICE[i]=EEPROM.read(i);       // clé provisionnée en EEPROM (0x00)
   Serial.begin(9600);Serial.println(F("=== actuator-01 (lora-6opto) 0x2a @868 (cibles 1-3, EEPROM-key, file+watchdog) ==="));
+  last_rx=millis();   // arme le detecteur de silence : sans ca il se declencherait au 1er tour
   if(radioReset()){
     Serial.println(F("LoRa OK @868"));setRGB(0,0,80);delay(300);setRGB(0,0,0);   // boot = bleu bref
   } else {Serial.println(F("LoRa FAIL"));blinkN(3,255,0,0);}
@@ -119,7 +130,7 @@ void setup(){
 void loop(){
   if(manager.available()){
     uint8_t buf[RH_RF95_MAX_MESSAGE_LEN];uint8_t len=sizeof(buf);uint8_t from;
-    if(manager.recvfromAck(buf,&len,&from)) handleFrame(buf,len);
+    if(manager.recvfromAck(buf,&len,&from)){ last_rx=millis(); handleFrame(buf,len); }  // vivacite = on a ENTENDU, valide ou non
   }
   // fin d'impulsion NON-BLOQUANTE : le satellite reste à l'écoute pendant l'impulsion
   if(active_pin && (long)(millis()-pulse_end)>=0){
@@ -139,6 +150,13 @@ void loop(){
       Serial.println(F("RADIO FIGEE -> re-init"));
       if(!radioReset()){ Serial.println(F("re-init KO -> WDT reset")); while(1){} }  // plus de wdt_reset → reset 8s
     }
+  }
+  // Silence prolonge -> re-init, MAIS jamais pendant une impulsion ni file non vide : un relais
+  // reste colle vaut bien pire qu'une radio sourde. On attend l'inactivite complete.
+  if(!active_pin && q_count==0 && (long)(millis()-last_rx)>=(long)SILENCE_MS){
+    Serial.println(F("SILENCE 20min -> re-init radio"));
+    last_rx=millis();                    // re-arme AVANT : sinon on re-declenche a chaque tour
+    if(!radioReset()){ Serial.println(F("re-init KO -> WDT reset")); while(1){} }
   }
   wdt_reset();   // ré-armé chaque tour (la loop ne bloque jamais > 8s hors fallback volontaire)
 }

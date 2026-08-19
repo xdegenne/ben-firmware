@@ -53,6 +53,11 @@ MQTT_PORT = 1883
 TOPIC_RX  = "ben/lora/rx"        # publié : {from, rssi, snr, hex}  hex = trame EN CLAIR (déchiffrée)
 TOPIC_TX  = "ben/lora/tx"        # souscrit : {to, body}  body = corps commande EN CLAIR (hex), scellé ici
 TOPIC_LED = "ben/led"            # souscrit : {r, g, b, duration, bypass} — topic TRANSVERSE (pas sous lora)
+TOPIC_TX_ACK = "ben/lora/tx/ack" # publié : issue du send_acked {to, cmd, ack, rtt_ms, id}
+# L'issue d'une commande n'existait QUE dans le journal : un client ne pouvait pas distinguer
+# « ordre parti » de « ordre acquitté par la cible ». Une cible devenue SOURDE est alors
+# indiscernable d'une cible qui marche — alors que send_acked() le sait dès l'ACK manqué,
+# à ~130 ms près. Publier l'issue est ce qui rend une panne de cible datable.
 
 # --------------------------------------------------------------------------- #
 # Clés — la façade est le SEUL détenteur (bus en clair, secure-by-default)      #
@@ -432,6 +437,17 @@ def on_mqtt_message(client, userdata, msg) -> None:
                 log.error(f"TX échec : {e}")
         ack_s = f"ACK @ {rtt*1000:.0f} ms" if rtt is not None else "PAS d'ACK (3 essais → perte RF)"
         log.info(f"TX → 0x{to:02x} cmd={body.hex()} cnt={counter} hid={_tx_hid} : {ack_s}")
+        # Issue publiée : SEULE preuve qu'un ordre a atteint sa cible. `id` est recopié tel quel
+        # depuis la demande → le client corrèle lui-même, aucun état à tenir ici.
+        try:
+            client.publish(TOPIC_TX_ACK, json.dumps({
+                "ts": time.time(), "to": to, "cmd": body.hex(), "cnt": counter,
+                "hid": _tx_hid, "ack": rtt is not None,
+                "rtt_ms": round(rtt * 1000) if rtt is not None else None,
+                "id": d.get("id"),
+            }), qos=0)
+        except Exception as e:
+            log.warning(f"publication issue TX échouée : {e}")
 
     elif msg.topic == TOPIC_LED:
         blink_rgb(int(d.get("r", 0)), int(d.get("g", 0)), int(d.get("b", 0)),

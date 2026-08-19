@@ -310,6 +310,13 @@ def _parse_label_std(line: str, out: dict) -> None:
         out["NJOURF"] = _std_int(data)
     elif name == "NJOURF+1":                  # n° profil lendemain (Tempo std) — collecté, pas stocké
         out["NJOURF+1"] = _std_int(data)
+    elif name == "STGE":                      # registre de statuts (std) — collecté, pas stocké
+        # ⚠️ BASE 16 : STGE est le SEUL champ hexadécimal de la TIC standard, tous les autres
+        # entiers sont en décimal. Un _std_int() par réflexe lirait « 013A4401 » comme 13.
+        try:
+            out["STGE"] = int(data.strip(), 16)
+        except ValueError:
+            pass                              # trame abîmée : on ignore, la suivante arrive en ~1 s
 
 
 def _std_horodate_to_epoch(h: str | None) -> int | None:
@@ -407,6 +414,21 @@ def build_flags(labels: dict) -> tuple[str | None, bool, bool]:
 # logués À MINIMA, ON-CHANGE en INFO — MÊME format/manière que le récepteur LoRa (main.py
 # log_uncabled). Visibilité sans noyer journald (~1,7 s/trame). MSG1/MSG2 = non émis (RAM ATmega328).
 _last_uncabled: dict = {}
+
+# Couleurs Tempo portées par STGE (mode standard). Offset VÉRIFIÉ sur trame réelle le
+# 2026-08-14 — capture data/tic-ben0001-20260814-1343.bin, STGE=013A4401 → « jour = BLEU »,
+# conforme au terrain, et TOUS les autres champs du registre tombent juste avec cette
+# convention. Deux sources publiques se contredisaient d'un bit ; c'est la trame qui a tranché.
+# Même table que frame_codec.stge_couleurs() côté LoRa — garder les deux alignées.
+_STGE_COULEUR = {0: "néant", 1: "bleu", 2: "blanc", 3: "rouge"}
+
+
+def _stge_lisible(v):
+    """'0x013A4401 jour=bleu demain=néant' — ou None si le champ est absent."""
+    if v is None:
+        return None
+    return "0x%08X jour=%s demain=%s" % (
+        v, _STGE_COULEUR.get((v >> 24) & 3), _STGE_COULEUR.get((v >> 26) & 3))
 
 
 def log_uncabled(fields: dict) -> None:
@@ -774,8 +796,15 @@ try:
                         mts = _std_horodate_to_epoch(labels.get("DATE_HORODATE"))
                         if mts is not None:
                             labels["_meter_ts"] = mts
-                        # Champs non-câblés std (NJOURF/NJOURF+1 Tempo) → log INFO on-change (aligné LoRa).
-                        log_uncabled({"NJOURF": labels.get("NJOURF"), "NJOURF+1": labels.get("NJOURF+1")})
+                        # Champs non-câblés std (NJOURF/NJOURF+1 Tempo, STGE) → log INFO
+                        # on-change (aligné LoRa). STGE est rendu LISIBLE : c'est le seul
+                        # porteur de la couleur du LENDEMAIN, et un entier décimal de 32 bits
+                        # serait indéchiffrable au journal. NJOURF/NJOURF+1, eux, valent 0 en
+                        # permanence (calendrier FOURNISSEUR non programmé par EDF pour Tempo)
+                        # — gardés par symétrie avec le LoRa, où ils sont désactivés en 0.1.8.
+                        log_uncabled({"NJOURF": labels.get("NJOURF"),
+                                      "NJOURF+1": labels.get("NJOURF+1"),
+                                      "STGE": _stge_lisible(labels.get("STGE"))})
                         if not std_first_logged:
                             # 1re trame valide : dump complet en INFO pour valider
                             # le décodage sur un vrai compteur standard.

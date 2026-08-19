@@ -18,6 +18,34 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.9.10] — 2026-08-19
+
+**`STGE` est nommé, décodé, et il porte la couleur Tempo de DEMAIN.** Le registre de statuts du mode standard (TLV `0x23`, 32 bits bruts) était jusqu'ici un champ inconnu de plus. Il est désormais interprété par `frame_codec.stge_couleurs()` et journalisé par `log_uncabled()` à chaque changement, sous forme lisible : `STGE='0x013A4401 jour=bleu demain=néant'`.
+
+Ce champ résout l'énigme ouverte le 12/08 : **la couleur du lendemain n'existe nulle part ailleurs dans la TIC standard.** `NJOURF+1`, le candidat évident, renvoie au calendrier **fournisseur** — qu'EDF ne programme pas pour Tempo. Il vaut `0` en permanence, vérifié sur ben-0001 les 12, 13 et 14/08 alors même que le contrat Tempo était actif depuis le 13/08 à 06:00.
+
+⚠️ **L'offset des bits vient d'une trame réelle, pas d'une documentation.** Deux sources publiques se contredisaient d'un bit — 24-25/26-27 contre 25-26/27-28 — et un décalage d'un seul bit fait dérailler la table entière. La capture du 14/08 (`data/tic-ben0001-20260814-1343.bin`, sha256 `18173ebf…`) donne `STGE=013A4401` : la convention **24-25 = jour** rend « BLEU », conforme au terrain et à l'API publique, et surtout **tous** les autres champs du registre tombent juste avec elle — index fournisseur = 2 concorde avec `NTARF=02`, sortie télé-info = standard, mode consommateur. C'est cette cohérence croisée qui tranche, pas l'autorité d'une source. Table complète dans `docs/tic-stge-capture-2026-08-14.md`.
+
+**Ce que ça ne fait pas** : aucun stockage, aucune colonne, aucune exposition par l'API. On **observe d'abord** — on ignore encore si les bits 26-27 se peuplent, et quand : « néant » à 13:43 le 14/08 alors que l'API publique connaissait déjà la couleur du 15, là où la littérature annonce ~20 h.
+
+> **Asymétrie à connaître.** Sur LoRa, `STGE` exige l'émetteur **≥ 0.1.8**, donc un reflash physique — il n'y a pas d'OTA sur AVR. En dessous, aucun TLV `0x23` n'arrive : sans effet, sans risque. Sur **filaire**, `main_uart.py` lit la TIC en direct et cet OTA suffit, sans intervention sur site. Un boîtier filaire en Tempo standard pourrait donc trancher la question de la couleur du lendemain **avant** le parc LoRa. Aucun n'est en service à ce jour — pi10jd75 est en historique, donc sans `STGE` — le code part **non éprouvé**, en attente d'un tel boîtier.
+
+**L'anti-rollback d'index comparait tous les registres dans un seul casier.** Deux défauts, découverts sur ben-0001 après sa bascule en Tempo.
+
+`active_name` vaut `None` pour **tous** les registres du mode standard — ils sont opaques, libellés par le `LTARF` fournisseur, sans table en dur — et c'est précisément lui qui servait de clé. Les dix registres Tempo partageaient donc un unique casier. Le registre 1 y avait déposé 15 415 362 Wh (le Linky ne remet pas ses `EASF` à zéro en changeant d'offre : tout l'historique pré-Tempo est tombé dedans), et le registre 2, né à ~4 000 Wh le 13/08 à 06:00, passait pour un rollback de quinze millions. Aggravant : la mise à jour de l'état vivait dans la branche `else`, donc l'alerte se **verrouillait** — une ligne toutes les 40 s, des heures durant.
+
+Second défaut, plus sournois : **la clé ne survivait pas au JSON.** `None` se sérialise en la *chaîne* `"null"`, que `.get(None)` ne retrouve plus au rechargement — d'où deux clés `"null"` en double dans `lora-state.json`, et un garde-fou **amnésique** repartant de zéro à chaque redémarrage. Il avait donc l'air de fonctionner (plus d'alerte) alors qu'il ne protégeait plus rien.
+
+Clé texte explicite désormais : `s<index_id>` en standard, le nom canonique en historique (`BASE`/`HCHC`/`BBRHCJB`… — il **existe** là-bas, et les boîtiers historiques l'ont déjà en base, migration `last_base` comprise). Le préfixe évite en prime la collision entre l'ère historique et l'ère standard d'un **même** boîtier : ben-0001 a fait cette bascule, son `BASE` et son registre standard n°1 ne désignent pas le même compteur physique. La mise à jour devient **inconditionnelle** — on signale une fois, on ne verrouille plus — et `load_state()` purge les clés `"null"` héritées, qui ne désignent aucun registre. La vraie défense contre un compteur étranger reste le garde ADCO.
+
+**L'issue d'une commande descendante devient observable.** `ben-radio` publie désormais sur `ben/lora/tx/ack` le résultat de chaque commande émise : `{ts, to, cmd, cnt, hid, ack, rtt_ms, id}`, où `ack: false` signifie trois essais sans réponse.
+
+`send_acked()` connaissait déjà le sort d'un ordre dès l'ACK RadioHead — à ~130 ms près — mais ne le disait **qu'au journal**. Un client du bus ne pouvait donc pas distinguer « ordre parti » de « ordre acquitté par la cible » : il affichait le même résultat dans les deux cas. La conséquence est structurelle et indépendante de tout actionneur : **une cible devenue sourde est indiscernable d'une cible qui marche**, et une panne datable à la seconde se transforme en plage d'incertitude de plusieurs heures. Le canal descendant n'avait aucun retour d'exécution ; c'est ce trou-là qui se ferme.
+
+`id` est recopié **tel quel** depuis la demande reçue sur `ben/lora/tx` : c'est le client qui corrèle, la façade ne mémorise rien et reste *stateless*. Publication en `qos=0` sous `try/except` — un broker qui râle ne doit jamais faire échouer une émission radio qui a déjà eu lieu. Aucun abonné n'est requis : le topic est purement additif.
+
+Pur code (`lora-receiver/frame_codec.py`, `ben-telemetry/ben_telemetry.py`, `tic-reader/main_uart.py`, `ben-radio/ben_radio.py`), **aucune migration**, aucune table, aucune colonne. **Universel** — pas de gate capability : un boîtier filaire ne reçoit simplement jamais le TLV `0x23`, et les deux autres correctifs le servent aussi. Redémarre `ben-radio`, `ben-telemetry` et `ben-tic-reader` ; `ben-local-api` n'est pas concerné.
+
 ### [0.9.9] — 2026-08-13
 
 **`/registers` montrait des registres d'offres révolues.** `db.registers()` agrégeait **tout** le rollup sans borne temporelle : un registre vu une fois restait affiché à vie. Constaté sur ben-0001 — le registre BASE de l'ère **historique**, muet depuis sept semaines, trônait dans la carte Réglages à côté des registres Tempo, donnant l'impression de deux index « Base » concurrents.
@@ -384,6 +412,21 @@ log-only baseline (Influx stripped, hostname rename)
 first dev release (published, no devices in field)
 
 ## Émetteur Arduino (tic-reader)
+
+### [0.1.8] — 2026-08-19
+
+**`STGE` émis à chaque trame de courbe — et ça coûte 74 octets de flash EN MOINS.** Nouveau TLV `T_STGE` (`0x23`), le registre de statuts du mode standard transmis **brut**, en `uint32` little-endian. Il porte la couleur Tempo du jour (bits 24-25) et du **lendemain** (bits 26-27), plus la surtension, le dépassement de `PREF`, l'état de l'organe de coupure et le mode producteur. Interpréter côté AVR aurait coûté de la flash sans rien rapporter : le Pi a la place, il décide.
+
+Le financement vient de `NJOURF`/`NJOURF+1`, passés derrière `#define SEND_NJOURF 0`. Ils désignent le calendrier **fournisseur**, qu'EDF ne programme pas pour Tempo, et valent `0` en permanence (vérifié les 12, 13 et 14/08). On échangeait donc 6 octets d'air contre du vide. **Désactivés et non supprimés** : ils redeviennent valides chez un fournisseur qui déclare un calendrier. Bilan flash : **30 154 → 30 080 o (98 % → 97 %)**.
+
+⚠️ **`STGE` est en HEXADÉCIMAL dans la TIC**, huit caractères — `strtoul(val, 0, 16)`. En base 10 la valeur est silencieusement fausse, pas rejetée.
+
+Émission **systématique**, pas sur-changement : il n'y a alors aucun état à synchroniser entre émetteur et récepteur — un Pi qui redémarre ne peut pas redemander la valeur courante — et une trame perdue est réparée au flush suivant, 40 s plus tard. Ce n'est pas théorique : ce boîtier a perdu 20-25 % de ses trames la semaine du 11/08. Coût réel : 6 octets sur 117, soit +5 %, exactement ce que libéraient les `NJOURF` désactivés.
+
+**Nouveau sketch de diagnostic `src/arduino/tic-relay/`** — c'est lui qui a rendu la capture possible. Le Pro Mini n'a qu'un seul UART, et c'est celui qui lit la TIC : impossible d'ouvrir un second port pour observer. Mais l'UART est **full duplex** — on réémet sur `TX` ce qu'on reçoit sur `RX`, sans toucher au câblage ni sortir le fer. Le FTDI voit alors la trame telle que l'Arduino la reçoit, y compris les champs que le firmware de production jette en silence. ⚠️ Il **remplace** `tic-reader` le temps de la session (plus d'émission LoRa) ; reflasher la production après. L'upload n'efface pas l'EEPROM, donc la clé ChaCha20 et le mode persisté survivent.
+
+- Reflash **MANUEL** (Pro Mini, pas d'OTA). Flash **97 %** — 698 o de marge.
+- Prérequis du décodage côté récepteur : **pi-0.9.10**. Les deux sont indépendants — un émetteur 0.1.8 face à un récepteur antérieur voit son TLV ignoré, sans erreur.
 
 ### [0.1.7] — 2026-08-13
 

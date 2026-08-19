@@ -175,6 +175,10 @@ def load_state() -> dict:
     except (FileNotFoundError, json.JSONDecodeError):
         raw = {}
     indexes = raw.get("indexes", {})
+    # Purge des clés "null" laissées par le bug de clé None (< 14/08) : elles ne
+    # correspondent à aucun registre et fausseraient une comparaison.
+    if "null" in indexes:
+        del indexes["null"]
     # Migration état lora_v5/v6 (last_base)
     if not indexes and "last_base" in raw:
         last_base = raw.get("last_base", 0)
@@ -541,13 +545,37 @@ def on_recv_curve(decoded, rssi, snr, pdl_index, now, time_since_prev) -> None:
         _maybe_prune()
 
     # Anti-rollback de l'index (sur le keyframe = absolu du 1er échantillon).
-    prev_value = state["indexes"].get(active_name, 0)
+    #
+    # La clé identifie le REGISTRE, jamais le mode. Deux défauts corrigés le 14/08 :
+    #
+    #  (1) en standard `active_name` vaut None pour TOUS les registres (ils sont opaques,
+    #      nommés par le LTARF fournisseur, pas de table en dur) → les 10 registres Tempo
+    #      partageaient UN SEUL casier. Une bascule HC→HP faisait donc passer 15 415 362 Wh
+    #      (registre 1, qui porte tout l'historique pré-Tempo) à ~4 000 Wh : un « rollback »
+    #      de 15 millions, à chaque trame.
+    #  (2) `None` se sérialise en la CHAÎNE "null", que `.get(None)` ne retrouve plus au
+    #      rechargement → deux clés "null" en double dans lora-state.json, et un garde-fou
+    #      AMNÉSIQUE (il repartait de 0 à chaque redémarrage, donc ne protégeait plus rien).
+    #
+    # Une clé texte explicite règle les deux : elle distingue les registres ET survit au JSON.
+    # Histo : le nom canonique (BASE/HCHC/BBRHCJB…) — il EXISTE (table INDEX_NAMES en dur) et
+    # les boîtiers historiques l'ont déjà en base, migration `last_base` comprise. Standard :
+    # pas de nom possible (registres opaques, libellés par le LTARF fournisseur) → on fabrique
+    # un identifiant préfixé, qui évite au passage la collision avec l'ère historique du même
+    # boîtier (ben-0001 est passé de histo à standard : son BASE et son registre standard n°1
+    # ne sont pas le même compteur physique).
+    reg_key = f"s{index_id}" if src_standard else active_name
+    prev_value = state["indexes"].get(reg_key, 0)
     if index_value < prev_value:
-        log.warning(f"{active_name} en décroissance : {index_value} < {prev_value}")
+        log.warning(f"registre {reg_key} en décroissance : {index_value} < {prev_value}")
         blink_rgb(30, 15, 0, 0.3, bypass=True)  # orange — décroissance
     else:
         blink_rgb(0, 5, 0, 0.05)               # vert court — batch valide
-        state["indexes"][active_name] = int(index_value)
+    # Mise à jour INCONDITIONNELLE. La laisser dans le `else` verrouillait l'avertissement à
+    # vie : le casier n'étant jamais rafraîchi, l'alerte repartait à chaque trame — constaté
+    # des heures durant le 14/08. Un garde-fou qui hurle en continu n'est plus lu. Il SIGNALE
+    # l'anomalie une fois ; la vraie défense contre un compteur étranger est le garde ADCO.
+    state["indexes"][reg_key] = int(index_value)
 
     state["last_active_id"] = int(index_id)
     state["last_batch_seq"] = int(batch_seq)
