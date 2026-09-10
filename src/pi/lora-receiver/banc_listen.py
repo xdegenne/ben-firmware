@@ -4,7 +4,7 @@
 Décode les trames LoRa du DUT (réutilise frame_codec, incl. 2e courbe IINST histo), N'ÉCRIT RIEN en base,
 et COMPARE chaque batch aux scénarios (banc_scenarios) → coche PASS. Rapport via `kill -USR1 <pid>`.
 
-À lancer quand ben-lora-receiver est ARRÊTÉ (conflit radio). Ne pollue JAMAIS la DB de prod.
+À lancer quand ben-radio est ARRÊTÉ (conflit radio). Ne pollue JAMAIS la DB de prod.
 """
 import signal
 import time

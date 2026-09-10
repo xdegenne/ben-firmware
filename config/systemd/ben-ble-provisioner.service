@@ -3,12 +3,12 @@ Description=BEN BLE WiFi Provisioner
 After=basic.target bluetooth.service NetworkManager.service ben-network-check.service
 Wants=bluetooth.service
 # Conflit LED + GPIO + radio SPI avec les agents normaux → mutuellement exclusifs.
-# ⚠️ ben-radio/ben-telemetry sont le mode normal d'un boîtier LoRa en CAPABILITIES
-# (monolithe ben-lora-receiver découpé en 0.9.1) : sans eux ici, l'exclusion était
-# fausse sur tout le parc moderne — le provisioner pouvait tourner en même temps
-# que la façade radio et se disputer le SX127x et la LED. Les noms legacy restent
-# pour les boîtiers non migrés ; une seule unit couvre ainsi les deux générations.
-Conflicts=ben-tic-reader.service ben-lora-receiver.service ben-radio.service ben-telemetry.service
+# ⚠️ La liste DOIT couvrir tous les services de `capabilities.CAP_SERVICES` : c'est
+# précisément d'avoir oublié ben-radio/ben-telemetry (découpage du monolithe en 0.9.1)
+# qui a laissé le provisioner coexister avec la façade radio et se disputer le SX127x
+# et la LED sur tout le parc LoRa. Le monolithe est supprimé depuis la 0.9.12 — et
+# aucune unit ne doit plus le nommer, fût-ce en commentaire (garde du préflight OTA).
+Conflicts=ben-tic-reader.service ben-radio.service ben-telemetry.service
 
 [Service]
 Type=simple

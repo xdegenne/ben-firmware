@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Régression : un boîtier hors ligne au boot doit ALTERNER, pas rester en BLE.
+"""Régression : un boîtier hors ligne au boot doit COLLECTER, pas rester en BLE.
 
 Le défaut d'origine (corrigé en pi-0.9.11) : `check_network` est un oneshot, il tranchait
 une fois au boot et rendait la main. Un device déjà provisionné qui démarrait sans réseau —
@@ -10,6 +10,11 @@ rien ne repassait en mode normal : violet-jaune et zéro mesure jusqu'à un déb
 CE DÉFAUT EST INVISIBLE EN EXPLOITATION : il ne se manifeste qu'au boot, sans réseau, donc
 sans personne pour lire un journal. D'où ce banc, qui déroule les cycles hors cible en
 stubbant GPIO, systemctl et ping.
+
+Depuis la 0.9.12 il couvre aussi QUELS agents démarrent : les capabilities et rien
+d'autre. Le repli par modèle a été supprimé — il ne matchait plus (device.json.model
+porte le LABEL COMMERCIAL depuis la 0.8.0) et démarrait le monolithe ben-lora-receiver,
+lui-même supprimé.
 
     python3 src/pi/provisioner/test_network_recovery.py
 """
@@ -40,6 +45,12 @@ _settings = types.ModuleType("settings")
 _settings.led_factor = lambda bypass=False: 1.0
 sys.modules.setdefault("settings", _settings)
 
+# device.json de banc : POSÉ AVANT d'importer capabilities, qui fige le chemin à l'import.
+DEVICE_JSON_TMP = os.path.join(tempfile.mkdtemp(), "device.json")
+os.environ["BEN_DEVICE_JSON"] = DEVICE_JSON_TMP
+pathlib.Path(DEVICE_JSON_TMP).write_text("{}", encoding="utf-8")
+
+import capabilities as caps_mod                              # noqa: E402
 import provisioning_state                                    # noqa: E402
 import network_recovery as nr                                # noqa: E402
 
@@ -160,8 +171,42 @@ def aiguillage(provisioned, online):
     return called
 
 
+def demarrage_readers(device_json: str):
+    """Rejoue check_network._start_readers() : QUELS agents démarrent, pour ce device.json.
+
+    ⚠️ Le cas qui compte est le device.json SANS capabilities. Il ne doit rien démarrer
+    du tout — surtout pas une liste de noms « par défaut ». C'est cette liste qui, jusqu'en
+    0.9.12, lançait `ben-lora-receiver` (le monolithe, découpé en 0.9.1) sur un boîtier
+    dont le `model` ne matchait plus rien depuis que ce champ porte le label commercial.
+    """
+    started = []
+    caps_mod._systemctl = lambda action, service: started.append(f"{action}:{service}")
+    pathlib.Path(DEVICE_JSON_TMP).write_text(device_json, encoding="utf-8")
+    nr.check_network._start_readers()
+    return started
+
+
 def main() -> int:
     ok = True
+
+    print("\n  choix des agents de mesure (capabilities SEULES)")
+    for title, device_json, expected in [
+        ("boîtier LoRa → la façade radio, dans l'ordre (ben-radio possède le GPIO)",
+         '{"capabilities": {"lora": {}, "lora-tic-receiver": {}}}',
+         ["start:ben-radio.service", "start:ben-telemetry.service"]),
+        ("boîtier filaire → le lecteur TIC",
+         '{"capabilities": {"tic-uart": {}}}',
+         ["start:ben-tic-reader.service"]),
+        ("device.json SANS capabilities → RIEN (et surtout pas le monolithe)",
+         '{"model": "Radio", "hardwareRevision": "rev01"}', []),
+        ("device.json illisible → RIEN",
+         'pas du json', []),
+    ]:
+        got = demarrage_readers(device_json)
+        good = got == expected
+        ok &= good
+        print(f"    [{'OK' if good else 'KO'}] {title}")
+        print(f"           démarré : {got or '(rien)'}")
 
     print("\n  aiguillage au boot (check_network)")
     for title, kw, expected in [

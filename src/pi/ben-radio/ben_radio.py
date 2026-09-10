@@ -341,8 +341,32 @@ def kernel_died() -> bool:
         return False
 
 
+_taint_signale = False
+
+
 def radio_alive() -> bool:
-    if kernel_died() or not lora_ok or lora is None:
+    """La radio est jugée SUR LA RADIO, jamais sur l'état du noyau.
+
+    ⚠️ `kernel_died()` ne doit PAS entrer ici. C'est un drapeau PERMANENT — un taint
+    noyau ne se nettoie que par un reboot — alors que ceci est un test PÉRIODIQUE dont
+    la seule action corrective est un RESTART DE SERVICE. Aucun restart ne nettoyant un
+    taint, la boucle est sans issue par construction : un oops, n'importe où dans le
+    système, condamnait la façade à mourir toutes les 90 s indéfiniment.
+
+    Vécu sur ben-0001 le 2026-09-05 : oops noyau à 14:35 dans le contexte d'un script
+    tiers (aucun rapport avec la radio) → 208 redémarrages en 6 h, 46 % des mesures
+    perdues — pendant que la radio ACQUITTAIT à 130 ms et recevait l'émetteur TIC. Le
+    garde-fou a détruit un service parfaitement sain.
+
+    Le taint reste utile comme INDICE de diagnostic : on le signale une fois, sans
+    jamais en tirer de conclusion sur la vivacité du lien radio.
+    """
+    global _taint_signale
+    if kernel_died() and not _taint_signale:
+        _taint_signale = True
+        log.warning("noyau TAINTED (un oops a eu lieu) — signalé une fois ; la radio "
+                    "reste jugée sur son self-test SPI, pas sur ce drapeau")
+    if not lora_ok or lora is None:
         return False
     try:
         with radio_lock:

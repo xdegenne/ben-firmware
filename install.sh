@@ -16,7 +16,7 @@ REPO_PATH="/opt/ben/repo"
 # == latest. §8 écrit un device.json CAPABILITIES-based (via caps_for_model) → un device neuf naît
 # directement en capabilities (+ watchdog durci pour un lora). Le parc EXISTANT migre par OTA
 # (0.5.0/0.6.0 → 0.6.1 → 0.7.0). Le chantier ben-ops (workflow opérateur) reste à part.
-INITIAL_TAG="pi-0.9.11"
+INITIAL_TAG="pi-0.9.12"
 # Version écrite dans device.json — DOIT correspondre au tag checkout, sinon
 # l'OTA re-grimpe depuis une version périmée. Dérivée de INITIAL_TAG pour
 # qu'elles ne puissent jamais diverger (ex. pi-0.0.28 → 0.0.28).
@@ -216,7 +216,7 @@ echo "[10/13] Python dependencies installed"
 # pip l'installe automatiquement même si requirements.txt a rpi-lgpio. Le pip
 # RPi.GPIO finit dans /usr/local et shadow le rpi-lgpio système (apt) qui est
 # le seul compatible avec le chardev GPIO du kernel Trixie 6.12+. Sans cette
-# désinstallation, ben-lora-receiver crashe avec "Failed to add edge detection".
+# désinstallation, ben-radio crashe avec "Failed to add edge detection".
 if [ "$MODEL" = "pi0-lora" ] || [ "$MODEL" = "pi0-lora-wired" ]; then
     pip3 uninstall -y --break-system-packages RPi.GPIO 2>/dev/null || true
     echo "[10a/13] RPi.GPIO transitif uninstall (rpi-lgpio prend la main)"
@@ -288,7 +288,7 @@ systemctl start  ben-local-api.service || true
 systemctl enable ben-level-profiler.timer
 systemctl start  ben-level-profiler.timer || true
 
-# Les agents de mesure (tic-reader / lora-receiver) ne sont PAS enable :
+# Les agents de mesure (voir capabilities.CAP_SERVICES) ne sont PAS enable :
 # pas de WantedBy → pas d'autostart au boot. C'est ben-network-check.service
 # (check_network.py) qui les démarre, et seulement si le réseau est up. Sinon
 # ils tournaient au boot en doublon et tuaient ben-ble-provisioner (Conflicts)

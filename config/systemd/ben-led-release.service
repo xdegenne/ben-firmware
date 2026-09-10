@@ -6,7 +6,7 @@ After=local-fs.target
 # Avant les services BEN qui pilotent la LED RGB. Pas de Before=basic.target
 # car ça créerait un cycle (multi-user.target wants ben-led-release ↔
 # basic.target required by multi-user.target ↔ Before=basic.target).
-Before=ben-network-check.service ben-tic-reader.service ben-lora-receiver.service ben-ble-provisioner.service
+Before=ben-network-check.service ben-tic-reader.service ben-radio.service ben-telemetry.service ben-ble-provisioner.service
 
 [Service]
 Type=oneshot

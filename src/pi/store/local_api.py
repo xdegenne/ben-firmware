@@ -48,6 +48,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -56,6 +57,9 @@ from urllib.parse import parse_qs, urlparse
 import db
 import levels
 import settings
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))  # src/pi
+import capabilities as caps  # noqa: E402  (source de vérité « capability → services »)
 
 HOST = "0.0.0.0"
 PORT = 8087
@@ -88,6 +92,28 @@ def _goodbye_flash() -> None:
         print("[unprovision] au revoir (3 flashs violets)", flush=True)
     except Exception as e:
         print(f"[unprovision] flash « au revoir » ignoré: {e}", flush=True)
+
+
+def _reader_units() -> list:
+    """Les units de mesure de CE boîtier, dérivées des capabilities.
+
+    Utilisé par le désappairage, où l'asymétrie des erreurs est nette : en arrêter
+    trop ne coûte rien (le boîtier s'éteint juste après), en arrêter trop peu laisse
+    la LED tenue et la base ouverte pendant le wipe. D'où le repli sur l'UNION de tous
+    les services connus si les capabilities sont illisibles — jamais sur une liste
+    figée de noms, qui est précisément ce qui avait rendu ce stop inopérant.
+    """
+    try:
+        declared = caps.capabilities()
+        units = [s for cap in declared for s in caps.services_for(cap)]
+        if units:
+            return list(dict.fromkeys(units))
+        print("[unprovision] aucune capability déclarée — arrêt de TOUS les lecteurs connus",
+              flush=True)
+    except Exception as e:
+        print(f"[unprovision] capabilities illisibles ({e}) — arrêt de TOUS les lecteurs connus",
+              flush=True)
+    return list(dict.fromkeys(s for v in caps.CAP_SERVICES.values() for s in v))
 
 
 def _device_info() -> dict:
@@ -253,9 +279,17 @@ class Handler(BaseHTTPRequestHandler):
             # Stop les readers TOUJOURS : (1) ils tiennent les pins de la LED RGB → il faut
             # les libérer pour le flash « au revoir » ci-dessous ; (2) si wipe, ça ferme la
             # base (WAL) AVANT le rm → wipe propre. On NE touche PAS ben-local-api (c'est lui
-            # qui exécute _teardown). Service absent selon le modèle → ignoré.
+            # qui exécute _teardown). Service absent sur ce boîtier → ignoré.
+            #
+            # ⚠️ Cette liste venait des CAPABILITIES depuis la 0.9.12, et pas avant : elle
+            # était figée sur « ben-tic-reader ben-lora-receiver », or le monolithe est
+            # découpé en ben-radio + ben-telemetry depuis la 0.9.1. Sur tout boîtier LoRa
+            # moderne ce stop n'arrêtait donc AUCUN lecteur : la LED restait tenue pendant
+            # le flash d'au revoir, et surtout le wipe supprimait une base que
+            # `ben-telemetry` gardait ouverte en WAL — elle se recréait dans la seconde.
+            # Même défaut que le wipe illusoire du script de preshipping (corrigé le 15/08).
             subprocess.run(
-                ["sudo", "systemctl", "stop", "ben-tic-reader", "ben-lora-receiver"],
+                ["sudo", "systemctl", "stop", *_reader_units()],
                 stderr=subprocess.DEVNULL)
             if wipe:
                 for suffix in ("", "-wal", "-shm"):

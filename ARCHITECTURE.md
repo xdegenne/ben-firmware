@@ -24,7 +24,9 @@ ben-firmware/
     arduino/
       tic-reader/            # Arduino sketch (pi0-lora only)
     pi/
-      lora-receiver/         # LoRa receiver agent (pi0-lora only)
+      lora-receiver/         # LoRa frame/curve codecs, shared by ben-radio & ben-telemetry
+      ben-radio/             # SX127x owner: RX/TX + LED (lora-tic-receiver capability)
+      ben-telemetry/         # Decodes & stores frames, no radio (lora-tic-receiver capability)
       tic-reader/            # Direct TIC reader (pi0-wired only)
       publisher/             # Cloud publisher (all models)
       updater/
@@ -367,7 +369,8 @@ One service per agent. Only the services relevant to the device model are enable
 | `ben-provision.service` | all | no | One-shot at boot: checks connectivity, triggers BLE provisioning if needed |
 | `ben-registrar.service` | all | yes | One-shot: registers device with backend, drives RGB LED verification sequence |
 | `ben-tic-reader.service` | `pi0-wired` only | no | Reads TIC directly from Linky |
-| `ben-lora-receiver.service` | `pi0-lora` only | no | Receives LoRa frames from Arduino |
+| `ben-radio.service` | `lora-tic-receiver` cap | no | Sole owner of the SX127x: RX/TX + LED |
+| `ben-telemetry.service` | `lora-tic-receiver` cap | no | Decodes and stores frames (no radio) |
 | `ben-publisher.service` | all | yes | Publishes data to cloud API |
 | `ben-update.service` | all | yes | One-shot: runs `check_update.py` |
 | `ben-update.timer` | all | yes | Triggers `ben-update.service` once a day (randomized) |
@@ -390,7 +393,7 @@ ben-update.timer
 Readers and receivers do not depend on the network — they start as soon as the system is up and run independently:
 
 ```ini
-# ben-lora-receiver.service / ben-tic-reader.service
+# ben-radio.service / ben-telemetry.service / ben-tic-reader.service
 [Unit]
 After=basic.target
 ```

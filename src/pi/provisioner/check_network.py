@@ -18,7 +18,6 @@ Aucune décision n'est prise sur la base de l'état nmcli seul : un wlan0
 mode provisioning.
 """
 
-import json
 import logging
 import subprocess
 import sys
@@ -33,15 +32,11 @@ DEVICE_JSON = "/etc/ben-firmware/device.json"
 # unboxé"). DOIT rester aligné avec wifi_config.CONNECTION_NAME.
 CONNECTION_NAME = "ben-provisioned"
 
-# Agents "normaux" à démarrer selon le modèle quand le réseau est up.
-# Ils n'ont PLUS d'autostart systemd (pas de WantedBy) : c'est ici, et
-# seulement ici, qu'ils sont lancés — sinon ils démarrent au boot en doublon
-# et tuent ben-ble-provisioner via Conflicts (bug "code couleur en boucle").
-READERS_BY_MODEL = {
-    "pi0-wired": ["ben-tic-reader.service"],
-    "pi0-lora": ["ben-lora-receiver.service"],
-    "pi0-lora-wired": ["ben-lora-receiver.service", "ben-tic-reader.service"],
-}
+# Les agents "normaux" n'ont PLUS d'autostart systemd (pas de WantedBy) : c'est
+# `_start_readers()`, et seulement lui, qui les lance — sinon ils démarrent au boot
+# en doublon et tuent ben-ble-provisioner via Conflicts (bug "code couleur en boucle").
+# QUELS agents : `capabilities.py`, source de vérité unique. Il n'y a plus de mapping
+# par modèle ici (supprimé en 0.9.12) — voir _start_readers().
 
 logging.basicConfig(
     level=logging.INFO,
@@ -101,34 +96,30 @@ def _start_readers() -> None:
     """Démarre les agents normaux (device provisionné + réseau up). Ces services n'ont
     pas d'autostart : ils ne tournent QUE par cet appel.
 
-    PRIORITÉ au device.json CAPABILITIES (source de vérité = capabilities.py) ; FALLBACK
-    sur le mapping par modèle pour un device pas encore migré."""
-    # Nouveau modèle : capabilities → services.
+    Les CAPABILITIES du `device.json` sont la seule source (`capabilities.py`). Le repli
+    par modèle a été supprimé en 0.9.12 : il était mort ET nuisible. Mort, parce que tout
+    boîtier ayant atteint la 0.9.x est passé par la migration 0.6.1 → 0.7.0 qui écrit les
+    capabilities. Nuisible, parce que `device.json.model` porte depuis la 0.8.0 le LABEL
+    COMMERCIAL (« Filaire », « Radio ») et non le modèle technique : la table ne matchait
+    plus rien, on tombait dans le défaut « modèle inconnu » et on démarrait le monolithe
+    `ben-lora-receiver` — supprimé en 0.9.12 — au lieu de la façade radio.
+
+    Sans capabilities lisibles il n'y a RIEN à démarrer, et il faut le dire fort : c'est
+    un boîtier qui ne mesurera pas."""
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # src/pi
         import capabilities as caps
         declared = caps.capabilities()
-        if declared:
-            for cap in declared:
-                caps.start(cap)
-            log.info("readers démarrés via capabilities: %s", list(declared))
-            return
     except Exception as e:
-        log.warning("capabilities indisponible (%s) — fallback modèle", e)
-
-    # Fallback (device pas encore migré : device.json a `model`, pas `capabilities`).
-    model = ""
-    try:
-        with open(DEVICE_JSON) as f:
-            model = json.load(f).get("model", "")
-    except Exception as e:
-        log.warning("lecture %s: %s", DEVICE_JSON, e)
-    services = READERS_BY_MODEL.get(model)
-    if not services:
-        log.warning("modèle inconnu (%r) → démarrage tic-reader + lora-receiver par défaut", model)
-        services = ["ben-tic-reader.service", "ben-lora-receiver.service"]
-    for s in services:
-        _start(s)
+        log.error("capabilities illisibles (%s) — AUCUN agent de mesure ne peut démarrer", e)
+        return
+    if not declared:
+        log.error("device.json sans capabilities — AUCUN agent de mesure ne peut démarrer "
+                  "(fichier=%s)", caps.DEVICE_JSON)
+        return
+    for cap in declared:
+        caps.start(cap)
+    log.info("readers démarrés via capabilities: %s", list(declared))
 
 
 def _has_been_provisioned() -> bool:

@@ -18,6 +18,26 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.9.12] — 2026-09-10
+
+**Un drapeau qui ne s'efface jamais pilotait un test qui recommence toutes les 90 secondes.** `radio_alive()` commençait par `kernel_died()`. Or un taint noyau est **permanent** — il ne se nettoie que par un reboot — tandis que ce test est **périodique** et que sa seule action corrective est un **restart de service**. Aucun restart ne nettoyant un taint, la boucle est sans issue **par construction** : un oops, n'importe où dans le système, condamne la façade radio à mourir indéfiniment.
+
+Vécu sur ben-0001 le 5 septembre : oops à 14:35 dans le contexte d'un script tiers, sans aucun rapport avec la radio → **208 redémarrages en 6 h, 46 % des mesures perdues**, pendant que la radio acquittait à 130 ms et recevait l'émetteur TIC. Le garde-fou a détruit un service parfaitement sain. Le filet `StartLimitAction=reboot` existait bel et bien, et **il est passé à 3 s près** : un cycle de 103 s contre une fenêtre de 300 s pour trois démarrages.
+
+La radio est désormais jugée **sur la radio** — son self-test SPI — et sur rien d'autre. Le taint garde son intérêt d'**indice** : signalé une fois au journal, sans jamais rien décider.
+
+**Et le monolithe `ben-lora-receiver` disparaît.** Découpé en `ben-radio` + `ben-telemetry` en 0.9.1, figé à l'état 0.9.4, exécuté par aucun boîtier depuis le cutover 0.9.0. Il laissait derrière lui 35 Ko de logique dupliquée qui ne pouvait que diverger, et une unit que `install.sh` copiait sur **chaque device neuf** (`cp config/systemd/*.service`).
+
+⚠️ **Ces références mortes ne dormaient pas : elles produisaient des défauts.**
+
+- **Le désappairage ne fermait pas la base.** `local_api._unprovision` arrêtait « `ben-tic-reader ben-lora-receiver` ». Sur un boîtier LoRa moderne, **ce stop n'arrêtait rien** : la LED restait tenue pendant le flash d'au revoir, et surtout le `?wipe=1` supprimait une base que `ben-telemetry` gardait **ouverte en WAL** — elle se recréait dans la seconde. Wipe illusoire, exactement le défaut corrigé le 15/08 dans le script de preshipping et resté intact ici. La liste vient maintenant des **capabilities**, avec repli sur l'**union** de tous les services connus : au désappairage, en arrêter trop ne coûte rien (le boîtier s'éteint juste après), en arrêter trop peu casse le wipe.
+- **Le repli par modèle démarrait le monolithe.** `check_network.READERS_BY_MODEL` était censé servir aux devices « pas encore migrés ». Il était mort **et** nuisible : mort, parce que tout boîtier arrivé en 0.9.x a franchi la migration 0.6.1 → 0.7.0 qui écrit les capabilities ; nuisible, parce que `device.json.model` porte le **label commercial** (« Filaire », « Radio ») depuis la 0.8.0 — la table ne matchait donc plus rien, on tombait dans la branche « modèle inconnu » et on lançait `ben-lora-receiver` au lieu de la façade radio. **Les capabilities sont la norme** ; sans elles il n'y a rien à démarrer, et on le dit en `ERROR` plutôt que d'inventer une liste par défaut.
+- **L'ordonnancement de la LED avait un trou** : le `Before=` de `ben-led-release` nommait le monolithe, donc ne couvrait plus `ben-radio`/`ben-telemetry` — les pins pouvaient n'être libérées qu'après le démarrage des lecteurs.
+
+> **Le répertoire `src/pi/lora-receiver/` reste, et c'est délibéré.** Il n'héberge plus de récepteur mais les **codecs partagés** — `frame_codec`, `curve_codec`, `secure_link` — importés en production par les deux services via `sys.path`. Le supprimer casserait la façade radio sur tout le parc. Un README l'explique désormais sur place ; le renommer est un chantier à part, pas un coup de balai.
+
+Le banc `test_network_recovery.py` couvre maintenant **quels** agents démarrent : un `device.json` sans capabilities ne doit rien lancer du tout. Aucune migration, aucune table, aucune colonne. **Universel.** Restart des services des capabilities déclarées (le correctif taint vit dans `ben-radio`), **puis** `ben-local-api` — dans cet ordre, l'API ouvrant la base en lecture seule.
+
 ### [0.9.11] — 2026-08-19
 
 **Un boîtier qui redémarre avant sa box restait bloqué en provisioning BLE, indéfiniment.** Le scénario n'a rien d'exotique : une coupure de courant, le boîtier reboote plus vite que la box, il ne trouve pas de réseau — et il n'en ressortait plus jamais.

@@ -48,7 +48,6 @@ récupération en panne. On patiente tant qu'elle dure — le drapeau EXPIRE, do
 une session oubliée ne peut pas retenir la collecte indéfiniment.
 """
 
-import json
 import logging
 import subprocess
 import sys
@@ -81,12 +80,6 @@ POLL_INTERVAL_SEC = 30
 # dès le premier point. D'où le timeout court.
 NMCLI_UP_TIMEOUT_SEC = 20
 
-# Repli si les capabilities sont illisibles. ⚠️ NE PAS s'en contenter : sur un
-# boîtier LoRa en capabilities, le mode normal est `ben-radio` + `ben-telemetry`
-# et non `ben-lora-receiver` (monolithe découpé en 0.9.1) — une garde codée sur
-# ces deux seuls noms ne verrait jamais un boîtier moderne déjà passé en normal.
-LEGACY_READERS = ("ben-tic-reader.service", "ben-lora-receiver.service")
-
 
 def _systemctl(*args: str, timeout: int = 60) -> int:
     cmd = ["systemctl", *args]
@@ -102,29 +95,24 @@ def _is_active(unit: str) -> bool:
 
 
 def _reader_units() -> tuple:
-    """Les units du mode NORMAL pour CE boîtier — mêmes sources que
-    `check_network._start_readers()` : capabilities d'abord, modèle ensuite."""
+    """Les units du mode NORMAL pour CE boîtier — même source que
+    `check_network._start_readers()` : les CAPABILITIES, et rien d'autre.
+
+    ⚠️ Surtout pas une liste de noms en dur. Elle ne servirait qu'à une chose ici —
+    détecter qu'un agent normal tourne déjà pour ne pas relancer le BLE par-dessus —
+    et une liste périmée (le monolithe `ben-lora-receiver`, découpé en 0.9.1) ne
+    verrait AUCUN boîtier moderne : on couperait la mesure pour offrir du BLE dont
+    personne n'a besoin. Capabilities illisibles → tuple vide, donc aucune garde :
+    c'est le comportement sûr, on ne prétend pas savoir."""
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # src/pi
         import capabilities as caps
         declared = caps.capabilities()
-        if declared:
-            units = [s for cap in declared for s in caps.services_for(cap)]
-            if units:
-                return tuple(dict.fromkeys(units))   # dédoublonne, ordre conservé
+        units = [s for cap in declared for s in caps.services_for(cap)]
+        return tuple(dict.fromkeys(units))           # dédoublonne, ordre conservé
     except Exception as e:
-        log.warning("capabilities indisponible (%s) — repli modèle", e)
-
-    try:
-        with open(check_network.DEVICE_JSON) as f:
-            model = json.load(f).get("model", "")
-        units = check_network.READERS_BY_MODEL.get(model)
-        if units:
-            return tuple(units)
-    except Exception as e:
-        log.warning("lecture modèle impossible (%s)", e)
-
-    return LEGACY_READERS
+        log.warning("capabilities illisibles (%s) — aucune garde « agent déjà actif »", e)
+        return ()
 
 
 def _ping_once() -> bool:
