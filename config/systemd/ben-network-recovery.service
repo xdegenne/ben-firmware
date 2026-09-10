@@ -1,0 +1,27 @@
+[Unit]
+Description=BEN network recovery (alterne provisioning BLE et retentatives WiFi)
+After=NetworkManager.service bluetooth.service
+Wants=NetworkManager.service
+# PAS de After=ben-network-check.service : c'est lui qui nous démarre, et
+# ben-ble-provisioner.service porte déjà cette dépendance. L'ajouter ici ferait
+# attendre un oneshot déjà terminé sans rien garantir de plus.
+# PAS de Conflicts= avec les readers : on démarre nous-mêmes un reader en sortant,
+# et systemd nous tuerait au milieu de cette sortie. La garde est dans le code
+# (on abandonne si un reader est déjà actif).
+
+[Service]
+Type=simple
+# root requis : systemctl start/stop du provisioner, nmcli (activation de
+# connexion), et PWM GPIO pour la LED pendant la phase de retentative.
+User=root
+WorkingDirectory=/opt/ben/repo/src/pi/provisioner
+ExecStart=/usr/bin/python3 /opt/ben/repo/src/pi/provisioner/network_recovery.py
+# Sortie 0 = réseau retrouvé, agents normaux démarrés → surtout pas de relance.
+# Un plantage, lui, laisserait le boîtier bloqué en BLE : c'est le défaut même
+# qu'on corrige, donc on relance.
+Restart=on-failure
+RestartSec=10
+
+# Pas d'[Install] : démarré uniquement par ben-network-check.service, et
+# uniquement pour un device DÉJÀ provisionné. Un boîtier jamais unboxé doit
+# rester en BLE indéfiniment — c'est son mode nominal, pas une panne.

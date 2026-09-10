@@ -2,8 +2,13 @@
 check_network — Boot-time connectivity check.
 
 Lancé en oneshot au boot. Décide qui prend la main :
-  • Réseau OK   → démarre les services normaux (ben-tic-reader, etc.)
-  • Réseau KO   → démarre ben-ble-provisioner.service (mode provisioning BLE)
+  • Réseau OK        → démarre les services normaux (ben-tic-reader, etc.)
+  • Jamais provisionné → ben-ble-provisioner.service (unboxing, BLE indéfiniment)
+  • Provisionné, réseau KO → ben-network-recovery.service : fenêtre de provisioning
+    BLE bornée (veille passive par ping), puis COLLECTE, réseau ou pas.
+
+⚠️ Ce module est un ONESHOT : il tranche une fois et rend la main. Toute décision
+qui doit être RÉVISÉE plus tard appartient à `network_recovery`, pas ici.
 
 Le test consiste à pinguer une cible Internet pendant un délai borné, le temps
 que NetworkManager finisse de monter wlan0 et obtienne une IP.
@@ -81,6 +86,15 @@ def _start(name: str) -> None:
 def _start_provisioning() -> None:
     """Mode BLE provisioning."""
     _start("ben-ble-provisioner.service")
+
+
+def _start_recovery() -> None:
+    """Mode RÉCUPÉRATION : fenêtre BLE bornée, puis collecte hors ligne.
+
+    Réservé au device DÉJÀ provisionné. C'est `network_recovery` qui démarre le
+    provisioner, pas nous : il doit rester seul maître de la fenêtre, sinon on
+    relancerait le BLE dans son dos juste après qu'il l'a coupé pour collecter."""
+    _start("ben-network-recovery.service")
 
 
 def _start_readers() -> None:
@@ -172,8 +186,12 @@ def main() -> int:
         log.info("réseau OK → démarrage des agents normaux")
         _start_readers()
     else:
-        log.info("provisionné mais réseau KO → mode provisioning BLE (récupération)")
-        _start_provisioning()
+        # PAS le provisioner directement : ce oneshot ne repassera jamais ici, et
+        # un device laissé en BLE y restait indéfiniment même une fois la box
+        # revenue (coupure de courant : le boîtier reboote avant la box).
+        # `network_recovery` prend le relais : fenêtre BLE, puis collecte.
+        log.info("provisionné mais réseau KO → récupération (fenêtre BLE, puis collecte)")
+        _start_recovery()
     return 0
 
 

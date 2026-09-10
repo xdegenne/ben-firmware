@@ -47,6 +47,7 @@ import time
 from bluezero import adapter, peripheral
 
 import led
+import provisioning_state
 from wifi_config import configure_wifi
 
 GRACE_PERIOD_AFTER_SUCCESS_SEC = 5  # LED verte fixe avant reboot, le temps de voir le signal
@@ -502,6 +503,12 @@ def main() -> int:
     device_id = read_device_id()
     log.info("démarrage BLE provisioner — deviceId=%s", device_id)
 
+    # Aucune session ne peut être en cours puisqu'on démarre. C'est ce nettoyage
+    # qui garantit qu'un drapeau oublié (provisioner tué en pleine session) ne
+    # condamne pas la récupération réseau : systemd nous relance à chaque
+    # déconnexion BLE, donc il est repassé à zéro très vite.
+    provisioning_state.clear_ble_session()
+
     # Au boot, bluetoothd peut mettre quelques secondes à exposer son adapter
     # sur D-Bus. On retry pendant 30s avant d'abandonner (évite la boucle
     # de crash systemd qui prend 2s entre chaque tentative).
@@ -595,6 +602,9 @@ def main() -> int:
     #     qui ré-initialise l'advertising bluezero (bug connu : sans restart,
     #     les centraux suivants ne nous voient plus).
     def _on_disconnect(*_args, **_kwargs):
+        # Plus de session : `network_recovery` a le droit de nous arrêter pour
+        # retenter le WiFi. À poser AVANT le retour anticipé du cas succès.
+        provisioning_state.clear_ble_session()
         if _provisioning_succeeded:
             log.info("BLE déconnecté après succès — on attend la grace period")
             return
@@ -615,6 +625,9 @@ def main() -> int:
             log.info("on_connect doublon (ServicesResolved) ignoré")
             return
         _connected = True
+        # Un téléphone est là : `network_recovery` ne doit pas nous couper la
+        # radio au milieu de la reco couleurs ou d'une saisie de mot de passe.
+        provisioning_state.set_ble_session()
         _verified = False
         _verify_attempts = 0
         _preview_active = False

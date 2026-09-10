@@ -2,10 +2,13 @@
 Description=BEN BLE WiFi Provisioner
 After=basic.target bluetooth.service NetworkManager.service ben-network-check.service
 Wants=bluetooth.service
-# Conflit LED + GPIO avec les agents normaux → mutuellement exclusifs.
-# Les 2 modèles (pi0-wired = tic-reader, pi0-lora = lora-receiver) sont listés
-# pour qu'une seule unit suffise au déploiement OTA.
-Conflicts=ben-tic-reader.service ben-lora-receiver.service
+# Conflit LED + GPIO + radio SPI avec les agents normaux → mutuellement exclusifs.
+# ⚠️ ben-radio/ben-telemetry sont le mode normal d'un boîtier LoRa en CAPABILITIES
+# (monolithe ben-lora-receiver découpé en 0.9.1) : sans eux ici, l'exclusion était
+# fausse sur tout le parc moderne — le provisioner pouvait tourner en même temps
+# que la façade radio et se disputer le SX127x et la LED. Les noms legacy restent
+# pour les boîtiers non migrés ; une seule unit couvre ainsi les deux générations.
+Conflicts=ben-tic-reader.service ben-lora-receiver.service ben-radio.service ben-telemetry.service
 
 [Service]
 Type=simple

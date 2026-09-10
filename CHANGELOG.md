@@ -18,6 +18,47 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.9.11] — 2026-08-19
+
+**Un boîtier qui redémarre avant sa box restait bloqué en provisioning BLE, indéfiniment.** Le scénario n'a rien d'exotique : une coupure de courant, le boîtier reboote plus vite que la box, il ne trouve pas de réseau — et il n'en ressortait plus jamais.
+
+`check_network.py` est un **oneshot** : il tranche une fois au boot, puis rend la main. Sur un device déjà provisionné mais sans réseau, il partait en provisioning BLE et **personne ne revenait tester**. Deux faits de structure l'enfermaient là :
+
+- `ben-network-check.service` est `Type=oneshot`, `WantedBy=multi-user.target`, sans aucun timer ni aucun service qui le relance ;
+- les agents de mesure n'ont **pas** de `[Install]`/`WantedBy` — ils ne démarrent **que** par un appel explicite de `_start_readers()`.
+
+Résultat : LED violet-jaune, aucune mesure enregistrée, jusqu'à ce que quelqu'un débranche le boîtier. Une coupure de trente secondes pouvait coûter des jours de données.
+
+⚠️ **Et aucun filet ne rattrapait ça.** On pourrait croire que `wifi-watchdog` — relance de NetworkManager toutes les deux minutes — sauvait au moins le réseau. Il n'est **installé nulle part** : `install.sh` ne copie jamais son script vers `/usr/local/bin` et n'active jamais son timer, et aucun `update.sh` ne le fait. Vérifié sur ben-0001 : script absent, timer `disabled`/`inactive`. La seule reprise réelle est l'autoconnect de NetworkManager, qui renonce après ses `autoconnect-retries` (défaut 4). Le déploiement de ce watchdog reste à faire, et c'est un chantier à part.
+
+**Nouvel agent `ben-network-recovery`**, démarré par `check_network` dans la **seule** branche « déjà provisionné mais réseau KO ». Son cycle :
+
+1. provisioning BLE pendant 5 min — le boîtier reste joignable par l'app, car une coupure peut aussi être un vrai changement de box et l'utilisateur doit pouvoir reconfigurer ;
+2. **veille passive** pendant cette fenêtre, un ping toutes les 30 s. C'est le cas nominal : NetworkManager se reconnecte seul quand la box revient, et on le voit **sans avoir rien coupé** ;
+3. fenêtre écoulée → on arrête le BLE et **la collecte démarre**, réseau ou pas.
+
+Le déroulé est **linéaire, sans boucle ni compteur**. Une première version alternait N fois BLE ↔ retentative WiFi avant de renoncer ; c'était inutile, puisqu'on collecte **de toute façon** au bout de la fenêtre — la retentative ne décidait plus de rien. Il n'en reste qu'une relance `nmcli` best-effort juste avant la bascule, qui n'améliore que les chances d'avoir l'heure NTP juste dès le premier point.
+
+**Un boîtier hors ligne n'est pas un boîtier inutile.** Il n'a pas besoin du réseau pour faire son travail : la base SQLite est **locale** et l'app lit l'API locale du device. Et surtout, un boîtier qui perd le réseau **en marche** continue de collecter — rien ne l'arrête, `check_network` est un oneshot déjà terminé. Refuser de collecter après un **redémarrage** était donc une **incohérence** : la même panne donnait deux comportements opposés selon qu'elle survenait avant ou après le boot. Passée la fenêtre, la mesure passe devant l'attente.
+
+⚠️ **L'horodatage hors ligne est décalé, pas corrompu.** Le Pi Zero n'a pas de RTC, mais systemd restaure la dernière heure connue au boot et seulement **vers l'avant** — `System time advanced to timestamp on /var/lib/systemd/timesync/clock`, relevé dans le journal de ben-0001. Aucun point ne peut donc s'écrire dans le passé de la base. L'erreur vaut la durée de la coupure, et le retour du NTP la rattrape d'un saut en avant, laissant un trou dans les `ts`. En mode **standard** elle est même évitable : `meter_ts` porte déjà l'horodate du **compteur** sur 100 % des points — mesuré sur ben-0001, 3802/3802 sur la dernière heure, écart maximal de 8 s avec NTP. Caler l'horloge système dessus est un chantier à part.
+
+> **Le BLE n'est pas sacrifié.** Démarrer les agents éteint le provisioning (`Conflicts` LED/GPIO), mais **chaque** boot sans réseau rejoue cette fenêtre : un simple débranchement rouvre 5 min de re-provisionnement. Le BLE étant le seul chemin de configuration hors ligne, il fallait garantir qu'il reste atteignable avant de rendre la mesure prioritaire.
+
+Une session BLE en cours **retient la bascule** : on patiente tant qu'elle dure, sans quoi la radio se couperait sous un utilisateur en pleine configuration. L'expiration du drapeau (15 min) empêche en retour une session oubliée de retenir la collecte indéfiniment.
+
+⚠️ **Pourquoi arrêter le BLE pour retenter le WiFi.** Sur Pi Zero W, la radio WiFi et BLE est **partagée**. C'est exactement pour cela que le rescan périodique avait été retiré du provisioner en 0.8.2 : il affamait le lien et faisait décrocher les téléphones. Une tentative WiFi pendant une session BLE reproduirait ce défaut à l'identique.
+
+**Ce qu'on ne coupe jamais : une session BLE en cours.** Nouveau drapeau `provisioning_state`, un fichier dans `/run` — tmpfs, donc effacé à chaque boot, ce qu'on attend d'un état de session. Posé par le provisioner à `on_connect`, retiré à `on_disconnect`. Arrêter la radio pendant qu'un utilisateur saisit son mot de passe transformerait la récupération **en panne**. Le drapeau **expire** au bout de 15 min et `main()` l'efface à chaque démarrage du provisioner — que systemd relance à chaque déconnexion BLE — de sorte qu'un provisioner tué en pleine session ne puisse pas condamner la récupération au silence.
+
+> **Le premier unboxing n'est pas concerné.** Un boîtier jamais provisionné n'a pas de connexion `ben-provisioned` : `check_network` part en BLE direct, sans récupération. Y rester indéfiniment est son mode **nominal**, pas une panne — l'alternance n'aurait aucun sens et rendrait le boîtier fuyant pendant l'unboxing.
+
+**Au passage : une exclusion mutuelle qui était fausse.** `ben-ble-provisioner.service` déclarait `Conflicts=ben-tic-reader ben-lora-receiver`. Or le monolithe `ben-lora-receiver` a été **découpé en `ben-radio` + `ben-telemetry` en 0.9.1** : sur tout boîtier LoRa en capabilities, aucune des deux units listées n'est jamais active, et l'exclusion ne protégeait donc **plus rien** depuis. Le provisioner pouvait coexister avec la façade radio et se disputer le SX127x et la LED. Les deux units sont ajoutées ; les noms legacy restent pour les boîtiers non migrés. La même leçon vaut pour le code : la garde « un agent normal tourne déjà » de `network_recovery` est dérivée des **capabilities**, pas d'une liste de noms en dur.
+
+Code (`provisioner/network_recovery.py`, `provisioner/provisioning_state.py`, `provisioner/check_network.py`, `provisioner/main.py`) + deux units systemd. **Aucune migration**, aucune table, aucune colonne. **Universel**, pas de gate. Banc de non-régression `provisioner/test_network_recovery.py`, **joué par l'update lui-même** : le défaut ne se manifeste qu'au boot, sans réseau, sans personne pour lire un journal — et compiler ne prouve rien sur une machine à états. Il couvre l'aiguillage de `check_network` (dont la garantie que le **premier unboxing** n'entre jamais en récupération), les quatre issues du déroulé, et l'invariant « jamais de reader démarré sur un provisioner actif ».
+
+> **Effet différé, et c'est voulu.** Cet OTA n'atteint qu'un boîtier **en ligne**, donc en mode normal, donc dont la récupération n'a rien à faire. On installe les units et on recharge systemd : **aucun service n'est redémarré**, aucune mesure n'est perdue, et le correctif prend effet au prochain boot sans réseau — celui qui suivra la prochaine coupure.
+
 ### [0.9.10] — 2026-08-19
 
 **`STGE` est nommé, décodé, et il porte la couleur Tempo de DEMAIN.** Le registre de statuts du mode standard (TLV `0x23`, 32 bits bruts) était jusqu'ici un champ inconnu de plus. Il est désormais interprété par `frame_codec.stge_couleurs()` et journalisé par `log_uncabled()` à chaque changement, sous forme lisible : `STGE='0x013A4401 jour=bleu demain=néant'`.
