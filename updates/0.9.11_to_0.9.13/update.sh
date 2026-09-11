@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
-# update.sh — → pi-0.9.12 : le garde-fou taint ne tue plus la façade radio,
+# update.sh — → pi-0.9.13 : le garde-fou taint ne tue plus la façade radio,
 #                            et le monolithe ben-lora-receiver disparaît du parc.
+#
+# ⚠️ REPUBLICATION DE pi-0.9.12, BRÛLÉE LE 2026-09-10. Le contenu livré est IDENTIQUE ;
+#    seul le contrôle d'effet final était faux : il interrogeait `/info`, une route qui
+#    N'EXISTE PAS dans l'API locale (404). L'API était parfaitement saine, le service
+#    `active (running)`, tout le reste de l'update appliqué — et le script échouait quand
+#    même, laissant `device.json` non bumpé et l'update rejouée à chaque tick, donc la
+#    façade radio redémarrée toutes les 10 min. Les routes réelles sont `/ping`, `/health`,
+#    `/pdls`, `/live`, `/measurements`, `/curve`, `/chart`, `/consumption`, `/registers`,
+#    `/lora-link`, `/events`, `/settings`, `/unprovision`. On contrôle désormais sur
+#    `/health` : il exerce `_device_info()` ET une lecture de base, donc il prouve que
+#    l'API MARCHE, là où `/ping` prouverait seulement qu'une socket répond (0,15 s mesuré).
+#    LEÇON : un contrôle d'effet se vérifie sur la cible AVANT de faire signer le tag, au
+#    même titre que le code qu'il contrôle. Un garde-fou faux brûle une version aussi
+#    sûrement qu'un vrai défaut.
 #
 # ═══ (1) LE VERROU TAINT ══════════════════════════════════════════════════════════════════════
 #
@@ -54,17 +68,17 @@
 # Restart : les services des capabilities déclarées (le correctif taint vit dans ben-radio),
 # PUIS ben-local-api — dans cet ordre, l'API ouvrant la base en lecture seule. AUCUNE
 # migration, aucune table, aucune colonne. UNIVERSEL (LoRa et filaire, pas de gate).
-# Code déjà sur disque après `git checkout pi-0.9.12`. Tourne en `ben` + sudo.
+# Code déjà sur disque après `git checkout pi-0.9.13`. Tourne en `ben` + sudo.
 
 set -euo pipefail
-TR="→ pi-0.9.12"
+TR="→ pi-0.9.13"
 log()  { echo "[update $TR] $*"; }
 fail() { echo "[update $TR] ✗ ERREUR : $*" >&2; exit 1; }
 REPO="${REPO_PATH:-/opt/ben/repo}"
 
 # ── Préflight : le code patché doit être présent (checkout du tag en amont) ────────────────────
 grep -q '_taint_signale' "$REPO/src/pi/ben-radio/ben_radio.py" \
-    || fail "correctif taint absent de ben_radio (checkout pi-0.9.12 incomplet ?)"
+    || fail "correctif taint absent de ben_radio (checkout pi-0.9.13 incomplet ?)"
 grep -q 'if kernel_died() or not lora_ok' "$REPO/src/pi/ben-radio/ben_radio.py" \
     && fail "radio_alive() consulte ENCORE kernel_died — la boucle de restart survivrait"
 
@@ -163,14 +177,17 @@ systemctl cat ben-lora-receiver.service >/dev/null 2>&1 \
 if [ "$api_restarted" = 1 ]; then
     systemctl is-active --quiet ben-local-api.service \
         || fail "ben-local-api ne tourne plus après restart (import capabilities ?)"
-    python3 - <<'PYEOF' || fail "l'API locale ne répond plus sur /info"
-import sys, urllib.request
+    python3 - <<'PYEOF' || fail "l'API locale ne répond plus sur /health"
+import json, sys, urllib.request
 try:
-    urllib.request.urlopen("http://127.0.0.1:8087/info", timeout=10).read()
+    d = json.loads(urllib.request.urlopen("http://127.0.0.1:8087/health", timeout=15).read())
 except Exception as e:
-    print(f"  /info KO : {e}", file=sys.stderr); sys.exit(1)
+    print(f"  /health KO : {e}", file=sys.stderr); sys.exit(1)
+# `db: false` = l'API répond mais ne lit plus la base — une panne qu'un simple 200 masque.
+if not d.get("db"):
+    print(f"  /health répond mais db=false : {d}", file=sys.stderr); sys.exit(1)
 PYEOF
-    log "✓ API locale toujours debout (/info répond)"
+    log "✓ API locale toujours debout (/health répond, base lisible)"
 fi
 
 log "✓ le taint noyau ne pilote plus la vivacité radio : plus de boucle de restart sans issue"

@@ -18,7 +18,10 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
-### [0.9.12] — 2026-09-10
+### [0.9.13] — 2026-09-11
+
+> ⚠️ **Republie `pi-0.9.12`, brûlée le 10 septembre.** Le contenu livré est identique ; seul le **contrôle d'effet** final était faux. Il interrogeait `/info` — une route qui **n'existe pas** dans l'API locale (404). L'API était parfaitement saine (`active (running)`, `/health` en 0,15 s), tout le reste de l'update était appliqué, et le script échouait quand même : `device.json` non bumpé, update rejouée à chaque tick, **façade radio redémarrée toutes les dix minutes**. Le contrôle porte désormais sur `/health`, qui exerce `_device_info()` **et** une lecture de base — un `db: false` est traité comme un échec, là où un simple code 200 l'aurait masqué. **Un garde-fou faux brûle une version aussi sûrement qu'un vrai défaut** : un contrôle d'effet se vérifie sur la cible avant de faire signer le tag, au même titre que le code qu'il contrôle. Aucune transition `0.9.12 → …` n'existe : cette version n'a jamais été inscrite sur un boîtier.
+
 
 **Un drapeau qui ne s'efface jamais pilotait un test qui recommence toutes les 90 secondes.** `radio_alive()` commençait par `kernel_died()`. Or un taint noyau est **permanent** — il ne se nettoie que par un reboot — tandis que ce test est **périodique** et que sa seule action corrective est un **restart de service**. Aucun restart ne nettoyant un taint, la boucle est sans issue **par construction** : un oops, n'importe où dans le système, condamne la façade radio à mourir indéfiniment.
 
