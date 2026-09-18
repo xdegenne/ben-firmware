@@ -33,7 +33,25 @@ import time
 from pathlib import Path
 
 DB_PATH = "/var/lib/ben-firmware/measurements.db"
-RETENTION_DAYS = 90  # 3 mois glissants
+# Rétention glissante des mesures. Portée de 90 à 180 jours en 0.9.14.
+#
+# 🚨 POURQUOI : le parc atteignait 3 mois alors que la rétention valait 3 mois — le
+#    plus ancien jour d'historique s'effaçait chaque jour, et il n'existait NULLE PART
+#    ailleurs (aucune sauvegarde des bases embarquées). L'ingestion cloud est en
+#    construction ; 180 jours suppriment l'échéance au lieu de courir après.
+#
+# Coût mesuré sur ben-0001 (2026-09-18) : 5 441 400 lignes / 420 Mo à 90 jours, donc
+# ~840 Mo à 180. Pour 9,5 Go libres sur la carte SD, c'est sans effet. Ce qui coûte
+# n'est pas l'espace mais la pression mémoire sur les 512 Mo du Pi Zero et la taille
+# du WAL — d'où 180 et non 365.
+#
+# 🎁 Et le mouvement s'inversera : une fois le cloud alimenté, cette valeur pourra
+#    DESCENDRE (7 à 30 jours) et le boîtier deviendra plus rapide. Les 90 jours ne
+#    servaient qu'à être la seule copie existante.
+#
+# ⚠️ Cette constante est lue À L'IMPORT (argument par défaut de `prune()`) : la
+#    changer n'a d'effet qu'après REDÉMARRAGE des lecteurs.
+RETENTION_DAYS = 180  # 6 mois glissants
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS measurements (

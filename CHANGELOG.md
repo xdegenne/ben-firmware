@@ -18,6 +18,28 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.9.14] — 2026-09-18
+
+**Le passé s'effaçait sous le chantier.** Le parc atteignait trois mois alors que `RETENTION_DAYS` valait 90 : le plus ancien jour d'historique disparaissait chaque jour, et il n'existait **nulle part ailleurs** — il n'y a aucune sauvegarde des bases embarquées. Mesuré sur ben-0001 le 18 septembre : 5 441 400 lignes couvrant **exactement** 90 jours (20/06 → 18/09). La purge mordait bel et bien.
+
+L'ingestion cloud est en construction. La bâtir avant que le passé n'ait disparu était une course perdue d'avance : chaque semaine de chantier coûtait une semaine d'historique. **180 jours suppriment l'échéance au lieu de courir après**, pour le prix d'une constante.
+
+Le coût est dérisoire — la base passe de 420 à ~840 Mo, pour 9,5 Go libres sur la carte de ben-0001. Ce n'est d'ailleurs pas l'espace qui limite, mais la pression mémoire sur les 512 Mo du Pi Zero et la taille du WAL : d'où 180 et non 365.
+
+> 🚨 **Le piège de cette version : un argument par défaut.**
+> ```python
+> def prune(conn, retention_days: int = RETENTION_DAYS)
+> ```
+> En Python, un argument par défaut est évalué **une seule fois, à l'import du module**. Un lecteur déjà lancé garde la valeur qu'il avait au démarrage. **Changer le fichier sans redémarrer les lecteurs n'aurait strictement rien fait** — et l'update serait passée pour réussie. On ne s'en serait aperçu que trois mois plus tard, en constatant que rien n'avait changé.
+
+Le préflight vérifie donc en **deux temps** : un `grep` sur la constante, puis un **import réel du module** pour lire la valeur effective — une redéfinition plus bas dans le fichier passerait le premier et pas le second. Un garde-fou d'espace disque refuse d'agir si la carte ne peut pas accueillir une base doublée plus 512 Mo de marge : échanger une perte d'historique contre une carte pleine serait nettement pire.
+
+⚠️ **Ce que le contrôle d'effet ne peut pas prouver** : que la purge garde effectivement 180 jours, puisqu'elle ne tourne qu'environ une fois par heure. Il vérifie ce qui est vérifiable dans sa fenêtre — services actifs après redémarrage, `/health` répondant avec `db: true` — et **imprime la ligne exacte à surveiller ensuite** plutôt que de faire semblant.
+
+🎁 **Le mouvement s'inversera.** Une fois le cloud alimenté, cette valeur pourra **descendre** à 7 ou 30 jours, et le boîtier deviendra plus rapide. Les 90 jours ne servaient qu'à être la seule copie existante.
+
+Aucune migration, aucune table, aucune colonne. Universel (LoRa et filaire).
+
 ### [0.9.13] — 2026-09-11
 
 > ⚠️ **Republie `pi-0.9.12`, brûlée le 10 septembre.** Le contenu livré est identique ; seul le **contrôle d'effet** final était faux. Il interrogeait `/info` — une route qui **n'existe pas** dans l'API locale (404). L'API était parfaitement saine (`active (running)`, `/health` en 0,15 s), tout le reste de l'update était appliqué, et le script échouait quand même : `device.json` non bumpé, update rejouée à chaque tick, **façade radio redémarrée toutes les dix minutes**. Le contrôle porte désormais sur `/health`, qui exerce `_device_info()` **et** une lecture de base — un `db: false` est traité comme un échec, là où un simple code 200 l'aurait masqué. **Un garde-fou faux brûle une version aussi sûrement qu'un vrai défaut** : un contrôle d'effet se vérifie sur la cible avant de faire signer le tag, au même titre que le code qu'il contrôle. Aucune transition `0.9.12 → …` n'existe : cette version n'a jamais été inscrite sur un boîtier.
