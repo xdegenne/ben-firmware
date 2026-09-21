@@ -121,6 +121,16 @@ def _start_readers() -> None:
         caps.start(cap)
     log.info("readers démarrés via capabilities: %s", list(declared))
 
+    # Le PUBLISHER n'est PAS une capability : publier n'est pas une propriété du
+    # matériel (comme l'est une radio ou une entrée TIC), c'est une fonction de
+    # flotte, identique sur tous les boîtiers. Il est donc démarré ici, en dur, et
+    # dans la MÊME branche que les lecteurs — un boîtier non provisionné ou hors
+    # ligne n'a rien à publier, et le laisser tourner ne ferait que remplir le
+    # journal d'échecs de connexion.
+    subprocess.run(["systemctl", "start", "--no-block", "ben-publisher.service"],
+                   capture_output=True)
+    log.info("ben-publisher démarré")
+
 
 def _has_been_provisioned() -> bool:
     """Vrai si une connexion WiFi `ben-provisioned` existe (= déjà unboxé).

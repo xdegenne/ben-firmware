@@ -13,6 +13,7 @@ Exit codes:
 
 import fcntl
 import logging
+import subprocess
 import sys
 from pathlib import Path
 
@@ -126,6 +127,35 @@ def main() -> None:
         device["softwareVersion"] = transition["to"]
         update_lib.save_device_json(device, DEVICE_JSON)
         log.info("device.json updated: softwareVersion = %s", transition["to"])
+
+        # 10. Redémarrer le PUBLISHER — SYSTÉMATIQUEMENT, après CHAQUE update.
+        #
+        # 🚨 POURQUOI ICI ET PAS DANS update.sh : le publisher exécute le code de
+        #    /opt/ben/repo. Après le `git checkout <tag>` de l'étape 6, le processus
+        #    VIVANT tourne toujours sur l'ANCIEN code — comme tout service Python.
+        #    Sans redémarrage il resterait sur la version précédente INDÉFINIMENT,
+        #    en se déclarant à jour (device.json, lui, est bumpé). Le laisser à la
+        #    charge de chaque update.sh reviendrait à l'oublier un jour.
+        #
+        #    Les LECTEURS, eux, restent redémarrés par update.sh : eux seuls savent
+        #    si leur correctif l'exige, et un restart de lecteur coûte des mesures.
+        #    Le publisher n'a pas d'état : le redémarrer ne coûte rien, il reprend
+        #    au premier point non envoyé.
+        #
+        # Best-effort : si le service n'existe pas (avant pi-0.9.15) ou n'est pas
+        # actif, on ne fait PAS échouer l'update pour autant — l'update elle-même
+        # a réussi, et un échec ici la rejouerait à chaque tick.
+        try:
+            if subprocess.run(["systemctl", "is-active", "--quiet",
+                               "ben-publisher.service"]).returncode == 0:
+                subprocess.run(["sudo", "systemctl", "restart", "ben-publisher.service"],
+                               check=True, capture_output=True)
+                log.info("ben-publisher redémarré (nouveau code)")
+            else:
+                log.info("ben-publisher inactif — rien à redémarrer")
+        except Exception as e:
+            log.warning("redémarrage de ben-publisher impossible (%s) — sans conséquence "
+                        "sur l'update, mais il tourne sur l'ancien code", e)
 
     except Exception:
         log.exception("Update failed — device.json not modified, will retry next tick")

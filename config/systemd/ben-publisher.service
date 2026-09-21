@@ -1,0 +1,27 @@
+[Unit]
+Description=BEN Publisher — pousse les mesures vers ben-api (mTLS)
+After=basic.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ben
+WorkingDirectory=/opt/ben/repo/src/pi/publisher
+ExecStart=/usr/bin/python3 /opt/ben/repo/src/pi/publisher/ben_publisher.py
+Restart=always
+RestartSec=30
+
+# Arrêt EN DOUCEUR : le sender termine son lot en cours et marque `sent=1` avant de
+# sortir. Le couper net rejouerait ce lot — absorbé par ON CONFLICT côté serveur,
+# donc sans dommage, mais autant l'éviter.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# PAS de WatchdogSec ni StartLimitAction=reboot : un publisher qui tombe ne doit
+# JAMAIS rebooter le Pi. Les mesures continuent d'être collectées et s'accumulent
+# dans l'outbox — c'est exactement ce à quoi elle sert. La leçon du verrou taint
+# (0.9.12) vaut ici aussi : un garde-fou plus destructeur que la panne qu'il traite
+# est un défaut, pas une protection.
+
+# PAS d'[Install]/WantedBy : démarré par ben-network-check.service, comme les autres
+# services BEN — dans la même branche que les lecteurs (device provisionné + réseau).

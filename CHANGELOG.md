@@ -18,6 +18,38 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.9.15] — 2026-09-21
+
+**Le boîtier pousse enfin ses mesures vers le cloud.** L'outbox `measurements.sent` existait dans le schéma **depuis le premier jour** — colonne et index posés en prévision, jamais écrits une seule fois. Cette version branche le tuyau.
+
+Trois pièces indissociables :
+
+**1. `ben_publisher.py`, le sender.** Lots de 500 points en mTLS toutes les 60 s, `sent=1` marqué **seulement après un 2xx**. Un seul curseur, qui avance **du plus ancien vers le plus récent** — le curseur à deux bouts avait été conçu, puis jeté : la rétention à 180 jours de la 0.9.14 a supprimé la contrainte qui le justifiait. Stdlib `http.client`, pas `requests`, absent de `requirements.txt`.
+
+> ⭐ **Gigue TOTALE sur échec** : `random.uniform(0, min(2**n, 300))`, et non `min(2**n, 300)`. La seconde forme *synchronise* — deux boîtiers tombés ensemble reviendraient frapper ensemble. Vérifié en coupant le serveur le 21/09 : délais tirés 0, 2, 1, 12, 9, 40, 40, 93, 202 s.
+
+> 🚨 **`pending_approx()` encadre par les rowid au lieu de compter.** `SELECT count(*) WHERE sent=0` prend **37 secondes** sur 5,4 M lignes de Pi Zero — et il était appelé après chaque lot.
+
+**2. `ben-publisher.service`** — l'unité **n'était installée nulle part**. Ni `install.sh`, ni aucune update ne la posaient : l'étape 10 de `check_update.py`, « redémarrer le publisher après chaque mise à jour », ne faisait donc **rien** depuis son ajout.
+
+> Pas de `WatchdogSec` ni de `StartLimitAction=reboot` : **un publisher qui tombe ne doit jamais redémarrer le Pi.** Les mesures continuent de s'accumuler dans l'outbox — c'est exactement à ça qu'elle sert. Leçon du verrou taint (0.9.12) : un garde-fou plus destructeur que la panne qu'il traite est un défaut, pas une protection.
+
+**3. 🚨 La CA conforme — et elle est posée en premier.** La CA du parc (1712 o) n'a **aucune extension X509v3**. `openssl s_client` la valide sans broncher ; Python 3.13, dont `create_default_context()` active `VERIFY_X509_STRICT` par défaut, la **refuse** — avec un message qui égare :
+
+```
+CERTIFICATE_VERIFY_FAILED: Missing Authority Key Identifier
+```
+
+Le vrai motif n'apparaît qu'avec `openssl verify -x509_strict` : *« error 79: invalid CA certificate »*. Constaté sur ben-0001 le 19/09, au premier hello réel. La CA a été **réémise avec la même clé et le même sujet** : les 11 certificats de boîtiers déjà émis restent valides, vérifié un par un avant tout déploiement.
+
+> ⭐ **Le garde-fou central** : avant de remplacer quoi que ce soit, le script exige que la **nouvelle CA valide le certificat de ce boîtier**. En poser une qui ne correspond pas le couperait définitivement du cloud, **en silence**. L'ancienne est sauvegardée horodatée à côté.
+
+> 🚨 **Ce qui ne fait PAS échouer l'update** : un boîtier sans certificat, ou un cloud injoignable. Le publisher a `Restart=always`, il réessaiera seul. Faire échouer l'update la ferait **rejouer tous les 10 minutes, pour toujours** — la mécanique exacte qui a brûlé pi-0.9.12. Un contrôle d'effet ne vérifie **que ce dont l'update est responsable**.
+
+Aucune migration, aucune table, aucune colonne : le publisher ouvre la base en **lecture seule**. Universel, LoRa et filaire.
+
+✅ **Script exécuté tel quel sur ben-0003 le 21/09 à 20:11** — 0.9.14, filaire, portant encore l'ancienne CA, donc exerçant réellement le remplacement. Code 0, tous contrôles verts, effet constaté côté serveur dans la seconde : `hello OK`, puis `envoyé 500 · inséré 500`.
+
 ### [0.9.14] — 2026-09-18
 
 **Le passé s'effaçait sous le chantier.** Le parc atteignait trois mois alors que `RETENTION_DAYS` valait 90 : le plus ancien jour d'historique disparaissait chaque jour, et il n'existait **nulle part ailleurs** — il n'y a aucune sauvegarde des bases embarquées. Mesuré sur ben-0001 le 18 septembre : 5 441 400 lignes couvrant **exactement** 90 jours (20/06 → 18/09). La purge mordait bel et bien.
