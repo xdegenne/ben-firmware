@@ -1212,31 +1212,67 @@ class Handler(BaseHTTPRequestHandler):
                     "count": len(rows), "points": rows})
 
 
+# Une poignée de main sur un LAN se compte en dizaines de millisecondes, même
+# sur un Pi Zero en ECDSA. 10 s laisse largement la place à un téléphone qui
+# rame, et coupe court à une socket qui ne dira jamais rien.
+_HANDSHAKE_TIMEOUT = 10.0
+# Après la poignée de main : de quoi lire une requête sans immobiliser un fil
+# indéfiniment si le client se tait au milieu.
+_LECTURE_TIMEOUT = 30.0
+
+
 class _ServeurTLS(ThreadingHTTPServer):
-    """Identique au serveur en clair, mais qui DIT quand une poignée de main rate.
+    """Écoute chiffrée dont la poignée de main a lieu DANS LE FIL DE LA REQUÊTE.
 
-    ⚠️ Ce n'est pas `handle_error` qu'il faut surcharger, et c'est contre-intuitif :
-    avec une socket enveloppée, la poignée de main TLS a lieu dans `accept()`,
-    donc dans `get_request()`. Or `socketserver._handle_request_noblock` avale
-    tout `OSError` levé là — et `ssl.SSLError` en hérite. Un `handle_error`
-    serait du code MORT pour le cas même qui l'a motivé.
+    🚨 CE QUI SE PASSAIT AVANT, ET POURQUOI C'ÉTAIT UN DÉNI DE SERVICE.
+       On enveloppait la socket D'ÉCOUTE (`ctx.wrap_socket(serveur.socket)`).
+       `accept()` rendait alors une socket déjà négociée — donc la poignée de
+       main se faisait dans le fil de `serve_forever`, AVANT la création du fil
+       de la requête.
 
-    ⭐ Par défaut, un client qui n'arrive pas à négocier disparaît donc en
-    silence. C'est précisément ce qu'on ne veut pas pendant le déploiement : une
-    app qui ne fait pas confiance à la CA BEN échouerait sans laisser la moindre
-    trace côté boîtier, et on chercherait le défaut du mauvais côté.
+       ⇒ UNE SEULE connexion TCP muette gelait TOUT :8088, depuis n'importe
+       quelle machine du réseau. Mesuré le 24/09 sur ben-0001 :
 
-    Le volume s'autorégule : sur un LAN, une poignée de main ratée est un
-    événement rare. Si ça inonde, c'est l'information.
+           connexion muette ouverte
+             https://:8088/ping   code 000   8,00 s   ← bloqué
+           ⚖️ http://:8087/ping   code 200   0,016 s  ← le boîtier allait bien
+
+       Le témoin est ce qui rend le diagnostic possible : ce n'est pas le
+       boîtier qui tombe, c'est l'écoute chiffrée seule. Et ça ne se libérait
+       qu'au redémarrage du service ou au keepalive TCP — des heures.
+
+    ⭐ Donc : `accept()` reste EN CLAIR (instantané, jamais bloquant), et
+       l'enveloppe se pose par connexion, avec un délai, dans le fil dédié.
+       Les poignées de main cessent aussi d'être sérialisées — sur un Pi Zero,
+       c'est ce qui coûte le plus cher.
+
+    ⚠️ Et on DIT quand une poignée de main rate. Par défaut, un client qui
+       n'arrive pas à négocier disparaît en silence : une app qui ne fait pas
+       confiance à la CA BEN échouerait sans laisser la moindre trace côté
+       boîtier, et on chercherait le défaut du mauvais côté.
     """
 
+    contexte: ssl.SSLContext
+
     def get_request(self):
+        # 🚨 `accept()` NU. Tout ce qui peut durer est renvoyé au fil dédié.
+        brut, adresse = super().get_request()
+        brut.settimeout(_HANDSHAKE_TIMEOUT)
+        return self.contexte.wrap_socket(
+            brut, server_side=True, do_handshake_on_connect=False), adresse
+
+    def finish_request(self, request, client_address):
         try:
-            return super().get_request()
-        except ssl.SSLError as e:
-            print(f"[:{PORT_TLS}] poignée de main refusée — {e.reason or e} "
-                  f"(client sans la CA BEN, ou http:// sur un port chiffré)")
-            raise
+            request.do_handshake()
+        except (ssl.SSLError, OSError) as e:
+            # `shutdown_request` fermera la socket : on sort, sans propager.
+            raison = getattr(e, "reason", None) or e
+            print(f"[:{PORT_TLS}] poignée de main refusée depuis "
+                  f"{client_address[0]} — {raison} (client sans la CA BEN, "
+                  f"http:// sur un port chiffré, ou silence)")
+            return
+        request.settimeout(_LECTURE_TIMEOUT)
+        super().finish_request(request, client_address)
 
 
 def _ecoute_tls() -> ThreadingHTTPServer | None:
@@ -1275,7 +1311,9 @@ def _ecoute_tls() -> ThreadingHTTPServer | None:
     #    `ben-certd` le remplace, il redémarre CE service — sans quoi l'écoute
     #    servirait l'ancien certificat jusqu'à son expiration, sans une erreur
     #    au journal. Voir config/etc/sudoers.d/ben-certd.
-    serveur.socket = ctx.wrap_socket(serveur.socket, server_side=True)
+    # ⚠️ On n'enveloppe PAS la socket d'écoute — cf. `_ServeurTLS`. Le contexte
+    #    est confié au serveur, qui l'appliquera connexion par connexion.
+    serveur.contexte = ctx
     return serveur
 
 
