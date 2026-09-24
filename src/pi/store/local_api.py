@@ -490,20 +490,35 @@ class Handler(BaseHTTPRequestHandler):
         if self._hors_canal_clair(path) or self._exige_jeton(path) \
                 or self._exige_owner(path):
             return
-        if path == "/claim":
-            return self._claim()
-        if path == "/invitations":
-            return self._inviter()
-        if path == "/access/revoke":
-            return self._revoquer_personne()
-        if path == "/tokens/revoke":
-            return self._revoquer_appareil()
-        if path == "/tokens/integration":
-            return self._creer_integration()
-        if path == "/access/rename":
-            return self._renommer_personne()
-        if path == "/unprovision":
-            return self._unprovision(parse_qs(url.query))
+        # 🚨 UN FILET, comme sur `do_GET`. Sans lui, toute exception levée par
+        #    une de ces routes remontait jusqu'à `socketserver`, qui fermait la
+        #    connexion SANS RÉPONSE — et l'app affichait « injoignable » pour ce
+        #    qui était un défaut serveur. Une base verrouillée suffisait.
+        #
+        # ⭐ 409 pour `ValueError` : ce sont les refus d'invariant du magasin
+        #    (« ce boîtier a déjà un owner », « rôle inconnu »). Ils méritent
+        #    une réponse qui les nomme, pas un 500 muet.
+        try:
+            if path == "/claim":
+                return self._claim()
+            if path == "/invitations":
+                return self._inviter()
+            if path == "/access/revoke":
+                return self._revoquer_personne()
+            if path == "/tokens/revoke":
+                return self._revoquer_appareil()
+            if path == "/tokens/integration":
+                return self._creer_integration()
+            if path == "/access/rename":
+                return self._renommer_personne()
+            if path == "/unprovision":
+                return self._unprovision(parse_qs(url.query))
+        except ValueError as e:
+            print(f"[{path}] refus du magasin : {e}")
+            return self._send({"error": "conflit", "detail": str(e)}, 409)
+        except Exception as e:  # noqa: BLE001
+            print(f"[{path}] échec inattendu : {type(e).__name__} {e}")
+            return self._send({"error": "internal"}, 500)
         if path != "/settings":
             return self._send({"error": "not_found"}, 404)
         try:
@@ -636,6 +651,15 @@ class Handler(BaseHTTPRequestHandler):
                 #    elle ne doit pas se retrouver rétrogradée. Changer le rôle de
                 #    quelqu'un se fait par révocation puis réinvitation, jamais par
                 #    effet de bord.
+                # ⚠️ Le rôle vient du cloud : on ne le passe pas tel quel au
+                #    magasin. `mint` lèverait sur un rôle inconnu, et une valeur
+                #    inattendue (champ renommé, réponse tronquée) coûterait une
+                #    revendication en 409 au lieu d'un accès. `member` est le
+                #    repli sûr : il ne donne aucun droit d'administration.
+                if role_cloud not in access.PERSON_ROLES:
+                    print(f"[claim] rôle cloud inattendu {role_cloud!r} "
+                          f"→ member")
+                    role_cloud = access.ROLE_MEMBER
                 jeton = access.mint(conn, uid=uid, label=label, role=role_cloud)
             else:
                 # Lignes 2 et 3 — sans droit connu, seule une invitation valide
