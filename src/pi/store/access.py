@@ -181,7 +181,16 @@ def session(path: str = ACCESS_PATH):
     with _lock:
         if _shared is None:
             _shared = connect(path)
-        yield _shared
+        try:
+            yield _shared
+        except Exception:
+            # 🚨 FILET DE DERNIER RECOURS. La connexion est PARTAGÉE : une
+            #    transaction laissée ouverte par un appelant qui échoue serait
+            #    validée par la prochaine écriture réussie, sans rapport.
+            #    Mesuré le 24/09 sur `mint` — qui se défait maintenant lui-même,
+            #    mais on ne compte pas sur chaque appelant pour y penser.
+            _shared.rollback()
+            raise
 
 
 def _digest(secret: str) -> str:
@@ -222,12 +231,29 @@ def role_of(conn: sqlite3.Connection, presented: str | None) -> str | None:
     # ⚠️ `LEFT JOIN` et non `JOIN` : un jeton d'INTÉGRATION (Home Assistant) n'a
     #    pas d'`uid`, donc aucune ligne `access`. Un `JOIN` le ferait disparaître.
     row = conn.execute(
-        "SELECT t.id, t.role, t.last_used_ts, a.revoked_ts "
+        "SELECT t.id, t.role, t.uid, t.last_used_ts, "
+        "       a.uid AS acces_uid, a.revoked_ts "
         "  FROM token t LEFT JOIN access a ON a.uid = t.uid "
         " WHERE t.token_hash = ?",
         (_digest(presented),),
     ).fetchone()
     if row is None or row["revoked_ts"] is not None:
+        return None
+    # 🚨 UN JETON QUI PORTE UN `uid` DOIT AVOIR SA LIGNE `access`.
+    #
+    #    Le `LEFT JOIN` rend une ligne même quand `access` n'en a aucune — et
+    #    `revoked_ts` vaut alors NULL, donc « non révoqué ». Un jeton orphelin
+    #    passait ainsi pour parfaitement valable, avec le rôle écrit SUR LUI.
+    #    Mesuré le 24/09 : un `token(uid_B, owner)` laissé par un `mint` échoué
+    #    rendait `role_of → owner`, alors que `grant` avait refusé ce droit.
+    #
+    # ⭐ On ne se contente donc pas de corriger la cause (le rollback de `mint`)
+    #    : on ferme la CLASSE. Toute ligne `token` non liée — bogue futur,
+    #    migration ratée, écriture à la main — est désormais refusée ici.
+    #
+    # ⚠️ `uid` NUL reste exempt, et c'est tout l'objet du `LEFT JOIN` : une
+    #    intégration n'appartient à personne et n'a donc aucune ligne `access`.
+    if row["uid"] is not None and row["acces_uid"] is None:
         return None
     _touch(conn, row)
     return row["role"]
@@ -382,8 +408,24 @@ def mint(conn: sqlite3.Connection, *, uid: str = "", label: str = "",
         "INSERT INTO token (token_hash, uid, role, label, created_ts) VALUES (?,?,?,?,?)",
         (_digest(clear), (uid or None), role, (label or "appareil")[:64], now),
     )
-    if role in PERSON_ROLES and uid:
-        grant(conn, uid, role)
+    # 🚨 DÉFAIRE L'INSERTION SI `grant` REFUSE. Sans ce bloc, le jeton restait
+    #    dans une transaction ouverte sur une connexion PARTAGÉE — et la
+    #    prochaine écriture réussie, sans aucun rapport, le validait.
+    #
+    #    Reproduit le 24/09 : `grant` refuse un second owner, `mint` lève, puis
+    #    un simple jeton d'intégration frappé ensuite commettait au passage
+    #    `token(uid_B, owner)`. Une ligne OWNER pour quelqu'un qui n'a aucune
+    #    ligne `access` — et `role_of` la lisait comme valable.
+    #
+    # ⚠️ Le clair n'est jamais rendu dans ce cas, donc personne ne détenait ce
+    #    jeton. C'était une corruption d'invariant, pas une porte ouverte — mais
+    #    on ne laisse pas une écriture survivre à l'échec qui l'a annulée.
+    try:
+        if role in PERSON_ROLES and uid:
+            grant(conn, uid, role)
+    except Exception:
+        conn.rollback()
+        raise
     conn.commit()
     return clear
 
