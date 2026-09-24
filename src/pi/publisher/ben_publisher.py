@@ -71,6 +71,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # src/pi
 import capabilities as caps  # noqa: E402
 import health  # noqa: E402
+from store import access  # noqa: E402
 from store import db  # noqa: E402
 
 # ── Réglages ──────────────────────────────────────────────────────────────────
@@ -689,9 +690,64 @@ def heartbeat(cli: Client, conn: sqlite3.Connection, dev: dict) -> None:
                                "std": None if r[4] is None else bool(r[4]),
                                "papp_max": r[5]})
 
+    # ── Les DROITS nés localement ────────────────────────────────────────────
+    #
+    # 🚨 DÉPLACÉS DU HELLO VERS LE BATTEMENT au rebase du 03/10, et le critère le
+    #    commande : /hello porte ce que le boîtier EST — identité, versions,
+    #    compteurs lus, et ça change par ÉVÉNEMENT. Des droits d'accès changent en
+    #    continu : quelqu'un revendique, quelqu'un est coupé. C'est donc ce qu'il
+    #    VIT, et ça voyage dans /ping.
+    #
+    # ⚠️ Et ce n'était pas qu'une question de rangement : depuis pi-0.9.27 le
+    #    serveur refuse les champs inconnus (`DisallowUnknownFields`), et le
+    #    `/hello` étroit ne déclare que sw·fw·model·pdl. Laissé dans le hello, ce
+    #    champ partait en 400 `bad_body` — le rebase aurait « réussi » et la
+    #    fonctionnalité serait morte EN SILENCE.
+    #
+    # ⭐ Le déplacement SERT leur intention d'origine. Elle était : « poussés en
+    #    entier à chaque hello, donc auto-réparateur — une ligne que le cloud aurait
+    #    perdue revient au hello suivant ». Or le hello est devenu RARE
+    #    (événementiel) et le battement est QUOTIDIEN : la réparation est plus
+    #    rapide dans le ping qu'elle ne l'était dans le hello.
+    #
+    # ⭐ Poussés EN ENTIER, sans boîte d'envoi : la table fait 1 à 5 lignes — un
+    #    foyer et ses habitants. Avec un `sent = 1`, une ligne perdue le serait
+    #    POUR TOUJOURS, et le boîtier se croirait à jour.
+    #
+    # 🚨 AJOUT SEULEMENT, le cloud ne retire rien sur cette base. La liste du
+    #    boîtier est un SOUS-ENSEMBLE de `device_access` : quelqu'un d'inscrit côté
+    #    cloud qui n'a jamais revendiqué n'apparaît pas ici. En déduire une
+    #    suppression effacerait des droits parfaitement valides.
+    #
+    # ⚠️ La RÉVOCATION ne passe donc pas par là : c'est l'app qui la fait des deux
+    #    côtés, elle seule étant à la fois sur le LAN et sur Internet
+    #    (cf. `access.revoke_person`). Rien ne descend du cloud vers le boîtier.
+    #
+    # ⚠️ L'import est au niveau du MODULE (voir en tête), pas ici. Écrit d'abord en
+    #    local sous `try`, il échouait en silence — `import access` ne résout pas
+    #    depuis ce répertoire, c'est `from store import access`. Le battement serait
+    #    parti sans les droits, avec un warning quotidien que personne ne lit. Un
+    #    import de module échoue AU DÉMARRAGE, et bruyamment.
+    #
+    # ⓘ `access.db` est une base SÉPARÉE (/var/lib/ben-firmware/access.db) avec sa
+    #    propre connexion sérialisée : aucune interférence avec `conn`.
+    acces = []
+    try:
+        with access.session() as ac:
+            # 🔒 La projection vit dans `access`, pas ici : c'est elle qui garantit
+            #    que le prénom local ne monte JAMAIS au cloud, et le banc la vérifie
+            #    nommément. Le cloud reçoit de quoi DÉCIDER — qui, quel rôle, coupé
+            #    ou non — et rien de plus.
+            acces = access.pour_le_hello(ac)
+    except Exception as e:  # noqa: BLE001
+        # La LECTURE peut légitimement échouer (base verrouillée) — et ne doit pas
+        # empêcher le battement de partir, ni les mesures.
+        log.warning("accès locaux illisibles (%s) — battement sans eux", e)
+
     payload = {"contract_epoch": key_by_ref(epochs),
                "tariff_labels": key_by_ref(labels),
-               "meter_profile": key_by_ref(profile)}
+               "meter_profile": key_by_ref(profile),
+               "access": acces}
 
     # ── L'instantané de santé (#16) ───────────────────────────────────────────
     #
