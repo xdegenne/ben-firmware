@@ -273,6 +273,20 @@ def uid_of(conn: sqlite3.Connection, presented: str | None) -> str | None:
     return r["uid"] if r else None
 
 
+LIBELLE_LONGUEUR_MAX = 64
+
+
+def normaliser_libelle(label: str | None) -> str:
+    """La forme SOUS LAQUELLE un libellé est stocké.
+
+    🚨 Écrite une fois, parce que la comparer à la main a déjà échoué :
+    `mint` rangeait `normaliser_libelle(label)` tandis qu'`elaguer_doublons`
+    comparait au libellé BRUT. Un libellé vide ou de plus de 64 caractères ne
+    correspondait donc jamais — et l'élagage ne s'appliquait pas, en silence.
+    """
+    return (label or "appareil")[:LIBELLE_LONGUEUR_MAX]
+
+
 NOM_LONGUEUR_MAX = 32
 
 
@@ -336,6 +350,8 @@ def elaguer_doublons(conn: sqlite3.Connection, uid: str, label: str,
     """
     if not uid or not label:
         return 0
+    # ⚠️ Comparer à la forme STOCKÉE, pas à ce qu'on a reçu.
+    label = normaliser_libelle(label)
     id_garde = id_of(conn, garder)
     if id_garde is None:
         return 0
@@ -406,7 +422,7 @@ def mint(conn: sqlite3.Connection, *, uid: str = "", label: str = "",
     now = int(time.time())
     conn.execute(
         "INSERT INTO token (token_hash, uid, role, label, created_ts) VALUES (?,?,?,?,?)",
-        (_digest(clear), (uid or None), role, (label or "appareil")[:64], now),
+        (_digest(clear), (uid or None), role, normaliser_libelle(label), now),
     )
     # 🚨 DÉFAIRE L'INSERTION SI `grant` REFUSE. Sans ce bloc, le jeton restait
     #    dans une transaction ouverte sur une connexion PARTAGÉE — et la
@@ -570,7 +586,7 @@ def consume_invitation(conn: sqlite3.Connection, invitation: str, *,
     conn.execute(
         "UPDATE token SET token_hash = ?, invitation_hash = NULL, uid = ?, label = ?, "
         "invitation_expiry_ts = NULL WHERE id = ?",
-        (_digest(clear), uid, (label or "appareil")[:64], row["id"]),
+        (_digest(clear), uid, normaliser_libelle(label), row["id"]),
     )
     grant(conn, uid, row["role"])
     conn.commit()
