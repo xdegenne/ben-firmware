@@ -39,9 +39,14 @@ Endpoints :
   GET /lora-link?pdl_index=N[&since=ts&limit=N]
       → qualité de réception LoRa (rssi/snr) — modèles pi0-lora
 
-Stdlib only (zéro dépendance — idéal Pi Zero W). Read-only sur la base
-(WAL → lectures concurrentes pendant que le reader écrit). LAN-only, read-only ;
-durcissement (cert device / token) prévu plus tard.
+Stdlib only (zéro dépendance — idéal Pi Zero W). Read-only sur `measurements.db`
+(WAL → lectures concurrentes pendant que le reader écrit).
+
+Durcissement, étape 1 (0.9.16) : l'en-tête `Authorization: Bearer` est RECONNU
+s'il est présent, et RIEN N'EST EXIGÉ. C'est ce qui rend la livraison invisible —
+les apps du parc et Home Assistant continuent à l'identique. L'exigence s'armera
+sur PREUVE que plus personne n'appelle sans jeton, jamais sur une date.
+Cf. `docs/chantier-acces-multi-utilisateur.md`.
 """
 
 import json
@@ -54,6 +59,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+import access
 import db
 import levels
 import settings
@@ -164,10 +170,35 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # ── Accès : ACCEPTÉ, JAMAIS EXIGÉ (0.9.16) ──────────────────────────────
+    #
+    # 🚨 Cette version ne REFUSE rien. Elle se contente de reconnaître un jeton
+    #    quand l'app en présente un. C'est ce qui rend la livraison invisible :
+    #    les apps du parc, qui n'en ont pas, continuent de fonctionner à
+    #    l'identique, et Home Assistant aussi.
+    #
+    # L'exigence s'arme plus tard, sur PREUVE que plus personne n'appelle sans
+    # jeton — jamais sur une date (cf. chantier, vague 5).
+    def _role(self) -> str | None:
+        """Le rôle porté par l'en-tête `Authorization: Bearer`, ou None.
+
+        Ne lève jamais : une base d'accès illisible doit dégrader vers « aucun
+        rôle », pas rendre l'API plus dangereuse que le défaut qu'elle corrige.
+        """
+        entete = self.headers.get("Authorization", "")
+        if not entete.startswith("Bearer "):
+            return None
+        try:
+            with access.session() as conn:
+                return access.role_of(conn, entete[7:].strip())
+        except Exception:  # noqa: BLE001
+            return None
+
     def do_GET(self):
         url = urlparse(self.path)
         path = url.path.rstrip("/") or "/"
         qs = parse_qs(url.query)
+        self.ben_role = self._role()
         try:
             if path == "/ping":
                 return self._ping()
@@ -203,6 +234,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         url = urlparse(self.path)
         path = url.path.rstrip("/") or "/"
+        self.ben_role = self._role()
         if path == "/unprovision":
             return self._unprovision(parse_qs(url.query))
         if path != "/settings":
