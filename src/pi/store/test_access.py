@@ -515,6 +515,17 @@ def elaguer_ne_touche_NI_les_autres_appareils_NI_les_integrations():
 
 
 @cas
+def elaguer_marche_sur_un_libelle_TRONQUE():
+    """🚨 `mint` range `label[:64]`, l'élagage comparait au libellé BRUT. Un nom
+    plus long ne correspondait jamais — l'élagage ne faisait rien, en silence."""
+    long = "X" * 80
+    c = neuf()
+    access.mint(c, uid="uid_xav", label=long, role=access.ROLE_OWNER)
+    dernier = access.mint(c, uid="uid_xav", label=long, role=access.ROLE_OWNER)
+    assert access.elaguer_doublons(c, "uid_xav", long, garder=dernier) == 1
+
+
+@cas
 def elaguer_sur_un_seul_jeton_ne_fait_RIEN():
     """Le cas courant. Un élagage qui se déclencherait à vide finirait par
     couper le seul jeton existant — c'est exactement l'erreur d'indice à ne pas
