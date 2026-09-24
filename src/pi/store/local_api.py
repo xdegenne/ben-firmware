@@ -1299,6 +1299,60 @@ class _ServeurTLS(ThreadingHTTPServer):
         super().finish_request(request, client_address)
 
 
+# Plafond Apple sur les certificats SERVEUR, MESURÉ le 23/09 sur iPhone 11 /
+# iOS 26.5 : au-delà, refusé — même avec une CA privée fournie par l'app.
+DUREE_MAX_JOURS = 398
+
+
+def _certificat_conforme(chemin: str, device_id: str) -> tuple[bool, str]:
+    """Ce certificat est-il acceptable par un TÉLÉPHONE ? Renvoie (ok, raison).
+
+    🚨 POURQUOI CE CONTRÔLE EXISTE, ET CE QU'IL ÉVITE.
+       Sans lui, `:8088` s'ouvrait avec n'importe quel certificat. Or quatre
+       boîtiers du parc portent encore le certificat d'origine — « CN seul,
+       zéro extension, 3650 jours ». Ils auraient donc ouvert une écoute que
+       l'iPhone REFUSE.
+       Et depuis que l'app ne se replie plus en clair sur un échec de poignée
+       de main (c'était nécessaire : sinon un tiers pouvait provoquer le
+       repli), le boîtier serait devenu INJOIGNABLE. Un firmware qui casse une
+       app — exactement ce que la règle cardinale interdit.
+
+    ⭐ Ne pas ouvrir `:8088` n'est PAS une panne : `:8087` continue de servir,
+       et c'est le repli légitime que l'app sait prendre (absence ≠ échec).
+
+    ⚠️ L'EKU n'est PAS vérifié, et c'est délibéré : la bibliothèque standard ne
+       l'expose pas, et le lire imposerait de parser la sortie texte d'`openssl`
+       — fragile d'une version à l'autre. Il n'attraperait rien de plus : les
+       certificats non conformes du parc échouent DÉJÀ sur la durée ET sur le
+       SAN.
+    """
+    try:
+        d = ssl._ssl._test_decode_cert(chemin)
+    except Exception as e:  # noqa: BLE001
+        # 🚨 NE PAS OUVRIR quand on ne sait pas. Le risque qu'on écarte est
+        #    « un certificat que le téléphone refuse » ; l'ignorance n'est pas
+        #    une raison de parier. Le pire cas devient le comportement d'avant
+        #    0.9.17 : l'app parle en clair.
+        return False, f"certificat illisible ({e})"
+
+    try:
+        jours = (ssl.cert_time_to_seconds(d["notAfter"])
+                 - ssl.cert_time_to_seconds(d["notBefore"])) / 86400
+    except Exception as e:  # noqa: BLE001
+        return False, f"dates illisibles ({e})"
+    if jours > DUREE_MAX_JOURS:
+        return False, (f"durée {jours:.0f} j > {DUREE_MAX_JOURS} j "
+                       f"— un iPhone le refusera")
+
+    noms = {v for genre, v in d.get("subjectAltName", ()) if genre == "DNS"}
+    if not noms:
+        return False, "aucun subjectAltName — un iPhone le refusera"
+    if device_id and device_id not in noms:
+        return False, f"subjectAltName {sorted(noms)} ne couvre pas {device_id}"
+
+    return True, f"{jours:.0f} j, SAN {sorted(noms)}"
+
+
 def _ecoute_tls() -> ThreadingHTTPServer | None:
     """Prépare l'écoute chiffrée, ou renvoie None en expliquant pourquoi.
 
@@ -1312,6 +1366,19 @@ def _ecoute_tls() -> ThreadingHTTPServer | None:
         print(f"[:{PORT_TLS}] pas de certificat dans {CERT_DIR} — écoute chiffrée "
               f"désactivée, :{PORT} continue de servir")
         return None
+    # 🚨 CONFORMITÉ AVANT OUVERTURE. Un certificat que le téléphone refuse rend
+    #    le boîtier injoignable, puisque l'app ne se replie plus en clair sur un
+    #    échec de poignée de main. Mieux vaut ne pas ouvrir : `:8087` sert, et
+    #    l'app y retombe légitimement (absence ≠ échec).
+    device_id = (_device_info() or {}).get("deviceId") or ""
+    conforme, raison = _certificat_conforme(crt, device_id)
+    if not conforme:
+        print(f"[:{PORT_TLS}] certificat NON CONFORME ({raison}) — écoute "
+              f"chiffrée désactivée, :{PORT} continue de servir. "
+              f"Renouveler avec ben-certd.", flush=True)
+        return None
+    print(f"[:{PORT_TLS}] certificat conforme : {raison}", flush=True)
+
     try:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(crt, key)
