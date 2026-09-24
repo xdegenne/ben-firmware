@@ -178,9 +178,20 @@ def demarrage_readers(device_json: str):
     du tout — surtout pas une liste de noms « par défaut ». C'est cette liste qui, jusqu'en
     0.9.12, lançait `ben-lora-receiver` (le monolithe, découpé en 0.9.1) sur un boîtier
     dont le `model` ne matchait plus rien depuis que ce champ porte le label commercial.
+
+    🚨 DEUX chemins de démarrage, et il faut stubber les deux :
+       · `caps_mod._systemctl` pour les LECTEURS (pilotés par les capabilities) ;
+       · `check_network._start`  pour les agents de FLOTTE (publisher, certd), qui
+         sont démarrés en dur parce qu'ils ne dépendent pas du matériel.
+       Le second manquait : le publisher, entré au boot en 0.9.15, appelait
+       `subprocess.run(["systemctl", …])` directement. Hors cible il n'existe pas de
+       `systemctl` → FileNotFoundError, et ce banc était ROUGE depuis trois versions
+       sans que ça se voie. On l'apprend deux fois : un agent non couvert par un banc
+       est un agent dont personne ne saura dire s'il démarre.
     """
     started = []
     caps_mod._systemctl = lambda action, service: started.append(f"{action}:{service}")
+    nr.check_network._start = lambda unit: started.append(f"start:{unit}")
     pathlib.Path(DEVICE_JSON_TMP).write_text(device_json, encoding="utf-8")
     nr.check_network._start_readers()
     return started
@@ -189,15 +200,23 @@ def demarrage_readers(device_json: str):
 def main() -> int:
     ok = True
 
-    print("\n  choix des agents de mesure (capabilities SEULES)")
+    # Les agents de FLOTTE : ni l'un ni l'autre n'est une capability, ils suivent
+    # TOUT boîtier qui mesure. Ils sont attendus derrière les lecteurs, dans la
+    # même branche — provisionné ET en ligne.
+    FLOTTE = ["start:ben-publisher.service", "start:ben-certd.service"]
+
+    print("\n  choix des agents de mesure (capabilities SEULES) + agents de flotte")
     for title, device_json, expected in [
         ("boîtier LoRa → la façade radio, dans l'ordre (ben-radio possède le GPIO)",
          '{"capabilities": {"lora": {}, "lora-tic-receiver": {}}}',
-         ["start:ben-radio.service", "start:ben-telemetry.service"]),
+         ["start:ben-radio.service", "start:ben-telemetry.service"] + FLOTTE),
         ("boîtier filaire → le lecteur TIC",
          '{"capabilities": {"tic-uart": {}}}',
-         ["start:ben-tic-reader.service"]),
-        ("device.json SANS capabilities → RIEN (et surtout pas le monolithe)",
+         ["start:ben-tic-reader.service"] + FLOTTE),
+        # ⭐ Et PAS les agents de flotte non plus : un boîtier qui ne mesure pas n'a
+        #    rien à publier, et son certificat n'a d'intérêt que s'il parle. On sort
+        #    avant, on ne démarre rien du tout.
+        ("device.json SANS capabilities → RIEN (ni lecteur, ni flotte)",
          '{"model": "Radio", "hardwareRevision": "rev01"}', []),
         ("device.json illisible → RIEN",
          'pas du json', []),

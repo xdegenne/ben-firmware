@@ -18,6 +18,68 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.9.16] — 2026-09-24
+
+**Le boîtier entretient son propre certificat.** Jusqu'ici, remplacer un certificat voulait dire se déplacer. Cette version installe l'agent qui le fait seul, à répétition, sans personne sur place.
+
+**Pourquoi maintenant.** Mesuré le 23/09 sur un iPhone 11 / iOS 26.5 — trois certificats portant **la même clé privée**, seul le certificat changeant :
+
+| certificat | Android | iOS |
+|---|---|---|
+| CN seul, zéro extension, 10 ans *(le parc)* | ✓ | ✗ |
+| CN + `subjectAltName`, 10 ans | ✓ | ✗ |
+| CN + `subjectAltName`, **397 jours** | | ✓ |
+
+> ⭐ **Une seule variable : la DURÉE.** Apple plafonne les certificats serveur à ~398 jours, **même avec une CA privée fournie par l'application**. Les certificats du parc font 3650 jours : inutilisables pour le futur HTTPS local, et impossibles à remplacer à la main tous les six mois.
+
+**1. `ben_certd.py`, l'agent.** Réveil quotidien, `GET :8444/`, une directive, on obéit.
+
+> ⭐ **Le boîtier ne se souvient de rien.** Aucun état local : il vit côté serveur. S'il tenait le sien, les deux pourraient diverger — et ce serait toujours le boîtier qui aurait tort, sans moyen de le savoir.
+
+> **Gigue pleine** (`random.uniform(période/2, période)`), pas un intervalle fixe : sinon toute la flotte se réveille ensemble après une coupure de courant générale.
+
+**Cinq gardes avant toute bascule, du moins cher au plus cher — et l'ordre compte :**
+
+1. **pas déjà expiré** — en premier, parce que `openssl verify` contrôle les dates *dans* la validation de chaîne. Placé après, ce contrôle ne serait **jamais atteint** et un certificat expiré serait journalisé « chaîne invalide » : on chercherait un problème de CA à 3 h du matin alors que c'est une date. *Trouvé par le banc, pas par relecture.*
+2. chaîne valide contre le `root-ca.crt` **du boîtier** ;
+3. 🚨 **la clé publique correspond à `device.key`** — le seul garde qui évite la brique définitive. Un certificat qui ne correspond pas à la clé locale rend le boîtier **muet**, et sans mTLS il ne peut même plus signaler qu'il est cassé ;
+4. le CN est bien le sien ;
+5. ⭐ **une poignée de main mTLS complète avec le candidat**, pendant que l'ancien est encore en place. On ne *déduit* plus qu'il marchera : on l'a **utilisé**.
+
+Puis écriture atomique (`os.replace`), ancien conservé à côté.
+
+**2. `ben-certd.service`** — sans `[Install]`/`WantedBy` : c'est `ben-network-check` qui le lance, dans la **même branche que les lecteurs** (provisionné *et* en ligne). Ni `WatchdogSec`, ni `StartLimitAction=reboot` — un agent de certificat qui tombe ne doit **jamais** redémarrer le Pi.
+
+**3. `/etc/sudoers.d/ben-certd`** — un verbe, une unité : `systemctl restart ben-publisher`.
+
+> 🚨 **Pourquoi ce redémarrage est obligatoire.** Le publisher charge son certificat **une seule fois**, à la construction de son contexte SSL, puis tient une connexion persistante. Sans redémarrage il continuerait indéfiniment avec l'ancien — **sans la moindre erreur au journal** — et ben-api enregistrerait l'ancien certificat. Une divergence silencieuse, dans la table même qui pilote la bascule du parc.
+
+> 🚨 **Et c'est le risque propre à cette version.** Un fichier malformé dans `/etc/sudoers.d` casse `sudo` **pour tout le monde**, sur un boîtier qu'on ne peut pas dépanner à distance. D'où `visudo -cf` sur la **source**, **avant** toute installation — vérifier après serait vérifier depuis l'intérieur du trou — mode `0440 root:root` (sudo refuse **en silence** un fichier accessible en écriture à autrui), puis `visudo -c` sur la configuration **globale**, celle que sudo relira réellement.
+
+**4. `check_network.py` démarre `certd`** à côté du publisher — par le helper `_start()`, jamais un `subprocess` en dur.
+
+> ⚠️ Les deux lignes qui l'avaient fait (le publisher, en 0.9.15) **échappaient au banc** `test_network_recovery.py`, qui stubbe `_start` et non `subprocess`. Le banc était **rouge depuis trois versions** sans que personne ne le voie : l'agent qui porte toutes les mesures vers le cloud était entré dans le chemin de démarrage **sans couverture**.
+
+> 🚨 **Ce qui ne fait PAS échouer l'update** : un boîtier sans certificat, ou un cloud injoignable. `certd` a `Restart=always`, l'ancien certificat reste valide jusqu'à son échéance, et il n'y a **jamais** urgence à renouveler. Faire échouer l'update la ferait rejouer toutes les 10 minutes, pour toujours — la mécanique qui a brûlé pi-0.9.12.
+
+Aucune migration, aucune table, aucune colonne : `certd` ne touche pas à la base. Universel, LoRa et filaire — entretenir son certificat n'est pas une propriété du matériel.
+
+Côté boîtier documenté dans [`docs/pki-renouvellement.md`](./docs/pki-renouvellement.md). ⚠️ Ce dépôt est **public** : la politique serveur (durées, seuil, révocation) n'y figure pas.
+
+✅ **Script exécuté tel quel sur ben-0003 le 24/09 à 11:50** — filaire, en 0.9.15, dépôt propre, sans l'agent ni l'unité ni le sudoers : l'installation fraîche a donc bien été exercée, geste sudoers compris. Code 0, tous contrôles verts.
+
+Effet constaté dans la foulée, boucle complète en six secondes :
+
+```
+CSR déposé (202) — motif : durée 3650 j > 180 j (plafond Apple ~398 j)
+   … signature côté opérateur …
+certificat remplacé (ancien conservé en .bak-20260924-115145)
+ben-publisher redémarré
+acquitté auprès de ben-api (204)
+```
+
+Tâche fermée côté serveur, inventaire passé de 3650 à 180 jours.
+
 ### [0.9.15] — 2026-09-21
 
 **Le boîtier pousse enfin ses mesures vers le cloud.** L'outbox `measurements.sent` existait dans le schéma **depuis le premier jour** — colonne et index posés en prévision, jamais écrits une seule fois. Cette version branche le tuyau.

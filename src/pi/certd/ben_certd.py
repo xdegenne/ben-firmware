@@ -2,7 +2,11 @@
 """
 ben_certd — le boîtier entretient son propre certificat.
 
-Conception → ~/work/ben/docs/chantier-pki.md
+Côté boîtier → docs/pki-renouvellement.md   (ce dépôt est PUBLIC)
+
+⚠️ La POLITIQUE — quand un certificat est jugé à remplacer, qui signe, comment on
+révoque — appartient au serveur et n'est pas décrite ici. Le boîtier ne la
+connaît pas : il se présente, on lui dit quoi faire.
 
     réveil quotidien (+ gigue) → GET :8444/ → une directive → on obéit.
 
@@ -18,9 +22,9 @@ redémarre son propre processus au milieu d'une opération, c'est la recette d'u
 ═══ CE QUI COMPTE VRAIMENT ═══════════════════════════════════════════════════
 
 1. ⭐ TOUT ÉCHEC LAISSE LE BOÎTIER EXACTEMENT DANS L'ÉTAT OÙ IL ÉTAIT.
-   L'ancien certificat est valide jusqu'en 2036 : il n'y a JAMAIS urgence à
-   basculer. C'est ce qui rend l'opération sans risque — donc ce qui interdit de
-   la bâcler.
+   L'ancien certificat reste valide jusqu'à son échéance : il n'y a JAMAIS
+   urgence à basculer. C'est ce qui rend l'opération sans risque — donc ce qui
+   interdit de la bâcler.
 
 2. 🚨 ON ESSAIE LE NOUVEAU CERTIFICAT AVANT DE REMPLACER L'ANCIEN.
    Une poignée de main mTLS complète sur :8443, avec le certificat candidat,
@@ -336,6 +340,28 @@ def un_tour() -> None:
             return
 
         basculer(CRT_NEW, KEY_NEW if cle == KEY_NEW else None)
+
+        # ⭐ Acquitter TOUT DE SUITE, sans attendre le tour suivant.
+        #
+        # 🚨 Sinon la tâche resterait `armed` pendant 12 à 24 h, et l'état
+        #    `armed` PORTE UN SENS : c'est lui qui signale « ce boîtier a
+        #    téléchargé et REFUSÉ » (voir juste au-dessus). Sans cet
+        #    acquittement, un succès et un refus se ressemblent toute une
+        #    journée — le dispositif brouillerait son propre signal par son
+        #    chemin NOMINAL, et une bascule de parc deviendrait illisible.
+        #
+        # ⚠️ Aucun contexte SSL n'est gardé en mémoire : `pointer()` rebâtit le
+        #    sien à chaque appel, donc celui-ci part bien avec le certificat
+        #    NEUF. C'est la raison pour laquelle certd, contrairement au
+        #    publisher, ne met JAMAIS son certificat en cache — c'est la chose
+        #    qu'il modifie.
+        #
+        # Un échec ici n'est pas grave : le tour suivant acquittera.
+        try:
+            statut, _ = pointer()
+            log.info("acquitté auprès de ben-api (%s)", statut)
+        except Exception as e:  # noqa: BLE001
+            log.info("acquittement remis au prochain tour : %s", e)
         return
 
     log.warning("directive inconnue : %r", directive)

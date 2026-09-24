@@ -2,7 +2,9 @@
 """
 ben_publisher — pousse les mesures du boîtier vers `ben-api`.
 
-Conception → ~/work/ben/docs/chantier-ingestion-cloud.md
+⚠️ Le document de conception de l'ingestion est INTERNE — ce dépôt est PUBLIC.
+Ce fichier décrit le comportement du boîtier ; le contrat de l'API et la
+politique serveur n'y figurent pas.
 
     hello  au démarrage, puis toutes les heures (versions + compteurs).
            S'il échoue, ON CONTINUE.

@@ -121,15 +121,31 @@ def _start_readers() -> None:
         caps.start(cap)
     log.info("readers démarrés via capabilities: %s", list(declared))
 
-    # Le PUBLISHER n'est PAS une capability : publier n'est pas une propriété du
-    # matériel (comme l'est une radio ou une entrée TIC), c'est une fonction de
-    # flotte, identique sur tous les boîtiers. Il est donc démarré ici, en dur, et
-    # dans la MÊME branche que les lecteurs — un boîtier non provisionné ou hors
-    # ligne n'a rien à publier, et le laisser tourner ne ferait que remplir le
-    # journal d'échecs de connexion.
-    subprocess.run(["systemctl", "start", "--no-block", "ben-publisher.service"],
-                   capture_output=True)
-    log.info("ben-publisher démarré")
+    # ── Les agents de FLOTTE ──────────────────────────────────────────────────
+    #
+    # Ni l'un ni l'autre n'est une capability : publier ses mesures et entretenir
+    # son certificat ne sont pas des propriétés du MATÉRIEL (comme le sont une
+    # radio ou une entrée TIC), ce sont des fonctions identiques sur TOUS les
+    # boîtiers, qu'ils lisent la TIC par un fil ou par radio.
+    #
+    # ⚠️ Les mettre dans CAP_SERVICES obligerait à les ajouter à CHAQUE
+    #    capability, et on en oublierait une — silencieusement : un boîtier qui
+    #    ne publie pas, ou dont le certificat ne se renouvelle pas, ne le signale
+    #    nulle part. Il se tait, simplement.
+    #
+    # ⭐ MÊME BRANCHE que les lecteurs, et c'est délibéré : ils ne démarrent que
+    #    si le boîtier est provisionné ET en ligne. Hors ligne, le publisher n'a
+    #    personne à qui parler (il ne remplirait le journal que d'échecs de
+    #    connexion) et certd non plus — l'ancien certificat reste valide, il n'y
+    #    a JAMAIS urgence à renouveler.
+    #
+    # 🚨 Passer par `_start()`, jamais par un `subprocess.run` en dur. Les deux
+    #    lignes qui l'ont fait (publisher en 0.9.15) échappaient au banc
+    #    `test_network_recovery.py` — qui stubbe `_start`, pas `subprocess` — et
+    #    l'ont laissé ROUGE pendant trois versions sans que personne ne le voie.
+    #    Un agent de flotte ajouté ici doit être couvert par ce banc.
+    for unite in ("ben-publisher.service", "ben-certd.service"):
+        _start(unite)
 
 
 def _has_been_provisioned() -> bool:
