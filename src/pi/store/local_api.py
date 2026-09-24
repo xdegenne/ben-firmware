@@ -363,6 +363,41 @@ class Handler(BaseHTTPRequestHandler):
     #    gagne une préférence qu'un membre devrait légitimement poser — un seuil
     #    d'alerte, un affichage — elle se prendra un 403 sans raison lisible.
     #    À ce moment-là, il faudra discriminer par CHAMP, pas par route.
+    # 🚨 CE QUE `:8087` A LE DROIT DE SERVIR. Tout le reste y est ABSENT.
+    #
+    #    ⭐ LISTE INVERSÉE, ET C'EST TOUT L'INTÉRÊT. La première version listait
+    #       les routes réservées au canal chiffré — donc ce qu'on OUBLIAIT d'y
+    #       inscrire était servi partout, en silence. C'est exactement ainsi que
+    #       `/access`, `/invitations` et `/tokens/integration` se sont retrouvées
+    #       ouvertes sans jeton sur le port clair (mesuré le 24/09 sur ben-0001 :
+    #       `/access` rendait uid ET prénom, `/tokens/integration` un jeton
+    #       `member` permanent, `/access/revoke` coupait l'owner sans recours).
+    #
+    #    ⭐ Ici, un oubli penche du BON CÔTÉ : une route nouvelle est absente du
+    #       canal clair par construction, ce qui se voit au premier essai — au
+    #       lieu de s'ouvrir sans bruit. Et cette liste-ci ne bougera jamais,
+    #       puisque `:8087` est GELÉ par décision.
+    #
+    #    ⚠️ 404 et non 426 : du point de vue de ce port, ces routes n'existent
+    #       réellement pas. Un 426 confirmerait à qui balaie le port clair qu'il
+    #       y a une surface d'administration ailleurs. Le journal, lui, le dit.
+    #       (`/claim` fait exception et répond 426 LUI-MÊME : l'app a besoin de
+    #       l'indication pour basculer.)
+    ROUTES_CLAIR = ("/ping", "/health", "/pdls", "/live", "/measurements",
+                    "/curve", "/chart", "/consumption", "/registers",
+                    "/lora-link", "/events", "/settings", "/unprovision",
+                    "/claim")
+
+    def _hors_canal_clair(self, path: str) -> bool:
+        if getattr(self.server, "chiffre", False):
+            return False
+        if path in self.ROUTES_CLAIR:
+            return False
+        print(f"[:{PORT}] {path} refusée — cette route n'existe que sur "
+              f"le canal chiffré :{PORT_TLS}")
+        self._send({"error": "not_found"}, 404)
+        return True
+
     ECRITURES = ("/settings", "/unprovision", "/invitations",
                  "/access/revoke", "/tokens/revoke", "/tokens/integration",
                  "/access/rename")
@@ -411,7 +446,8 @@ class Handler(BaseHTTPRequestHandler):
         path = url.path.rstrip("/") or "/"
         qs = parse_qs(url.query)
         self.ben_role = self._role()
-        if self._exige_jeton(path) or self._exige_owner(path, "GET"):
+        if self._hors_canal_clair(path) or self._exige_jeton(path) \
+                or self._exige_owner(path, "GET"):
             return
         try:
             if path == "/access":
@@ -451,7 +487,8 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         path = url.path.rstrip("/") or "/"
         self.ben_role = self._role()
-        if self._exige_jeton(path) or self._exige_owner(path):
+        if self._hors_canal_clair(path) or self._exige_jeton(path) \
+                or self._exige_owner(path):
             return
         if path == "/claim":
             return self._claim()
