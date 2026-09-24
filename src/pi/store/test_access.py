@@ -427,6 +427,53 @@ def le_hello_ne_transporte_JAMAIS_le_prenom():
     assert "Claire" not in repr(charge)
 
 
+# ── Une écriture ne survit pas à l'échec qui l'annule ────────────────────────
+
+@cas
+def un_mint_refuse_ne_laisse_AUCUNE_ligne():
+    """🚨 `mint` insère le jeton PUIS appelle `grant`. Quand `grant` refuse, la
+    ligne restait dans une transaction ouverte — sur une connexion PARTAGÉE —
+    et la prochaine écriture réussie, sans rapport, la validait."""
+    c = neuf()
+    access.grant(c, "uid_A", access.ROLE_OWNER)
+    try:
+        access.mint(c, uid="uid_B", label="pirate", role=access.ROLE_OWNER)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("grant a accepté un second owner")
+
+    # Une opération QUELCONQUE qui réussit ensuite : c'est elle qui commettait.
+    access.mint(c, label="Home Assistant", role=access.ROLE_MEMBER)
+
+    porteurs = [d["uid"] for d in access.list_tokens(c)]
+    assert "uid_B" not in porteurs, f"jeton orphelin validé : {porteurs}"
+
+
+@cas
+def un_jeton_sans_ligne_access_ne_vaut_RIEN():
+    """🚨 LA CLASSE, pas seulement la cause. Le `LEFT JOIN` rend `revoked_ts`
+    NULL quand `access` n'a aucune ligne — donc « non révoqué ». Un jeton
+    orphelin passait pour valable, avec le rôle écrit sur LUI."""
+    c = neuf()
+    j = access.mint(c, uid="uid_claire", label="iPhone", role=access.ROLE_MEMBER)
+    assert access.role_of(c, j) == access.ROLE_MEMBER, "témoin : il marchait"
+
+    # On coupe le lien comme le ferait un bogue ou une migration ratée.
+    c.execute("DELETE FROM access WHERE uid = 'uid_claire'")
+    c.commit()
+    assert access.role_of(c, j) is None, "un jeton délié ouvre encore"
+
+
+@cas
+def une_integration_reste_exempte_de_cette_regle():
+    """⚖️ LE TÉMOIN. Une intégration n'appartient à personne et n'a donc AUCUNE
+    ligne `access` : la règle ci-dessus ne doit pas l'emporter avec elle."""
+    c = neuf()
+    j = access.mint(c, label="Home Assistant", role=access.ROLE_MEMBER)
+    assert access.role_of(c, j) == access.ROLE_MEMBER
+
+
 # ── Réinstallation : la clé qui traîne ───────────────────────────────────────
 
 @cas
