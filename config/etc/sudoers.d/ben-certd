@@ -1,0 +1,8 @@
+# ben-certd a besoin de redémarrer le publisher après avoir remplacé le
+# certificat — celui-ci tient une connexion TLS PERSISTANTE ouverte avec
+# l'ancien, et continuerait de l'utiliser sans redémarrage.
+#
+# 🚨 Un SEUL verbe, sur une SEULE unité. Pas `systemctl *`, pas `ALL`.
+#    Un droit plus large que le besoin est un droit qu'on finit par utiliser
+#    pour autre chose.
+ben ALL=(root) NOPASSWD: /usr/bin/systemctl restart ben-publisher

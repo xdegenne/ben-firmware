@@ -1,0 +1,28 @@
+[Unit]
+Description=BEN certd — le boîtier entretient son propre certificat (mTLS :8444)
+After=basic.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ben
+WorkingDirectory=/opt/ben/repo/src/pi/certd
+ExecStart=/usr/bin/python3 /opt/ben/repo/src/pi/certd/ben_certd.py
+Restart=always
+RestartSec=60
+
+# 🚨 PAS de WatchdogSec, PAS de StartLimitAction=reboot.
+#
+# Un certd qui tombe ne doit JAMAIS rebooter le Pi : l'ancien certificat reste
+# valide jusqu'en 2036, les mesures continuent de partir, et il n'y a AUCUNE
+# urgence à renouveler. La leçon du verrou taint (0.9.12) vaut ici aussi — un
+# garde-fou plus destructeur que la panne qu'il traite est un défaut, pas une
+# protection.
+
+# ⚠️ La SEULE opération privilégiée est `systemctl restart ben-publisher`, après
+#    une bascule réussie. Elle passe par sudoers, limitée à cette unité :
+#      ben ALL=(root) NOPASSWD: /usr/bin/systemctl restart ben-publisher
+#    (cf. config/etc/sudoers.d/ben-certd)
+
+# PAS d'[Install]/WantedBy : démarré par ben-network-check.service, comme les
+# autres services BEN — device provisionné ET réseau présent.
