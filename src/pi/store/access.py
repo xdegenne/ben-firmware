@@ -94,7 +94,19 @@ CREATE TABLE IF NOT EXISTS access (
     uid        TEXT PRIMARY KEY,
     role       TEXT    NOT NULL,
     updated_ts INTEGER NOT NULL,
-    sent       INTEGER NOT NULL DEFAULT 0   -- 0 = pas encore remontée au cloud
+    sent       INTEGER NOT NULL DEFAULT 0,  -- plus lue : le hello pousse tout
+    -- ⭐ RÉVOCATION = UN DRAPEAU, PAS UNE SUPPRESSION.
+    --    Une ligne supprimée ne se propage pas : le boîtier ne peut plus rien en
+    --    dire, et le cloud ne peut pas l'inférer (sa liste est un SUR-ensemble).
+    --    Marquée, elle part au hello comme le reste, et le hello suivant la
+    --    redit si le cloud l'a ratée. Auto-réparateur, sans double appel.
+    revoked_ts INTEGER,
+    -- ⭐ 🔒 STRICTEMENT LOCAL AU BOÎTIER. Un prénom pour que l'écran de partage
+    --    dise « Claire » au lieu de « Membre ». Il ne part PAS au hello : le
+    --    cloud n'a besoin que de l'uid et du rôle pour décider, et un prénom
+    --    est une donnée personnelle qui n'a aucune raison de voyager pour
+    --    rendre une liste plus jolie. La personne le donne en entrant son code.
+    nom TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_access_sent ON access(sent);
 
@@ -125,6 +137,17 @@ def connect(path: str = ACCESS_PATH) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(_SCHEMA)
+    # ⚠️ `CREATE TABLE IF NOT EXISTS` n'ajoute RIEN à une table déjà là : sur un
+    #    boîtier du parc, la colonne n'apparaîtrait jamais. SQLite n'a pas de
+    #    `ADD COLUMN IF NOT EXISTS`, d'où la lecture du schéma réel.
+    #
+    # ⭐ On n'AJOUTE que : l'ancien code doit pouvoir tourner sur la nouvelle
+    #    base — c'est ce qui rend un retour arrière possible sans la restaurer.
+    colonnes = {r["name"] for r in conn.execute("PRAGMA table_info(access)")}
+    if "revoked_ts" not in colonnes:
+        conn.execute("ALTER TABLE access ADD COLUMN revoked_ts INTEGER")
+    if "nom" not in colonnes:
+        conn.execute("ALTER TABLE access ADD COLUMN nom TEXT")
     conn.commit()
     try:
         Path(path).chmod(0o600)
@@ -158,7 +181,16 @@ def session(path: str = ACCESS_PATH):
     with _lock:
         if _shared is None:
             _shared = connect(path)
-        yield _shared
+        try:
+            yield _shared
+        except Exception:
+            # 🚨 FILET DE DERNIER RECOURS. La connexion est PARTAGÉE : une
+            #    transaction laissée ouverte par un appelant qui échoue serait
+            #    validée par la prochaine écriture réussie, sans rapport.
+            #    Mesuré le 24/09 sur `mint` — qui se défait maintenant lui-même,
+            #    mais on ne compte pas sur chaque appelant pour y penser.
+            _shared.rollback()
+            raise
 
 
 def _digest(secret: str) -> str:
@@ -191,14 +223,158 @@ def role_of(conn: sqlite3.Connection, presented: str | None) -> str | None:
     """
     if not presented:
         return None
+    # 🚨 JOINTURE SUR `access` : un jeton dont la PERSONNE est révoquée ne vaut
+    #    plus rien, même s'il a survécu. `revoke_person` supprime bien les jetons,
+    #    mais s'appuyer là-dessus serait faire dépendre la sécurité d'un ménage
+    #    réussi. Ici le refus est STRUCTUREL — il tient même si le ménage a raté.
+    #
+    # ⚠️ `LEFT JOIN` et non `JOIN` : un jeton d'INTÉGRATION (Home Assistant) n'a
+    #    pas d'`uid`, donc aucune ligne `access`. Un `JOIN` le ferait disparaître.
     row = conn.execute(
-        "SELECT id, role, last_used_ts FROM token WHERE token_hash = ?",
+        "SELECT t.id, t.role, t.uid, t.last_used_ts, "
+        "       a.uid AS acces_uid, a.revoked_ts "
+        "  FROM token t LEFT JOIN access a ON a.uid = t.uid "
+        " WHERE t.token_hash = ?",
         (_digest(presented),),
     ).fetchone()
-    if row is None:
+    if row is None or row["revoked_ts"] is not None:
+        return None
+    # 🚨 UN JETON QUI PORTE UN `uid` DOIT AVOIR SA LIGNE `access`.
+    #
+    #    Le `LEFT JOIN` rend une ligne même quand `access` n'en a aucune — et
+    #    `revoked_ts` vaut alors NULL, donc « non révoqué ». Un jeton orphelin
+    #    passait ainsi pour parfaitement valable, avec le rôle écrit SUR LUI.
+    #    Mesuré le 24/09 : un `token(uid_B, owner)` laissé par un `mint` échoué
+    #    rendait `role_of → owner`, alors que `grant` avait refusé ce droit.
+    #
+    # ⭐ On ne se contente donc pas de corriger la cause (le rollback de `mint`)
+    #    : on ferme la CLASSE. Toute ligne `token` non liée — bogue futur,
+    #    migration ratée, écriture à la main — est désormais refusée ici.
+    #
+    # ⚠️ `uid` NUL reste exempt, et c'est tout l'objet du `LEFT JOIN` : une
+    #    intégration n'appartient à personne et n'a donc aucune ligne `access`.
+    if row["uid"] is not None and row["acces_uid"] is None:
         return None
     _touch(conn, row)
     return row["role"]
+
+
+def uid_of(conn: sqlite3.Connection, presented: str | None) -> str | None:
+    """À QUI appartient ce jeton, ou None. Vide pour une intégration.
+
+    ⭐ Existe pour que personne n'ait à toucher `_digest` de l'extérieur : le
+    hachage est un détail de ce module, et un appelant qui le recopie casse en
+    silence le jour où il change.
+    """
+    if not presented:
+        return None
+    r = conn.execute("SELECT uid FROM token WHERE token_hash = ?",
+                     (_digest(presented),)).fetchone()
+    return r["uid"] if r else None
+
+
+LIBELLE_LONGUEUR_MAX = 64
+
+
+def normaliser_libelle(label: str | None) -> str:
+    """La forme SOUS LAQUELLE un libellé est stocké.
+
+    🚨 Écrite une fois, parce que la comparer à la main a déjà échoué :
+    `mint` rangeait `normaliser_libelle(label)` tandis qu'`elaguer_doublons`
+    comparait au libellé BRUT. Un libellé vide ou de plus de 64 caractères ne
+    correspondait donc jamais — et l'élagage ne s'appliquait pas, en silence.
+    """
+    return (label or "appareil")[:LIBELLE_LONGUEUR_MAX]
+
+
+NOM_LONGUEUR_MAX = 32
+
+
+def nommer(conn: sqlite3.Connection, uid: str, nom: str | None,
+           *, seulement_si_vide: bool = False) -> bool:
+    """Donne (ou retire) le prénom affiché d'une personne. 🔒 NE SORT JAMAIS DU
+    BOÎTIER — ni au hello, ni nulle part ailleurs.
+
+    ⭐ Écrase ce qui existe, délibérément : le propriétaire doit pouvoir
+       corriger « ffff » en « Claire ». Une valeur vide remet à NULL, donc
+       l'écran repasse à « Membre » — pas à une chaîne vide invisible.
+
+    ⚠️ Ne CRÉE pas la ligne. Nommer quelqu'un qui n'a pas d'accès n'a pas de
+       sens, et le faire ouvrirait une route d'écriture sur une table de droits.
+
+    🚨 [seulement_si_vide] POUR LE CHEMIN AUTOMATIQUE, et il est indispensable.
+       Un téléphone se re-revendique tout seul (réinstallation, jeton retiré).
+       S'il réécrivait le prénom à chaque fois, la correction du propriétaire —
+       « ffff » devenu « Claire » — serait effacée dans les secondes qui
+       suivent, sans que personne comprenne pourquoi. On ne remplit donc que le
+       vide ; corriger reste un geste délibéré.
+    """
+    propre = (nom or "").strip()[:NOM_LONGUEUR_MAX]
+    sql = "UPDATE access SET nom = ? WHERE uid = ?"
+    if seulement_si_vide:
+        sql += " AND (nom IS NULL OR nom = '')"
+    cur = conn.execute(sql, (propre or None, uid))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def elaguer_doublons(conn: sqlite3.Connection, uid: str, label: str,
+                     garder: str | None = None) -> int:
+    """Ne garde que le DERNIER jeton d'un (uid, label) donné. Renvoie le nombre
+    de jetons retirés.
+
+    ⭐ POURQUOI CE N'EST PAS UNE DEVINETTE. Le libellé est ce que l'app dit du
+       matériel sur lequel elle tourne. Deux lignes avec le même `uid` ET le
+       même libellé, c'est la même personne sur le même modèle — en pratique une
+       réinstallation, qui emporte le coffre et force une nouvelle
+       revendication. L'ancien jeton reste alors parfaitement VALIDE et plus
+       personne ne le détient : c'est une clé qui traîne, pas une ligne en trop.
+
+    ⚠️ LE CAS OÙ ON A TORT, et ce qu'il coûte : une personne possédant DEUX
+       téléphones du même modèle, sur le même compte. Le second perd son jeton,
+       s'en aperçoit à son appel suivant — moins de cinq secondes — et se
+       revendique. Une ligne qui clignote contre une liste qui se remplit
+       silencieusement de clés vivantes : le choix est vite fait.
+
+    ⚠️ On élague APRÈS avoir frappé le nouveau, jamais avant : si la frappe
+       échoue, on n'aura rien détruit.
+
+    🚨 [garder] EST LE JETON QU'ON VIENT DE RENDRE, et il faut le passer.
+       Le repérer par `MAX(id)` serait faux : `consume_invitation` ne CRÉE pas
+       de ligne, elle TRANSFORME celle de l'invitation — dont le numéro date du
+       moment où le propriétaire a frappé le code, pas du moment où la personne
+       l'utilise. Un jeton obtenu entre les deux porterait un numéro plus grand,
+       et l'élagage supprimerait celui qu'on vient tout juste de remettre. Sans
+       [garder] on ne supprime donc RIEN : mieux vaut une ligne en trop qu'un
+       accès coupé à la seconde où il est accordé.
+    """
+    if not uid or not label:
+        return 0
+    # ⚠️ Comparer à la forme STOCKÉE, pas à ce qu'on a reçu.
+    label = normaliser_libelle(label)
+    id_garde = id_of(conn, garder)
+    if id_garde is None:
+        return 0
+    cur = conn.execute(
+        "DELETE FROM token WHERE uid = ? AND label = ? AND token_hash IS NOT NULL "
+        "  AND id <> ?",
+        (uid, label, id_garde))
+    conn.commit()
+    return cur.rowcount
+
+
+def id_of(conn: sqlite3.Connection, presented: str | None) -> int | None:
+    """Le NUMÉRO du jeton présenté, pour que l'appelant reconnaisse le sien.
+
+    ⭐ Sert à marquer « cet appareil » dans la liste : l'app ne peut pas faire ce
+    rapprochement seule, puisqu'on ne lui rend aucune empreinte. Le boîtier, lui,
+    vient de résoudre ce jeton pour autoriser la requête — autant qu'il le dise.
+    """
+    if not presented:
+        return None
+    r = conn.execute("SELECT id FROM token WHERE token_hash = ?",
+                     (_digest(presented),)).fetchone()
+    return r["id"] if r else None
 
 
 def _touch(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
@@ -246,10 +422,26 @@ def mint(conn: sqlite3.Connection, *, uid: str = "", label: str = "",
     now = int(time.time())
     conn.execute(
         "INSERT INTO token (token_hash, uid, role, label, created_ts) VALUES (?,?,?,?,?)",
-        (_digest(clear), (uid or None), role, (label or "appareil")[:64], now),
+        (_digest(clear), (uid or None), role, normaliser_libelle(label), now),
     )
-    if role in PERSON_ROLES and uid:
-        grant(conn, uid, role)
+    # 🚨 DÉFAIRE L'INSERTION SI `grant` REFUSE. Sans ce bloc, le jeton restait
+    #    dans une transaction ouverte sur une connexion PARTAGÉE — et la
+    #    prochaine écriture réussie, sans aucun rapport, le validait.
+    #
+    #    Reproduit le 24/09 : `grant` refuse un second owner, `mint` lève, puis
+    #    un simple jeton d'intégration frappé ensuite commettait au passage
+    #    `token(uid_B, owner)`. Une ligne OWNER pour quelqu'un qui n'a aucune
+    #    ligne `access` — et `role_of` la lisait comme valable.
+    #
+    # ⚠️ Le clair n'est jamais rendu dans ce cas, donc personne ne détenait ce
+    #    jeton. C'était une corruption d'invariant, pas une porte ouverte — mais
+    #    on ne laisse pas une écriture survivre à l'échec qui l'a annulée.
+    try:
+        if role in PERSON_ROLES and uid:
+            grant(conn, uid, role)
+    except Exception:
+        conn.rollback()
+        raise
     conn.commit()
     return clear
 
@@ -268,12 +460,29 @@ def grant(conn: sqlite3.Connection, uid: str, role: str) -> None:
         return
     if role == ROLE_OWNER and has_owner(conn):
         raise ValueError("ce boîtier a déjà un owner")
+    # ⭐ `revoked_ts = NULL` : réinviter quelqu'un LÈVE le drapeau. Sans ça, une
+    #    personne révoquée puis réinvitée resterait refusée par `role_of`, et on
+    #    chercherait longtemps pourquoi son jeton tout neuf ne marche pas.
     conn.execute(
-        "INSERT INTO access (uid, role, updated_ts, sent) VALUES (?,?,?,0) "
-        "ON CONFLICT(uid) DO UPDATE SET role=excluded.role, updated_ts=excluded.updated_ts, sent=0",
+        "INSERT INTO access (uid, role, updated_ts, sent, revoked_ts) VALUES (?,?,?,0,NULL) "
+        "ON CONFLICT(uid) DO UPDATE SET role=excluded.role, "
+        "  updated_ts=excluded.updated_ts, sent=0, revoked_ts=NULL",
         (uid, role, int(time.time())),
     )
     conn.commit()
+
+
+def est_revoquee(conn: sqlite3.Connection, uid: str) -> bool:
+    """Cette personne a-t-elle été coupée ICI ?
+
+    🚨 Le boîtier est L'AUTORITÉ pour ses propres révocations ; le cloud n'en est
+    que le miroir, et un miroir EN RETARD — le hello est quotidien. Sans cette
+    lecture, quelqu'un de révoqué il y a dix minutes revendique, le cloud répond
+    encore « member » (il l'ignore), et le boîtier le laisse revenir. Sans
+    invitation, et sans que le propriétaire en sache rien.
+    """
+    r = conn.execute("SELECT revoked_ts FROM access WHERE uid = ?", (uid,)).fetchone()
+    return r is not None and r["revoked_ts"] is not None
 
 
 def has_owner(conn: sqlite3.Connection) -> bool:
@@ -283,6 +492,45 @@ def has_owner(conn: sqlite3.Connection) -> bool:
 
 
 # ── Invitation : un BON DE DROIT, pas un secret ──────────────────────────────
+
+# ── Le code d'invitation : fait pour être DIT, pas pour être scanné ──────────
+#
+# ⭐ On commence par un code court qu'on communique de vive voix. Le scan de QR
+#    viendra plus tard : il demande la permission caméra, examinée par Apple, et
+#    une fonction qui EXIGE une permission disparaît pour qui la décline.
+#
+# ⭐ Et le QR n'est pas ce qui rend l'invitation sûre : elle est consommée par
+#    `/claim` SUR LE BOÎTIER, par le LAN. L'invité doit donc déjà être sur le
+#    WiFi du foyer — c'est ça qui impose « tu es vraiment là », pas le QR.
+#
+# ⚠️ ALPHABET SANS AMBIGUÏTÉ : ni `I`, ni `L`, ni `O`. On ne les ÉMET jamais, et
+#    on les RATTRAPE à la lecture (O→0, I→1, L→1) — parce que celui qui épelle
+#    « O » au téléphone voulait dire zéro, et qu'un code refusé sans raison
+#    visible est pire qu'un code trop long.
+_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTUVWXYZ"   # 33 caractères
+_CONFUSIONS = str.maketrans({"O": "0", "I": "1", "L": "1"})
+CODE_LONGUEUR = 6                                  # 33^6 ≈ 1,3 milliard
+
+
+def normaliser_code(saisi: str) -> str:
+    """Ce que la personne a tapé → ce qu'on compare.
+
+    Majuscules, séparateurs jetés, confusions rattrapées. Sans ça, `ben-4k7q`
+    tapé en minuscules échouerait et personne ne comprendrait pourquoi.
+    """
+    s = (saisi or "").upper().translate(_CONFUSIONS)
+    return "".join(c for c in s if c in _ALPHABET)
+
+
+def _frapper_code() -> str:
+    return "".join(secrets.choice(_ALPHABET) for _ in range(CODE_LONGUEUR))
+
+
+def formater_code(code: str) -> str:
+    """`4K7QMX` → `4K7-QMX`. Pour l'écran et pour l'oreille, jamais pour comparer."""
+    m = CODE_LONGUEUR // 2
+    return f"{code[:m]}-{code[m:]}"
+
 
 def create_invitation(conn: sqlite3.Connection, *, role: str = ROLE_MEMBER,
                       ttl_sec: int = INVITATION_TTL_SEC) -> str:
@@ -297,15 +545,23 @@ def create_invitation(conn: sqlite3.Connection, *, role: str = ROLE_MEMBER,
     """
     if role not in PERSON_ROLES:
         raise ValueError(f"on n'invite pas une personne comme {role}")
-    clear = secrets.token_urlsafe(TOKEN_OCTETS)
     now = int(time.time())
-    conn.execute(
-        "INSERT INTO token (invitation_hash, role, created_ts, invitation_expiry_ts) "
-        "VALUES (?,?,?,?)",
-        (_digest(clear), role, now, now + ttl_sec),
-    )
-    conn.commit()
-    return clear
+    # ⚠️ `invitation_hash` est UNIQUE : sur un code court, une collision avec une
+    #    invitation encore vivante est improbable mais pas impossible. On
+    #    retente plutôt que de lever une exception au nez de l'utilisateur.
+    for _ in range(8):
+        clear = _frapper_code()
+        try:
+            conn.execute(
+                "INSERT INTO token (invitation_hash, role, created_ts, invitation_expiry_ts) "
+                "VALUES (?,?,?,?)",
+                (_digest(clear), role, now, now + ttl_sec),
+            )
+            conn.commit()
+            return clear
+        except sqlite3.IntegrityError:
+            continue
+    raise RuntimeError("impossible de frapper un code d'invitation libre")
 
 
 def consume_invitation(conn: sqlite3.Connection, invitation: str, *,
@@ -316,12 +572,13 @@ def consume_invitation(conn: sqlite3.Connection, invitation: str, *,
     annonce. Le QR prouve le consentement de l'owner, Firebase prouve l'identité de
     l'invitée : aucune des deux moitiés ne suffit seule.
     """
-    if not invitation or not uid:
+    code = normaliser_code(invitation)
+    if not code or not uid:
         return None
     now = int(time.time())
     row = conn.execute(
         "SELECT id, role FROM token WHERE invitation_hash = ? AND invitation_expiry_ts > ?",
-        (_digest(invitation), now),
+        (_digest(code), now),
     ).fetchone()
     if row is None:
         return None
@@ -329,7 +586,7 @@ def consume_invitation(conn: sqlite3.Connection, invitation: str, *,
     conn.execute(
         "UPDATE token SET token_hash = ?, invitation_hash = NULL, uid = ?, label = ?, "
         "invitation_expiry_ts = NULL WHERE id = ?",
-        (_digest(clear), uid, (label or "appareil")[:64], row["id"]),
+        (_digest(clear), uid, normaliser_libelle(label), row["id"]),
     )
     grant(conn, uid, row["role"])
     conn.commit()
@@ -366,8 +623,15 @@ def revoke_person(conn: sqlite3.Connection, uid: str) -> int:
     s'en charge, elle est le seul acteur à être à la fois sur le LAN et sur
     Internet. Rien ne descend du cloud vers le boîtier.
     """
+    # Les JETONS meurent tout de suite : marquer la personne sans les tuer
+    # laisserait des téléphones parfaitement vivants.
     n = conn.execute("DELETE FROM token WHERE uid = ?", (uid,)).rowcount
-    n += conn.execute("DELETE FROM access WHERE uid = ?", (uid,)).rowcount
+    # La LIGNE, elle, survit marquée — c'est elle qui portera la nouvelle au
+    # cloud, au prochain hello, et la redira tant qu'il ne l'aura pas prise.
+    n += conn.execute(
+        "UPDATE access SET revoked_ts = ?, updated_ts = ?, sent = 0 "
+        " WHERE uid = ? AND revoked_ts IS NULL",
+        (int(time.time()), int(time.time()), uid)).rowcount
     conn.commit()
     return n
 
@@ -386,6 +650,44 @@ def list_tokens(conn: sqlite3.Connection) -> list[dict]:
         "WHERE token_hash IS NOT NULL ORDER BY created_ts")]
 
 
+def tout_effacer(conn: sqlite3.Connection) -> tuple[int, int]:
+    """Efface TOUS les droits et TOUS les jetons. Renvoie (accès, jetons).
+
+    🚨 POUR LE DÉSAPPAIRAGE, ET C'EST INDISPENSABLE — pas une politesse.
+       `grant` est en ÉCRITURE UNIQUE pour le rôle `owner` : un boîtier qui
+       repart en configuration d'usine en gardant sa ligne `owner` refuserait
+       le propriétaire SUIVANT avec « ce boîtier a déjà un owner », et il n'y
+       aurait aucun chemin de retour depuis l'app. Le boîtier serait à jeter.
+
+    ⭐ Et c'est aussi la seule chose juste : le boîtier quitte ce foyer. Les
+       droits de ce foyer, les téléphones de ce foyer et ses intégrations n'ont
+       plus rien à décrire. Les garder, ce serait laisser des clés vivantes
+       dans un logement qu'on vient de quitter.
+    """
+    jetons = conn.execute("DELETE FROM token").rowcount
+    acces = conn.execute("DELETE FROM access").rowcount
+    conn.commit()
+    return acces, jetons
+
+
+def pour_le_hello(conn: sqlite3.Connection) -> list[dict]:
+    """Les droits, tels qu'ils REMONTENT au cloud. Rien de plus.
+
+    🔒 SEULE PORTE DE SORTIE des lignes `access`, et c'est tout son intérêt :
+       la projection est écrite ICI, une fois, au lieu d'être recopiée dans le
+       publisher où personne ne la relira. Le jour où quelqu'un remplace la
+       construction champ par champ par un `dict(row)` commode, il le fait dans
+       une fonction dont le banc vérifie explicitement le contenu.
+
+    ⭐ Ce que le cloud a besoin de savoir pour DÉCIDER : qui, quel rôle, coupé
+       ou non. Le prénom ne sert qu'à rendre un écran lisible sur le téléphone
+       du propriétaire — une donnée personnelle n'a pas à voyager pour ça.
+    """
+    return [{"uid": r["uid"], "role": r["role"],
+             "revoked": r["revoked_ts"] is not None}
+            for r in list_access(conn)]
+
+
 def list_access(conn: sqlite3.Connection) -> list[dict]:
     """Les personnes connues LOCALEMENT.
 
@@ -394,21 +696,19 @@ def list_access(conn: sqlite3.Connection) -> list[dict]:
     DEUX listes — les personnes chez `ben-api`, les appareils ici.
     """
     return [dict(r) for r in conn.execute(
-        "SELECT uid, role, updated_ts, sent FROM access ORDER BY updated_ts")]
+        "SELECT uid, role, updated_ts, sent, revoked_ts, nom FROM access "
+        "ORDER BY updated_ts")]
 
 
-# ── La boîte d'envoi (consommée par ben_publisher) ───────────────────────────
+# ⭐ `pending()` / `mark_sent()` ONT ÉTÉ SUPPRIMÉES (24/09).
+#
+# Le hello pousse désormais la liste ENTIÈRE des accès, comme il pousse déjà les
+# contrats et les libellés. Sur une table de 1 à 5 lignes, une boîte d'envoi
+# n'économise rien et coûte une panne : une ligne marquée `sent = 1` que le
+# cloud aurait perdue n'est jamais renvoyée, et le boîtier se croit à jour.
+#
+# ⚠️ La colonne `sent` reste dans le schéma — on n'enlève jamais une colonne
+#    d'une base embarquée, l'ancien code doit pouvoir tourner sur la nouvelle
+#    (c'est ce qui rend le retour arrière possible sans restaurer la base).
+#    Elle n'est simplement plus lue.
 
-def pending(conn: sqlite3.Connection, limit: int = 100) -> list[dict]:
-    """Les lignes nées localement, pas encore remontées. Comme `measurements.sent`."""
-    return [dict(r) for r in conn.execute(
-        "SELECT uid, role, updated_ts FROM access WHERE sent = 0 ORDER BY updated_ts LIMIT ?",
-        (limit,))]
-
-
-def mark_sent(conn: sqlite3.Connection, uids: list[str]) -> None:
-    """Marque remontées les lignes ACQUITTÉES par le cloud, jamais les autres."""
-    if not uids:
-        return
-    conn.executemany("UPDATE access SET sent = 1 WHERE uid = ?", [(u,) for u in uids])
-    conn.commit()
