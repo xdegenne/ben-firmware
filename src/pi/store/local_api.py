@@ -42,16 +42,37 @@ Endpoints :
 Stdlib only (zéro dépendance — idéal Pi Zero W). Read-only sur `measurements.db`
 (WAL → lectures concurrentes pendant que le reader écrit).
 
-Durcissement, étape 1 (0.9.16) : l'en-tête `Authorization: Bearer` est RECONNU
-s'il est présent, et RIEN N'EST EXIGÉ. C'est ce qui rend la livraison invisible —
-les apps du parc et Home Assistant continuent à l'identique. L'exigence s'armera
-sur PREUVE que plus personne n'appelle sans jeton, jamais sur une date.
+═══ DEUX PORTS, DEUX RÉGIMES — ET C'EST LE CANAL QUI DURCIT ═══════════════════
+
+  :8087  en clair   l'existant. `Authorization: Bearer` est RECONNU s'il est
+                    présent, et RIEN N'EST EXIGÉ — ni jeton, ni rôle. TOUT y
+                    reste faisable, y compris `/settings` et `/unprovision`.
+
+                    🚨 C'EST ASSUMÉ, pas un oubli. Ce port n'a jamais rien
+                    exigé ; y ajouter une règle casserait Home Assistant et les
+                    apps déjà installées, chez des gens, sans rien protéger —
+                    quiconque est sur le LAN peut de toute façon l'appeler
+                    directement. On ne durcit pas un canal ouvert, on en offre
+                    un autre.
+
+  :8088  chiffré    le neuf. JETON EXIGÉ sur toutes les routes sauf `/claim`,
+                    et RÔLE `owner` EXIGÉ sur les écritures (`/settings`,
+                    `/unprovision`). `/health` y ANNONCE le rôle du porteur.
+
+⭐ Il n'y a donc PAS de « on exigera le jeton plus tard, sur preuve que plus
+personne n'appelle sans ». Ce jour-là n'arrive jamais tout seul, et il faudrait
+l'organiser. Ici l'exigence naît AVEC le port : une app qui parle :8088 a
+forcément revendiqué, c'est impossible autrement. Aucune population à migrer,
+aucune date à tenir.
+
 Cf. `docs/chantier-acces-multi-utilisateur.md`.
 """
 
+import http.client
 import json
 import os
 import sqlite3
+import ssl
 import subprocess
 import sys
 import threading
@@ -70,6 +91,28 @@ import capabilities as caps  # noqa: E402  (source de vérité « capability →
 HOST = "0.0.0.0"
 PORT = 8087
 DEVICE_JSON = "/etc/ben-firmware/device.json"
+
+# ── L'écoute CHIFFRÉE, en plus — jamais à la place ────────────────────────────
+#
+# ⭐ :8087 RESTE EN CLAIR, et ce n'est pas une étape transitoire qu'on oublierait
+#    de finir. Home Assistant refuse un certificat présenté sur une IP (le SAN
+#    porte `DNS:ben-0001`, pas une adresse) et les versions de l'app déjà
+#    installées ne connaissent que le port en clair. Couper :8087 casserait les
+#    deux, chez des gens, sans prévenir.
+#
+#    On l'enlèvera sur PREUVE que plus personne n'y appelle — jamais sur une
+#    date. Même règle que l'en-tête `Authorization` ci-dessus.
+#
+# ⚠️ Le SAN du certificat est `DNS:<device-id>`, JAMAIS une IP : une IP change au
+#    gré du DHCP, et un certificat ne se réémet pas à chaque bail. C'est donc à
+#    l'app de mettre le NOM dans l'URL et l'IP dans la socket — le nom n'a pas
+#    besoin de résoudre, il doit seulement correspondre.
+PORT_TLS = 8088
+CERT_DIR = os.environ.get("BEN_CERT_DIR", "/etc/ben-firmware/certs")
+
+# Le cloud, pour le RELAIS de /claim uniquement (mêmes valeurs que le publisher).
+API_HOST = os.environ.get("BEN_API_HOST", "api.benpilote.fr")
+API_PORT = int(os.environ.get("BEN_API_PORT", "8443"))
 DEFAULT_WINDOW_SEC = 24 * 3600
 MAX_LIMIT = 10000
 DEFAULT_CURVE_BUCKETS = 500   # points servis par défaut (≈ largeur écran)
@@ -139,6 +182,85 @@ def _device_info() -> dict:
     return info
 
 
+# ── Le frein de /claim ────────────────────────────────────────────────────────
+#
+# 🚨 /claim est NON AUTHENTIFIÉ par construction — le demandeur n'a pas encore de
+#    jeton, c'est tout l'objet de l'appel — et il déclenche une poignée de main
+#    TLS SORTANTE vers ben-api. Sans frein, n'importe qui sur le WiFi du foyer
+#    transforme le boîtier en amplificateur : il martèle le cloud, et sur un Pi
+#    Zero les poignées de main RSA le rendent inutilisable au passage.
+#
+# ⭐ Deux bornes qui suffisent, parce qu'elles collent à l'usage réel : une
+#    revendication se fait UNE FOIS PAR TÉLÉPHONE. Une seule à la fois, et pas
+#    plus d'une toutes les deux secondes. Un utilisateur légitime ne les voit
+#    jamais ; un script les prend en pleine face.
+#
+# ⚠️ Volontairement EN MÉMOIRE, pas en base : c'est un frein, pas un journal. Le
+#    perdre à un redémarrage est sans conséquence.
+_CLAIM_VERROU = threading.Lock()
+_CLAIM_INTERVALLE_SEC = 2.0
+_claim_dernier = 0.0
+
+
+class _CloudRefuse(Exception):
+    """ben-api a répondu que l'identité n'est pas valable (401)."""
+
+
+class _CloudInjoignable(Exception):
+    """Réseau, serveur, certificat — tout ce qui n'est pas un verdict."""
+
+
+def _demander_au_cloud(jeton_firebase: str) -> tuple[str, str | None]:
+    """« Qui est-ce, et qu'a-t-il ICI ? » — relayé à ben-api en mTLS.
+
+    🚨 LE BOÎTIER NE VÉRIFIE PAS LE JETON, IL LE TRANSPORTE. Vérifier un JWT
+    demande un cache de clés Google, une horloge fiable et de la crypto RSA —
+    sur un Pi Zero SANS RTC. C'est `ben-api` qui sait déjà le faire.
+
+    ⭐ Renvoie TOUJOURS l'uid quand l'identité est prouvée, et le rôle peut être
+    None : « je sais qui tu es, tu n'as aucun droit ici ». Ce n'est pas une
+    erreur — c'est le cas normal de quelqu'un qu'on vient d'inviter, et l'uid est
+    précisément ce que le boîtier attendait pour pouvoir consommer l'invitation.
+
+    ⚠️ Conséquence assumée : cloud injoignable ⇒ revendication impossible. C'est
+    la contrepartie d'avoir sorti la crypto JWT du Pi Zero, pour une opération
+    qu'on fait une fois par téléphone.
+    """
+    device_id = (_device_info() or {}).get("deviceId")
+    if not device_id:
+        raise _CloudInjoignable("device.json illisible")
+    try:
+        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH,
+                                         cafile=f"{CERT_DIR}/root-ca.crt")
+        ctx.load_cert_chain(f"{CERT_DIR}/device.crt", f"{CERT_DIR}/device.key")
+        conn = http.client.HTTPSConnection(API_HOST, API_PORT, context=ctx, timeout=20)
+    except Exception as e:  # noqa: BLE001
+        raise _CloudInjoignable(f"mTLS impossible : {e}") from e
+
+    try:
+        corps = json.dumps({"firebase_token": jeton_firebase}).encode()
+        conn.request("POST", f"/api/devices/{device_id}/claim", body=corps,
+                     headers={"Content-Type": "application/json"})
+        r = conn.getresponse()
+        brut = r.read()
+        if r.status == 401:
+            raise _CloudRefuse("jeton d'identité refusé")
+        if r.status != 200:
+            raise _CloudInjoignable(f"ben-api a répondu {r.status}")
+        rep = json.loads(brut.decode("utf-8"))
+    except (_CloudRefuse, _CloudInjoignable):
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise _CloudInjoignable(str(e)) from e
+    finally:
+        conn.close()
+
+    uid = (rep.get("uid") or "").strip()
+    if not uid:
+        raise _CloudInjoignable("réponse sans uid")
+    return uid, rep.get("role") or None
+
+
 def _rows(conn, sql, params) -> list:
     return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
@@ -194,12 +316,106 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:  # noqa: BLE001
             return None
 
+    # ── Le durcissement, c'est LE CANAL ───────────────────────────────────────
+    #
+    # ⭐ Pas de « on exigera le jeton plus tard, sur preuve que plus personne
+    #    n'appelle sans ». Ce jour-là n'arrive jamais tout seul, et il faudrait
+    #    l'organiser. Ici l'exigence naît AVEC le port chiffré :
+    #
+    #      :8087  en clair    l'existant — Home Assistant, apps déjà installées.
+    #                         GELÉ, aucune exigence. On ne casse rien.
+    #      :8088  chiffré     le neuf — jeton EXIGÉ dès le premier jour.
+    #
+    # ⭐ Une app qui parle :8088 a forcément revendiqué : c'est impossible
+    #    autrement. Il n'y a donc aucune population à migrer, aucune date à
+    #    tenir, aucun basculement à négocier.
+    #
+    # ⚠️ UNE SEULE exemption, et elle est structurelle : `/claim` est l'appel par
+    #    lequel on OBTIENT le jeton. L'exiger là reviendrait à demander d'avoir
+    #    déjà ce qu'on vient chercher.
+    #
+    # 🚨 Ne pas ajouter d'autre exemption « pour la commodité ». `/ping` et
+    #    `/health` sont tentants — ils servent à sonder la joignabilité — mais
+    #    ils restent servis EN CLAIR sur :8087, qui répond exactement à ce
+    #    besoin. Une exemption de confort sur un canal dont l'intérêt est la
+    #    rigueur, c'est le trou par lequel tout repasse.
+    # ── Les routes qui MODIFIENT ou DÉTRUISENT ────────────────────────────────
+    #
+    # 🚨 Jusqu'ici `ben_role` était calculé à chaque requête et consulté NULLE
+    #    PART : un `member` pouvait donc appeler `/unprovision`, c'est-à-dire
+    #    effacer les mesures et éteindre le boîtier de quelqu'un d'autre. Les
+    #    deux rôles étaient identiques en effet — seul leur nom différait.
+    #
+    # ⚠️ L'exigence vaut sur le canal CHIFFRÉ seulement. Sur :8087 il n'y a
+    #    jamais eu ni jeton ni rôle ; y appliquer la règle refuserait `/settings`
+    #    à tout le monde, au nom d'une protection que ce port ne peut pas offrir.
+    # Ce qu'un membre ne peut pas faire, et pourquoi c'est bien ces trois-là :
+    #
+    #   /settings      la LUMINOSITÉ de la LED — elle est sur le mur de quelqu'un
+    #   /unprovision   efface les mesures et éteint le boîtier
+    #   /invitations   frappe un droit d'entrée pour un tiers
+    #
+    # ⭐ La LECTURE reste ouverte : ce garde n'est branché que sur `do_POST`.
+    #    Voir le réglage ne fait de mal à personne, le changer si.
+    #
+    # ⚠️ LA RÈGLE PORTE SUR LA ROUTE, PAS SUR LE CHAMP. Aujourd'hui `/settings`
+    #    ne transporte que `led_level`, donc les deux coïncident. Le jour où il
+    #    gagne une préférence qu'un membre devrait légitimement poser — un seuil
+    #    d'alerte, un affichage — elle se prendra un 403 sans raison lisible.
+    #    À ce moment-là, il faudra discriminer par CHAMP, pas par route.
+    ECRITURES = ("/settings", "/unprovision", "/invitations",
+                 "/access/revoke", "/tokens/revoke", "/tokens/integration",
+                 "/access/rename")
+    # ⚠️ Une LECTURE réservée au propriétaire : savoir QUI d'autre a accès est
+    #    une vue d'administration. Elle expose les identifiants des autres
+    #    habitants — ça regarde celui qui les a invités.
+    LECTURES_OWNER = ("/access",)
+
+    def _exige_owner(self, path: str, methode: str = "POST") -> bool:
+        if not getattr(self.server, "chiffre", False):
+            return False
+        reserve = self.ECRITURES if methode == "POST" else self.LECTURES_OWNER
+        if path not in reserve:
+            return False
+        if self.ben_role != access.ROLE_OWNER:
+            self._send({"error": "owner_required",
+                        "detail": "seul le propriétaire peut faire cela"}, 403)
+            return True
+        return False
+
+    def _exige_jeton(self, path: str) -> bool:
+        if not getattr(self.server, "chiffre", False):
+            return False
+        # ⭐ DEUX ROUTES SANS JETON, ET SEULEMENT DEUX.
+        #
+        #    `/claim` : il faut bien un chemin pour en OBTENIR un.
+        #
+        #    `/ping`  : il rend `{"ben": true}` et RIEN d'autre — pas de lecture,
+        #    pas de base, pas d'identité. Le mettre derrière un jeton ne protège
+        #    donc rien : le `deviceId` qu'il pourrait trahir est déjà diffusé en
+        #    clair sur le réseau local par mDNS. En revanche, l'exiger casse le
+        #    seul geste qu'une app doit pouvoir faire AVANT d'avoir le moindre
+        #    droit : vérifier qu'un BEN répond à cette adresse. Sans ça, « ce
+        #    boîtier ne répond pas » et « je ne suis pas invité » deviennent
+        #    indiscernables — et c'est la deuxième qu'il faut dire.
+        if path in ("/claim", "/ping"):
+            return False
+        if self.ben_role is None:
+            self._send({"error": "token_required",
+                        "detail": "POST /claim pour obtenir un jeton"}, 401)
+            return True
+        return False
+
     def do_GET(self):
         url = urlparse(self.path)
         path = url.path.rstrip("/") or "/"
         qs = parse_qs(url.query)
         self.ben_role = self._role()
+        if self._exige_jeton(path) or self._exige_owner(path, "GET"):
+            return
         try:
+            if path == "/access":
+                return self._lister_acces()
             if path == "/ping":
                 return self._ping()
             if path == "/health":
@@ -235,6 +451,20 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         path = url.path.rstrip("/") or "/"
         self.ben_role = self._role()
+        if self._exige_jeton(path) or self._exige_owner(path):
+            return
+        if path == "/claim":
+            return self._claim()
+        if path == "/invitations":
+            return self._inviter()
+        if path == "/access/revoke":
+            return self._revoquer_personne()
+        if path == "/tokens/revoke":
+            return self._revoquer_appareil()
+        if path == "/tokens/integration":
+            return self._creer_integration()
+        if path == "/access/rename":
+            return self._renommer_personne()
         if path == "/unprovision":
             return self._unprovision(parse_qs(url.query))
         if path != "/settings":
@@ -273,8 +503,317 @@ class Handler(BaseHTTPRequestHandler):
                 last_tic = row[0] if row else None
         except sqlite3.OperationalError:
             db_ok = False
+        # ⭐ Le rôle est ANNONCÉ, pas stocké par l'app. Un rôle mémorisé à la
+        #    revendication PÉRIME : rétrograder quelqu'un ne changerait rien sur
+        #    son téléphone, qui a déjà son jeton et ne revendiquera plus jamais.
+        #    Ici il est relu à chaque appel, donc toujours juste.
+        #
+        # ⚠️ `null` sur :8087 — ce port ne connaît ni jeton ni rôle, et prétendre
+        #    le contraire ferait croire à l'app qu'elle sait quelque chose.
         self._send({**info, "db": db_ok, "last_tic_ts": last_tic,
+                    "role": self.ben_role,
                     "now": int(time.time())})
+
+    def _claim(self):
+        """POST /claim — une personne revendique un accès sur CE boîtier.
+
+        🚨 CHIFFRÉ OBLIGATOIRE. C'est le seul endpoint qui DÉLIVRE un secret : le
+        jeton part dans la réponse. En clair sur le WiFi du foyer, n'importe qui
+        le capterait — et un jeton capté donne accès à la consommation du foyer.
+        D'où le refus franc sur :8087 plutôt qu'une tolérance « le temps de la
+        transition ».
+
+        ⭐ DEUX MOITIÉS, ET AUCUNE NE SUFFIT SEULE. `ben-api` fournit le QUI
+        (identité Google vérifiée) ; l'invitation fournit le QUOI (le rôle, décidé
+        par l'owner au moment où il invite). Une invitation ne peut pas se donner
+        d'identité, un jeton Firebase ne peut pas se donner de rôle.
+        """
+        if not getattr(self.server, "chiffre", False):
+            return self._send({"error": "tls_required",
+                               "detail": f"/claim n'est servi que sur :{PORT_TLS} (HTTPS)"}, 426)
+
+        entete = self.headers.get("Authorization", "")
+        if not entete.lower().startswith("bearer "):
+            return self._send({"error": "missing_identity",
+                               "detail": "Authorization: Bearer <ID token Firebase>"}, 401)
+        jeton_firebase = entete[7:].strip()
+
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            body = json.loads((self.rfile.read(length) if length else b"{}").decode() or "{}")
+            if not isinstance(body, dict):
+                raise ValueError
+        except (ValueError, json.JSONDecodeError):
+            return self._send({"error": "invalid_json"}, 400)
+        label = str(body.get("label") or "")
+        invitation = str(body.get("invitation") or "")
+        # 🔒 Prénom d'affichage, STRICTEMENT LOCAL. Facultatif : sans lui la
+        #    liste dira « Membre », ce qui marche — juste moins bien.
+        nom = str(body.get("name") or "")
+
+        # 🚨 Le frein, AVANT le moindre octet vers le cloud. Non bloquant : on
+        #    refuse franchement plutôt que d'empiler des threads en attente, ce
+        #    qui serait exactement la panne qu'on veut éviter.
+        global _claim_dernier
+        if not _CLAIM_VERROU.acquire(blocking=False):
+            return self._send({"error": "busy", "detail": "revendication déjà en cours"}, 429)
+        try:
+            if time.monotonic() - _claim_dernier < _CLAIM_INTERVALLE_SEC:
+                return self._send({"error": "too_many", "detail": "réessayer dans un instant"}, 429)
+            _claim_dernier = time.monotonic()
+            return self._claim_relais(jeton_firebase, label, invitation, nom)
+        finally:
+            _CLAIM_VERROU.release()
+
+    def _claim_relais(self, jeton_firebase: str, label: str, invitation: str,
+                      nom: str = ""):
+        """La partie coûteuse : un aller-retour mTLS, puis la décision."""
+        try:
+            uid, role_cloud = _demander_au_cloud(jeton_firebase)
+        except _CloudRefuse as e:
+            print(f"[claim] identité refusée par ben-api : {e}")
+            return self._send({"error": "bad_identity"}, 401)
+        except _CloudInjoignable as e:
+            # ⚠️ 503 et NON 500 : rien n'est cassé, le cloud n'est pas là.
+            #    L'app doit proposer de réessayer, pas afficher une erreur.
+            print(f"[claim] cloud injoignable : {e}")
+            return self._send({"error": "cloud_unreachable",
+                               "detail": "réessayer plus tard"}, 503)
+
+        with access.session() as conn:
+            # 🚨 LE DRAPEAU LOCAL L'EMPORTE SUR LE CLOUD. Le hello est quotidien :
+            #    pendant 24 h après une révocation, ben-api répond encore l'ancien
+            #    rôle. Faire confiance à sa réponse laisserait revenir quelqu'un
+            #    qu'on vient de couper — sans invitation, et en silence.
+            #
+            # ⭐ Une réinvitation reste possible : l'invitation lève le drapeau
+            #    (`grant`). Ce qui devient impossible, c'est le retour FURTIF.
+            if access.est_revoquee(conn, uid) and not invitation:
+                print(f"[claim] {uid} est révoqué ici — refusé malgré le cloud")
+                return self._send({"error": "revoked"}, 403)
+
+            if role_cloud and not access.est_revoquee(conn, uid):
+                # ⚠️ Ligne 1 — UN DROIT EXISTANT L'EMPORTE, et l'invitation n'est
+                #    PAS consommée. Claire déjà `member` qui réinstalle son app n'a
+                #    besoin d'aucun QR ; et si on lui en présente un par mégarde,
+                #    elle ne doit pas se retrouver rétrogradée. Changer le rôle de
+                #    quelqu'un se fait par révocation puis réinvitation, jamais par
+                #    effet de bord.
+                jeton = access.mint(conn, uid=uid, label=label, role=role_cloud)
+            else:
+                # Lignes 2 et 3 — sans droit connu, seule une invitation valide
+                # ouvre. `consume_invitation` renvoie None si elle est absente,
+                # inconnue ou périmée : les trois cas se traitent pareil.
+                jeton = access.consume_invitation(conn, invitation, uid=uid, label=label)
+                if jeton is None:
+                    print(f"[claim] aucun droit pour {uid} et pas d'invitation valable")
+                    return self._send({"error": "no_access"}, 403)
+
+            # 🚨 Élaguer APRÈS la frappe : une réinstallation emporte le coffre
+            #    du téléphone et le force à se revendiquer, laissant derrière
+            #    elle un jeton VALIDE que plus personne ne détient. Sans ça la
+            #    liste se remplit de clés vivantes, toutes du même nom, sans
+            #    qu'on puisse dire laquelle couper.
+            if nom:
+                # ⭐ Une revendication PAR INVITATION est un geste délibéré : la
+                #    personne a vu le prénom proposé et l'a validé, il fait
+                #    autorité. Une revendication automatique, elle, ne fait que
+                #    combler un vide — sinon elle écraserait la correction du
+                #    propriétaire au tour suivant.
+                access.nommer(conn, uid, nom,
+                              seulement_si_vide=not invitation)
+
+            elagues = access.elaguer_doublons(conn, uid, label, garder=jeton)
+            if elagues:
+                print(f"[claim] {elagues} jeton(s) périmé(s) de {label!r} retiré(s)")
+
+            # ⭐ Le rôle rendu est RELU dans la base, pas celui qu'on croit avoir
+            #    écrit. Si `grant` a refusé une promotion (owner en écriture
+            #    unique), la réponse dit la vérité plutôt que l'intention.
+            role = access.role_of(conn, jeton)
+
+        print(f"[claim] {uid} → rôle {role} (label={label or 'appareil'})")
+        return self._send({"token": jeton, "role": role})
+
+    def _inviter(self):
+        """POST /invitations — le propriétaire frappe un code à communiquer.
+
+        ⭐ UN CODE QU'ON DIT, PAS UN QR QU'ON SCANNE. Le scan viendra, avec la
+        permission caméra ; mais une fonction qui EXIGE une permission disparaît
+        pour qui la décline, et le QR n'est de toute façon pas ce qui rend
+        l'invitation sûre : elle est consommée par `/claim` SUR LE BOÎTIER, par
+        le LAN. L'invité doit donc déjà être sur le WiFi du foyer.
+        
+        🚨 Réservée au propriétaire (`_exige_owner`) et au canal chiffré
+        (`_exige_jeton`) : un code d'invitation est un DROIT au porteur, il n'a
+        rien à faire sur un canal que tout le LAN peut écouter.
+
+        ⚠️ Le rôle est décidé ICI, par celui qui invite. L'invité ne le choisit
+        jamais — sinon n'importe qui se frapperait `owner`.
+        """
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            body = json.loads((self.rfile.read(length) if length else b"{}").decode() or "{}")
+            if not isinstance(body, dict):
+                raise ValueError
+        except (ValueError, json.JSONDecodeError):
+            return self._send({"error": "invalid_json"}, 400)
+
+        role = str(body.get("role") or access.ROLE_MEMBER)
+        # ⚠️ On n'invite PAS un second propriétaire : `grant` est en écriture
+        #    unique et lèverait au moment où l'invité consomme le code. Refuser
+        #    à la FRAPPE évite de remettre à quelqu'un un code condamné, qu'il
+        #    découvrirait cassé chez lui, sans comprendre pourquoi.
+        if role != access.ROLE_MEMBER:
+            return self._send({"error": "bad_role",
+                               "detail": "on n'invite qu'en tant que member"}, 400)
+
+        with access.session() as conn:
+            access.purge_expired_invitations(conn)
+            code = access.create_invitation(conn, role=role)
+
+        print(f"[invitation] code frappé pour un rôle {role}")
+        # ⚠️ Le CLAIR n'est rendu qu'ici, une seule fois : seule son empreinte
+        #    est stockée. Personne ne pourra le relire, pas même nous.
+        return self._send({"code": access.formater_code(code),
+                           "role": role,
+                           "expires_in": access.INVITATION_TTL_SEC})
+
+    def _corps(self):
+        """Le corps JSON, ou None (la réponse d'erreur est déjà envoyée)."""
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            body = json.loads((self.rfile.read(length) if length else b"{}").decode() or "{}")
+            if not isinstance(body, dict):
+                raise ValueError
+            return body
+        except (ValueError, json.JSONDecodeError):
+            self._send({"error": "invalid_json"}, 400)
+            return None
+
+    def _lister_acces(self):
+        """GET /access — qui a accès, et avec quels appareils.
+
+        ⭐ DEUX ÉTAGES, et c'est ce qui rend la révocation utilisable : une ligne
+        par PERSONNE, une ligne par APPAREIL. « J'ai perdu mon téléphone » coupe
+        un appareil ; « Claire est partie » coupe une personne et tous les siens.
+        Ne proposer que le second obligerait à tout couper pour un téléphone
+        égaré ; ne proposer que le premier laisserait Claire entrer.
+
+        ⚠️ Aucune empreinte n'est exposée — ni de jeton, ni d'invitation. On dit
+        QUI et QUOI, jamais COMMENT se faire passer pour eux.
+        """
+        with access.session() as conn:
+            access.purge_expired_invitations(conn)
+            personnes = [
+                # 🔒 `nom` sort ICI et NULLE PART AILLEURS : cette route est
+                #    réservée au propriétaire, sur son réseau local, pour son
+                #    propre écran. Il ne part pas au hello — cf.
+                #    `access.pour_le_hello`, dont le banc le vérifie.
+                {"uid": a["uid"], "role": a["role"],
+                 "revoked": a["revoked_ts"] is not None,
+                 "updated_ts": a["updated_ts"], "nom": a["nom"]}
+                for a in access.list_access(conn)
+            ]
+            # ⭐ « Cet appareil » : sans ce repère, retirer sa propre ligne
+            #    donne un spectacle absurde — elle disparaît et revient aussitôt
+            #    sous un autre numéro, puisque le téléphone se revendique. On
+            #    préfère ne pas proposer le geste plutôt que de l'annuler.
+            mien = access.id_of(conn, self._jeton_presente())
+            appareils = [{**t, "self": t["id"] == mien}
+                         for t in access.list_tokens(conn)]
+        return self._send({"people": personnes, "devices": appareils})
+
+    def _revoquer_personne(self):
+        """POST /access/revoke — couper QUELQU'UN, et tous ses appareils."""
+        body = self._corps()
+        if body is None:
+            return
+        uid = str(body.get("uid") or "")
+        if not uid:
+            return self._send({"error": "missing_uid"}, 400)
+
+        # 🚨 On ne se coupe pas soi-même. Un propriétaire qui se révoque laisse un
+        #    boîtier SANS PROPRIÉTAIRE, et `grant` étant en écriture unique, il
+        #    n'y a aucun chemin de retour — il faudrait désappairer.
+        with access.session() as conn:
+            jeton = self._jeton_presente()
+            if self.ben_role == access.ROLE_OWNER \
+                    and access.uid_of(conn, jeton) == uid:
+                return self._send({"error": "self_revoke",
+                                   "detail": "un propriétaire ne peut pas se révoquer"}, 400)
+            n = access.revoke_person(conn, uid)
+        print(f"[access] {uid} révoqué ({n} ligne(s))")
+        return self._send({"revoked": uid, "rows": n})
+
+    def _revoquer_appareil(self):
+        """POST /tokens/revoke — couper UN appareil, sans toucher à la personne."""
+        body = self._corps()
+        if body is None:
+            return
+        try:
+            token_id = int(body.get("id"))
+        except (TypeError, ValueError):
+            return self._send({"error": "missing_id"}, 400)
+        with access.session() as conn:
+            n = access.revoke_token(conn, token_id)
+        print(f"[access] appareil {token_id} révoqué ({n})")
+        return self._send({"revoked_device": token_id, "rows": n})
+
+    def _renommer_personne(self):
+        """POST /access/rename — mettre un prénom sur un uid. 🔒 Reste au boîtier.
+
+        ⭐ Réservé au propriétaire, et ce n'est pas un excès de zèle : c'est SON
+           écran. Sans ça, un membre pourrait se renommer « Propriétaire » ou
+           prendre le prénom de quelqu'un d'autre dans une liste où le vrai
+           identifiant n'est volontairement pas affiché.
+        """
+        body = self._corps()
+        if body is None:
+            return
+        uid = str(body.get("uid") or "")
+        if not uid:
+            return self._send({"error": "missing_uid"}, 400)
+        with access.session() as conn:
+            if not access.nommer(conn, uid, str(body.get("name") or "")):
+                return self._send({"error": "unknown_uid"}, 404)
+        return self._send({"renamed": uid})
+
+    def _creer_integration(self):
+        """POST /tokens/integration — un jeton pour une MACHINE, pas un humain.
+
+        Home Assistant, un script, un tableau de bord : ça ne se connecte pas à
+        Google et ça n'a pas de téléphone à revendiquer. Le propriétaire frappe
+        le jeton ici et le colle dans la configuration de l'outil.
+
+        ⭐ `uid` reste NUL, et ce n'est pas un raccourci : une intégration
+           n'appartient à PERSONNE. Si le propriétaire s'en va, le chauffe-eau
+           piloté par Home Assistant ne doit pas s'arrêter avec lui. C'est
+           exactement ce que le `LEFT JOIN` de `role_of` rend possible — et
+           c'est pourquoi elle se révoque à la main, comme un appareil.
+
+        ⚠️ Rôle `member`, jamais `owner`. Un jeton collé dans un fichier de
+           configuration, en clair, sur une machine qu'on n'administre pas
+           forcément, n'a aucune raison de pouvoir inviter ni désappairer.
+        """
+        body = self._corps()
+        if body is None:
+            return
+        libelle = str(body.get("label") or "").strip()[:64]
+        if not libelle:
+            return self._send({"error": "missing_label",
+                               "detail": "nommez l\'intégration pour la reconnaître plus tard"}, 400)
+        with access.session() as conn:
+            jeton = access.mint(conn, uid="", label=libelle,
+                                role=access.ROLE_MEMBER)
+        print(f"[access] jeton d'intégration frappé pour {libelle!r}")
+        # Le CLAIR ne repassera jamais : il n'est stocké nulle part.
+        return self._send({"token": jeton, "label": libelle,
+                           "role": access.ROLE_MEMBER})
+
+    def _jeton_presente(self) -> str:
+        entete = self.headers.get("Authorization", "")
+        return entete[7:].strip() if entete.lower().startswith("bearer ") else ""
 
     def _unprovision(self, qs):
         """Désappaire le boîtier : oublie le WiFi (→ provisioning BLE au prochain
@@ -323,6 +862,23 @@ class Handler(BaseHTTPRequestHandler):
             subprocess.run(
                 ["sudo", "systemctl", "stop", *_reader_units()],
                 stderr=subprocess.DEVNULL)
+
+            # 🚨 LES DROITS PARTENT TOUJOURS, `wipe` ou pas. `wipe` concerne les
+            #    MESURES — une question de vie privée sur la consommation. Les
+            #    droits, eux, DOIVENT disparaître : `grant` est en écriture
+            #    unique pour `owner`, donc un boîtier qui garderait sa ligne
+            #    refuserait le propriétaire suivant, sans aucun recours depuis
+            #    l'app. Lier ça à `wipe` rendrait le boîtier inutilisable pour
+            #    quiconque décoche la case.
+            try:
+                with access.session() as ac:
+                    a, j = access.tout_effacer(ac)
+                print(f"[unprovision] droits effacés : {a} accès, {j} jeton(s)",
+                      flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"[unprovision] ⚠️ droits NON effacés ({e}) — "
+                      f"le prochain propriétaire sera refusé", flush=True)
+
             if wipe:
                 for suffix in ("", "-wal", "-shm"):
                     try:
@@ -619,7 +1175,81 @@ class Handler(BaseHTTPRequestHandler):
                     "count": len(rows), "points": rows})
 
 
+class _ServeurTLS(ThreadingHTTPServer):
+    """Identique au serveur en clair, mais qui DIT quand une poignée de main rate.
+
+    ⚠️ Ce n'est pas `handle_error` qu'il faut surcharger, et c'est contre-intuitif :
+    avec une socket enveloppée, la poignée de main TLS a lieu dans `accept()`,
+    donc dans `get_request()`. Or `socketserver._handle_request_noblock` avale
+    tout `OSError` levé là — et `ssl.SSLError` en hérite. Un `handle_error`
+    serait du code MORT pour le cas même qui l'a motivé.
+
+    ⭐ Par défaut, un client qui n'arrive pas à négocier disparaît donc en
+    silence. C'est précisément ce qu'on ne veut pas pendant le déploiement : une
+    app qui ne fait pas confiance à la CA BEN échouerait sans laisser la moindre
+    trace côté boîtier, et on chercherait le défaut du mauvais côté.
+
+    Le volume s'autorégule : sur un LAN, une poignée de main ratée est un
+    événement rare. Si ça inonde, c'est l'information.
+    """
+
+    def get_request(self):
+        try:
+            return super().get_request()
+        except ssl.SSLError as e:
+            print(f"[:{PORT_TLS}] poignée de main refusée — {e.reason or e} "
+                  f"(client sans la CA BEN, ou http:// sur un port chiffré)")
+            raise
+
+
+def _ecoute_tls() -> ThreadingHTTPServer | None:
+    """Prépare l'écoute chiffrée, ou renvoie None en expliquant pourquoi.
+
+    🚨 AUCUNE raison de ne pas démarrer ici ne doit empêcher :8087 de servir.
+    Un boîtier qui devient injoignable parce que son certificat est illisible
+    serait une panne créée par une amélioration de sécurité — et elle se
+    manifesterait chez le client, pas ici.
+    """
+    crt, key = f"{CERT_DIR}/device.crt", f"{CERT_DIR}/device.key"
+    if not (os.path.exists(crt) and os.path.exists(key)):
+        print(f"[:{PORT_TLS}] pas de certificat dans {CERT_DIR} — écoute chiffrée "
+              f"désactivée, :{PORT} continue de servir")
+        return None
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(crt, key)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        # ⭐ Le boîtier ne demande AUCUN certificat au client. L'app s'authentifie
+        #    par jeton (cf. `access.py`) ; le TLS ne sert ici qu'à prouver l'identité
+        #    du BOÎTIER et à chiffrer. Exiger un certificat client fermerait la porte
+        #    à Home Assistant et à tout ce qui n'est pas l'app.
+        ctx.verify_mode = ssl.CERT_NONE
+    except Exception as e:  # noqa: BLE001
+        print(f"[:{PORT_TLS}] certificat inutilisable ({e}) — écoute chiffrée "
+              f"désactivée, :{PORT} continue de servir")
+        return None
+
+    serveur = _ServeurTLS((HOST, PORT_TLS), Handler)
+    # ⭐ Le drapeau que lit /claim. Le handler est le MÊME sur les deux écoutes ;
+    #    c'est le SERVEUR qui sait s'il est chiffré, pas la requête. Se fier à un
+    #    en-tête (`X-Forwarded-Proto` et consorts) serait se fier à l'appelant.
+    serveur.chiffre = True
+    # ⚠️ Le contexte lit le certificat MAINTENANT, une fois pour toutes. Quand
+    #    `ben-certd` le remplace, il redémarre CE service — sans quoi l'écoute
+    #    servirait l'ancien certificat jusqu'à son expiration, sans une erreur
+    #    au journal. Voir config/etc/sudoers.d/ben-certd.
+    serveur.socket = ctx.wrap_socket(serveur.socket, server_side=True)
+    return serveur
+
+
 def main() -> None:
+    tls = _ecoute_tls()
+    if tls is not None:
+        threading.Thread(target=tls.serve_forever, daemon=True).start()
+        print(f"ben-local-api en écoute CHIFFRÉE sur {HOST}:{PORT_TLS}")
+
+    # L'écoute en clair reste dans le thread principal : si tout le reste échoue,
+    # c'est elle qui survit.
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"ben-local-api en écoute sur {HOST}:{PORT}")
     try:
@@ -628,6 +1258,8 @@ def main() -> None:
         pass
     finally:
         server.shutdown()
+        if tls is not None:
+            tls.shutdown()
 
 
 if __name__ == "__main__":

@@ -264,17 +264,32 @@ def basculer(candidat: str, cle_neuve: str | None) -> None:
     os.chmod(CRT, 0o644)
     log.warning("certificat remplacé (ancien conservé en .bak-%s)", horo)
 
-    # Le publisher tient une connexion TLS PERSISTANTE ouverte avec l'ancien
-    # certificat : sans redémarrage, il continuerait de l'utiliser jusqu'à ce que
-    # le serveur la ferme.
-    try:
-        subprocess.run(["sudo", "-n", "systemctl", "restart", "ben-publisher"],
-                       check=True, capture_output=True, timeout=60)
-        log.info("ben-publisher redémarré")
-    except Exception as e:  # noqa: BLE001
-        # ⚠️ Non fatal : le certificat est en place ET PROUVÉ (essai sur :8443).
-        #    `Restart=always` relèvera le publisher de toute façon.
-        log.error("redémarrage du publisher impossible : %s", e)
+    # ⭐ TOUT CE QUI TIENT LE CERTIFICAT DOIT REDÉMARRER. Un processus Python lit
+    #    son certificat UNE SEULE FOIS, à la construction de son contexte SSL ;
+    #    remplacer le fichier sous lui ne l'atteint jamais.
+    #
+    #    ben-publisher   CLIENT mTLS du cloud — et connexion PERSISTANTE, donc
+    #                    doublement figé sur l'ancien certificat.
+    #    ben-local-api   SERVEUR TLS de l'app sur :8088.
+    #
+    # 🚨 Oublier le second ne casse RIEN aujourd'hui — et c'est le piège. L'écoute
+    #    continuerait de servir l'ancien certificat, sans une erreur au journal,
+    #    jusqu'à son expiration dans 180 jours. À ce moment-là c'est l'app qui
+    #    refuserait le boîtier, et ça ressemblerait à un défaut d'app.
+    #
+    # ⚠️ Chaque unité a sa propre ligne dans sudoers : un verbe, une unité. En
+    #    ajouter une ici sans l'ajouter là-bas échoue franchement, ce qui est le
+    #    comportement voulu — on préfère un refus visible à un droit trop large.
+    for unite in ("ben-publisher", "ben-local-api"):
+        try:
+            subprocess.run(["sudo", "-n", "systemctl", "restart", unite],
+                           check=True, capture_output=True, timeout=60)
+            log.info("%s redémarré", unite)
+        except Exception as e:  # noqa: BLE001
+            # ⚠️ Non fatal : le certificat est en place ET PROUVÉ (essai sur :8443).
+            #    `Restart=always` relèvera le service de toute façon, et l'ancien
+            #    certificat reste valide entre-temps.
+            log.error("redémarrage de %s impossible : %s", unite, e)
 
 
 # ── Un tour ───────────────────────────────────────────────────────────────────

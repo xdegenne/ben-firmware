@@ -66,6 +66,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # src/pi
 import capabilities as caps  # noqa: E402
+from store import access  # noqa: E402
 from store import db  # noqa: E402
 
 # ── Réglages ──────────────────────────────────────────────────────────────────
@@ -342,12 +343,47 @@ def send_hello(cli: Client, conn: sqlite3.Connection, dev: dict) -> None:
                                "std": None if r[4] is None else bool(r[4]),
                                "papp_max": r[5]})
 
+    # ── Les DROITS nés localement ────────────────────────────────────────────
+    #
+    # ⭐ Poussés EN ENTIER à chaque hello, comme les contrats et les libellés.
+    #    Pas de boîte d'envoi : la table fait 1 à 5 lignes — un foyer et ses
+    #    habitants. Envoyer tout coûte quelques centaines d'octets par heure et
+    #    rend l'opération AUTO-RÉPARATRICE : une ligne que le cloud aurait
+    #    perdue revient au hello suivant. Avec un `sent = 1`, elle serait perdue
+    #    pour toujours, et le boîtier se croirait à jour.
+    #
+    # 🚨 AJOUT SEULEMENT, le cloud ne retire rien sur cette base. La liste du
+    #    boîtier est un SOUS-ENSEMBLE de `device_access` : quelqu'un d'inscrit
+    #    côté cloud qui n'a jamais revendiqué n'apparaît pas ici. En déduire une
+    #    suppression effacerait des droits parfaitement valides.
+    #
+    # ⚠️ La RÉVOCATION ne passe donc pas par là : c'est l'app qui la fait des
+    #    deux côtés, elle seule étant à la fois sur le LAN et sur Internet
+    #    (cf. `access.revoke_person`). Rien ne descend du cloud vers le boîtier.
+    # ⚠️ L'import est au niveau du MODULE (voir en tête), pas ici. Écrit d'abord
+    #    en local sous `try`, il échouait en silence — `import access` ne résout
+    #    pas depuis ce répertoire, c'est `from store import access`. Le hello
+    #    serait parti sans les droits, avec un warning quotidien que personne ne
+    #    lit. Un import de module échoue AU DÉMARRAGE, et bruyamment.
+    acces = []
+    try:
+        with access.session() as ac:
+            # 🔒 La projection vit dans `access`, pas ici : c'est elle qui
+            #    garantit que le prénom local ne monte JAMAIS au cloud, et le
+            #    banc la vérifie nommément.
+            acces = access.pour_le_hello(ac)
+    except Exception as e:  # noqa: BLE001
+        # La LECTURE, elle, peut légitimement échouer (base verrouillée) — et ne
+        # doit pas empêcher les mesures de partir.
+        log.warning("accès locaux illisibles (%s) — hello sans eux", e)
+
     payload = {"sw": dev.get("softwareVersion", ""),
                "model": dev.get("model", ""),
                "pdl": pdls,
                "contract_epoch": epochs,
                "tariff_labels": labels,
-               "meter_profile": profile}
+               "meter_profile": profile,
+               "access": acces}
     status, body = cli.post("/hello", payload)
     if 200 <= status < 300:
         log.info("hello OK — %d compteur(s) déclaré(s)", len(pdls))
