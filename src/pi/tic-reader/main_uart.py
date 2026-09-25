@@ -47,6 +47,8 @@ from threading import Thread
 from time import sleep
 
 import RPi.GPIO as GPIO
+
+from tic_parite import octet_valide  # noqa: E402
 import serial
 
 # Module store partagé (src/pi/store/db.py)
@@ -355,16 +357,28 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
     labels: dict = {}
     current = bytearray()
     in_line = False
-    kept = dropped = 0
+    kept = dropped = parite_ko = 0
 
     while time.time() < deadline:
         raw = ser.read(1)
         if not raw:
             continue
+        if not octet_valide(raw[0]):
+            # Caractère fautif : on le JETTE. La ligne devient courte, son
+            # checksum tombe faux, le groupe est rejeté — comportement voulu.
+            parite_ko += 1
+            continue
         b = raw[0] & 0x7F
 
         if b == ETX:
-            log.debug(f"Trame TIC complète : {kept} lignes gardées, {dropped} rejetées")
+            # ⭐ `parite_ko` est COMPTÉ, pas seulement écarté : c'est ce qui
+            #    transforme une protection muette en une mesure. Une liaison
+            #    bruyante se verra ici, au lieu de se déduire de PDL fantômes.
+            if parite_ko:
+                log.warning(f"TIC : {parite_ko} caractère(s) rejeté(s) sur "
+                            f"parité — liaison bruyante ?")
+            log.debug(f"Trame TIC complète : {kept} lignes gardées, "
+                      f"{dropped} rejetées, {parite_ko} car. hors parité")
             return labels if labels else None
         elif b == LF:
             current = bytearray()
@@ -472,6 +486,8 @@ def count_valid_groups(ser: serial.Serial, checksum_ok, window_s: float) -> int:
     while time.time() < deadline:
         raw = ser.read(1)
         if not raw:
+            continue
+        if not octet_valide(raw[0]):
             continue
         b = raw[0] & 0x7F
         if b == LF:
