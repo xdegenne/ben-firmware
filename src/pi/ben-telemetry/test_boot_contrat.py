@@ -41,13 +41,13 @@ def _frame(**tlvs):
 # (libellé, TLV de la trame boot, époque tarifaire attendue)
 CAS = [
     ("boot sur trame tronquee  (ADCO + CONTRAT='00', ni PREF ni ISOUSC)",
-     dict(T_ADCO=b"031864467282", T_CONTRAT=b"00", T_PAPP=b"\x00\x00\x00"),
+     dict(T_ADCO=b"031864000000", T_CONTRAT=b"00", T_PAPP=b"\x00\x00\x00"),
      None),
     ("boot standard complet    (PREF present, CONTRAT='TEMPO')",
-     dict(T_ADCO=b"031864467282", T_PREF=b"\x06", T_CONTRAT=b"TEMPO", T_PAPP=b"{\x00\x00"),
+     dict(T_ADCO=b"031864000000", T_PREF=b"\x06", T_CONTRAT=b"TEMPO", T_PAPP=b"{\x00\x00"),
      "TEMPO"),
     ("boot historique complet  (ISOUSC present, CONTRAT='HC..')",
-     dict(T_ADCO=b"031864467282", T_ISOUSC=b"\x1e", T_CONTRAT=b"HC..", T_PAPP=b"{\x00\x00"),
+     dict(T_ADCO=b"031864000000", T_ISOUSC=b"\x1e", T_CONTRAT=b"HC..", T_PAPP=b"{\x00\x00"),
      "HC.."),
 ]
 
