@@ -29,6 +29,21 @@ jobs:
         with:
           python-version: "3.11"
 
+      # 🚨 PAS `pip install -r src/pi/requirements.txt`, et c'est la première
+      #    chose que ce CI a apprise : ce fichier contient `rpi-lgpio`, qui ne
+      #    s'installe QUE sur un Raspberry Pi. Sur un runner x86, l'installation
+      #    echoue et rien ne tourne.
+      #
+      # ⭐ Les bancs n'en ont pas besoin — ils le prouvent en passant sur un Mac,
+      #    où `rpi-lgpio` n'existe pas davantage : ils neutralisent eux-mêmes les
+      #    modules matériels (cf. `test_read_frame.py`, qui les remplace par des
+      #    coquilles). Seuls les paquets PORTABLES sont donc nécessaires.
+      #
+      # ⚠️ Si un banc futur réclame autre chose, l'ajouter ICI — et surtout pas
+      #    en tirant tout le requirements, qui casserait le CI entier.
+      - name: Dépendances portables
+        run: pip install --quiet pyyaml pyserial cryptography
+
       - name: Bancs
         run: |
           echec=0
