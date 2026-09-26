@@ -100,7 +100,7 @@ def un_ETX_corrompu_ne_fond_pas_deux_trames():
     #    débranché, l'ETX corrompu retombe sur le masque `& 0x7F` et ferme quand
     #    même la trame — comportement d'avant la PR. Vérifié par sabotage le
     #    26/09 : il reste vert. Ceux qui prouvent le branchement sont
-    #    `un_caractere_corrompu_ne_coute_QUE_SA_LIGNE` et `le_releve_dit_POURQUOI`.
+    #    `un_octet_corrompu_ne_coute_QUE_SON_GROUPE` et `le_releve_dit_POURQUOI`.
 
 
 @cas
@@ -118,7 +118,7 @@ def un_faux_STX_de_parite_fausse_ne_demarre_pas_une_trame():
 
 
 @cas
-def un_caractere_corrompu_ne_coute_QUE_SA_LIGNE():
+def un_octet_corrompu_ne_coute_QUE_SON_GROUPE():
     """
     ⭐ La granularité de la perte, et c'est le protocole TIC qui la permet :
     chaque ligne porte SON checksum, donc une ligne corrompue n'empoisonne pas
@@ -147,7 +147,7 @@ def un_caractere_corrompu_ne_coute_QUE_SA_LIGNE():
 
 
 @cas
-def une_ligne_amputee_est_REJETEE_meme_si_le_checksum_la_valide():
+def un_groupe_ampute_est_REJETE_meme_si_le_checksum_le_valide():
     """
     🚨 LE SEUL CAS DE TOUT CE CHANTIER QUI FABRIQUAIT UNE DONNÉE FAUSSE.
 
@@ -222,7 +222,7 @@ def le_releve_n_accuse_PAS_la_parite_pour_un_octet_hors_trame():
 
 
 @cas
-def le_releve_dit_si_la_ligne_rejetee_PORTAIT_l_etiquette_cherchee():
+def le_releve_dit_si_le_groupe_rejete_PORTAIT_l_etiquette_cherchee():
     """
     ⭐ Des lignes SONT tombées, mais aucune ne portait celle qu'on cherche. Dire
        « 2 lignes rejetées » laisse croire à un lien de cause à effet qui n'existe
@@ -247,14 +247,14 @@ def le_releve_dit_si_la_ligne_rejetee_PORTAIT_l_etiquette_cherchee():
     #    passait même en supprimant tout le relevé d'étiquettes. Mesuré par
     #    sabotage — il restait vert.
     cause = m._cause_rejets("PTEC")
-    assert "aucune ne portait" not in cause, (
+    assert "aucun ne portait" not in cause, (
         f"PTEC est tombée, et le relevé prétend qu'aucune ligne ne la portait : "
         f"{cause!r}")
-    assert "rejetée(s) sur checksum" in cause, f"cause muette : {cause!r}"
+    assert "rejeté(s) sur checksum" in cause, f"cause muette : {cause!r}"
 
     # On cherchait IINST : une ligne est tombée, mais ce n'était pas elle.
     cause = m._cause_rejets("IINST")
-    assert "aucune ne portait IINST" in cause, (
+    assert "aucun ne portait IINST" in cause, (
         f"une ligne sans rapport est imputée à IINST : {cause!r}")
     assert "probablement" in cause, (
         "l'indice est présenté comme une certitude : une étiquette corrompue "
@@ -324,7 +324,7 @@ def le_releve_dit_POURQUOI_une_etiquette_manque():
     abimee = ligne("PAPP 00450 X")
     abimee[7] = corrompu(abimee[7] & 0x7F)      # dans la VALEUR : le nom survit
     m.read_frame(FauxPort([sain(STX)] + abimee + [sain(ETX)]), tout_bon, range_brut)
-    assert "sur parité" in m._cause_rejets("PAPP"), (
+    assert "hors parité" in m._cause_rejets("PAPP"), (
         f"une ligne condamnée par la parité n'est pas rapportée : "
         f"{m._cause_rejets('PAPP')!r}")
 

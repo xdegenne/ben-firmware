@@ -390,7 +390,7 @@ def _signaler_parite(n: int) -> None:
     # ⓘ Rien à dire quand rien n'est rejeté : le silence EST l'information.
     if _parite_cumul["car"]:
         log.warning(
-            f"TIC : {_parite_cumul['car']} caractère(s) rejeté(s) sur parité "
+            f"TIC : {_parite_cumul['car']} octet(s) rejeté(s) sur parité "
             f"dans {_parite_cumul['trames']} trame(s) en {ecoule / 60:.0f} min "
             f"— liaison bruyante ?")
     _parite_cumul.update(car=0, trames=0, debut=maintenant)
@@ -418,7 +418,7 @@ def _signaler_parite(n: int) -> None:
 #    `parite` compte TOUT : la synchronisation sur STX, l'inter-ligne, les
 #    lignes. C'est la mesure du BRUIT de la liaison, et elle doit tout voir.
 #
-#    `parite_lignes` ne compte que les octets tombés À L'INTÉRIEUR d'une ligne,
+#    `parite_groupes` ne compte que les octets tombés À L'INTÉRIEUR d'une ligne,
 #    donc les seuls qui ont réellement fait rejeter quelque chose. C'est la
 #    mesure de l'IMPUTATION.
 #
@@ -431,7 +431,7 @@ def _signaler_parite(n: int) -> None:
 #    n'est jamais émis, un octet bruité traîne avant le STX, et le message
 #    accuse la parité au lieu de dire que le compteur n'émet pas cette étiquette.
 _derniere_trame = {"gardees": 0, "rejetees": 0, "parite": 0,
-                   "parite_lignes": 0, "etiquettes_rejetees": set()}
+                   "parite_groupes": 0, "etiquettes_rejetees": set()}
 
 
 def _cause_rejets(etiquette: str = "") -> str:
@@ -441,14 +441,14 @@ def _cause_rejets(etiquette: str = "") -> str:
     connaissent, donc on peut répondre sur ELLE plutôt que sur la trame entière.
     """
     r  = _derniere_trame["rejetees"]
-    pa = _derniere_trame["parite_lignes"]
+    pa = _derniere_trame["parite_groupes"]
     vues = _derniere_trame["etiquettes_rejetees"]
 
     if not r:
         # 🚨 AUCUNE ligne rejetée, et l'étiquette manque : ce n'est donc NI le
         #    checksum NI la parité. C'est le compteur qui ne l'émet pas — mode,
         #    triphasé, trame courte. C'est CE cas que l'ancien message masquait.
-        return " — aucune ligne rejetée : cette étiquette n'est pas émise ?"
+        return " — aucun groupe rejeté : cette étiquette n'est pas émise ?"
 
     if etiquette and etiquette not in vues:
         # Des lignes SONT tombées, mais aucune ne portait celle-ci.
@@ -465,17 +465,17 @@ def _cause_rejets(etiquette: str = "") -> str:
         #    était émise, et abîmée. On dit donc ce qu'on sait, et on nomme le
         #    doute au lieu de le taire.
         if pa:
-            return (f" — {r} ligne(s) rejetée(s), dont {pa} caractère(s) sur parité ; "
-                    f"aucune ne portait {etiquette}, mais la parité a pu en abîmer le nom")
-        return (f" — {r} ligne(s) rejetée(s) sur checksum, aucune ne portait "
+            return (f" — {r} groupe(s) rejeté(s), dont {pa} octet(s) hors parité ; "
+                    f"aucun ne portait {etiquette}, mais la parité a pu en abîmer le nom")
+        return (f" — {r} groupe(s) rejeté(s) sur checksum, aucun ne portait "
                 f"{etiquette} : cette étiquette n'est probablement pas émise")
 
     if pa:
-        return f" — {r} ligne(s) rejetée(s), dont {pa} caractère(s) sur parité"
-    return f" — {r} ligne(s) rejetée(s) sur checksum"
+        return f" — {r} groupe(s) rejeté(s), dont {pa} octet(s) hors parité"
+    return f" — {r} groupe(s) rejeté(s) sur checksum"
 
 
-def _note_ligne_rejetee(vues: set, brut: bytes | bytearray | str) -> None:
+def _note_groupe_rejete(vues: set, brut: bytes | bytearray | str) -> None:
     """Relève l'étiquette d'une ligne rejetée, pour pouvoir l'imputer.
 
     ⚠️ `vues` est LOCAL à la trame en cours, jamais l'ensemble du relevé. Une
@@ -505,7 +505,7 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
     #    décrire la trame PRÉCÉDENTE. Inoffensif aujourd'hui — l'appelant
     #    n'interroge le relevé que sur une trame lue — mais c'est le genre de
     #    dépendance invisible qui se paie au premier appelant suivant.
-    _derniere_trame.update(gardees=0, rejetees=0, parite=0, parite_lignes=0,
+    _derniere_trame.update(gardees=0, rejetees=0, parite=0, parite_groupes=0,
                            etiquettes_rejetees=set())
 
     # Synchronisation sur STX.
@@ -533,16 +533,16 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
         #    comptés : le résumé n'apparaîtrait pas, et le silence se lirait
         #    « tout va bien ».
         _signaler_parite(parite_ko)
-        log.warning(f"TIC timeout en attente STX ({parite_ko} car. hors parité)")
+        log.warning(f"TIC timeout en attente STX ({parite_ko} octet(s) hors parité)")
         return None
 
     labels: dict = {}
-    parite_lignes = 0          # sous-ensemble de parite_ko : voir _derniere_trame
+    parite_groupes = 0          # sous-ensemble de parite_ko : voir _derniere_trame
     etiquettes_ko: set = set()
     current = bytearray()
     in_line = False
     # 🚨 UN SEUL OCTET FAUTIF CONDAMNE TOUTE LA LIGNE. Voir au CR pourquoi.
-    ligne_douteuse = False
+    groupe_douteux = False
     kept = dropped = 0
 
     while time.time() < deadline:
@@ -564,7 +564,7 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
             #    corruption. Le coût réel est UNE TRAME PERDUE.
             #
             # ⭐ Mais fermer ici coûte trois lignes et rend le découpage
-            #    prévisible, alors que fondre rend les compteurs (gardées,
+            #    prévisible, alors que fondre rend les compteurs (gardés,
             #    rejetées, parité) faux : ils porteraient sur deux trames en
             #    disant une. C'est la MESURE qu'on protège, pas la donnée.
             #
@@ -572,9 +572,9 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
             #    resynchronise. On les laisse tomber.
             if (raw[0] & 0x7F) == ETX:
                 log.debug(f"TIC : ETX corrompu (parité) — trame close ici plutôt "
-                          f"que fondue avec la suivante ; {kept} ligne(s) gardée(s)")
+                          f"que fondue avec la suivante ; {kept} groupe(s) gardé(s)")
                 _derniere_trame.update(gardees=kept, rejetees=dropped, parite=parite_ko,
-                                   parite_lignes=parite_lignes,
+                                   parite_groupes=parite_groupes,
                                    etiquettes_rejetees=etiquettes_ko)
                 _signaler_parite(parite_ko)
                 return labels if labels else None
@@ -601,8 +601,8 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
             #    contrôles réunis ». C'était vrai du CARACTÈRE, faux de la LIGNE —
             #    parce que le code ne rejetait pas la ligne.
             if in_line:
-                ligne_douteuse = True
-                parite_lignes += 1      # celui-là, lui, a coûté une ligne
+                groupe_douteux = True
+                parite_groupes += 1      # celui-là, lui, a coûté une ligne
             continue
         b = raw[0] & 0x7F
 
@@ -611,25 +611,25 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
             #    transforme une protection muette en une mesure. Une liaison
             #    bruyante se verra, au lieu de se déduire de PDL fantômes.
             _derniere_trame.update(gardees=kept, rejetees=dropped, parite=parite_ko,
-                                   parite_lignes=parite_lignes,
+                                   parite_groupes=parite_groupes,
                                    etiquettes_rejetees=etiquettes_ko)
             _signaler_parite(parite_ko)
-            log.debug(f"Trame TIC complète : {kept} lignes gardées, "
-                      f"{dropped} rejetées, {parite_ko} car. hors parité")
+            log.debug(f"Trame TIC complète : {kept} groupe(s) gardé(s), "
+                      f"{dropped} rejeté(s), {parite_ko} octet(s) hors parité")
             return labels if labels else None
         elif b == LF:
             current = bytearray()
             in_line = True
-            ligne_douteuse = False
+            groupe_douteux = False
         elif b == CR:
-            if in_line and ligne_douteuse:
+            if in_line and groupe_douteux:
                 # On ne CONSULTE même pas le checksum : il ne peut pas trancher,
                 # puisqu'il est aveugle à ce qui manque une fois sur soixante-quatre.
-                log.debug("Ligne rejetée : un caractère au moins hors parité")
-                _note_ligne_rejetee(etiquettes_ko, current)
+                log.debug("Groupe rejeté : au moins un octet hors parité")
+                _note_groupe_rejete(etiquettes_ko, current)
                 dropped += 1
                 in_line = False
-                ligne_douteuse = False
+                groupe_douteux = False
                 continue
             if in_line and current:
                 line = current.decode("ascii", errors="replace")
@@ -638,7 +638,7 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
                     kept += 1
                 else:
                     log.debug(f"Checksum invalide : <{line}>")
-                    _note_ligne_rejetee(etiquettes_ko, line)
+                    _note_groupe_rejete(etiquettes_ko, line)
                     dropped += 1
             in_line = False
         elif in_line:
@@ -647,11 +647,11 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
     # ⚠️ Même raison qu'au timeout de synchronisation : c'est précisément quand
     #    tout échoue qu'il faut que le compteur parle.
     _derniere_trame.update(gardees=kept, rejetees=dropped, parite=parite_ko,
-                                   parite_lignes=parite_lignes,
+                                   parite_groupes=parite_groupes,
                                    etiquettes_rejetees=etiquettes_ko)
     _signaler_parite(parite_ko)
-    log.warning(f"TIC timeout en lecture trame ({kept} gardée(s), {dropped} "
-                f"rejetée(s), {parite_ko} car. hors parité)")
+    log.warning(f"TIC timeout en lecture trame ({kept} groupe(s) gardé(s), {dropped} "
+                f"rejeté(s), {parite_ko} octet(s) hors parité)")
     return None
 
 # ---------------------------------------------------------------------------
