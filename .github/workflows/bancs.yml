@@ -1,0 +1,67 @@
+# Lance les bancs Python à chaque poussée.
+#
+# 🚨 POURQUOI CE FICHIER EXISTE. Il n'y avait AUCUN CI — ni ici, ni sur ben-api,
+#    ni sur ben-app — alors que neuf bancs existaient déjà. Ils ne tournaient
+#    donc que quand quelqu'un y pensait.
+#
+#    Le 26/09, `read_frame` a été modifié TROIS FOIS dans la même soirée
+#    (synchronisation STX, ETX corrompu, relevé des compteurs). Les bancs ont été
+#    lancés à la main à chaque fois. Un oubli, et le défaut partait sur un
+#    boîtier avant d'être vu.
+#
+# ⭐ Les neuf bancs tournent SANS MATÉRIEL — vérifié le 26/09, 9/9 sur un Mac.
+#    C'est ce qui rend ce fichier possible en quinze lignes plutôt qu'en chantier.
+#
+# ⓘ Gratuit : Actions est illimité sur les dépôts publics.
+name: bancs
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Bancs
+        run: |
+          echec=0
+          for f in $(find src -name "test_*.py" | sort); do
+            echo "── $f"
+            # ⚠️ Chaque banc se lance DEPUIS SON RÉPERTOIRE : ils importent
+            #    leurs voisins par leur nom nu (`import db`, `import main_uart`),
+            #    sans paquet. C'est aussi comme ça qu'ils tournent sur le Pi.
+            ( cd "$(dirname "$f")" && python3 "$(basename "$f")" ) || echec=1
+          done
+          exit $echec
+
+      - name: Couverture
+        # ⚠️ INDICATIF, et jamais bloquant. La couverture mesure les lignes
+        #    EXÉCUTÉES, pas les comportements VÉRIFIÉS : un test sans assertion
+        #    marque 100 %. Cette soirée en a produit un — une assertion qui ne
+        #    pouvait pas échouer, et qui est passée au vert pendant des heures.
+        #
+        # ⭐ Utile comme PLANCHER : on voit si une modification fait baisser le
+        #    chiffre. Pas comme note.
+        if: always()
+        run: |
+          pip install --quiet coverage
+          rm -rf /tmp/cov && mkdir -p /tmp/cov
+          for f in $(find src -name "test_*.py" | sort); do
+            ( cd "$(dirname "$f")" \
+              && COVERAGE_FILE=/tmp/cov/.coverage python3 -m coverage run \
+                   --parallel-mode --source=. "$(basename "$f")" >/dev/null 2>&1 )
+          done
+          cd /tmp/cov
+          COVERAGE_FILE=/tmp/cov/.coverage python3 -m coverage combine >/dev/null
+          echo '### Couverture des bancs Python' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          COVERAGE_FILE=/tmp/cov/.coverage python3 -m coverage report \
+            | tail -25 >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
