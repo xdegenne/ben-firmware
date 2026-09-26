@@ -124,10 +124,14 @@ def un_caractere_corrompu_ne_coute_QUE_SA_LIGNE():
     chaque ligne porte SON checksum, donc une ligne corrompue n'empoisonne pas
     le groupe.
     """
-    # Le checksum injecté refuse toute ligne amputée — ce que fait le vrai.
+    # ⚠️ Ce commentaire disait « le checksum injecté refuse toute ligne amputée —
+    #    ce que fait le vrai ». C'ÉTAIT FAUX, et le cas suivant le prouve : le vrai
+    #    checksum ne voit la somme que modulo 64, donc il accepte certaines lignes
+    #    amputées. Ici on injecte un checksum PARFAIT — plus strict que le vrai —
+    #    pour que ce cas ne porte que sur le découpage.
     attendues = {"PREMIERE 111 X", "TROISIEME 333 X"}
 
-    def checksum_strict(l):
+    def checksum_parfait(l):
         return l in attendues or l == "DEUXIEME 222 X"
 
     flux = [sain(STX)] + ligne("PREMIERE 111 X")
@@ -135,11 +139,90 @@ def un_caractere_corrompu_ne_coute_QUE_SA_LIGNE():
     abimee[3] = corrompu(abimee[3] & 0x7F)      # un caractère de la 2ᵉ ligne
     flux += abimee + ligne("TROISIEME 333 X") + [sain(ETX)]
 
-    labels = m.read_frame(FauxPort(flux), checksum_strict, range_brut)
+    labels = m.read_frame(FauxPort(flux), checksum_parfait, range_brut)
 
     assert "PREMIERE" in labels and "TROISIEME" in labels, (
         f"les lignes saines ont été perdues : {labels}")
     assert "DEUXIEME" not in labels, "la ligne amputée a été gardée"
+
+
+@cas
+def une_ligne_amputee_est_REJETEE_meme_si_le_checksum_la_valide():
+    """
+    🚨 LE SEUL CAS DE TOUT CE CHANTIER QUI FABRIQUAIT UNE DONNÉE FAUSSE.
+
+       Le code jetait le CARACTÈRE hors parité et gardait la ligne, en comptant
+       sur le checksum pour rattraper l'amputation. Il ne peut pas : il vaut
+       `(somme & 0x3F) + 0x20`, donc il est aveugle à tout retrait dont la somme
+       est un multiple de 64.
+
+    ⚖️ LE TÉMOIN EST DANS LE CAS LUI-MÊME, et c'est ce qui le rend concluant :
+       on donne ici le VRAI checksum, celui du compteur. La ligne amputée et la
+       ligne entière ont le MÊME — on l'affirme par assertion avant de mesurer le
+       comportement du lecteur. Sans cette première assertion, un lecteur qui
+       rejetterait la ligne pour n'importe quelle autre raison passerait le test.
+    """
+    def ck(corps):
+        return chr((sum(map(ord, corps)) & 0x3F) + 0x20)
+
+    entiere = "HCHC 001000000"          # un INDEX : la donnée la plus lourde
+    amputee = "HCHC 00100"              # quatre '0' retirés → 4 × 0x30 = 192
+    assert ck(entiere) == ck(amputee), (
+        "prémisse fausse : le checksum distingue ces deux lignes, "
+        "le cas ne prouverait plus rien")
+
+    # ⭐ On injecte le VRAI validateur de production, pas une imitation : si
+    #    `tic_checksum_ok` changeait de convention, ce cas le saurait.
+    flux = [sain(STX), sain(LF)] + [sain(ord(c)) for c in amputee]
+    flux += [corrompu(ord("0")) for _ in range(4)]          # les quatre perdus
+    flux += [sain(ord(c)) for c in " " + ck(entiere)]        # le checksum ÉMIS
+    flux += [sain(CR), sain(ETX)]
+
+    labels = m.read_frame(FauxPort(flux), m.tic_checksum_ok, range_brut)
+
+    assert not labels or "HCHC" not in labels, (
+        f"index FAUX enregistré : {labels} — la ligne amputée a passé les deux "
+        f"contrôles, exactement le défaut que ce cas existe pour interdire")
+    assert m._derniere_trame["rejetees"] == 1, (
+        f"la ligne n'est pas comptée comme rejetée : {m._derniere_trame} — "
+        f"le relevé mentirait sur la santé de la liaison")
+
+
+@cas
+def une_liaison_si_bruyante_quelle_expire_est_QUAND_MEME_comptee():
+    """
+    🚨 Le cas que le compteur existe pour mesurer, et le seul où il se taisait.
+
+       Les deux sorties sur expiration de délai rendaient `None` sans rien
+       signaler. Or une liaison assez bruyante pour qu'AUCUNE trame n'aboutisse
+       est précisément celle dont on veut connaître le bruit : sans ces appels,
+       `parite_ko` était perdu à chaque tour, le résumé périodique restait muet,
+       et le silence se lisait « tout va bien ».
+
+    ⚠️ Deux sorties, donc deux moitiés : expirer en cherchant le STX, et expirer
+       en lisant la trame. Une seule des deux corrigée laisserait un trou.
+    """
+    vrai_delai, m.TIC_TIMEOUT_S = m.TIC_TIMEOUT_S, 0.05
+    try:
+        # ── moitié 1 : on n'accroche jamais le STX ──────────────────────────
+        m._parite_cumul.update(car=0, trames=0, debut=0.0)
+        m.read_frame(FauxPort([corrompu(ord("A"))] * 3), tout_bon, range_brut)
+        assert m._parite_cumul["car"] == 3, (
+            f"expiration en synchronisation : {m._parite_cumul['car']} rejet(s) "
+            f"compté(s) au lieu de 3 — la mesure de bruit sous-estime le réel")
+
+        # ── moitié 2 : STX accroché, mais jamais d'ETX ──────────────────────
+        m._parite_cumul.update(car=0, trames=0, debut=0.0)
+        m.read_frame(FauxPort([sain(STX)] + [corrompu(ord("A"))] * 2),
+                     tout_bon, range_brut)
+        assert m._parite_cumul["car"] == 2, (
+            f"expiration en lecture : {m._parite_cumul['car']} rejet(s) compté(s) "
+            f"au lieu de 2")
+        assert m._derniere_trame["parite"] == 2, (
+            f"le relevé de la dernière trame est resté en arrière : "
+            f"{m._derniere_trame} — `_cause_rejets()` accuserait le compteur")
+    finally:
+        m.TIC_TIMEOUT_S = vrai_delai
 
 
 @cas

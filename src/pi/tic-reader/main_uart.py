@@ -458,12 +458,20 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
         if (raw[0] & 0x7F) == STX:
             break
     else:
-        log.warning("TIC timeout en attente STX")
+        # ⚠️ Compter AVANT de renoncer. Sur une ligne très bruitée — le cas même
+        #    que ce compteur existe pour mesurer — la synchronisation échoue à
+        #    chaque tour, et sans cette ligne les rejets ne seraient JAMAIS
+        #    comptés : le résumé n'apparaîtrait pas, et le silence se lirait
+        #    « tout va bien ».
+        _signaler_parite(parite_ko)
+        log.warning(f"TIC timeout en attente STX ({parite_ko} car. hors parité)")
         return None
 
     labels: dict = {}
     current = bytearray()
     in_line = False
+    # 🚨 UN SEUL OCTET FAUTIF CONDAMNE TOUTE LA LIGNE. Voir au CR pourquoi.
+    ligne_douteuse = False
     kept = dropped = 0
 
     while time.time() < deadline:
@@ -497,6 +505,30 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
                 _derniere_trame.update(gardees=kept, rejetees=dropped, parite=parite_ko)
                 _signaler_parite(parite_ko)
                 return labels if labels else None
+
+            # 🚨 LA LIGNE EN COURS EST CONDAMNÉE, et ce n'est pas du zèle.
+            #
+            #    Jeter le caractère et garder le reste supposait que le checksum
+            #    rattraperait l'amputation. FAUX : il vaut (somme & 0x3F) + 0x20,
+            #    donc il ne voit la somme QUE MODULO 64. Si les caractères
+            #    retirés somment à un multiple de 64, la ligne raccourcie porte
+            #    le MÊME checksum et passe.
+            #
+            #    Et ce n'est pas exotique :
+            #        2 espaces   2 × 0x20 = 64   ← le SÉPARATEUR des champs
+            #        4 zéros     4 × 0x30 = 192  ← dans un INDEX
+            #        1 arobase   1 × 0x40 = 64
+            #
+            # 🚨 Conséquence mesurée sur le papier : « 001000000 » amputé de
+            #    quatre zéros devient « 00100 » — un index FAUX, accepté, écrit
+            #    en base. C'est le seul défaut de tout ce chantier qui
+            #    fabriquerait une donnée erronée plutôt que d'en perdre une.
+            #
+            # ⚠️ La note de la PR affirmait « 1 bit → aucun cas ne passe les deux
+            #    contrôles réunis ». C'était vrai du CARACTÈRE, faux de la LIGNE —
+            #    parce que le code ne rejetait pas la ligne.
+            if in_line:
+                ligne_douteuse = True
             continue
         b = raw[0] & 0x7F
 
@@ -512,7 +544,16 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
         elif b == LF:
             current = bytearray()
             in_line = True
+            ligne_douteuse = False
         elif b == CR:
+            if in_line and ligne_douteuse:
+                # On ne CONSULTE même pas le checksum : il ne peut pas trancher,
+                # puisqu'il est aveugle à ce qui manque une fois sur soixante-quatre.
+                log.debug("Ligne rejetée : un caractère au moins hors parité")
+                dropped += 1
+                in_line = False
+                ligne_douteuse = False
+                continue
             if in_line and current:
                 line = current.decode("ascii", errors="replace")
                 if checksum_ok(line):
@@ -525,7 +566,12 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
         elif in_line:
             current.append(b)
 
-    log.warning("TIC timeout en lecture trame")
+    # ⚠️ Même raison qu'au timeout de synchronisation : c'est précisément quand
+    #    tout échoue qu'il faut que le compteur parle.
+    _derniere_trame.update(gardees=kept, rejetees=dropped, parite=parite_ko)
+    _signaler_parite(parite_ko)
+    log.warning(f"TIC timeout en lecture trame ({kept} gardée(s), {dropped} "
+                f"rejetée(s), {parite_ko} car. hors parité)")
     return None
 
 # ---------------------------------------------------------------------------

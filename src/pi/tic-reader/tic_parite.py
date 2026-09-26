@@ -36,6 +36,23 @@ def octet_valide(octet: int) -> bool:
     ⚠️ Calculé exhaustivement sur les corruptions de 1 ou 2 bits :
            1 bit  → AUCUNE ne passe les deux contrôles réunis
            2 bits → 17 cas sur 612 passent encore
+
+    🚨 MAIS CE COMPTE PORTE SUR LE CARACTÈRE, PAS SUR LA LIGNE — et la première
+       version du lecteur confondait les deux. Elle jetait le caractère fautif et
+       gardait le reste de la ligne, en supposant que le checksum rattraperait
+       l'amputation. Il ne peut pas : aveugle modulo 64, il valide toute ligne
+       dont les caractères retirés somment à un multiple de 64.
+
+           2 espaces  2 × 0x20 = 64   ← et l'espace est le SÉPARATEUR
+           4 zéros    4 × 0x30 = 192  ← et le zéro est dans tous les INDEX
+           1 arobase  1 × 0x40 = 64
+
+       « 001000000 » amputé de quatre zéros devient « 00100 », même checksum,
+       index FAUX enregistré. L'affirmation ci-dessus ne vaut donc QUE parce que
+       `read_frame` condamne désormais la ligne ENTIÈRE dès qu'un de ses
+       caractères échoue à la parité — sans consulter le checksum, qui ne peut
+       pas trancher. Voir `test_read_frame.py` :
+       `une_ligne_amputee_est_REJETEE_meme_si_le_checksum_la_valide`.
        La parité ne rend pas les erreurs impossibles ; elle supprime l'angle
        MORT SYSTÉMATIQUE du checksum. On passe d'un événement simple et fréquent
        qui traverse, à une coïncidence rare — deux bits dans le même caractère,
