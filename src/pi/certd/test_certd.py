@@ -11,6 +11,7 @@ seul ne prouverait rien : ce sont les REFUS qui valident les gardes.
 
     python3 src/pi/certd/test_certd.py
 """
+import datetime
 import pathlib
 import shutil
 import subprocess
@@ -32,6 +33,16 @@ def cas(fn):
 # ⭐ L'AGENT tourne avec OpenSSL 3 sur le Pi. Le banc doit donc forger ses
 #    certificats avec le MÊME outil — sinon il valide un monde qui n'existe pas.
 #    (macOS livre LibreSSL, qui refuse `-not_after` et les durées négatives.)
+#
+# ⚠️ CE DIAGNOSTIC ÉTAIT INCOMPLET, et le CI l'a montré le 26/09 : ce n'est pas
+#    « OpenSSL 3 contre LibreSSL ». Les options `-not_before` / `-not_after` sont
+#    arrivées en **OpenSSL 3.2** (fin 2023). Ubuntu 24.04 — donc le runner GitHub
+#    — livre 3.0.13 et ne les connaît pas. Le banc passait sur un Mac avec
+#    Homebrew et tombait ailleurs.
+#
+# ⇒ Le seul cas qui a besoin de DATES ARBITRAIRES est forgé en Python
+#   (`_certificat_expire`), sans dépendre d'aucune version d'outil. Tout le
+#   reste continue de passer par `openssl`, avec `-days`, qui marche partout.
 OSSL = next((p for p in ("/opt/homebrew/opt/openssl@3/bin/openssl",
                          "/usr/local/opt/openssl@3/bin/openssl")
              if shutil.which(p)), "openssl")
@@ -40,6 +51,52 @@ OSSL = next((p for p in ("/opt/homebrew/opt/openssl@3/bin/openssl",
 def ossl(*a, entree=None):
     return subprocess.run([OSSL, *a], input=entree,
                           capture_output=True, check=True).stdout
+
+
+def _certificat_expire(ca_crt, ca_key, cle, cn: str, sortie) -> None:
+    """Forge un certificat DÉJÀ EXPIRÉ, sans dépendre de la version d'openssl.
+
+    ⭐ `cryptography` accepte des dates arbitraires ; `openssl x509 -req` ne le
+    permet qu'à partir de la 3.2, que le runner GitHub n'a pas. C'est le seul
+    endroit du banc qui en a besoin — les autres certificats se font avec
+    `-days`, qui existe partout.
+
+    ⚠️ Les extensions reproduisent EXACTEMENT celles du chemin openssl : si
+    elles divergeaient, ce cas validerait un certificat que la production ne
+    produit pas, et le garde éprouvé ne serait pas le bon.
+    """
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.x509.oid import NameOID
+
+    ca = x509.load_pem_x509_certificate(pathlib.Path(ca_crt).read_bytes())
+    ca_k = serialization.load_pem_private_key(
+        pathlib.Path(ca_key).read_bytes(), password=None)
+    pub = serialization.load_pem_private_key(
+        pathlib.Path(cle).read_bytes(), password=None).public_key()
+
+    maintenant = datetime.datetime.now(datetime.timezone.utc)
+    sujet = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, cn),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "BEN"),
+    ])
+
+    crt = (x509.CertificateBuilder()
+           .subject_name(sujet)
+           .issuer_name(ca.subject)
+           .public_key(pub)
+           .serial_number(x509.random_serial_number())
+           .not_valid_before(maintenant - datetime.timedelta(days=730))
+           .not_valid_after(maintenant - datetime.timedelta(days=365))
+           .add_extension(x509.SubjectAlternativeName([x509.DNSName(cn)]), False)
+           .add_extension(x509.ExtendedKeyUsage([
+               x509.oid.ExtendedKeyUsageOID.SERVER_AUTH,
+               x509.oid.ExtendedKeyUsageOID.CLIENT_AUTH]), False)
+           .add_extension(x509.BasicConstraints(ca=False, path_length=None), True)
+           .sign(ca_k, hashes.SHA256()))
+
+    pathlib.Path(sortie).write_bytes(
+        crt.public_bytes(serialization.Encoding.PEM))
 
 
 class Atelier:
@@ -77,16 +134,13 @@ class Atelier:
                        "basicConstraints=critical,CA:FALSE\n")
         ossl("req", "-new", "-key", str(cle), "-subj", f"/CN={cn}/O=BEN",
              "-out", str(csr))
-        dates = ["-days", str(jours)]
         if expire:
             # Deux ans en arrière, expiré depuis un an : le cas du boîtier
             # revenu après une longue absence.
-            hier = time.gmtime(time.time() - 365 * 86400)
-            avant = time.gmtime(time.time() - 730 * 86400)
-            dates = ["-not_before", time.strftime("%Y%m%d%H%M%SZ", avant),
-                     "-not_after", time.strftime("%Y%m%d%H%M%SZ", hier)]
+            _certificat_expire(self.ca_crt, self.ca_key, cle, cn, crt)
+            return crt
         ossl("x509", "-req", "-in", str(csr), "-CA", str(self.ca_crt),
-             "-CAkey", str(self.ca_key), "-CAcreateserial", *dates,
+             "-CAkey", str(self.ca_key), "-CAcreateserial", "-days", str(jours),
              "-extfile", str(ext), "-out", str(crt))
         return crt
 
