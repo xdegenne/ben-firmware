@@ -262,6 +262,45 @@ def le_releve_dit_si_le_groupe_rejete_PORTAIT_l_etiquette_cherchee():
 
 
 @cas
+def un_groupe_perdu_par_son_CR_ou_son_LF_est_COMPTE_quand_meme():
+    """
+    🚨 Le dernier endroit où le relevé accusait encore le compteur à tort.
+
+       Un groupe n'est évalué qu'à son CR. Si c'est le CR lui-même qui échoue à
+       la parité, le LF suivant remet `groupe_douteux` à faux AVANT que le groupe
+       soit compté : il disparaît sans laisser de trace dans `rejetees`. Et si
+       c'est le LF qui échoue, `in_line` reste faux, donc les octets du groupe
+       sont jetés un par un sans que rien ne l'enregistre.
+
+       Dans les deux cas `_cause_rejets` voit `rejetees == 0`, prend la branche
+       « aucun groupe rejeté » et annonce « cette étiquette n'est pas émise ».
+       On accuse le compteur alors que la liaison est bruyante — exactement le
+       mauvais diagnostic que cette PR existe pour supprimer.
+
+    ⚖️ Le témoin est dans le cas : on vérifie d'abord que les groupes SAINS de la
+       même trame sont bien lus. Sans ça, un lecteur qui ne rendrait plus rien du
+       tout satisferait l'assertion principale.
+    """
+    for quoi, place in (("CR", -1), ("LF", 0)):
+        groupe = ligne("PAPP 00450 X")
+        groupe[place] = corrompu(groupe[place] & 0x7F)
+        flux = ([sain(STX)] + ligne("ADCO 021861000000 X") + groupe
+                + ligne("IINST 003 X") + [sain(ETX)])
+        labels = m.read_frame(FauxPort(flux), tout_bon, range_brut)
+
+        assert labels and "ADCO" in labels and "IINST" in labels, (
+            f"{quoi} corrompu : les groupes sains sont perdus aussi — {labels}")
+        assert "PAPP" not in labels, f"{quoi} corrompu : groupe abîmé accepté — {labels}"
+        assert m._derniere_trame["rejetees"] >= 1, (
+            f"{quoi} corrompu : le groupe disparaît sans être compté — "
+            f"{m._derniere_trame}")
+        cause = m._cause_rejets("PAPP")
+        assert "n'est pas émise" not in cause, (
+            f"{quoi} corrompu : on accuse le COMPTEUR alors que c'est la "
+            f"LIAISON — {cause!r}")
+
+
+@cas
 def une_liaison_si_bruyante_quelle_expire_est_QUAND_MEME_comptee():
     """
     🚨 Le cas que le compteur existe pour mesurer, et le seul où il se taisait.
@@ -299,6 +338,46 @@ def une_liaison_si_bruyante_quelle_expire_est_QUAND_MEME_comptee():
 
 
 @cas
+def cent_trames_REELLES_et_saines_ne_perdent_AUCUN_groupe():
+    """
+    ⚖️ LE TÉMOIN DE TOUT CE CHANTIER, et il manquait.
+
+       Tous les autres cas prouvent qu'on rejette ce qu'il faut. Aucun ne
+       prouvait qu'on ne rejette QUE ça — or un lecteur qui refuserait tout les
+       satisferait tous, et ne lirait plus rien, en silence. C'est le risque que
+       la condamnation du groupe entier a introduit : elle est plus sévère
+       qu'avant, et « plus sévère » doit se mesurer, pas s'espérer.
+
+    ⭐ Sur la VRAIE trame d'un boîtier en production, pas sur une fabrication :
+       elle porte le cas limite d'un checksum valant l'espace (PTEC), un PAPP à
+       zéro, onze groupes de longueurs différentes. Rejouée cent fois d'affilée,
+       elle éprouve aussi l'enchaînement ETX→STX.
+    """
+    import sys as _sys
+    _sys.path.insert(0, "../lora-receiver")
+    import banc_frames
+
+    brut = banc_frames.frame_bytes("ben0003_histo_hc_prod")
+    flux = [sain(o) for o in brut] * 100        # 7 bits + parité paire, comme sur le fil
+    port = FauxPort(flux)
+
+    trames = gardes = rejetes = parite = 0
+    while True:
+        labels = m.read_frame(port, m.tic_checksum_ok, m._parse_label)
+        if labels is None:
+            break
+        trames += 1
+        gardes  += m._derniere_trame["gardees"]
+        rejetes += m._derniere_trame["rejetees"]
+        parite  += m._derniere_trame["parite"]
+
+    assert trames == 100, f"trames perdues : {trames}/100"
+    assert gardes == 1100, f"groupes perdus : {gardes}/1100 gardés"
+    assert rejetes == 0, f"SUR-REJET : {rejetes} groupe(s) sains refusés"
+    assert parite == 0, f"parité mal calculée : {parite} octet(s) sains refusés"
+
+
+@cas
 def le_releve_dit_POURQUOI_une_etiquette_manque():
     """
     🚨 Les messages disaient « (checksum KO?) » — ils DEVINAIENT. Le relevé
@@ -310,13 +389,30 @@ def le_releve_dit_POURQUOI_une_etiquette_manque():
     assert "n'est pas émise" in m._cause_rejets(), (
         f"aucun rejet, la cause devrait pointer le compteur : {m._cause_rejets()!r}")
 
-    # ⚠️ Un octet fautif ENTRE le CR et l'ETX n'est dans AUCUNE ligne : il n'a
-    #    donc rien coûté à cette trame, et l'accuser serait le même mensonge.
+    # ⭐ LA FRONTIÈRE EST À L'ENTRÉE DE LA TRAME, PAS À L'ENTRÉE DU GROUPE.
+    #
+    #    Un octet fautif ENTRE le CR et l'ETX est bien hors de tout groupe — mais
+    #    une trame TIC bien formée ne contient RIEN à cet endroit, donc c'est
+    #    presque sûrement un LF mangé, et le groupe qui devait suivre est perdu.
+    #    Il est compté, et le relevé parle de rejet.
+    #
+    # ⚠️ Ce n'était pas le cas avant : l'octet était ignoré et le relevé
+    #    concluait « pas émise » — il envoyait chercher un défaut chez le
+    #    COMPTEUR alors que le bruit était sur le FIL.
+    #
+    # ⚖️ Et c'est bien une FRONTIÈRE, pas une règle qui avale tout : le cas
+    #    `le_releve_n_accuse_PAS_la_parite_pour_un_octet_hors_trame` met le même
+    #    octet fautif AVANT le STX — là il ne coûte rien, et « pas émise » reste
+    #    la bonne réponse. Les deux cas se tiennent l'un l'autre.
     flux = ([sain(STX)] + ligne("ADCO 021861000000 X")
             + [corrompu(ord("A"))] + [sain(ETX)])
     m.read_frame(FauxPort(flux), tout_bon, range_brut)
-    assert "n'est pas émise" in m._cause_rejets(), (
-        f"un octet hors de toute ligne est imputé à tort : {m._cause_rejets()!r}")
+    cause = m._cause_rejets()
+    assert "groupe(s) rejeté(s)" in cause, (
+        f"un octet fautif DANS la trame ne coûte rien : le groupe qu'il a fait "
+        f"perdre disparaît du relevé — {cause!r}")
+    assert "n'est pas émise" not in cause, (
+        f"le compteur est accusé alors que la liaison est en cause — {cause!r}")
 
     # Celui-ci, en revanche, tombe DANS la ligne : il la condamne, et il doit
     # être rapporté. ⚖️ C'est le témoin de l'assertion précédente — sans lui,
@@ -343,6 +439,19 @@ def le_releve_dit_POURQUOI_une_etiquette_manque():
 
 
 if __name__ == "__main__":
+    # 🚨 ON RATTRAPE TOUTE EXCEPTION, PAS SEULEMENT AssertionError.
+    #
+    #    Avant, un cas qui levait autre chose — un TypeError parce qu'un
+    #    `read_frame` cassé rendait None — faisait REMONTER l'exception et
+    #    TUAIT la suite : les cas suivants ne tournaient jamais et aucun total
+    #    n'était imprimé. Trouvé en sabotant `octet_valide` : trois échecs
+    #    s'affichaient, sept cas disparaissaient en silence, et on ne pouvait
+    #    pas savoir lesquels.
+    #
+    # ⚠️ Le code de sortie était juste — la CI serait passée au rouge. C'est le
+    #    RELEVÉ qui mentait, en montrant moins de dégâts qu'il n'y en avait.
+    #    Un banc qui sous-estime la casse est pire qu'un banc qui plante.
+    import traceback
     ko = 0
     for f in CAS:
         try:
@@ -351,5 +460,9 @@ if __name__ == "__main__":
         except AssertionError as e:
             ko += 1
             print(f"  ÉCHEC {f.__name__}\n        {e}")
+        except Exception:
+            ko += 1
+            trace = traceback.format_exc().strip().splitlines()[-1]
+            print(f"  PLANTE {f.__name__}\n        {trace}")
     print(f"\n{len(CAS) - ko}/{len(CAS)}")
     sys.exit(1 if ko else 0)

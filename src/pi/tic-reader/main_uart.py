@@ -571,6 +571,9 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
             # ⓘ CR et LF corrompus, eux, ne coûtent qu'une ligne : la suivante
             #    resynchronise. On les laisse tomber.
             if (raw[0] & 0x7F) == ETX:
+                if in_line:            # un groupe commencé, jamais refermé
+                    _note_groupe_rejete(etiquettes_ko, current)
+                    dropped += 1
                 log.debug(f"TIC : ETX corrompu (parité) — trame close ici plutôt "
                           f"que fondue avec la suivante ; {kept} groupe(s) gardé(s)")
                 _derniere_trame.update(gardees=kept, rejetees=dropped, parite=parite_ko,
@@ -579,12 +582,12 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
                 _signaler_parite(parite_ko)
                 return labels if labels else None
 
-            # 🚨 LA LIGNE EN COURS EST CONDAMNÉE, et ce n'est pas du zèle.
+            # 🚨 LE GROUPE EN COURS EST CONDAMNÉ, et ce n'est pas du zèle.
             #
             #    Jeter le caractère et garder le reste supposait que le checksum
             #    rattraperait l'amputation. FAUX : il vaut (somme & 0x3F) + 0x20,
             #    donc il ne voit la somme QUE MODULO 64. Si les caractères
-            #    retirés somment à un multiple de 64, la ligne raccourcie porte
+            #    retirés somment à un multiple de 64, le groupe raccourci porte
             #    le MÊME checksum et passe.
             #
             #    Et ce n'est pas exotique :
@@ -598,15 +601,38 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
             #    fabriquerait une donnée erronée plutôt que d'en perdre une.
             #
             # ⚠️ La note de la PR affirmait « 1 bit → aucun cas ne passe les deux
-            #    contrôles réunis ». C'était vrai du CARACTÈRE, faux de la LIGNE —
-            #    parce que le code ne rejetait pas la ligne.
-            if in_line:
-                groupe_douteux = True
-                parite_groupes += 1      # celui-là, lui, a coûté une ligne
+            #    contrôles réunis ». C'était vrai de l'OCTET, faux du GROUPE —
+            #    parce que le code ne rejetait pas le groupe.
+            # 🚨 UN OCTET FAUTIF HORS GROUPE N'EST PAS ANODIN — et le croire
+            #    était le dernier endroit où le relevé accusait le compteur.
+            #
+            #    Entre le CR d'un groupe et le LF du suivant, une trame TIC bien
+            #    formée ne contient RIEN. Un octet fautif à cet endroit est donc
+            #    presque sûrement le LF lui-même. Or sans LF, `in_line` reste
+            #    faux : les octets du groupe qui suit sont jetés un par un, le CR
+            #    ne trouve rien à évaluer, et le groupe DISPARAÎT SANS TRACE.
+            #
+            # ⇒ On ouvre le groupe nous-mêmes, condamné d'avance. Il sera rejeté
+            #   au CR et COMPTÉ. Au pire on fabrique un groupe fantôme et le
+            #   relevé dit « un groupe rejeté » là où il aurait dit « aucun » :
+            #   c'est l'erreur la moins chère des deux, puisque l'autre envoie
+            #   chercher un défaut chez le COMPTEUR au lieu de sur le FIL.
+            #
+            # ⚠️ Ne vaut QUE dans la trame. Les octets refusés pendant l'attente
+            #    du STX sont la queue de la trame précédente et n'ouvrent rien —
+            #    c'est ce qui laisse le cas du triphasé dire « pas émise ».
+            if not in_line:
+                current = bytearray()
+                in_line = True
+            groupe_douteux = True
+            parite_groupes += 1      # celui-là, lui, a coûté un groupe
             continue
         b = raw[0] & 0x7F
 
         if b == ETX:
+            if in_line:                # CR perdu sur le dernier groupe
+                _note_groupe_rejete(etiquettes_ko, current)
+                dropped += 1
             # ⭐ `parite_ko` est COMPTÉ, pas seulement écarté : c'est ce qui
             #    transforme une protection muette en une mesure. Une liaison
             #    bruyante se verra, au lieu de se déduire de PDL fantômes.
@@ -618,6 +644,15 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
                       f"{dropped} rejeté(s), {parite_ko} octet(s) hors parité")
             return labels if labels else None
         elif b == LF:
+            # 🚨 `in_line` encore vrai à l'arrivée d'un LF veut dire une seule
+            #    chose : le CR du groupe précédent ne nous est jamais parvenu.
+            #    Sans ce comptage, ce groupe s'évaporait — `groupe_douteux` était
+            #    remis à faux deux lignes plus bas, AVANT d'avoir servi à quoi que
+            #    ce soit, et `rejetees` restait à zéro. Le relevé concluait alors
+            #    « aucun groupe rejeté : cette étiquette n'est pas émise ».
+            if in_line:
+                _note_groupe_rejete(etiquettes_ko, current)
+                dropped += 1
             current = bytearray()
             in_line = True
             groupe_douteux = False
