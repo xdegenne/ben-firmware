@@ -72,9 +72,9 @@ def cas(f):
 def une_trame_saine_est_lue_entierement():
     """⚖️ Le témoin de tous les autres : sans lui, « X absent » passerait aussi
     avec un `read_frame` qui ne rendrait jamais rien."""
-    flux = [sain(STX)] + ligne("ADCO 021861862663 X") + ligne("PAPP 00450 X") + [sain(ETX)]
+    flux = [sain(STX)] + ligne("ADCO 021861000000 X") + ligne("PAPP 00450 X") + [sain(ETX)]
     labels = m.read_frame(FauxPort(flux), tout_bon, range_brut)
-    assert labels == {"ADCO": "021861862663", "PAPP": "00450"}, f"trame mal lue : {labels}"
+    assert labels == {"ADCO": "021861000000", "PAPP": "00450"}, f"trame mal lue : {labels}"
 
 
 @cas
@@ -149,12 +149,12 @@ def le_releve_dit_POURQUOI_une_etiquette_manque():
     distingue désormais les trois causes, dont celle qui a coûté un après-midi
     à l'oscilloscope : l'étiquette que le compteur n'émet tout simplement pas.
     """
-    flux = [sain(STX)] + ligne("ADCO 021861862663 X") + [sain(ETX)]
+    flux = [sain(STX)] + ligne("ADCO 021861000000 X") + [sain(ETX)]
     m.read_frame(FauxPort(flux), tout_bon, range_brut)
     assert "n'est pas émise" in m._cause_rejets(), (
         f"aucun rejet, la cause devrait pointer le compteur : {m._cause_rejets()!r}")
 
-    flux = ([sain(STX)] + ligne("ADCO 021861862663 X")
+    flux = ([sain(STX)] + ligne("ADCO 021861000000 X")
             + [corrompu(ord("A"))] + [sain(ETX)])
     m.read_frame(FauxPort(flux), tout_bon, range_brut)
     assert "parité" in m._cause_rejets(), (

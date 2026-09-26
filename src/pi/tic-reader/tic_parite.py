@@ -26,8 +26,8 @@ def octet_valide(octet: int) -> bool:
        — et le masque jette cette retenue. Par construction, cette erreur lui est
        INVISIBLE :
 
-           ADCO 061947720012  -> checksum '>'
-           ADCO p61947720012  -> checksum '>'   ← identique
+           ADCO 061947000000  -> checksum '2'
+           ADCO p61947000000  -> checksum '2'   ← identique
 
        C'est ce trou qui a fabriqué les quatre PDL fantômes de ben-0004 :
        `0`→`p`, `1`→`q`, à chaque fois le bit 6. Quatre corruptions d'un seul

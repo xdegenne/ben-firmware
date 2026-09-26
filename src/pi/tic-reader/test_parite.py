@@ -45,7 +45,7 @@ def trame(c: str) -> int:
     return d | ((bin(d).count("1") & 1) << 7)
 
 
-LIGNE = "ADCO 061947720012"
+LIGNE = "ADCO 061947000000"
 
 
 @cas
