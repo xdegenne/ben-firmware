@@ -706,314 +706,332 @@ def watchdog_loop() -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-setup_led()
-log.info("LED RGB initialisée (boot indicator vert éteint)")
+if __name__ == "__main__":
+    # ⭐ TOUT CE QUI SUIT NE S'EXÉCUTE QUE SI ON LANCE CE FICHIER.
+    #
+    #    Avant, ces lignes étaient au niveau du module : ouvrir le fichier — donc
+    #    l'importer — allumait la LED, sondait le port série et démarrait le
+    #    watchdog. Un banc qui voulait juste éprouver `read_frame` démarrait en
+    #    fait tout le lecteur, et restait bloqué sur une machine sans UART.
+    #
+    # 🚨 C'est ce qui rendait `read_frame` INTESTABLE, alors que c'est la boucle
+    #    la plus délicate du fichier — trois modifications rien que le 26/09
+    #    (synchronisation STX, ETX corrompu, relevé des compteurs), sans qu'aucun
+    #    banc ne puisse rougir.
+    #
+    # ⓘ `if __name__` NE CRÉE PAS DE PORTÉE en Python : les variables assignées
+    #    ici restent globales, donc `flush_batch()` et `watchdog_loop()`, qui les
+    #    lisent, fonctionnent exactement comme avant. Le changement est purement
+    #    mécanique — quatre espaces, aucune logique touchée.
 
-# Auto-détection du mode (historique 1200 / standard 9600). Le mode persisté est
-# sondé en premier. Si rien n'est détecté (compteur muet au boot, NTP/TIC pas
-# encore là), on retombe sur le mode persisté ou, à défaut, historique (sortie
-# d'usine) — et le watchdog relancera la détection si aucune trame ne vient.
-detected = detect_mode(state.get("mode"))
-if detected is None:
-    mode_name = state.get("mode") or "historique"
-    log.warning(f"Aucun mode détecté au boot — repli sur '{mode_name}' "
-                f"(le watchdog re-sondera si rien ne vient)")
-else:
-    mode_name = detected
-    if mode_name != state.get("mode"):
-        log.info(f"Mode TIC : {mode_name} (changement vs persisté={state.get('mode') or 'aucun'})")
-        state["mode"] = mode_name
-        save_state(state)
+    setup_led()
+    log.info("LED RGB initialisée (boot indicator vert éteint)")
 
-mode = MODES[mode_name]
-checksum_ok = mode["checksum"]
-parse_label = mode["parse"]
-is_standard = mode_name == "standard"
+    # Auto-détection du mode (historique 1200 / standard 9600). Le mode persisté est
+    # sondé en premier. Si rien n'est détecté (compteur muet au boot, NTP/TIC pas
+    # encore là), on retombe sur le mode persisté ou, à défaut, historique (sortie
+    # d'usine) — et le watchdog relancera la détection si aucune trame ne vient.
+    detected = detect_mode(state.get("mode"))
+    if detected is None:
+        mode_name = state.get("mode") or "historique"
+        log.warning(f"Aucun mode détecté au boot — repli sur '{mode_name}' "
+                    f"(le watchdog re-sondera si rien ne vient)")
+    else:
+        mode_name = detected
+        if mode_name != state.get("mode"):
+            log.info(f"Mode TIC : {mode_name} (changement vs persisté={state.get('mode') or 'aucun'})")
+            state["mode"] = mode_name
+            save_state(state)
 
-ser = open_serial(mode["baud"])
-# ⭐ Dire que le contrôle est ACTIF, pas seulement qu'on a ouvert le port.
-#
-#    Le résumé de parité ne parle que s'il y a des rejets : au bout de trois
-#    jours de silence, « aucune erreur » et « le code ne tourne pas » sont
-#    indiscernables. Cette ligne les sépare — elle est le témoin de la mesure.
-log.info(f"Série ouvert : {UART_DEV} {mode['baud']} 8N1 proto TIC {mode_name} "
-         f"— contrôle de parité ACTIF (7E1 lu en 8N1), résumé toutes les "
-         f"{_PARITE_PERIODE_S // 60} min s'il y a des rejets")
-log.info(f"PDL connu : {state.get('adco') or '(aucun)'}")
+    mode = MODES[mode_name]
+    checksum_ok = mode["checksum"]
+    parse_label = mode["parse"]
+    is_standard = mode_name == "standard"
 
-Thread(target=watchdog_loop, daemon=True, name="watchdog").start()
-log.info(f"Watchdog démarré (seuil={WATCHDOG_THRESHOLD}s)")
+    ser = open_serial(mode["baud"])
+    # ⭐ Dire que le contrôle est ACTIF, pas seulement qu'on a ouvert le port.
+    #
+    #    Le résumé de parité ne parle que s'il y a des rejets : au bout de trois
+    #    jours de silence, « aucune erreur » et « le code ne tourne pas » sont
+    #    indiscernables. Cette ligne les sépare — elle est le témoin de la mesure.
+    log.info(f"Série ouvert : {UART_DEV} {mode['baud']} 8N1 proto TIC {mode_name} "
+             f"— contrôle de parité ACTIF (7E1 lu en 8N1), résumé toutes les "
+             f"{_PARITE_PERIODE_S // 60} min s'il y a des rejets")
+    log.info(f"PDL connu : {state.get('adco') or '(aucun)'}")
 
-# Store SQLite local (conso + outbox cloud). Non bloquant : si la base est
-# indisponible, le reader continue (LED/logs), juste sans stockage.
-try:
-    measurements_db = db.connect()
-    log.info(f"Store SQLite ouvert : {db.DB_PATH}")
-except Exception as e:
-    measurements_db = None
-    log.error(f"Store SQLite indisponible ({e}) — on continue sans stockage")
-last_prune = time.time()
+    Thread(target=watchdog_loop, daemon=True, name="watchdog").start()
+    log.info(f"Watchdog démarré (seuil={WATCHDOG_THRESHOLD}s)")
 
-# --- Batch d'écriture (volet B) ---------------------------------------------
-# La lecture au fil de l'eau densifie les trames (~7×). Pour ne pas faire un fsync
-# par trame, on accumule et on flush en UN commit (executemany) toutes les
-# BATCH_MAX_AGE_S (ou BATCH_MAX_SIZE). Granularité de perte = le batch (crash → au
-# pire les ~15 dernières s ; courbe append-only, non critique à la seconde).
-batch: list = []          # (pdl_index, labels, ts)
-last_flush = time.time()
-last_heartbeat = 0.0
-last_isousc: int | None = None  # garde RAM : record_isousc seulement sur changement
-last_src_std: int | None = None  # garde RAM : record_tic_mode seulement sur changement
-
-
-def note_tic_mode(mode_std: int) -> None:
-    """Signale le mode observé. Garde RAM d'abord : la boucle tourne à ~1 trame/s, on ne
-    veut pas d'une lecture SQLite par trame (même raison que le cache pdl_index)."""
-    global last_src_std
-    if mode_std == last_src_std or measurements_db is None:
-        return
+    # Store SQLite local (conso + outbox cloud). Non bloquant : si la base est
+    # indisponible, le reader continue (LED/logs), juste sans stockage.
     try:
-        if db.record_tic_mode(measurements_db, PDL_INDEX, mode_std, db.device_id()):
-            log.info(f"MODE TIC → {'standard' if mode_std else 'historique'} — événement émis")
-        last_src_std = mode_std
+        measurements_db = db.connect()
+        log.info(f"Store SQLite ouvert : {db.DB_PATH}")
     except Exception as e:
-        log.warning(f"store: record_tic_mode échoué: {e}")
+        measurements_db = None
+        log.error(f"Store SQLite indisponible ({e}) — on continue sans stockage")
+    last_prune = time.time()
 
-
-last_pref: int | None = None    # garde RAM : record_pref (abonnement standard, kVA) sur changement
-last_ltarf: tuple | None = None # garde RAM : record_tariff_label (NTARF, LTARF) sur changement
-last_ngtf: str | None = None    # garde RAM : record_ngtf (calendrier fournisseur) sur changement
-
-
-def flush_batch() -> None:
-    global batch, last_flush
+    # --- Batch d'écriture (volet B) ---------------------------------------------
+    # La lecture au fil de l'eau densifie les trames (~7×). Pour ne pas faire un fsync
+    # par trame, on accumule et on flush en UN commit (executemany) toutes les
+    # BATCH_MAX_AGE_S (ou BATCH_MAX_SIZE). Granularité de perte = le batch (crash → au
+    # pire les ~15 dernières s ; courbe append-only, non critique à la seconde).
+    batch: list = []          # (pdl_index, labels, ts)
     last_flush = time.time()
-    if not batch or measurements_db is None:
-        batch = []
-        return
-    try:
-        n = db.record_measurements_batch(measurements_db, batch)
-        log.debug(f"store: batch flush {n} mesures")
-    except Exception as e:
-        log.warning(f"store: flush batch échoué ({len(batch)} pts perdus): {e}")
-    finally:
-        batch = []
+    last_heartbeat = 0.0
+    last_isousc: int | None = None  # garde RAM : record_isousc seulement sur changement
+    last_src_std: int | None = None  # garde RAM : record_tic_mode seulement sur changement
 
 
-def _on_sigterm(signum, frame):
-    # systemd stop → flush le batch courant avant de mourir (pas de perte évitable).
-    log.info("SIGTERM — flush batch puis arrêt")
-    flush_batch()
-    raise SystemExit(0)
-
-
-signal.signal(signal.SIGTERM, _on_sigterm)
-
-# En mode standard, on logge la PREMIÈRE trame valide en INFO (tous les champs
-# parsés) pour valider le décodage sur un vrai compteur standard ; ensuite on
-# repasse en DEBUG (cadence ~1 s, ne pas noyer journald — cf. preshipping).
-std_first_logged = False
-
-try:
-    while True:
-        frame_ok = False
+    def note_tic_mode(mode_std: int) -> None:
+        """Signale le mode observé. Garde RAM d'abord : la boucle tourne à ~1 trame/s, on ne
+        veut pas d'une lecture SQLite par trame (même raison que le cache pdl_index)."""
+        global last_src_std
+        if mode_std == last_src_std or measurements_db is None:
+            return
         try:
-            # Au fil de l'eau : read_frame se cale sur la cadence du compteur.
-            # PAS de reset_input_buffer (on lit le flux en continu) ni de sleep
-            # (la trame suivante nous attend déjà dans le port).
-            labels = read_frame(ser, checksum_ok, parse_label)
+            if db.record_tic_mode(measurements_db, PDL_INDEX, mode_std, db.device_id()):
+                log.info(f"MODE TIC → {'standard' if mode_std else 'historique'} — événement émis")
+            last_src_std = mode_std
+        except Exception as e:
+            log.warning(f"store: record_tic_mode échoué: {e}")
 
-            if labels is None:
-                log.warning("Trame TIC invalide ou timeout")
-            else:
-                adco = labels.get("ADCO", "")
-                if adco:
-                    prev_adco = state.get("adco", "")
-                    if adco != prev_adco:
-                        log.info(f"NOUVEAU PDL détecté : ADCO={adco} (précédent={prev_adco or 'aucun'})")
-                        state["adco"] = adco
-                        save_state(state)
-                    # Résolution ADCO → pdl_index. Plus simple qu'en LoRa : l'ADCO est
-                    # dans CHAQUE trame, donc ni table `emitter`, ni attente d'une trame
-                    # de boot, ni fenêtre de repli. On résout à la première trame de
-                    # chaque exécution (pas seulement au changement) : sinon un boîtier
-                    # déplacé puis redémarré retomberait sur l'index 0, celui de son
-                    # ancien compteur. `graine=0` = convention de la source câblée.
-                    if adco != _pdl_source_adco and measurements_db is not None:
-                        try:
-                            pdl = db.resolve_pdl(measurements_db, adco, graine=0)
-                            if pdl is not None:
-                                if pdl != PDL_INDEX:
-                                    log.info(f"pdl_index : {PDL_INDEX} → {pdl} (ADCO={adco})")
-                                PDL_INDEX = pdl
-                                _pdl_source_adco = adco
-                        except Exception as e:
-                            log.warning(f"store: resolve_pdl échoué: {e}")
 
-                # ISOUSC (abonnement) — écrit SUR CHANGEMENT seulement (garde RAM
-                # + record_isousc fait aussi sa garde DB). Indépendant de la
-                # validité PTEC/PAPP de la trame.
-                isousc = labels.get("ISOUSC")
-                if (isousc is not None and isousc != last_isousc
-                        and measurements_db is not None):
-                    if db.record_isousc(measurements_db, PDL_INDEX, isousc):
-                        log.info(f"ISOUSC={isousc} A enregistré (maxVa≈{isousc * 230} VA)")
-                    last_isousc = isousc
+    last_pref: int | None = None    # garde RAM : record_pref (abonnement standard, kVA) sur changement
+    last_ltarf: tuple | None = None # garde RAM : record_tariff_label (NTARF, LTARF) sur changement
+    last_ngtf: str | None = None    # garde RAM : record_ngtf (calendrier fournisseur) sur changement
 
-                # PREF (abonnement en mode STANDARD, kVA) — record-on-change (chantier ISOUSC std).
-                # Le standard ne donne pas ISOUSC ; PREF×1000 calibre la jauge (arbitré par /live).
-                pref = labels.get("PREF")
-                if (pref is not None and pref != last_pref
-                        and measurements_db is not None):
-                    if db.record_pref(measurements_db, PDL_INDEX, pref):
-                        log.info(f"PREF={pref} kVA enregistré (maxVa≈{pref * 1000} VA)")
-                    last_pref = pref
 
-                # LTARF (libellé tarif standard AUTORITATIF) — cache NTARF→label, on-change.
-                # Le wired lit LTARF gratuitement dans la TIC standard (chantier unification labels).
-                ltarf = labels.get("LTARF")
-                ntarf_lbl = labels.get("NTARF")
-                # LTARF n'existe qu'en standard → le contrat associé = NGTF.
-                lt_key = (ntarf_lbl, ltarf, labels.get("NGTF"))
-                if (ltarf and ntarf_lbl and lt_key != last_ltarf
-                        and measurements_db is not None):
-                    if db.record_tariff_label(measurements_db, PDL_INDEX, 1, ntarf_lbl, ltarf,
-                                              labels.get("NGTF") or ""):
-                        log.info(f"LTARF NTARF={ntarf_lbl} → {ltarf!r} enregistré")
-                    last_ltarf = lt_key
+    def flush_batch() -> None:
+        global batch, last_flush
+        last_flush = time.time()
+        if not batch or measurements_db is None:
+            batch = []
+            return
+        try:
+            n = db.record_measurements_batch(measurements_db, batch)
+            log.debug(f"store: batch flush {n} mesures")
+        except Exception as e:
+            log.warning(f"store: flush batch échoué ({len(batch)} pts perdus): {e}")
+        finally:
+            batch = []
 
-                # Contrat (calendrier tarifaire) — NGTF en standard, OPTARIF en historique.
-                # Mode-agnostique → level_profile.ngtf. On-change (changement fournisseur/offre).
-                contract = labels.get("NGTF") or labels.get("OPTARIF")
-                if contract and contract != last_ngtf and measurements_db is not None:
-                    if db.record_ngtf(measurements_db, PDL_INDEX, contract):
-                        log.info(f"Contrat={contract!r} enregistré")
-                    last_ngtf = contract
 
-                iinst  = labels.get("IINST")
-                papp   = labels.get("PAPP")
+    def _on_sigterm(signum, frame):
+        # systemd stop → flush le batch courant avant de mourir (pas de perte évitable).
+        log.info("SIGTERM — flush batch puis arrêt")
+        flush_batch()
+        raise SystemExit(0)
 
-                if not is_standard:
-                    # --- Mode HISTORIQUE : index actif déduit de PTEC ----------
-                    ptec = labels.get("PTEC")
-                    active_id = active_name = active_value = None
-                    if ptec:
-                        active_id, active_name, active_value = select_active_index(ptec, labels)
 
-                    if not ptec:
-                        log.error("PTEC absent de la trame TIC")
-                    elif active_name is None:
-                        log.warning(f"PTEC inconnu : '{ptec}' — trame ignorée")
-                    elif active_value is None:
-                        log.warning(f"{active_name} absent de la trame TIC{_cause_rejets()} — trame ignorée")
-                    elif iinst is None:
-                        log.warning(f"IINST absent de la trame TIC{_cause_rejets()} — trame ignorée")
-                    elif papp is None:
-                        log.warning(f"PAPP absent de la trame TIC{_cause_rejets()} — trame ignorée")
-                    else:
-                        demain, adps, pejp = build_flags(labels)
-                        # Champs non-câblés (DEMAIN/ADPS/PEJP) → log INFO on-change (aligné LoRa).
-                        log_uncabled({"DEMAIN": demain, "ADPS": adps or None, "PEJP": pejp or None})
-                        # Clé générique (chantier index bi-mode) : index_id = rang PTEC.
-                        labels["_src_standard"] = 0
-                        note_tic_mode(0)
-                        labels["_index_id"] = active_id
-                        labels["_index_value"] = active_value
-                        log.debug(f"OK pdl_index={PDL_INDEX} PTEC={ptec} {active_name}={active_value} "
-                                  f"IINST={iinst} PAPP={papp} demain={demain} adps={adps} pejp={pejp}")
-                        # On EMPILE dans le batch ; l'écriture BDD se fait par lot
-                        # (flush plus bas, volet B). Log en DEBUG : à ~1,7 s/trame, un
-                        # INFO par trame noierait journald (cf. preshipping).
-                        if measurements_db is not None:
-                            batch.append((PDL_INDEX, labels, int(time.time())))
-                        frame_ok = True
-                else:
-                    # --- Mode STANDARD : papp←SINSTS, iinst←IRMS1 --------------
-                    # Stockage GÉNÉRIQUE (chantier index bi-mode) : (src_standard=1,
-                    # index_id=NTARF, index_value=EASF[NTARF]) + inject_total=EAIT +
-                    # meter_ts (horodate compteur). papp+iinst aussi (courbe + jauge).
-                    # PREF (kVA) ≠ ISOUSC (A) → pas mappé dans la jauge (maxVa fausse).
-                    ntarf = labels.get("NTARF")
-                    east  = labels.get("EAST")
-                    easf  = labels.get("EASF", {})
-                    active_value = easf.get(f"EASF{ntarf:02d}") if ntarf else None
+    signal.signal(signal.SIGTERM, _on_sigterm)
 
-                    if papp is None:
-                        log.warning(f"SINSTS absent de la trame standard{_cause_rejets()} — trame ignorée")
-                    elif iinst is None:
-                        log.warning(f"IRMS1 absent de la trame standard{_cause_rejets()} — trame ignorée")
-                    else:
-                        # _src_standard TOUJOURS posé (c'est le mode → tic_mode/lecture papp).
-                        # index_id/index_value seulement si l'index actif a été vu (sinon NULL
-                        # sur cette ligne → carry-forward au calcul conso, pas de point perdu).
-                        labels["_src_standard"] = 1
-                        note_tic_mode(1)
-                        if ntarf is not None and active_value is not None:
-                            labels["_index_id"] = ntarf
-                            labels["_index_value"] = active_value
-                        if labels.get("EAIT") is not None:
-                            labels["_inject_total"] = labels["EAIT"]
-                        mts = _std_horodate_to_epoch(labels.get("DATE_HORODATE"))
-                        if mts is not None:
-                            labels["_meter_ts"] = mts
-                        # Champs non-câblés std (NJOURF/NJOURF+1 Tempo, STGE) → log INFO
-                        # on-change (aligné LoRa). STGE est rendu LISIBLE : c'est le seul
-                        # porteur de la couleur du LENDEMAIN, et un entier décimal de 32 bits
-                        # serait indéchiffrable au journal. NJOURF/NJOURF+1, eux, valent 0 en
-                        # permanence (calendrier FOURNISSEUR non programmé par EDF pour Tempo)
-                        # — gardés par symétrie avec le LoRa, où ils sont désactivés en 0.1.8.
-                        log_uncabled({"NJOURF": labels.get("NJOURF"),
-                                      "NJOURF+1": labels.get("NJOURF+1"),
-                                      "STGE": _stge_lisible(labels.get("STGE"))})
-                        if not std_first_logged:
-                            # 1re trame valide : dump complet en INFO pour valider
-                            # le décodage sur un vrai compteur standard.
-                            log.info("Première trame STANDARD décodée : "
-                                     f"ADSC={labels.get('ADCO')} VTIC={labels.get('VTIC')} "
-                                     f"SINSTS={papp} IRMS1={iinst} EAST={east} NTARF={ntarf} "
-                                     f"EASF[{ntarf}]={active_value} LTARF={labels.get('LTARF')!r} "
-                                     f"PREF={labels.get('PREF')} SINSTI={labels.get('SINSTI')} "
-                                     f"EAIT={labels.get('EAIT')}")
-                            std_first_logged = True
-                        log.debug(f"OK[std] pdl_index={PDL_INDEX} SINSTS(PAPP)={papp} "
-                                  f"IRMS1(IINST)={iinst} EAST={east} NTARF={ntarf} "
-                                  f"EASF[{ntarf}]={active_value} SINSTI={labels.get('SINSTI')}")
-                        if measurements_db is not None:
-                            batch.append((PDL_INDEX, labels, int(time.time())))
-                        frame_ok = True
+    # En mode standard, on logge la PREMIÈRE trame valide en INFO (tous les champs
+    # parsés) pour valider le décodage sur un vrai compteur standard ; ensuite on
+    # repasse en DEBUG (cadence ~1 s, ne pas noyer journald — cf. preshipping).
+    std_first_logged = False
 
-        except Exception:
-            log.error(f"Exception dans la boucle principale:\n{traceback.format_exc()}")
-
-        now = time.time()
-        if frame_ok:
-            last_success_time = now
-            # Heartbeat vert DISCRET, throttlé (≠ un flash par trame ~1,7 s) — la
-            # LED en bonne santé reste calme (cf. note d'origine).
-            if now - last_heartbeat >= HEARTBEAT_S:
-                blink_rgb(0, 5, 0, 0.1)
-                last_heartbeat = now
-        else:
-            blink_rgb(5, 0, 0, 0.1, bypass=True)  # rouge immédiat (erreur, visible)
-
-        # Flush du batch si âge ou taille atteinte (volet B).
-        if batch and (len(batch) >= BATCH_MAX_SIZE
-                      or now - last_flush >= BATCH_MAX_AGE_S):
-            flush_batch()
-
-        if measurements_db is not None and now - last_prune > 3600:
+    try:
+        while True:
+            frame_ok = False
             try:
-                deleted = db.prune(measurements_db)
-                log.info(f"store purge (>{db.RETENTION_DAYS}j): {deleted}")
-            except Exception as e:
-                log.warning(f"store: purge échouée: {e}")
-            last_prune = time.time()
+                # Au fil de l'eau : read_frame se cale sur la cadence du compteur.
+                # PAS de reset_input_buffer (on lit le flux en continu) ni de sleep
+                # (la trame suivante nous attend déjà dans le port).
+                labels = read_frame(ser, checksum_ok, parse_label)
 
-except (KeyboardInterrupt, SystemExit):
-    log.info("Arrêt.")
-finally:
-    flush_batch()   # ne pas perdre le batch courant à l'arrêt
-    try: ser.close()
-    except Exception: pass
-    try: GPIO.cleanup()
-    except Exception: pass
+                if labels is None:
+                    log.warning("Trame TIC invalide ou timeout")
+                else:
+                    adco = labels.get("ADCO", "")
+                    if adco:
+                        prev_adco = state.get("adco", "")
+                        if adco != prev_adco:
+                            log.info(f"NOUVEAU PDL détecté : ADCO={adco} (précédent={prev_adco or 'aucun'})")
+                            state["adco"] = adco
+                            save_state(state)
+                        # Résolution ADCO → pdl_index. Plus simple qu'en LoRa : l'ADCO est
+                        # dans CHAQUE trame, donc ni table `emitter`, ni attente d'une trame
+                        # de boot, ni fenêtre de repli. On résout à la première trame de
+                        # chaque exécution (pas seulement au changement) : sinon un boîtier
+                        # déplacé puis redémarré retomberait sur l'index 0, celui de son
+                        # ancien compteur. `graine=0` = convention de la source câblée.
+                        if adco != _pdl_source_adco and measurements_db is not None:
+                            try:
+                                pdl = db.resolve_pdl(measurements_db, adco, graine=0)
+                                if pdl is not None:
+                                    if pdl != PDL_INDEX:
+                                        log.info(f"pdl_index : {PDL_INDEX} → {pdl} (ADCO={adco})")
+                                    PDL_INDEX = pdl
+                                    _pdl_source_adco = adco
+                            except Exception as e:
+                                log.warning(f"store: resolve_pdl échoué: {e}")
+
+                    # ISOUSC (abonnement) — écrit SUR CHANGEMENT seulement (garde RAM
+                    # + record_isousc fait aussi sa garde DB). Indépendant de la
+                    # validité PTEC/PAPP de la trame.
+                    isousc = labels.get("ISOUSC")
+                    if (isousc is not None and isousc != last_isousc
+                            and measurements_db is not None):
+                        if db.record_isousc(measurements_db, PDL_INDEX, isousc):
+                            log.info(f"ISOUSC={isousc} A enregistré (maxVa≈{isousc * 230} VA)")
+                        last_isousc = isousc
+
+                    # PREF (abonnement en mode STANDARD, kVA) — record-on-change (chantier ISOUSC std).
+                    # Le standard ne donne pas ISOUSC ; PREF×1000 calibre la jauge (arbitré par /live).
+                    pref = labels.get("PREF")
+                    if (pref is not None and pref != last_pref
+                            and measurements_db is not None):
+                        if db.record_pref(measurements_db, PDL_INDEX, pref):
+                            log.info(f"PREF={pref} kVA enregistré (maxVa≈{pref * 1000} VA)")
+                        last_pref = pref
+
+                    # LTARF (libellé tarif standard AUTORITATIF) — cache NTARF→label, on-change.
+                    # Le wired lit LTARF gratuitement dans la TIC standard (chantier unification labels).
+                    ltarf = labels.get("LTARF")
+                    ntarf_lbl = labels.get("NTARF")
+                    # LTARF n'existe qu'en standard → le contrat associé = NGTF.
+                    lt_key = (ntarf_lbl, ltarf, labels.get("NGTF"))
+                    if (ltarf and ntarf_lbl and lt_key != last_ltarf
+                            and measurements_db is not None):
+                        if db.record_tariff_label(measurements_db, PDL_INDEX, 1, ntarf_lbl, ltarf,
+                                                  labels.get("NGTF") or ""):
+                            log.info(f"LTARF NTARF={ntarf_lbl} → {ltarf!r} enregistré")
+                        last_ltarf = lt_key
+
+                    # Contrat (calendrier tarifaire) — NGTF en standard, OPTARIF en historique.
+                    # Mode-agnostique → level_profile.ngtf. On-change (changement fournisseur/offre).
+                    contract = labels.get("NGTF") or labels.get("OPTARIF")
+                    if contract and contract != last_ngtf and measurements_db is not None:
+                        if db.record_ngtf(measurements_db, PDL_INDEX, contract):
+                            log.info(f"Contrat={contract!r} enregistré")
+                        last_ngtf = contract
+
+                    iinst  = labels.get("IINST")
+                    papp   = labels.get("PAPP")
+
+                    if not is_standard:
+                        # --- Mode HISTORIQUE : index actif déduit de PTEC ----------
+                        ptec = labels.get("PTEC")
+                        active_id = active_name = active_value = None
+                        if ptec:
+                            active_id, active_name, active_value = select_active_index(ptec, labels)
+
+                        if not ptec:
+                            log.error("PTEC absent de la trame TIC")
+                        elif active_name is None:
+                            log.warning(f"PTEC inconnu : '{ptec}' — trame ignorée")
+                        elif active_value is None:
+                            log.warning(f"{active_name} absent de la trame TIC{_cause_rejets()} — trame ignorée")
+                        elif iinst is None:
+                            log.warning(f"IINST absent de la trame TIC{_cause_rejets()} — trame ignorée")
+                        elif papp is None:
+                            log.warning(f"PAPP absent de la trame TIC{_cause_rejets()} — trame ignorée")
+                        else:
+                            demain, adps, pejp = build_flags(labels)
+                            # Champs non-câblés (DEMAIN/ADPS/PEJP) → log INFO on-change (aligné LoRa).
+                            log_uncabled({"DEMAIN": demain, "ADPS": adps or None, "PEJP": pejp or None})
+                            # Clé générique (chantier index bi-mode) : index_id = rang PTEC.
+                            labels["_src_standard"] = 0
+                            note_tic_mode(0)
+                            labels["_index_id"] = active_id
+                            labels["_index_value"] = active_value
+                            log.debug(f"OK pdl_index={PDL_INDEX} PTEC={ptec} {active_name}={active_value} "
+                                      f"IINST={iinst} PAPP={papp} demain={demain} adps={adps} pejp={pejp}")
+                            # On EMPILE dans le batch ; l'écriture BDD se fait par lot
+                            # (flush plus bas, volet B). Log en DEBUG : à ~1,7 s/trame, un
+                            # INFO par trame noierait journald (cf. preshipping).
+                            if measurements_db is not None:
+                                batch.append((PDL_INDEX, labels, int(time.time())))
+                            frame_ok = True
+                    else:
+                        # --- Mode STANDARD : papp←SINSTS, iinst←IRMS1 --------------
+                        # Stockage GÉNÉRIQUE (chantier index bi-mode) : (src_standard=1,
+                        # index_id=NTARF, index_value=EASF[NTARF]) + inject_total=EAIT +
+                        # meter_ts (horodate compteur). papp+iinst aussi (courbe + jauge).
+                        # PREF (kVA) ≠ ISOUSC (A) → pas mappé dans la jauge (maxVa fausse).
+                        ntarf = labels.get("NTARF")
+                        east  = labels.get("EAST")
+                        easf  = labels.get("EASF", {})
+                        active_value = easf.get(f"EASF{ntarf:02d}") if ntarf else None
+
+                        if papp is None:
+                            log.warning(f"SINSTS absent de la trame standard{_cause_rejets()} — trame ignorée")
+                        elif iinst is None:
+                            log.warning(f"IRMS1 absent de la trame standard{_cause_rejets()} — trame ignorée")
+                        else:
+                            # _src_standard TOUJOURS posé (c'est le mode → tic_mode/lecture papp).
+                            # index_id/index_value seulement si l'index actif a été vu (sinon NULL
+                            # sur cette ligne → carry-forward au calcul conso, pas de point perdu).
+                            labels["_src_standard"] = 1
+                            note_tic_mode(1)
+                            if ntarf is not None and active_value is not None:
+                                labels["_index_id"] = ntarf
+                                labels["_index_value"] = active_value
+                            if labels.get("EAIT") is not None:
+                                labels["_inject_total"] = labels["EAIT"]
+                            mts = _std_horodate_to_epoch(labels.get("DATE_HORODATE"))
+                            if mts is not None:
+                                labels["_meter_ts"] = mts
+                            # Champs non-câblés std (NJOURF/NJOURF+1 Tempo, STGE) → log INFO
+                            # on-change (aligné LoRa). STGE est rendu LISIBLE : c'est le seul
+                            # porteur de la couleur du LENDEMAIN, et un entier décimal de 32 bits
+                            # serait indéchiffrable au journal. NJOURF/NJOURF+1, eux, valent 0 en
+                            # permanence (calendrier FOURNISSEUR non programmé par EDF pour Tempo)
+                            # — gardés par symétrie avec le LoRa, où ils sont désactivés en 0.1.8.
+                            log_uncabled({"NJOURF": labels.get("NJOURF"),
+                                          "NJOURF+1": labels.get("NJOURF+1"),
+                                          "STGE": _stge_lisible(labels.get("STGE"))})
+                            if not std_first_logged:
+                                # 1re trame valide : dump complet en INFO pour valider
+                                # le décodage sur un vrai compteur standard.
+                                log.info("Première trame STANDARD décodée : "
+                                         f"ADSC={labels.get('ADCO')} VTIC={labels.get('VTIC')} "
+                                         f"SINSTS={papp} IRMS1={iinst} EAST={east} NTARF={ntarf} "
+                                         f"EASF[{ntarf}]={active_value} LTARF={labels.get('LTARF')!r} "
+                                         f"PREF={labels.get('PREF')} SINSTI={labels.get('SINSTI')} "
+                                         f"EAIT={labels.get('EAIT')}")
+                                std_first_logged = True
+                            log.debug(f"OK[std] pdl_index={PDL_INDEX} SINSTS(PAPP)={papp} "
+                                      f"IRMS1(IINST)={iinst} EAST={east} NTARF={ntarf} "
+                                      f"EASF[{ntarf}]={active_value} SINSTI={labels.get('SINSTI')}")
+                            if measurements_db is not None:
+                                batch.append((PDL_INDEX, labels, int(time.time())))
+                            frame_ok = True
+
+            except Exception:
+                log.error(f"Exception dans la boucle principale:\n{traceback.format_exc()}")
+
+            now = time.time()
+            if frame_ok:
+                last_success_time = now
+                # Heartbeat vert DISCRET, throttlé (≠ un flash par trame ~1,7 s) — la
+                # LED en bonne santé reste calme (cf. note d'origine).
+                if now - last_heartbeat >= HEARTBEAT_S:
+                    blink_rgb(0, 5, 0, 0.1)
+                    last_heartbeat = now
+            else:
+                blink_rgb(5, 0, 0, 0.1, bypass=True)  # rouge immédiat (erreur, visible)
+
+            # Flush du batch si âge ou taille atteinte (volet B).
+            if batch and (len(batch) >= BATCH_MAX_SIZE
+                          or now - last_flush >= BATCH_MAX_AGE_S):
+                flush_batch()
+
+            if measurements_db is not None and now - last_prune > 3600:
+                try:
+                    deleted = db.prune(measurements_db)
+                    log.info(f"store purge (>{db.RETENTION_DAYS}j): {deleted}")
+                except Exception as e:
+                    log.warning(f"store: purge échouée: {e}")
+                last_prune = time.time()
+
+    except (KeyboardInterrupt, SystemExit):
+        log.info("Arrêt.")
+    finally:
+        flush_batch()   # ne pas perdre le batch courant à l'arrêt
+        try: ser.close()
+        except Exception: pass
+        try: GPIO.cleanup()
+        except Exception: pass
