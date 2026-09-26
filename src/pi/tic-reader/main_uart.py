@@ -21,9 +21,19 @@ Aligné sur src/arduino/tic-reader/tic-reader.ino :
   - même mapping PTEC → index (selectActiveIndex), mode historique
   - même détection DEMAIN / ADPS / PEJP (buildFlags)
 
-Note parité : on lit en 8N1 et on masque le bit de parité (& 0x7F) dans les deux
-modes — la TIC est 7E1, le masque suffit (le checksum TIC couvre l'intégrité).
-Marche sur mini-UART (ttyS0, sans parité matérielle) comme sur PL011.
+Note parité : on lit en 8N1 et on VÉRIFIE le bit de parité avant de masquer, dans
+les deux modes. La TIC est 7E1 : sur un port 8N1 le bit de parité arrive en bit 7,
+et `tic_parite.octet_valide()` le contrôle.
+
+⚠️ Une version antérieure de ce texte disait que « le masque suffit, le checksum
+TIC couvre l'intégrité ». C'EST FAUX, et c'est ce qui a motivé le changement : le
+checksum vaut (somme & 0x3F) + 0x20, il ne voit donc la somme QUE MODULO 64 et
+est structurellement aveugle aux basculements du bit 6. Trois ADCO fantômes sur
+ben-0004 en portent la trace — toujours un chiffre devenu lettre.
+
+⭐ La parité, elle, attrape tout basculement d'un seul bit, dont celui-là.
+Marche sur mini-UART (ttyS0, sans parité matérielle) comme sur PL011 : c'est un
+contrôle LOGICIEL, il ne dépend d'aucune capacité du port.
 
 Stockage (chantier index bi-mode, docs/chantier-index-energie-bimode.md) : on
 remplit les colonnes GÉNÉRIQUES de measurements — (src_standard, index_id,
@@ -386,6 +396,41 @@ def _signaler_parite(n: int) -> None:
     _parite_cumul.update(car=0, trames=0, debut=maintenant)
 
 
+# ─── Ce que la DERNIÈRE trame a coûté ───────────────────────────────────────
+#
+# 🚨 POURQUOI CE RELEVÉ EXISTE. Les messages « étiquette absente » disaient
+#    « (checksum KO?) » — ils DEVINAIENT la cause. Depuis qu'on rejette aussi sur
+#    parité, il y en a trois : checksum réellement invalide, caractère écarté sur
+#    parité, ou étiquette qui n'existe pas dans ce mode.
+#
+# ⚠️ Ce projet s'est déjà brûlé exactement là : sur un compteur TRIPHASÉ, le
+#    message accusait le checksum alors qu'`IINST` n'existe tout simplement pas
+#    (c'est `IINST1/2/3`). Un après-midi à l'oscilloscope, pour un défaut qui
+#    n'était pas analogique. *Un garde-fou qui se trompe de coupable coûte plus
+#    cher que pas de garde-fou.*
+#
+# ⭐ On ne devine donc plus : on rapporte ce qu'on a compté.
+#
+# ⓘ État de module plutôt qu'une valeur de retour : `read_frame` a un seul
+#    appelant, qui lit ce relevé dans la foulée. Le couplage est local et visible.
+_derniere_trame = {"gardees": 0, "rejetees": 0, "parite": 0}
+
+
+def _cause_rejets() -> str:
+    """« — 2 ligne(s) rejetée(s), dont 1 caractère sur parité » ou une piste."""
+    r, pa = _derniere_trame["rejetees"], _derniere_trame["parite"]
+    if r and pa:
+        return f" — {r} ligne(s) rejetée(s), dont {pa} caractère(s) sur parité"
+    if r:
+        return f" — {r} ligne(s) rejetée(s) sur checksum"
+    if pa:
+        return f" — {pa} caractère(s) rejeté(s) sur parité"
+    # 🚨 AUCUN rejet, et l'étiquette manque quand même : ce n'est donc NI le
+    #    checksum NI la parité. C'est le compteur qui ne l'émet pas — mode,
+    #    triphasé, trame courte. C'est CE cas que l'ancien message masquait.
+    return " — aucune ligne rejetée : cette étiquette n'est pas émise ?"
+
+
 def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
     """
     Lit une trame TIC complète (STX..ETX), mode-agnostique.
@@ -449,6 +494,7 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
             if (raw[0] & 0x7F) == ETX:
                 log.debug(f"TIC : ETX corrompu (parité) — trame close ici plutôt "
                           f"que fondue avec la suivante ; {kept} ligne(s) gardée(s)")
+                _derniere_trame.update(gardees=kept, rejetees=dropped, parite=parite_ko)
                 _signaler_parite(parite_ko)
                 return labels if labels else None
             continue
@@ -458,6 +504,7 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
             # ⭐ `parite_ko` est COMPTÉ, pas seulement écarté : c'est ce qui
             #    transforme une protection muette en une mesure. Une liaison
             #    bruyante se verra, au lieu de se déduire de PDL fantômes.
+            _derniere_trame.update(gardees=kept, rejetees=dropped, parite=parite_ko)
             _signaler_parite(parite_ko)
             log.debug(f"Trame TIC complète : {kept} lignes gardées, "
                       f"{dropped} rejetées, {parite_ko} car. hors parité")
@@ -545,7 +592,15 @@ MODES = {
 
 
 def open_serial(baud: int) -> serial.Serial:
-    """Ouvre l'UART au débit donné, 8N1 + masque 0x7F (la TIC est 7E1)."""
+    """
+    Ouvre l'UART au débit donné, en 8N1.
+
+    ⭐ 8N1 et NON 7E1, délibérément : `pyserial` n'active pas `INPCK` même avec
+    `PARITY_EVEN` — mesuré sur ben-0003 —, donc la parité matérielle serait un
+    coup d'épée dans l'eau. On lit les 8 bits et on vérifie le 7ᵉ nous-mêmes
+    (`tic_parite.octet_valide`), ce qui marche sur tous les ports, mini-UART
+    compris.
+    """
     return serial.Serial(
         port=UART_DEV,
         baudrate=baud,
@@ -676,7 +731,14 @@ parse_label = mode["parse"]
 is_standard = mode_name == "standard"
 
 ser = open_serial(mode["baud"])
-log.info(f"Série ouvert : {UART_DEV} {mode['baud']} 8N1 (masque 0x7F) proto TIC {mode_name}")
+# ⭐ Dire que le contrôle est ACTIF, pas seulement qu'on a ouvert le port.
+#
+#    Le résumé de parité ne parle que s'il y a des rejets : au bout de trois
+#    jours de silence, « aucune erreur » et « le code ne tourne pas » sont
+#    indiscernables. Cette ligne les sépare — elle est le témoin de la mesure.
+log.info(f"Série ouvert : {UART_DEV} {mode['baud']} 8N1 proto TIC {mode_name} "
+         f"— contrôle de parité ACTIF (7E1 lu en 8N1), résumé toutes les "
+         f"{_PARITE_PERIODE_S // 60} min s'il y a des rejets")
 log.info(f"PDL connu : {state.get('adco') or '(aucun)'}")
 
 Thread(target=watchdog_loop, daemon=True, name="watchdog").start()
@@ -843,11 +905,11 @@ try:
                     elif active_name is None:
                         log.warning(f"PTEC inconnu : '{ptec}' — trame ignorée")
                     elif active_value is None:
-                        log.warning(f"{active_name} absent de la trame TIC (checksum KO?) — trame ignorée")
+                        log.warning(f"{active_name} absent de la trame TIC{_cause_rejets()} — trame ignorée")
                     elif iinst is None:
-                        log.warning("IINST absent de la trame TIC (checksum KO?) — trame ignorée")
+                        log.warning(f"IINST absent de la trame TIC{_cause_rejets()} — trame ignorée")
                     elif papp is None:
-                        log.warning("PAPP absent de la trame TIC (checksum KO?) — trame ignorée")
+                        log.warning(f"PAPP absent de la trame TIC{_cause_rejets()} — trame ignorée")
                     else:
                         demain, adps, pejp = build_flags(labels)
                         # Champs non-câblés (DEMAIN/ADPS/PEJP) → log INFO on-change (aligné LoRa).
@@ -877,9 +939,9 @@ try:
                     active_value = easf.get(f"EASF{ntarf:02d}") if ntarf else None
 
                     if papp is None:
-                        log.warning("SINSTS absent de la trame standard (checksum KO?) — trame ignorée")
+                        log.warning(f"SINSTS absent de la trame standard{_cause_rejets()} — trame ignorée")
                     elif iinst is None:
-                        log.warning("IRMS1 absent de la trame standard (checksum KO?) — trame ignorée")
+                        log.warning(f"IRMS1 absent de la trame standard{_cause_rejets()} — trame ignorée")
                     else:
                         # _src_standard TOUJOURS posé (c'est le mode → tic_mode/lecture papp).
                         # index_id/index_value seulement si l'index actif a été vu (sinon NULL
