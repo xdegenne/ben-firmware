@@ -413,22 +413,84 @@ def _signaler_parite(n: int) -> None:
 #
 # ⓘ État de module plutôt qu'une valeur de retour : `read_frame` a un seul
 #    appelant, qui lit ce relevé dans la foulée. Le couplage est local et visible.
-_derniere_trame = {"gardees": 0, "rejetees": 0, "parite": 0}
+# 🚨 DEUX COMPTEURS DE PARITÉ, ET C'EST DÉLIBÉRÉ.
+#
+#    `parite` compte TOUT : la synchronisation sur STX, l'inter-ligne, les
+#    lignes. C'est la mesure du BRUIT de la liaison, et elle doit tout voir.
+#
+#    `parite_lignes` ne compte que les octets tombés À L'INTÉRIEUR d'une ligne,
+#    donc les seuls qui ont réellement fait rejeter quelque chose. C'est la
+#    mesure de l'IMPUTATION.
+#
+# ⚠️ Les confondre remet exactement le défaut que ce relevé existe pour tuer.
+#    Les octets refusés pendant l'attente du STX sont la QUEUE DE LA TRAME
+#    PRÉCÉDENTE, et ceux entre un CR et le LF suivant ne sont dans aucune ligne :
+#    ni les uns ni les autres n'ont coûté une étiquette à CETTE trame. Compter
+#    l'ensemble fait dire « rejeté sur parité » à une trame dont AUCUNE ligne
+#    n'a été rejetée — et c'est précisément le mensonge du triphasé : `IINST`
+#    n'est jamais émis, un octet bruité traîne avant le STX, et le message
+#    accuse la parité au lieu de dire que le compteur n'émet pas cette étiquette.
+_derniere_trame = {"gardees": 0, "rejetees": 0, "parite": 0,
+                   "parite_lignes": 0, "etiquettes_rejetees": set()}
 
 
-def _cause_rejets() -> str:
-    """« — 2 ligne(s) rejetée(s), dont 1 caractère sur parité » ou une piste."""
-    r, pa = _derniere_trame["rejetees"], _derniere_trame["parite"]
-    if r and pa:
-        return f" — {r} ligne(s) rejetée(s), dont {pa} caractère(s) sur parité"
-    if r:
-        return f" — {r} ligne(s) rejetée(s) sur checksum"
+def _cause_rejets(etiquette: str = "") -> str:
+    """Dit POURQUOI une étiquette manque, sans jamais accuser au hasard.
+
+    `etiquette` : celle que l'appelant cherchait. Les cinq appelants la
+    connaissent, donc on peut répondre sur ELLE plutôt que sur la trame entière.
+    """
+    r  = _derniere_trame["rejetees"]
+    pa = _derniere_trame["parite_lignes"]
+    vues = _derniere_trame["etiquettes_rejetees"]
+
+    if not r:
+        # 🚨 AUCUNE ligne rejetée, et l'étiquette manque : ce n'est donc NI le
+        #    checksum NI la parité. C'est le compteur qui ne l'émet pas — mode,
+        #    triphasé, trame courte. C'est CE cas que l'ancien message masquait.
+        return " — aucune ligne rejetée : cette étiquette n'est pas émise ?"
+
+    if etiquette and etiquette not in vues:
+        # Des lignes SONT tombées, mais aucune ne portait celle-ci.
+        #
+        # 🚨 ET LA CONFIANCE À ACCORDER À CE CONSTAT DÉPEND DE LA CAUSE DU REJET.
+        #
+        #    Une ligne refusée au CHECKSUM est intégralement lue : tous ses
+        #    caractères sont là, donc son étiquette est relevée juste. Dire
+        #    « aucune ne portait celle-ci » est alors un indice solide.
+        #
+        #    Une ligne condamnée par la PARITÉ a perdu des caractères — et s'ils
+        #    étaient dans le NOM, l'étiquette relevée est fausse. Conclure
+        #    « pas émise » serait alors se tromper dans l'autre sens : elle
+        #    était émise, et abîmée. On dit donc ce qu'on sait, et on nomme le
+        #    doute au lieu de le taire.
+        if pa:
+            return (f" — {r} ligne(s) rejetée(s), dont {pa} caractère(s) sur parité ; "
+                    f"aucune ne portait {etiquette}, mais la parité a pu en abîmer le nom")
+        return (f" — {r} ligne(s) rejetée(s) sur checksum, aucune ne portait "
+                f"{etiquette} : cette étiquette n'est probablement pas émise")
+
     if pa:
-        return f" — {pa} caractère(s) rejeté(s) sur parité"
-    # 🚨 AUCUN rejet, et l'étiquette manque quand même : ce n'est donc NI le
-    #    checksum NI la parité. C'est le compteur qui ne l'émet pas — mode,
-    #    triphasé, trame courte. C'est CE cas que l'ancien message masquait.
-    return " — aucune ligne rejetée : cette étiquette n'est pas émise ?"
+        return f" — {r} ligne(s) rejetée(s), dont {pa} caractère(s) sur parité"
+    return f" — {r} ligne(s) rejetée(s) sur checksum"
+
+
+def _note_ligne_rejetee(vues: set, brut: bytes | bytearray | str) -> None:
+    """Relève l'étiquette d'une ligne rejetée, pour pouvoir l'imputer.
+
+    ⚠️ `vues` est LOCAL à la trame en cours, jamais l'ensemble du relevé. Une
+       première version écrivait directement dans `_derniere_trame` : les
+       étiquettes s'accumulaient d'une trame à l'autre, et au bout de quelques
+       minutes toute étiquette avait « déjà été rejetée une fois » — le test
+       « aucune ne portait celle-ci » ne mordait plus jamais, en silence.
+    """
+    if isinstance(brut, (bytes, bytearray)):
+        brut = brut.decode("ascii", errors="replace")
+    # `split()` sans argument coupe sur TOUTE espace : l'espace de l'historique
+    # comme la tabulation du standard. Une seule ligne pour les deux modes.
+    morceaux = brut.split()
+    if morceaux:
+        vues.add(morceaux[0])
 
 
 def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
@@ -438,6 +500,13 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
     Retourne un dict des labels parsés, ou None si timeout / trame vide.
     """
     deadline = time.time() + TIC_TIMEOUT_S
+    # ⚠️ Remis à neuf ICI, pas aux sorties : la sortie sur délai en
+    #    synchronisation n'en touchait aucune, et laissait donc `_cause_rejets`
+    #    décrire la trame PRÉCÉDENTE. Inoffensif aujourd'hui — l'appelant
+    #    n'interroge le relevé que sur une trame lue — mais c'est le genre de
+    #    dépendance invisible qui se paie au premier appelant suivant.
+    _derniere_trame.update(gardees=0, rejetees=0, parite=0, parite_lignes=0,
+                           etiquettes_rejetees=set())
 
     # Synchronisation sur STX.
     #
@@ -468,6 +537,8 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
         return None
 
     labels: dict = {}
+    parite_lignes = 0          # sous-ensemble de parite_ko : voir _derniere_trame
+    etiquettes_ko: set = set()
     current = bytearray()
     in_line = False
     # 🚨 UN SEUL OCTET FAUTIF CONDAMNE TOUTE LA LIGNE. Voir au CR pourquoi.
@@ -502,7 +573,9 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
             if (raw[0] & 0x7F) == ETX:
                 log.debug(f"TIC : ETX corrompu (parité) — trame close ici plutôt "
                           f"que fondue avec la suivante ; {kept} ligne(s) gardée(s)")
-                _derniere_trame.update(gardees=kept, rejetees=dropped, parite=parite_ko)
+                _derniere_trame.update(gardees=kept, rejetees=dropped, parite=parite_ko,
+                                   parite_lignes=parite_lignes,
+                                   etiquettes_rejetees=etiquettes_ko)
                 _signaler_parite(parite_ko)
                 return labels if labels else None
 
@@ -529,6 +602,7 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
             #    parce que le code ne rejetait pas la ligne.
             if in_line:
                 ligne_douteuse = True
+                parite_lignes += 1      # celui-là, lui, a coûté une ligne
             continue
         b = raw[0] & 0x7F
 
@@ -536,7 +610,9 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
             # ⭐ `parite_ko` est COMPTÉ, pas seulement écarté : c'est ce qui
             #    transforme une protection muette en une mesure. Une liaison
             #    bruyante se verra, au lieu de se déduire de PDL fantômes.
-            _derniere_trame.update(gardees=kept, rejetees=dropped, parite=parite_ko)
+            _derniere_trame.update(gardees=kept, rejetees=dropped, parite=parite_ko,
+                                   parite_lignes=parite_lignes,
+                                   etiquettes_rejetees=etiquettes_ko)
             _signaler_parite(parite_ko)
             log.debug(f"Trame TIC complète : {kept} lignes gardées, "
                       f"{dropped} rejetées, {parite_ko} car. hors parité")
@@ -550,6 +626,7 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
                 # On ne CONSULTE même pas le checksum : il ne peut pas trancher,
                 # puisqu'il est aveugle à ce qui manque une fois sur soixante-quatre.
                 log.debug("Ligne rejetée : un caractère au moins hors parité")
+                _note_ligne_rejetee(etiquettes_ko, current)
                 dropped += 1
                 in_line = False
                 ligne_douteuse = False
@@ -561,6 +638,7 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
                     kept += 1
                 else:
                     log.debug(f"Checksum invalide : <{line}>")
+                    _note_ligne_rejetee(etiquettes_ko, line)
                     dropped += 1
             in_line = False
         elif in_line:
@@ -568,7 +646,9 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
 
     # ⚠️ Même raison qu'au timeout de synchronisation : c'est précisément quand
     #    tout échoue qu'il faut que le compteur parle.
-    _derniere_trame.update(gardees=kept, rejetees=dropped, parite=parite_ko)
+    _derniere_trame.update(gardees=kept, rejetees=dropped, parite=parite_ko,
+                                   parite_lignes=parite_lignes,
+                                   etiquettes_rejetees=etiquettes_ko)
     _signaler_parite(parite_ko)
     log.warning(f"TIC timeout en lecture trame ({kept} gardée(s), {dropped} "
                 f"rejetée(s), {parite_ko} car. hors parité)")
@@ -969,11 +1049,11 @@ if __name__ == "__main__":
                         elif active_name is None:
                             log.warning(f"PTEC inconnu : '{ptec}' — trame ignorée")
                         elif active_value is None:
-                            log.warning(f"{active_name} absent de la trame TIC{_cause_rejets()} — trame ignorée")
+                            log.warning(f"{active_name} absent de la trame TIC{_cause_rejets(active_name)} — trame ignorée")
                         elif iinst is None:
-                            log.warning(f"IINST absent de la trame TIC{_cause_rejets()} — trame ignorée")
+                            log.warning(f"IINST absent de la trame TIC{_cause_rejets('IINST')} — trame ignorée")
                         elif papp is None:
-                            log.warning(f"PAPP absent de la trame TIC{_cause_rejets()} — trame ignorée")
+                            log.warning(f"PAPP absent de la trame TIC{_cause_rejets('PAPP')} — trame ignorée")
                         else:
                             demain, adps, pejp = build_flags(labels)
                             # Champs non-câblés (DEMAIN/ADPS/PEJP) → log INFO on-change (aligné LoRa).
@@ -1003,9 +1083,9 @@ if __name__ == "__main__":
                         active_value = easf.get(f"EASF{ntarf:02d}") if ntarf else None
 
                         if papp is None:
-                            log.warning(f"SINSTS absent de la trame standard{_cause_rejets()} — trame ignorée")
+                            log.warning(f"SINSTS absent de la trame standard{_cause_rejets('SINSTS')} — trame ignorée")
                         elif iinst is None:
-                            log.warning(f"IRMS1 absent de la trame standard{_cause_rejets()} — trame ignorée")
+                            log.warning(f"IRMS1 absent de la trame standard{_cause_rejets('IRMS1')} — trame ignorée")
                         else:
                             # _src_standard TOUJOURS posé (c'est le mode → tic_mode/lecture papp).
                             # index_id/index_value seulement si l'index actif a été vu (sinon NULL

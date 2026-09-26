@@ -189,6 +189,79 @@ def une_ligne_amputee_est_REJETEE_meme_si_le_checksum_la_valide():
 
 
 @cas
+def le_releve_n_accuse_PAS_la_parite_pour_un_octet_hors_trame():
+    """
+    🚨 LE CAS DU TRIPHASÉ, celui qui a coûté un après-midi d'oscilloscope.
+
+       Un compteur triphasé émet `IINST1/2/3` et JAMAIS `IINST`. La cause est
+       « cette étiquette n'est pas émise », et c'est tout ce qu'on veut lire.
+
+       Mais si un seul octet bruité traîne pendant l'attente du STX — et ces
+       octets-là sont la QUEUE DE LA TRAME PRÉCÉDENTE — l'ancien relevé
+       annonçait « 1 caractère rejeté sur parité ». Il accusait la liaison pour
+       une trame dont aucune ligne n'avait été rejetée, remettant exactement le
+       mauvais diagnostic que `_cause_rejets` existe pour tuer.
+
+    ⚠️ Le compteur de BRUIT, lui, doit toujours voir cet octet : c'est bien une
+       erreur de transmission. Les deux affirmations coexistent, et le cas
+       vérifie les deux — sinon « ne pas accuser » se confondrait avec
+       « ne pas compter ».
+    """
+    m._parite_cumul.update(car=0, trames=0, debut=0.0)
+    flux = ([corrompu(ord("A"))]                      # queue de la trame d'avant
+            + [sain(STX)] + ligne("ADCO 021861000000 X") + [sain(ETX)])
+    labels = m.read_frame(FauxPort(flux), tout_bon, range_brut)
+
+    assert labels == {"ADCO": "021861000000"}, f"trame mal lue : {labels}"
+    assert "n'est pas émise" in m._cause_rejets("IINST"), (
+        f"la parité est accusée alors qu'aucune ligne n'a été rejetée : "
+        f"{m._cause_rejets('IINST')!r}")
+    assert m._parite_cumul["car"] == 1, (
+        f"l'octet n'est plus compté comme bruit : {m._parite_cumul} — "
+        f"ne pas accuser ne veut pas dire ne pas mesurer")
+
+
+@cas
+def le_releve_dit_si_la_ligne_rejetee_PORTAIT_l_etiquette_cherchee():
+    """
+    ⭐ Des lignes SONT tombées, mais aucune ne portait celle qu'on cherche. Dire
+       « 2 lignes rejetées » laisse croire à un lien de cause à effet qui n'existe
+       pas — c'est la même faute, un cran plus subtil.
+
+    ⚖️ Deux moitiés opposées, et c'est ce qui rend le cas concluant : la même
+       trame, la même étiquette manquante, mais selon que la ligne tombée la
+       portait ou non, le message doit changer de camp.
+    """
+    def checksum_refuse_PTEC(l):
+        return not l.startswith("PTEC")
+
+    flux = ([sain(STX)] + ligne("ADCO 021861000000 X") + ligne("PTEC HP.. X")
+            + [sain(ETX)])
+    m.read_frame(FauxPort(flux), checksum_refuse_PTEC, range_brut)
+
+    # On cherchait PTEC, et c'est bien PTEC qui est tombée.
+    #
+    # ⚠️ Assertion NÉGATIVE, et c'est ce qui la rend concluante. Vérifier que le
+    #    message contient « rejetée(s) sur checksum » ne prouvait RIEN : la
+    #    branche « aucune ne portait PTEC » contient la même chaîne, donc le test
+    #    passait même en supprimant tout le relevé d'étiquettes. Mesuré par
+    #    sabotage — il restait vert.
+    cause = m._cause_rejets("PTEC")
+    assert "aucune ne portait" not in cause, (
+        f"PTEC est tombée, et le relevé prétend qu'aucune ligne ne la portait : "
+        f"{cause!r}")
+    assert "rejetée(s) sur checksum" in cause, f"cause muette : {cause!r}"
+
+    # On cherchait IINST : une ligne est tombée, mais ce n'était pas elle.
+    cause = m._cause_rejets("IINST")
+    assert "aucune ne portait IINST" in cause, (
+        f"une ligne sans rapport est imputée à IINST : {cause!r}")
+    assert "probablement" in cause, (
+        "l'indice est présenté comme une certitude : une étiquette corrompue "
+        f"par la parité peut avoir un nom relevé faux — {cause!r}")
+
+
+@cas
 def une_liaison_si_bruyante_quelle_expire_est_QUAND_MEME_comptee():
     """
     🚨 Le cas que le compteur existe pour mesurer, et le seul où il se taisait.
@@ -237,11 +310,36 @@ def le_releve_dit_POURQUOI_une_etiquette_manque():
     assert "n'est pas émise" in m._cause_rejets(), (
         f"aucun rejet, la cause devrait pointer le compteur : {m._cause_rejets()!r}")
 
+    # ⚠️ Un octet fautif ENTRE le CR et l'ETX n'est dans AUCUNE ligne : il n'a
+    #    donc rien coûté à cette trame, et l'accuser serait le même mensonge.
     flux = ([sain(STX)] + ligne("ADCO 021861000000 X")
             + [corrompu(ord("A"))] + [sain(ETX)])
     m.read_frame(FauxPort(flux), tout_bon, range_brut)
-    assert "parité" in m._cause_rejets(), (
-        f"un caractère rejeté sur parité n'est pas rapporté : {m._cause_rejets()!r}")
+    assert "n'est pas émise" in m._cause_rejets(), (
+        f"un octet hors de toute ligne est imputé à tort : {m._cause_rejets()!r}")
+
+    # Celui-ci, en revanche, tombe DANS la ligne : il la condamne, et il doit
+    # être rapporté. ⚖️ C'est le témoin de l'assertion précédente — sans lui,
+    # un `_cause_rejets` qui ne parlerait JAMAIS de parité la satisferait aussi.
+    abimee = ligne("PAPP 00450 X")
+    abimee[7] = corrompu(abimee[7] & 0x7F)      # dans la VALEUR : le nom survit
+    m.read_frame(FauxPort([sain(STX)] + abimee + [sain(ETX)]), tout_bon, range_brut)
+    assert "sur parité" in m._cause_rejets("PAPP"), (
+        f"une ligne condamnée par la parité n'est pas rapportée : "
+        f"{m._cause_rejets('PAPP')!r}")
+
+    # 🚨 ET LA LIMITE, dite plutôt que tue : si la parité mange un caractère du
+    #    NOM, l'étiquette relevée est fausse et l'imputation ne peut plus
+    #    trancher. Le message doit alors NOMMER ce doute — conclure « pas
+    #    émise » serait se tromper dans l'autre sens, puisqu'elle l'était.
+    abimee = ligne("PAPP 00450 X")
+    abimee[3] = corrompu(abimee[3] & 0x7F)      # dans le NOM cette fois
+    m.read_frame(FauxPort([sain(STX)] + abimee + [sain(ETX)]), tout_bon, range_brut)
+    cause = m._cause_rejets("PAPP")
+    assert "abîmer le nom" in cause, (
+        f"le doute sur le nom relevé est passé sous silence : {cause!r}")
+    assert "pas émise" not in cause, (
+        f"conclusion fausse : l'étiquette ÉTAIT émise, elle a été abîmée — {cause!r}")
 
 
 if __name__ == "__main__":
