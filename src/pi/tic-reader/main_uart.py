@@ -337,6 +337,55 @@ def _std_horodate_to_epoch(h: str | None) -> int | None:
         return None
 
 
+# ─── Bruit de parité : mesurer sans noyer la carte SD ───────────────────────
+#
+# 🚨 Une version antérieure émettait un WARNING PAR TRAME dès qu'un caractère
+#    était rejeté. Sur une liaison bruyante, à ~1,5 s par trame, ça fait
+#    ~57 000 lignes par jour dans journald — SUR LA CARTE SD. Le reste de ce
+#    fichier évite précisément ça (cf. `log_uncabled`, qui ne parle qu'aux
+#    changements d'état).
+#
+# ⭐ On accumule et on résume. Le signal reste — une liaison qui se dégrade se
+#    voit toujours — mais il tient en une ligne toutes les cinq minutes au lieu
+#    de deux cents.
+#
+# 🔬 CE COMPTEUR EST AUSSI L'INSTRUMENT D'UNE MESURE QUI RESTE À FAIRE.
+#
+#    Question ouverte : que faire d'un ETX corrompu ? Le fermer ici coûte la
+#    fin de la trame courante ; fondre avec la suivante coûte UNE TRAME DE PLUS
+#    (on attend l'ETX d'après). Lequel est préférable dépend entièrement du
+#    TAUX D'ERREUR réel sur la ligne, et personne ne le connaît.
+#
+#    ⇒ Laisser tourner cette branche sur un boîtier plusieurs jours et lire ces
+#      résumés. Si le taux est ~0, la question ne se pose pas. S'il ne l'est
+#      pas, le chiffre tranche — et il tranchera mieux qu'un raisonnement.
+_PARITE_PERIODE_S = 300
+_parite_cumul = {"car": 0, "trames": 0, "debut": 0.0}
+
+
+def _signaler_parite(n: int) -> None:
+    """Accumule les rejets de parité, et n'en parle qu'une fois par période."""
+    maintenant = time.monotonic()
+    if _parite_cumul["debut"] == 0.0:
+        _parite_cumul["debut"] = maintenant
+
+    _parite_cumul["car"] += n
+    if n:
+        _parite_cumul["trames"] += 1
+
+    ecoule = maintenant - _parite_cumul["debut"]
+    if ecoule < _PARITE_PERIODE_S:
+        return
+
+    # ⓘ Rien à dire quand rien n'est rejeté : le silence EST l'information.
+    if _parite_cumul["car"]:
+        log.warning(
+            f"TIC : {_parite_cumul['car']} caractère(s) rejeté(s) sur parité "
+            f"dans {_parite_cumul['trames']} trame(s) en {ecoule / 60:.0f} min "
+            f"— liaison bruyante ?")
+    _parite_cumul.update(car=0, trames=0, debut=maintenant)
+
+
 def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
     """
     Lit une trame TIC complète (STX..ETX), mode-agnostique.
@@ -345,10 +394,23 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
     """
     deadline = time.time() + TIC_TIMEOUT_S
 
-    # Synchronisation sur STX
+    # Synchronisation sur STX.
+    #
+    # ⚠️ La parité est vérifiée ICI AUSSI. Une version antérieure n'appliquait
+    #    que `& 0x7F` : un octet de parité fausse dont les 7 bits de poids
+    #    faible valent 0x02 était alors pris pour un début de trame. Et les
+    #    erreurs vues pendant cette phase n'étaient pas comptées, donc la mesure
+    #    de bruit SOUS-ESTIMAIT la réalité — ce qui est le pire défaut possible
+    #    pour un compteur dont le seul rôle est de mesurer.
+    parite_ko = 0
     while time.time() < deadline:
         raw = ser.read(1)
-        if raw and (raw[0] & 0x7F) == STX:
+        if not raw:
+            continue
+        if not octet_valide(raw[0]):
+            parite_ko += 1
+            continue
+        if (raw[0] & 0x7F) == STX:
             break
     else:
         log.warning("TIC timeout en attente STX")
@@ -357,26 +419,46 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
     labels: dict = {}
     current = bytearray()
     in_line = False
-    kept = dropped = parite_ko = 0
+    kept = dropped = 0
 
     while time.time() < deadline:
         raw = ser.read(1)
         if not raw:
             continue
         if not octet_valide(raw[0]):
-            # Caractère fautif : on le JETTE. La ligne devient courte, son
-            # checksum tombe faux, le groupe est rejeté — comportement voulu.
             parite_ko += 1
+
+            # Un ETX corrompu ferme quand même la trame.
+            #
+            # Sans ça, la lecture continue DANS LA TRAME SUIVANTE et rend un
+            # dict mêlant les deux.
+            #
+            # ⓘ CE N'EST PAS GRAVE, et il ne faut pas le présenter comme tel :
+            #    les trames TIC sont répétitives et viennent du MÊME compteur
+            #    sur la MÊME ligne. Fondre N et N+1 donne surtout les valeurs de
+            #    N+1 écrasant celles de N — une trame lue déphasée, pas une
+            #    corruption. Le coût réel est UNE TRAME PERDUE.
+            #
+            # ⭐ Mais fermer ici coûte trois lignes et rend le découpage
+            #    prévisible, alors que fondre rend les compteurs (gardées,
+            #    rejetées, parité) faux : ils porteraient sur deux trames en
+            #    disant une. C'est la MESURE qu'on protège, pas la donnée.
+            #
+            # ⓘ CR et LF corrompus, eux, ne coûtent qu'une ligne : la suivante
+            #    resynchronise. On les laisse tomber.
+            if (raw[0] & 0x7F) == ETX:
+                log.debug(f"TIC : ETX corrompu (parité) — trame close ici plutôt "
+                          f"que fondue avec la suivante ; {kept} ligne(s) gardée(s)")
+                _signaler_parite(parite_ko)
+                return labels if labels else None
             continue
         b = raw[0] & 0x7F
 
         if b == ETX:
             # ⭐ `parite_ko` est COMPTÉ, pas seulement écarté : c'est ce qui
             #    transforme une protection muette en une mesure. Une liaison
-            #    bruyante se verra ici, au lieu de se déduire de PDL fantômes.
-            if parite_ko:
-                log.warning(f"TIC : {parite_ko} caractère(s) rejeté(s) sur "
-                            f"parité — liaison bruyante ?")
+            #    bruyante se verra, au lieu de se déduire de PDL fantômes.
+            _signaler_parite(parite_ko)
             log.debug(f"Trame TIC complète : {kept} lignes gardées, "
                       f"{dropped} rejetées, {parite_ko} car. hors parité")
             return labels if labels else None
