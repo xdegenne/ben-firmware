@@ -18,6 +18,68 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.9.17] — 2026-09-27
+
+**Le lecteur TIC vérifie la parité au lieu de la jeter.** La protection arrivait jusqu'à nous, et on la mettait à la poubelle à l'entrée.
+
+**Le symptôme.** Un boîtier du parc déclarait **quatre compteurs** alors qu'il n'en lit qu'un. Ce n'était pas quatre compteurs : c'était le même ADCO, corrompu d'un seul caractère, et à chaque fois sur le **bit 6** (`'0'` = 0x30 → `'p'` = 0x70).
+
+**Pourquoi le checksum ne peut pas le voir.** Il vaut `(somme & 0x3F) + 0x20` : il ne voit la somme que **modulo 64**. Basculer le bit 6 ajoute exactement 64, et le masque jette la retenue.
+
+```
+ADCO 061947000000  -> checksum '2'
+ADCO p61947000000  -> checksum '2'   ← IDENTIQUE
+```
+
+> 🚨 Invisible **par construction**, et ce n'est pas un défaut de la spec : le checksum doit tenir dans un caractère imprimable, donc six bits.
+
+**La protection existait, on l'effaçait.** La TIC est en **7E1** : chaque caractère porte un bit de parité. Le port étant ouvert en 8N1, l'UART nous le remettait fidèlement en position 7 — et `& 0x7F` l'effaçait sans jamais le regarder. L'Arduino, lui, n'a jamais rien jeté (`SERIAL_7E1` depuis toujours) : deux lecteurs du même protocole, deux niveaux de protection, et c'est le moins protégé qui a produit les ADCO déformés.
+
+**Logiciel, pas matériel — et c'est une mesure qui l'a décidé.**
+
+| configuration | `INPCK` | résultat |
+|---|---|---|
+| 8N1 + masque *(l'ancien)* | non | 124 valides · 0 rejeté |
+| 7E1 sans `INPCK` | non | 123 valides · 0 rejeté |
+| 7E1 + `INPCK\|IGNPAR` | **oui** | 123 valides · 0 rejeté |
+
+> ⭐ `pyserial` n'active **pas** `INPCK`, même avec `PARITY_EVEN`. Passer le port en 7E1 n'aurait **rien** changé tout en donnant l'air d'un correctif — le pire des deux mondes. Le contrôle logiciel, lui, ne dépend d'aucun drapeau, marche aussi sur mini-UART, **se teste sans matériel**, et laisse **compter** les rejets : ce que le noyau fait en silence.
+
+**1. `tic_parite.py`, fichier nouveau.** `octet_valide()` vit à part parce que `main_uart.py` importe `RPi.GPIO` au chargement : tant que la fonction y était, « testable sans boîtier » était **faux**.
+
+**2. Un octet hors parité condamne le GROUPE entier.** Jeter l'octet et garder le reste supposait que le checksum rattraperait l'amputation. Il ne peut pas : toute amputation dont les caractères retirés somment à un multiple de 64 le laisse **inchangé**.
+
+```
+2 espaces   2 × 0x20 =  64    ← et l'espace est le SÉPARATEUR des champs
+4 zéros     4 × 0x30 = 192    ← et le zéro est dans tout INDEX
+```
+
+> 🚨 `HCHC 001000000` amputé de quatre zéros devient `HCHC 00100`, **même checksum**, et un **index faux** est écrit en base. Seul défaut de ce chantier qui fabriquait une donnée *erronée* plutôt que d'en perdre une.
+
+**3. Le relevé n'accuse plus le compteur pour un défaut de la liaison.** Deux compteurs séparés : `parite` mesure le **bruit** et voit tout ; `parite_groupes` mesure l'**imputation** et ne compte que ce qui a coûté un groupe. Et `_cause_rejets` prend l'étiquette cherchée en argument pour répondre sur **elle**.
+
+**Ce que ça coûte.**
+
+| | µs/octet | % CPU à 9600 bd |
+|---|---|---|
+| masque seul *(l'ancien)* | 0,55 | 0,053 % |
+| `bin().count()` | 5,82 | 0,559 % |
+| table de 256 entrées | 2,24 | 0,215 % |
+
+Le lecteur consomme 9 % de CPU : **+0,16 point**, dix fois moins en 1200 bauds.
+
+**Ce qui l'éprouve.** Banc de **11 cas**, sans matériel. Dont le témoin qui manquait au chantier : une **vraie trame de production** encodée en 7E1 et rejouée cent fois → **1100 groupes gardés, 0 rejeté**. Dix cas prouvaient qu'on rejette ce qu'il faut, aucun ne prouvait qu'on ne rejette **que** ça.
+
+> ⚖️ Chaque garde-fou a été saboté séparément — ce qui a révélé **trois défauts du banc lui-même**, dont un lanceur qui ne rattrapait que `AssertionError` : une autre exception **tuait la suite** en n'affichant que trois échecs sur onze.
+
+Sur un boîtier en production, trois déploiements successifs : débit inchangé dans la plage **325-337 mesures/10 min**.
+
+**Vocabulaire.** Les termes de la spec sont désormais tenus dans le code et les journaux : **trame** (`STX`…`ETX`) · **groupe** (`LF`…`CR`, l'unité qui porte *son* checksum) · **étiquette** · **séparateur** · **caractère** (ce qui circule, 7 bits + parité) · **octet** (ce que l'UART remet, 8 bits). 🚨 Les deux derniers ne sont pas synonymes, et c'est le cœur de cette version.
+
+**Et le dépôt est public.** Les numéros de série réels de compteurs en ont été retirés : un ADCO identifie un foyer. Matricules **inventés**, pas tronqués — un ADS fait douze caractères numériques (§2.2) et une valeur amputée n'aurait plus la forme que les bancs vérifient.
+
+---
+
 ### [0.9.16] — 2026-09-24
 
 **Le boîtier entretient son propre certificat.** Jusqu'ici, remplacer un certificat voulait dire se déplacer. Cette version installe l'agent qui le fait seul, à répétition, sans personne sur place.
