@@ -18,6 +18,56 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.9.18] — 2026-09-27
+
+**Répare ce que 0.9.17 a cassé sur les boîtiers radio.** Le code de 0.9.17 était bon ; son script d'update avait deux défauts enchaînés.
+
+> 🚨 **`pi-0.9.17` est brûlée.** Sa transition a été retirée de `compatibility.yaml` pour arrêter l'hémorragie, et remplacée par deux transitions vers 0.9.18 — une qui répare, une qui aligne.
+
+**Le premier défaut : une garde qui ne joue jamais.**
+
+```bash
+if ! systemctl cat ben-tic-reader.service >/dev/null 2>&1; then … exit 0
+```
+
+`systemctl cat` réussit dès que le **fichier d'unité** existe — et l'image dorée le pose sur **tous** les boîtiers, radio compris. Tester l'existence d'un fichier ne dit rien sur ce qui doit tourner.
+
+**Le second en découle.** Le script atteignait donc `systemctl restart ben-tic-reader`. Or cette unité est `static` : pas de `[Install]`, pas activée, c'est `check_network` qui la démarre d'après les **capabilities**. ⚠️ Et `restart` sur un service **arrêté le démarre**.
+
+**Ce que ça a coûté, mesuré :**
+
+| | |
+|---|---|
+| plantages du lecteur, 3 jours **avant** le tag | **0** |
+| plantages dans les 9 h **après** | **2 538** |
+| cycles d'update en échec | 53 |
+
+Le lecteur filaire, démarré là où il n'a rien à faire, perd la course au GPIO de la LED contre `ben-radio` qui en est le propriétaire (`lgpio.error: 'GPIO not allocated'`), et systemd le relance sans fin. Le contrôle d'effet échouant, `device.json` n'était pas bumpé : l'update **rejouait toutes les 10 minutes**. C'est la mécanique exacte qui avait brûlé `pi-0.9.12`.
+
+> ⭐ **La règle qui en sort, et elle vaut pour toute update future :**
+>
+> **Une update redémarre ce qui TOURNE. Elle ne démarre JAMAIS ce qui ne tourne pas.**
+>
+> Ce qui doit tourner est une décision de `check_network` à partir des capabilities. Une update n'a ni à la reprendre, ni à la contredire.
+
+**Et la décision vient des capabilities, jamais du modèle.** `device.json.model` porte depuis la 0.8.0 un **label commercial** (« Radio », « Filaire »), pas un modèle technique — s'y fier avait déjà été supprimé en 0.9.12. Le script interroge `capabilities.py`, la même source que `check_network`. Capabilities illisibles ⇒ **aucun service n'est touché**.
+
+Les trois modèles, dont le troisième que 0.9.17 aurait cassé aussi :
+
+| capabilities déclarées | ce que 0.9.18 fait |
+|---|---|
+| `tic-uart` | redémarrage encadré, **seulement s'il tournait déjà** |
+| `lora` + `lora-tic-receiver` | **arrête** le lecteur filaire si 0.9.17 l'a lancé |
+| `lora` + `lora-tic-receiver` + `tic-uart` | les deux lecteurs coexistent, et `ben-radio` possède le GPIO |
+
+**Pourquoi le contrôle d'effet de 0.9.17 ne l'a pas vu.** Il avait été éprouvé sur un boîtier **filaire**, où le lecteur tourne déjà : `restart` y redémarre au lieu de démarrer, et la garde inopérante ne se voyait pas. Le cas radio n'avait été exercé sur **aucune** cible.
+
+> ⭐ **Un script « universel » doit être éprouvé sur les deux modèles, pas sur le plus favorable.** Et une garde qu'on n'a pas vue jouer est une garde qu'on suppose.
+
+**La transition 0.9.17 → 0.9.18 ne fait rien, volontairement.** Les boîtiers filaires ont déjà le bon code ; les deux tags portent le même arbre pour le lecteur TIC. 🚨 Elle **ne redémarre pas** le lecteur : ça coûterait des secondes de mesures sur chaque boîtier pour rien, et rouvrirait la fenêtre de course au GPIO. Elle se contente de vérifier le checkout — un tag est une chose qu'on peut rater, et un fichier manquant doit être vu tant que rien n'a bougé.
+
+---
+
 ### [0.9.17] — 2026-09-27
 
 **Le lecteur TIC vérifie la parité au lieu de la jeter.** La protection arrivait jusqu'à nous, et on la mettait à la poubelle à l'entrée.
