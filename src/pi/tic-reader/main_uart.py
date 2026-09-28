@@ -214,6 +214,51 @@ def tic_checksum_ok(line: str) -> bool:
 
 CONDAMNEE = "_trame_condamnee"   # posé par un décodeur, lu par read_frame
 
+# 🚨 UNE TRAME CONDAMNÉE N'EST PAS UNE TRAME ABSENTE, et les confondre RECRÉE la panne
+#    que tout ce fichier cherche à éviter.
+#
+#    `read_frame` rendait `None` pour deux choses opposées : « rien n'est arrivé »
+#    (timeout, liaison morte) et « tout est arrivé, mais l'identité ne tient pas ». La
+#    boucle traite le premier cas en laissant `frame_ok` à faux — donc
+#    `last_success_time` n'avance plus, donc le watchdog relance le process au bout de
+#    10 min, DONC TOUTES LES 10 MINUTES tant que le compteur émet le même ADCO. C'est
+#    exactement le mode de panne de pi-0.9.12, par une autre porte que celle qu'on
+#    avait bouchée : sortir `frame_ok` du garde de stockage ne couvrait QUE le cas
+#    `PDL_INDEX is None`, pas celui d'une trame condamnée.
+#
+# ⭐ Une trame condamnée prouve au contraire que LA LIAISON EST VIVANTE : ses groupes
+#    arrivent, leur parité et leur checksum passent. Le watchdog surveille le FIL, pas
+#    notre capacité à nommer le compteur. Redémarrer ne répare pas un compteur qui émet
+#    un ADCO difforme — ça ne fait que perdre les mesures des autres lecteurs.
+TRAME_CONDAMNEE = object()      # ≠ None : reçue et lisible, mais sans identité valable
+
+
+# ⓘ Même forme que `_signaler_parite` : un cumul, un message par période, et rien à
+#   dire quand il n'y a rien à dire. Indispensable ici, puisqu'on ne redémarre plus :
+#   sans ce relevé, un boîtier qui ne stocke plus rien garderait un journal calme.
+_CONDAMNEES_PERIODE_S = 300
+_condamnees_cumul = {"trames": 0, "debut": 0.0}
+
+
+def _signaler_condamnees(condamnee: bool) -> None:
+    """Accumule les trames condamnées, et n'en parle qu'une fois par période."""
+    maintenant = time.monotonic()
+    if _condamnees_cumul["debut"] == 0.0:
+        _condamnees_cumul["debut"] = maintenant
+    if condamnee:
+        _condamnees_cumul["trames"] += 1
+
+    ecoule = maintenant - _condamnees_cumul["debut"]
+    if ecoule < _CONDAMNEES_PERIODE_S:
+        return
+    if _condamnees_cumul["trames"]:
+        log.warning(
+            f"TIC : {_condamnees_cumul['trames']} trame(s) CONDAMNÉE(S) en "
+            f"{ecoule / 60:.0f} min — ADCO non conforme alors que parité ET checksum "
+            f"passent : des caractères ont été perdus, et rien ne dit que les autres "
+            f"groupes y ont échappé")
+    _condamnees_cumul.update(trames=0, debut=maintenant)
+
 
 def garder_adco(brut: str, out: dict) -> None:
     """Ne retient l'ADCO que s'il EN EST un — et CONDAMNE la trame sinon.
@@ -600,7 +645,7 @@ def _note_groupe_rejete(vues: set, brut: bytes | bytearray | str) -> None:
         vues.add(morceaux[0])
 
 
-def _rendre(labels: dict) -> dict | None:
+def _rendre(labels: dict):    # dict | TRAME_CONDAMNEE | None
     """Ce que `read_frame` rend : la trame, ou rien si un décodeur l'a CONDAMNÉE.
 
     ⭐ `read_frame` reste MODE-AGNOSTIQUE : elle ne connaît aucune étiquette, seulement
@@ -611,14 +656,13 @@ def _rendre(labels: dict) -> dict | None:
     if not labels:
         return None
     if labels.pop(CONDAMNEE, False):
-        log.warning("Trame TIC condamnée : ADCO non conforme alors que parité ET "
-                    "checksum passent — des caractères ont été perdus, et rien ne dit "
-                    "que les autres groupes y ont échappé")
-        return None
+        # Pas de journal ICI : à ~1 trame/s un message par trame noie journald. Le
+        # relevé périodique `_signaler_condamnees` s'en charge, comme pour la parité.
+        return TRAME_CONDAMNEE
     return labels
 
 
-def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
+def read_frame(ser: serial.Serial, checksum_ok, parse_label):    # dict | TRAME_CONDAMNEE | None
     """
     Lit une trame TIC complète (STX..ETX), mode-agnostique.
     `checksum_ok(line)` valide la ligne ; `parse_label(line, labels)` la décode.
@@ -1132,7 +1176,15 @@ if __name__ == "__main__":
                 # (la trame suivante nous attend déjà dans le port).
                 labels = read_frame(ser, checksum_ok, parse_label)
 
-                if labels is None:
+                _signaler_condamnees(labels is TRAME_CONDAMNEE)
+
+                if labels is TRAME_CONDAMNEE:
+                    # 🚨 `frame_ok` VRAI : la liaison est vivante, seule l'identité
+                    #    manque. Le laisser à faux ferait repartir le watchdog toutes
+                    #    les 10 min (cf. TRAME_CONDAMNEE). Rien n'est stocké pour
+                    #    autant : la trame n'a pas franchi ce point.
+                    frame_ok = True
+                elif labels is None:
                     log.warning("Trame TIC invalide ou timeout")
                 else:
                     # ⓘ La clé n'existe que si l'ADCO EN ÉTAIT un : `garder_adco` l'a

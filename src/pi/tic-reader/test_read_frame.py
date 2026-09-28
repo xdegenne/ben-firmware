@@ -528,7 +528,8 @@ def un_ADCO_non_conforme_CONDAMNE_TOUTE_la_trame():
     m._parse_label("PAPP 01230 5", labels)            # d'apparence saine…
     m._parse_label("IINST 005 7", labels)
     assert "ADCO" not in labels
-    assert m._rendre(labels) is None, "la trame a été rendue malgré un ADCO non conforme"
+    assert m._rendre(labels) is m.TRAME_CONDAMNEE, \
+        "la trame a été rendue malgré un ADCO non conforme"
 
 
 @cas
@@ -596,7 +597,7 @@ def L_AMPUTATION_traverse_parite_ET_checksum_et_est_QUAND_MEME_arretee():
         "l'angle mort du checksum n'est pas reproduit — le cas ne prouve plus rien"
 
     port = FauxPort(_trame(ampute, "PAPP 01230", "IINST 005", "PTEC TH.."))
-    assert m.read_frame(port, m.tic_checksum_ok, m._parse_label) is None, \
+    assert m.read_frame(port, m.tic_checksum_ok, m._parse_label) is m.TRAME_CONDAMNEE, \
         "une trame dont l'ADCO a perdu des caractères a été rendue"
 
     # ⚖️ Le témoin : la MÊME trame, ADCO entier → rendue, avec ses mesures.
@@ -642,6 +643,44 @@ def de_la_trame_au_pdl_index_le_parcours_complet():
     assert pdl_index == 0, "le 1er compteur d'un boîtier neuf doit être l'index 0"
     assert m.peut_stocker(conn, pdl_index) is True       # après : le boîtier peut écrire
     assert conn.execute("SELECT adco FROM pdl").fetchone()[0] == "021861000000"
+
+
+@cas
+def une_trame_CONDAMNEE_n_est_PAS_une_trame_ABSENTE():
+    """🚨 LE DÉFAUT TROUVÉ EN REVUE, et il recréait la panne que cette PR combat.
+
+    `read_frame` rendait `None` pour deux choses opposées : « rien n'est arrivé »
+    (timeout, liaison morte) et « tout est arrivé, mais l'identité ne tient pas ». La
+    boucle laisse `frame_ok` à faux sur le premier cas, donc `last_success_time`
+    n'avance plus, donc le watchdog relance le process au bout de 10 min — et TOUTES
+    LES 10 MINUTES tant que le compteur émet le même ADCO. C'est le mode de panne de
+    pi-0.9.12, atteint par une autre porte : sortir `frame_ok` du garde de stockage ne
+    couvrait QUE le cas `PDL_INDEX is None`.
+
+    ⭐ Une trame condamnée PROUVE que la liaison est vivante : ses groupes arrivent,
+       leur parité et leur checksum passent. Le watchdog surveille le FIL.
+
+    ⚠️ La boucle principale et le watchdog vivent sous `if __name__` et ne sont pas
+       importables : ce banc ne peut pas les faire tourner. Il tient donc le CONTRAT
+       qui rend la panne impossible — les trois retours sont DISCERNABLES — et c'est
+       `labels is None` dans la boucle qui décide du reste.
+    """
+    entier, ampute = "ADCO 061947000000", "ADCO 06194700"
+
+    condamnee = m.read_frame(FauxPort(_trame(ampute, "PTEC TH..")),
+                             m.tic_checksum_ok, m._parse_label)
+    absente = m.read_frame(FauxPort([]), m.tic_checksum_ok, m._parse_label)
+    saine = m.read_frame(FauxPort(_trame(entier, "PAPP 01230", "IINST 005", "PTEC TH..")),
+                         m.tic_checksum_ok, m._parse_label)
+
+    assert condamnee is m.TRAME_CONDAMNEE
+    assert absente is None
+    assert saine is not None and saine is not m.TRAME_CONDAMNEE
+
+    # 🚨 L'ASSERTION QUI PORTE TOUT : condamnée ≠ absente. Les confondre, c'est
+    #    `frame_ok` à faux, donc le watchdog, donc os.execv toutes les 10 min.
+    assert condamnee is not absente, \
+        "condamnée et absente confondues — le watchdog relancera le process en boucle"
 
 
 @cas
