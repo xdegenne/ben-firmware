@@ -97,8 +97,14 @@ DETECT_MIN_GROUPS  = 5
 # Le cache est assumé : la boucle tourne à ~1 trame/s sur un Pi Zero mono-cœur, on ne
 # veut pas d'une lecture SQLite par trame. Le chemin LoRa, lui, n'a pas de global :
 # il résout par trame et passe le PDL en paramètre.
-PDL_INDEX         = 0       # résolu depuis l'ADCO dès la 1re trame (0 = valeur d'amorce,
-                            # et index du 1er compteur vu — cf. docs/chantier-pdl-adco.md)
+# 🚨 `None`, et surtout PAS `0` : `0` est l'index du PREMIER compteur de tout boîtier
+#    (cf. docs/chantier-pdl-adco.md), donc une amorce à 0 est INDISCERNABLE d'une vraie
+#    réponse. Tant qu'aucun ADCO conforme n'a été lu, on ne SAIT pas, et une donnée
+#    écrite sous un index deviné est fausse en silence — c'est ce qui arrivait à un
+#    boîtier déplacé sur un autre compteur puis redémarré : ses mesures repartaient
+#    sous l'index de son ANCIEN compteur jusqu'à la première trame lisible.
+# ⭐ Même idiome que la voie LoRa, où `get_pdl_index()` rend déjà `int | None`.
+PDL_INDEX         = None    # résolu depuis l'ADCO dès la 1re trame ; None = PAS ENCORE SU
 _pdl_source_adco  = ""      # ADCO ayant servi à résoudre PDL_INDEX ci-dessus
 
 # Lecture au fil de l'eau (volet A) : plus de PERIOD_S — on suit la cadence des
@@ -206,6 +212,44 @@ def tic_checksum_ok(line: str) -> bool:
     return chr((total & 0x3F) + 0x20) == line[-1]
 
 
+CONDAMNEE = "_trame_condamnee"   # posé par un décodeur, lu par read_frame
+
+
+def garder_adco(brut: str, out: dict) -> None:
+    """Ne retient l'ADCO que s'il EN EST un — et CONDAMNE la trame sinon.
+
+    🚨 ET C'EST BIEN LA TRAME ENTIÈRE, PAS LE SEUL GROUPE. Le raisonnement tient à ce
+       qu'on N'ARRIVE JAMAIS ICI par une ligne abîmée ordinaire : un groupe ADCO tombé
+       sur la parité ou sur le checksum est déjà jeté par `read_frame`, et la clé
+       n'existe pas. Le seul cas qui atteint cette fonction est donc un groupe qui a
+       passé LES DEUX CONTRÔLES sans avoir la forme d'un ADCO — autrement dit
+       L'AMPUTATION DANS L'ANGLE MORT DU CHECKSUM (caractères retirés sommant à un
+       multiple de 64 ; cf. le commentaire du rejet de groupe plus bas).
+
+       Or cet angle mort est le MÊME pour tous les groupes de la trame. Des caractères
+       perdus ici veulent dire que la ligne en a perdu PENDANT CETTE TRAME, et un index
+       ou un PAPP raccourci a pu passer exactement de la même façon — en silence, et
+       sans qu'aucune forme permette de s'en apercevoir, puisqu'un nombre raccourci
+       reste un nombre. Garder le reste de la trame reviendrait à jeter le seul signal
+       qu'on ait.
+
+    ⭐ L'ADCO est le SEUL champ de la TIC dont la forme soit connue d'avance — douze
+       chiffres. C'est donc le seul endroit du protocole où l'angle mort du checksum
+       devienne OBSERVABLE. Il sert ici de témoin pour toute la trame.
+
+    ⓘ Coût : une trame, soit ~1,7 s de courbe, et la suivante arrive derrière. Mesuré
+      sur le parc, l'événement se compte en unités par jour pour ~50 000 trames.
+    """
+    adco = (brut or "").strip()
+    if not adco:
+        return
+    if not db.adco_valide(adco):
+        signaler_adco_refuse(adco)
+        out[CONDAMNEE] = True
+        return
+    out["ADCO"] = adco
+
+
 def _parse_label(line: str, out: dict) -> None:
     """Extrait label et valeur d'une ligne TIC validée."""
     parts = line.split(' ')
@@ -243,7 +287,7 @@ def _parse_label(line: str, out: dict) -> None:
         except ValueError:
             pass
     elif name == "ADCO":
-        out["ADCO"] = value.strip()
+        garder_adco(value, out)
     elif name in ("ADPS", "PEJP"):
         out[name] = True
 
@@ -286,7 +330,7 @@ def _parse_label_std(line: str, out: dict) -> None:
     data = parts[-2]            # checksum = parts[-1] (déjà validé), donnée = parts[-2]
 
     if name == "ADSC":                       # adresse compteur ≈ ADCO historique
-        out["ADCO"] = data.strip()
+        garder_adco(data, out)
     elif name == "SINSTS":                    # puiss. app. instantanée soutirée (VA) ≈ PAPP
         v = _std_int(data)
         if v is not None:
@@ -396,6 +440,69 @@ def _signaler_parite(n: int) -> None:
     _parite_cumul.update(car=0, trames=0, debut=maintenant)
 
 
+# ─── Un pdl_index ne se devine pas ──────────────────────────────────────────
+#
+# 🚨 `0` EST UN pdl_index VALIDE — celui du premier compteur de tout boîtier. Une
+#    valeur d'amorce égale à 0 est donc INDISCERNABLE d'une vraie réponse, et rien
+#    dans le code ne peut les séparer. D'où la sentinelle `None` (cf. PDL_INDEX),
+#    et d'où ce prédicat : `peut_stocker` est le SEUL juge de « ai-je le droit
+#    d'écrire cette ligne ».
+#
+# ⭐ Il prend ses deux arguments au lieu de lire les globales, et ce n'est pas du
+#    zèle : c'est ce qui le rend éprouvable sur une machine sans UART — la même
+#    leçon que le bloc `if __name__` plus bas, sans lequel `read_frame` est resté
+#    intestable pendant toute sa vie.
+def peut_stocker(conn, pdl_index) -> bool:
+    """Écriture possible : base ouverte ET pdl_index RÉSOLU (jamais deviné)."""
+    return conn is not None and pdl_index is not None
+
+
+# ⓘ Le refus d'un ADCO est une ASSERTION D'INVARIANT, pas un tamis : en amont il y a
+#   déjà la parité, le checksum TIC et — côté LoRa — le MAC ChaCha20. En arriver là
+#   veut dire qu'autre chose est cassé. Donc ERROR, et la valeur en %r : sans elle on
+#   ne saura jamais ce qui a frappé à la porte.
+#
+# 🚨 Et il FAUT la garde anti-répétition : un ADCO refusé ne met pas à jour
+#    `_pdl_source_adco`, donc la résolution est retentée À CHAQUE TRAME (~1/s). Sans
+#    garde, journald est noyé par la même ligne — et un journal noyé ne se lit plus.
+_dernier_adco_refuse: str | None = None
+
+
+def signaler_adco_refuse(adco: str) -> None:
+    """Crie UNE FOIS par valeur refusée distincte, jamais une fois par trame."""
+    global _dernier_adco_refuse
+    if adco == _dernier_adco_refuse:
+        return
+    _dernier_adco_refuse = adco
+    log.error("ADCO non conforme refusé : %r — aucun PDL créé, aucune écriture", adco)
+
+
+# ⓘ Un boîtier qui décode bien mais ne stocke rien montre un heartbeat VERT et un
+#   journal CALME : indiscernable d'un boîtier sain. Même forme que `_signaler_parite`
+#   — un cumul, un message par période, et rien à dire quand il n'y a rien à dire.
+_NON_STOCKE_PERIODE_S = 300
+_non_stocke_cumul = {"trames": 0, "debut": 0.0}
+
+
+def _signaler_non_stocke(saute: bool) -> None:
+    """Accumule les trames décodées mais NON stockées faute de pdl_index résolu."""
+    maintenant = time.monotonic()
+    if _non_stocke_cumul["debut"] == 0.0:
+        _non_stocke_cumul["debut"] = maintenant
+    if saute:
+        _non_stocke_cumul["trames"] += 1
+
+    ecoule = maintenant - _non_stocke_cumul["debut"]
+    if ecoule < _NON_STOCKE_PERIODE_S:
+        return
+    if _non_stocke_cumul["trames"]:
+        log.warning(
+            f"TIC : {_non_stocke_cumul['trames']} trame(s) décodée(s) mais NON "
+            f"stockée(s) en {ecoule / 60:.0f} min — pdl_index non résolu "
+            f"(ADCO illisible ?)")
+    _non_stocke_cumul.update(trames=0, debut=maintenant)
+
+
 # ─── Ce que la DERNIÈRE trame a coûté ───────────────────────────────────────
 #
 # 🚨 POURQUOI CE RELEVÉ EXISTE. Les messages « étiquette absente » disaient
@@ -493,6 +600,24 @@ def _note_groupe_rejete(vues: set, brut: bytes | bytearray | str) -> None:
         vues.add(morceaux[0])
 
 
+def _rendre(labels: dict) -> dict | None:
+    """Ce que `read_frame` rend : la trame, ou rien si un décodeur l'a CONDAMNÉE.
+
+    ⭐ `read_frame` reste MODE-AGNOSTIQUE : elle ne connaît aucune étiquette, seulement
+       la convention « un décodeur peut condamner sa trame ». C'est `garder_adco` qui
+       sait pourquoi, et c'est le bon partage — historique et standard nomment le même
+       champ ADCO et ADSC.
+    """
+    if not labels:
+        return None
+    if labels.pop(CONDAMNEE, False):
+        log.warning("Trame TIC condamnée : ADCO non conforme alors que parité ET "
+                    "checksum passent — des caractères ont été perdus, et rien ne dit "
+                    "que les autres groupes y ont échappé")
+        return None
+    return labels
+
+
 def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
     """
     Lit une trame TIC complète (STX..ETX), mode-agnostique.
@@ -580,7 +705,7 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
                                    parite_groupes=parite_groupes,
                                    etiquettes_rejetees=etiquettes_ko)
                 _signaler_parite(parite_ko)
-                return labels if labels else None
+                return _rendre(labels)
 
             # 🚨 LE GROUPE EN COURS EST CONDAMNÉ, et ce n'est pas du zèle.
             #
@@ -642,7 +767,7 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label) -> dict | None:
             _signaler_parite(parite_ko)
             log.debug(f"Trame TIC complète : {kept} groupe(s) gardé(s), "
                       f"{dropped} rejeté(s), {parite_ko} octet(s) hors parité")
-            return labels if labels else None
+            return _rendre(labels)
         elif b == LF:
             # 🚨 `in_line` encore vrai à l'arrivée d'un LF veut dire une seule
             #    chose : le CR du groupe précédent ne nous est jamais parvenu.
@@ -918,7 +1043,12 @@ if __name__ == "__main__":
     log.info(f"Série ouvert : {UART_DEV} {mode['baud']} 8N1 proto TIC {mode_name} "
              f"— contrôle de parité ACTIF (7E1 lu en 8N1), résumé toutes les "
              f"{_PARITE_PERIODE_S // 60} min s'il y a des rejets")
-    log.info(f"PDL connu : {state.get('adco') or '(aucun)'}")
+    # ⓘ `state["adco"]` est INFORMATIF : il n'amorce pas PDL_INDEX, et le dire évite de
+    #   lire cette ligne comme « le boîtier sait où écrire ». Il ne le sait pas encore —
+    #   la table `pdl` porte bien la correspondance ADCO → pdl_index, mais personne ne
+    #   la joint au démarrage. Tant que rien n'est résolu, RIEN N'EST STOCKÉ.
+    log.info(f"Dernier compteur vu : {state.get('adco') or '(aucun)'} "
+             f"— pdl_index NON RÉSOLU, en attente de la 1re trame portant un ADCO")
 
     Thread(target=watchdog_loop, daemon=True, name="watchdog").start()
     log.info(f"Watchdog démarré (seuil={WATCHDOG_THRESHOLD}s)")
@@ -949,7 +1079,7 @@ if __name__ == "__main__":
         """Signale le mode observé. Garde RAM d'abord : la boucle tourne à ~1 trame/s, on ne
         veut pas d'une lecture SQLite par trame (même raison que le cache pdl_index)."""
         global last_src_std
-        if mode_std == last_src_std or measurements_db is None:
+        if mode_std == last_src_std or not peut_stocker(measurements_db, PDL_INDEX):
             return
         try:
             if db.record_tic_mode(measurements_db, PDL_INDEX, mode_std, db.device_id()):
@@ -1005,6 +1135,9 @@ if __name__ == "__main__":
                 if labels is None:
                     log.warning("Trame TIC invalide ou timeout")
                 else:
+                    # ⓘ La clé n'existe que si l'ADCO EN ÉTAIT un : `garder_adco` l'a
+                    #   tranché au décodage. Rien à valider ici — ni pour `state.json`
+                    #   juste en dessous, ni pour la résolution du PDL plus bas.
                     adco = labels.get("ADCO", "")
                     if adco:
                         prev_adco = state.get("adco", "")
@@ -1034,7 +1167,7 @@ if __name__ == "__main__":
                     # validité PTEC/PAPP de la trame.
                     isousc = labels.get("ISOUSC")
                     if (isousc is not None and isousc != last_isousc
-                            and measurements_db is not None):
+                            and peut_stocker(measurements_db, PDL_INDEX)):
                         if db.record_isousc(measurements_db, PDL_INDEX, isousc):
                             log.info(f"ISOUSC={isousc} A enregistré (maxVa≈{isousc * 230} VA)")
                         last_isousc = isousc
@@ -1043,7 +1176,7 @@ if __name__ == "__main__":
                     # Le standard ne donne pas ISOUSC ; PREF×1000 calibre la jauge (arbitré par /live).
                     pref = labels.get("PREF")
                     if (pref is not None and pref != last_pref
-                            and measurements_db is not None):
+                            and peut_stocker(measurements_db, PDL_INDEX)):
                         if db.record_pref(measurements_db, PDL_INDEX, pref):
                             log.info(f"PREF={pref} kVA enregistré (maxVa≈{pref * 1000} VA)")
                         last_pref = pref
@@ -1055,7 +1188,7 @@ if __name__ == "__main__":
                     # LTARF n'existe qu'en standard → le contrat associé = NGTF.
                     lt_key = (ntarf_lbl, ltarf, labels.get("NGTF"))
                     if (ltarf and ntarf_lbl and lt_key != last_ltarf
-                            and measurements_db is not None):
+                            and peut_stocker(measurements_db, PDL_INDEX)):
                         if db.record_tariff_label(measurements_db, PDL_INDEX, 1, ntarf_lbl, ltarf,
                                                   labels.get("NGTF") or ""):
                             log.info(f"LTARF NTARF={ntarf_lbl} → {ltarf!r} enregistré")
@@ -1064,7 +1197,7 @@ if __name__ == "__main__":
                     # Contrat (calendrier tarifaire) — NGTF en standard, OPTARIF en historique.
                     # Mode-agnostique → level_profile.ngtf. On-change (changement fournisseur/offre).
                     contract = labels.get("NGTF") or labels.get("OPTARIF")
-                    if contract and contract != last_ngtf and measurements_db is not None:
+                    if contract and contract != last_ngtf and peut_stocker(measurements_db, PDL_INDEX):
                         if db.record_ngtf(measurements_db, PDL_INDEX, contract):
                             log.info(f"Contrat={contract!r} enregistré")
                         last_ngtf = contract
@@ -1103,8 +1236,15 @@ if __name__ == "__main__":
                             # On EMPILE dans le batch ; l'écriture BDD se fait par lot
                             # (flush plus bas, volet B). Log en DEBUG : à ~1,7 s/trame, un
                             # INFO par trame noierait journald (cf. preshipping).
-                            if measurements_db is not None:
+                            if peut_stocker(measurements_db, PDL_INDEX):
                                 batch.append((PDL_INDEX, labels, int(time.time())))
+                            # 🚨 `frame_ok` HORS du garde : il pilote last_success_time,
+                            #    lu par le watchdog (10 min sans succès -> os.execv). Le
+                            #    mettre dedans ferait d'un ADCO illisible une BOUCLE DE
+                            #    REDÉMARRAGE toutes les 10 min — ce qui a brûlé pi-0.9.12.
+                            #    Le watchdog surveille la LIAISON TIC, pas la base : même
+                            #    raison qui fait continuer le lecteur base indisponible.
+                            _signaler_non_stocke(not peut_stocker(measurements_db, PDL_INDEX))
                             frame_ok = True
                     else:
                         # --- Mode STANDARD : papp←SINSTS, iinst←IRMS1 --------------
@@ -1157,8 +1297,15 @@ if __name__ == "__main__":
                             log.debug(f"OK[std] pdl_index={PDL_INDEX} SINSTS(PAPP)={papp} "
                                       f"IRMS1(IINST)={iinst} EAST={east} NTARF={ntarf} "
                                       f"EASF[{ntarf}]={active_value} SINSTI={labels.get('SINSTI')}")
-                            if measurements_db is not None:
+                            if peut_stocker(measurements_db, PDL_INDEX):
                                 batch.append((PDL_INDEX, labels, int(time.time())))
+                            # 🚨 `frame_ok` HORS du garde : il pilote last_success_time,
+                            #    lu par le watchdog (10 min sans succès -> os.execv). Le
+                            #    mettre dedans ferait d'un ADCO illisible une BOUCLE DE
+                            #    REDÉMARRAGE toutes les 10 min — ce qui a brûlé pi-0.9.12.
+                            #    Le watchdog surveille la LIAISON TIC, pas la base : même
+                            #    raison qui fait continuer le lecteur base indisponible.
+                            _signaler_non_stocke(not peut_stocker(measurements_db, PDL_INDEX))
                             frame_ok = True
 
             except Exception:
