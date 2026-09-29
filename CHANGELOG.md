@@ -18,6 +18,45 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.9.19] — 2026-09-29
+
+**Ne jamais écrire sous un `pdl_index` deviné.** Trois portes laissaient une mesure partir en base sous un compteur qui n'était pas le sien. Ferme [#6](https://github.com/xdegenne/ben-firmware/issues/6).
+
+> 🚨 **Le défaut n'était pas théorique** : un ADCO fait de **deux octets NUL** a créé un PDL fantôme portant **13 056 mesures** sur un boîtier du parc. Un second est né **en direct pendant la préparation de cette version**, le 28/09 à 22:00:46, et a détourné la courbe du vrai compteur pendant treize heures.
+
+**① `resolve_pdl` acceptait n'importe quel ADCO.** Son garde testait le **vide**, pas la **forme** — et `.strip()` ne retire pas les octets NUL, si bien que `'\x00\x00'` le passait.
+
+Nouveau prédicat **public** `db.adco_valide()` : douze chiffres ASCII, **miroir exact du `CHECK (ads ~ '^[0-9]{12}$')` du cloud**, mais posé **là où la donnée naît**. Public parce que le ménage des fantômes doit cibler par prédicat, jamais par une liste de `pdl_index` recopiée — le bon PDL est presque toujours `0`, et une faute de recopie détruirait la vraie courbe.
+
+⚠️ **`isdigit()` seul ne suffit pas** : il est vrai des chiffres Unicode. `'²' * 12` fait bien douze caractères et passerait — il créerait donc un PDL que le cloud refuserait. C'est `isascii()` qui rend les deux prédicats équivalents, pas une précaution de style.
+
+**② `PDL_INDEX` valait `0` à l'amorce du lecteur filaire.** Or `0` est l'index du **premier compteur de tout boîtier** : l'amorce et une vraie réponse étaient **indiscernables**. Si la première trame ne portait pas d'ADCO exploitable, la mesure partait sous `0` — le compteur d'un boîtier **déplacé**, en silence.
+
+Sentinelle `None`, et prédicat pur `peut_stocker(conn, pdl_index)` comme seul juge du droit d'écrire. ⭐ Même idiome que la voie LoRa, où `get_pdl_index()` rend déjà `int | None`.
+
+**③ Un ADCO non conforme condamne la TRAME ENTIÈRE**, pas seulement son groupe — et c'est le point le moins intuitif.
+
+On n'atteint ce contrôle **que** par un groupe ayant passé **la parité ET le checksum** sans avoir la forme d'un ADCO : un groupe abîmé par l'un ou l'autre est déjà jeté par `read_frame`. Le seul cas qui arrive jusque-là est donc **l'amputation dans l'angle mort du checksum** — caractères retirés sommant à un multiple de 64.
+
+⭐ Or cet angle mort est le **même pour tous les groupes** de la trame. Un index ou un PAPP raccourci a pu passer exactement pareil, sans qu'aucune forme ne le révèle, puisqu'un nombre raccourci reste un nombre. **L'ADCO est le seul champ de la TIC dont la forme soit connue d'avance** : c'est le seul témoin qu'on ait de cet angle mort, et le garder pour ne jeter que son groupe reviendrait à s'en priver.
+
+**Côté LoRa**, une trame de boot sans identité valable est écartée **en entier**. Le MAC ChaCha20 prouve que les octets sont ceux qui ont été émis — donc un ADCO difforme ne dit pas « la radio a abîmé la trame », il dit **« l'émetteur a mal lu sa TIC »**. Et `ISOUSC`, `PREF`, `CONTRAT` sortent de **la même lecture**.
+
+🚨 **`frame_ok` reste HORS du garde de stockage, et `TRAME_CONDAMNEE` est distinct de `None`.** Une trame condamnée **prouve que la liaison est vivante** : ses groupes arrivent, leur parité et leur checksum passent. La confondre avec une trame absente laisserait `last_success_time` figé et le watchdog relancerait le process **toutes les 10 minutes** — le mode de défaillance qui a brûlé `pi-0.9.12`. Défaut trouvé **en revue**, couvert par un banc dédié.
+
+**Le script d'update**
+
+| | |
+|---|---|
+| 🚨 **ne redémarre PAS `ben-radio`** | `capabilities.py` mappe `lora-tic-receiver` sur ben-radio **et** ben-telemetry, mais la façade radio n'est pas touchée — elle n'importe même pas `db.py`. On se sert de `capabilities has` pour **décider**, on nomme les unités **à la main** |
+| ne démarre pas ce qui ne tournait pas | leçon de 0.9.17, qui avait lancé un lecteur filaire sur des boîtiers radio |
+| préflight | `ast.parse` — **jamais `py_compile`**, qui écrit un `__pycache__` appartenant à root — **plus `adco_valide` éprouvé sur la cible AVEC SON TÉMOIN** |
+| contrôle d'effet | `/health`, **jamais `/info`** : il prouve en plus que la base est lisible (`db: true`), et que `last_tic_ts` **avance** |
+
+⭐ Le témoin du préflight n'est pas décoratif : **sans lui, un `adco_valide` qui refuserait tout passerait tous les cas de refus**, et le boîtier cesserait de créer le moindre PDL sans que rien ne le signale. Un garde faux brûle une version aussi sûrement qu'un vrai défaut.
+
+**Aucune migration, aucune table, aucune colonne.** Éprouvé 20 h sur un boîtier filaire et 4 h sur un boîtier LoRa ; bancs joués **sur les Pi Zero eux-mêmes**, pas seulement en CI.
+
 ### [0.9.18] — 2026-09-27
 
 **Répare ce que 0.9.17 a cassé sur les boîtiers radio.** Le code de 0.9.17 était bon ; son script d'update avait deux défauts enchaînés.
