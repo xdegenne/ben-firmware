@@ -52,8 +52,66 @@ CAS = [
 ]
 
 
-def main() -> int:
+def boot_sans_identite_n_ecrit_RIEN() -> bool:
+    """🚨 Une trame de boot qui n'identifie pas son compteur est écartée EN ENTIER.
+
+    Le raisonnement diffère du filaire : ici le MAC ChaCha20 a déjà prouvé que ces
+    octets sont bien ceux que l'émetteur a émis. Un ADCO difforme ne dit donc pas « la
+    radio a abîmé la trame », il dit « L'ÉMETTEUR A MAL LU SA TIC ». Or `ISOUSC`, `PREF`
+    et `CONTRAT` sortent de LA MÊME lecture : les garder reviendrait à enregistrer la
+    configuration d'un compteur qu'on n'a pas su nommer, sous le pdl_index du PRÉCÉDENT.
+
+    ⚠️ Et le bloc `state` ne passe pas par `resolve_pdl` : il EFFACE `indexes`,
+       `last_boot_seq` et `last_active_id` dès que l'ADCO diffère du retenu. `'\\x00\\x00'`
+       est « non vide », donc il passait — carry-forward NTARF/EASF perdu, valeur bidon
+       mémorisée, et la trame SAINE suivante rejouait l'effacement.
+
+    ⓘ Rien n'est perdu de la MESURE : les trames de COURBE continuent d'arriver et
+      `get_pdl_index` se replie sur sources.json. On écarte l'identité, jamais la mesure.
+    """
     ok = True
+    for libelle, adco in [("ADCO a deux octets NUL", b"\x00\x00"),
+                          ("ADCO ampute (checksum aveugle)", b"06194700"),
+                          ("ADCO a douze NUL", b"\x00" * 12)]:
+        conn = db.connect(":memory:")
+        bt.measurements_db = conn
+        bt.state = {"adco": "031864000000", "indexes": {"1": 42}}
+        bt.save_state = lambda *a, **k: None
+        bt.blink_rgb = lambda *a, **k: None
+        bt._adco_refuse_par_emetteur = {}
+
+        bt.on_recv_boot(_frame(T_ADCO=adco, T_ISOUSC=b"\x1e", T_CONTRAT=b"HC.."), -60, 10, 0, 31)
+
+        intact = (
+            conn.execute("SELECT count(*) FROM pdl").fetchone()[0] == 0
+            and conn.execute("SELECT count(*) FROM emitter").fetchone()[0] == 0
+            and conn.execute("SELECT count(*) FROM contract_epoch").fetchone()[0] == 0
+            and bt.state["adco"] == "031864000000"      # l'etat n'a pas ete ecrase
+            and bt.state["indexes"] == {"1": 42}        # ni le carry-forward efface
+        )
+        ok = ok and intact
+        print(f"  [{'OK   ' if intact else 'ECHEC'}] boot ecarte : {libelle}")
+
+    # ⚖️ LE TÉMOIN : un ADCO conforme doit, lui, traverser — sinon un garde qui
+    #    refuserait TOUT passerait les trois cas ci-dessus, et aucun boîtier LoRa ne
+    #    s'enregistrerait plus jamais.
+    conn = db.connect(":memory:")
+    bt.measurements_db = conn
+    bt.state = {}
+    bt.save_state = lambda *a, **k: None
+    bt.blink_rgb = lambda *a, **k: None
+    bt._pdl_par_emetteur = {}
+
+    bt.on_recv_boot(_frame(T_ADCO=b"031864000000", T_ISOUSC=b"\x1e", T_CONTRAT=b"HC.."), -60, 10, 0, 31)
+    lie = (conn.execute("SELECT count(*) FROM pdl").fetchone()[0] == 1
+           and db.emitter_pdl(conn, 31) is not None)
+    ok = ok and lie
+    print(f"  [{'OK   ' if lie else 'ECHEC'}] temoin : un ADCO conforme lie bien l'emetteur")
+    return ok
+
+
+def main() -> int:
+    ok = boot_sans_identite_n_ecrit_RIEN()
     for libelle, tlvs, attendu in CAS:
         conn = db.connect(":memory:")
         bt.measurements_db = conn

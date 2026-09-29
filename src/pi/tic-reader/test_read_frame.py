@@ -16,7 +16,13 @@ import sys
 from unittest.mock import MagicMock
 
 # Le Pi seul a ces modules ; rien de ce qu'on teste ici ne les touche.
-for _n in ("RPi", "RPi.GPIO", "serial", "db", "settings"):
+#
+# 🚨 `db` N'EST PLUS UNE COQUILLE, et c'est délibéré : `garder_adco` appelle
+#    `db.adco_valide()`, et un MagicMock rend un objet TOUJOURS VRAI. Le banc aurait
+#    donc affiché vert avec un prédicat qui n'aurait rien refusé — le pire des relevés.
+#    `db.py` n'importe que la bibliothèque standard, il tourne donc partout, et
+#    `main_uart` pose lui-même `../store` dans le chemin avant de l'importer.
+for _n in ("RPi", "RPi.GPIO", "serial", "settings"):
     sys.modules.setdefault(_n, MagicMock())
 sys.modules["RPi"].GPIO = sys.modules["RPi.GPIO"]
 
@@ -436,6 +442,265 @@ def le_releve_dit_POURQUOI_une_etiquette_manque():
         f"le doute sur le nom relevé est passé sous silence : {cause!r}")
     assert "pas émise" not in cause, (
         f"conclusion fausse : l'étiquette ÉTAIT émise, elle a été abîmée — {cause!r}")
+
+
+# ─── `peut_stocker` : ce qui autorise une écriture ──────────────────────────
+#
+# 🚨 `0` EST UN pdl_index VALIDE — celui du premier compteur de tout boîtier. C'est
+#    toute la raison d'être de ce prédicat : avant, l'amorce valait 0 et personne ne
+#    pouvait distinguer « pas encore résolu » de « compteur n°0 ». Une trame arrivée
+#    avant la résolution partait donc en base sous l'index d'un AUTRE compteur, en
+#    silence, sur tout boîtier déplacé puis redémarré.
+#
+# ⭐ Le prédicat prend ses deux arguments : c'est ce qui permet de l'éprouver ici,
+#    sur une machine sans UART, sans base et sans Pi.
+@cas
+def peut_stocker_refuse_un_pdl_non_resolu():
+    """Le cas qui motive tout : base ouverte, mais on ne SAIT pas encore où écrire."""
+    assert m.peut_stocker(object(), None) is False
+
+
+@cas
+def peut_stocker_accepte_le_pdl_zero():
+    """⚖️ LE TÉMOIN, et il n'est pas décoratif : sans lui, un prédicat qui refuserait
+    TOUT passerait le cas précédent — et le boîtier cesserait de stocker en silence,
+    heartbeat vert et journal calme."""
+    assert m.peut_stocker(object(), 0) is True
+
+
+@cas
+def peut_stocker_refuse_une_base_fermee():
+    """Comportement HISTORIQUE préservé : base indisponible → le lecteur continue
+    (LED, journal), simplement sans stocker."""
+    assert m.peut_stocker(None, 0) is False
+    assert m.peut_stocker(None, None) is False
+
+
+@cas
+def un_adco_non_conforme_n_atteint_jamais_l_etat_persistant():
+    """🚨 LE DÉFAUT QUE CE BANC EXISTE POUR TENIR FERMÉ.
+
+    La boucle écrivait `state["adco"] = adco` AVANT toute validation — deux lignes plus
+    haut que l'appel à `resolve_pdl`. Le garde du magasin ne voyait donc rien : il
+    protège la CRÉATION d'un PDL, pas le fichier d'état. Conséquence, un `'\\x00\\x00'`
+    s'installait dans `tic-state.json`, et la trame SAINE suivante était annoncée
+    « NOUVEAU PDL » puisqu'elle différait du bidon retenu.
+
+    Le rejet est désormais au DÉCODAGE : `garder_adco` ne pose simplement pas la clé,
+    donc `labels.get("ADCO", "")` rend la chaîne vide et tous les gardes `if adco:` en
+    aval — écriture de `state.json` comprise — suffisent sans qu'on en ajoute un seul.
+    """
+    for bidon in ("\x00\x00", "06194700", "0619470000000", "06194700000A", "²" * 12):
+        labels = {}
+        m.garder_adco(bidon, labels)
+        assert "ADCO" not in labels, f"{bidon!r} a été retenu comme ADCO"
+        # Ce que la boucle en fait : la clé absente ⇒ rien ne part vers `state.json`.
+        assert labels.get("ADCO", "") == ""
+
+
+@cas
+def un_adco_conforme_traverse_bien_le_decodage():
+    """⚖️ LE TÉMOIN du décodeur. Sans lui, un `garder_adco` qui ne poserait JAMAIS la
+    clé passerait le cas précédent — et le boîtier ne résoudrait plus jamais son PDL."""
+    labels = {}
+    m.garder_adco("  021861000000 ", labels)     # blancs autour : même compteur
+    assert labels["ADCO"] == "021861000000"
+
+
+@cas
+def un_ADCO_non_conforme_CONDAMNE_TOUTE_la_trame():
+    """🚨 LE CŒUR DE L'ARBITRAGE, et il va CONTRE l'intuition « un groupe fautif coûte
+    son groupe ».
+
+    On n'arrive ici que par un groupe ADCO ayant passé LA PARITÉ ET LE CHECKSUM sans
+    avoir la forme d'un ADCO — donc par l'amputation dans l'angle mort du checksum
+    (caractères retirés sommant à un multiple de 64). Cet angle mort est le MÊME pour
+    tous les groupes : un index ou un PAPP raccourci a pu passer de la même façon, sans
+    qu'aucune forme ne permette de le voir, puisqu'un nombre raccourci reste un nombre.
+
+    ⭐ L'ADCO est le seul champ de la TIC dont la forme soit connue d'avance : c'est le
+       seul témoin que nous ayons de cet angle mort. Garder la trame reviendrait à le
+       jeter — et à écrire en base des mesures dont on a la PREUVE que la ligne a perdu
+       des caractères pendant leur transmission.
+    """
+    labels = {}
+    m._parse_label("ADCO 00000000000A 1", labels)     # identité de forme fausse
+    m._parse_label("PAPP 01230 5", labels)            # d'apparence saine…
+    m._parse_label("IINST 005 7", labels)
+    assert "ADCO" not in labels
+    assert m._rendre(labels) is m.TRAME_CONDAMNEE, \
+        "la trame a été rendue malgré un ADCO non conforme"
+
+
+@cas
+def une_trame_saine_est_bien_rendue():
+    """⚖️ LE TÉMOIN de la condamnation : sans lui, un `_rendre` qui refuserait TOUT
+    passerait le cas précédent — et le lecteur ne stockerait plus jamais rien."""
+    labels = {}
+    m._parse_label("ADCO 021861000000 1", labels)
+    m._parse_label("PAPP 01230 5", labels)
+    rendu = m._rendre(labels)
+    assert rendu is not None and rendu["PAPP"] == 1230
+    assert m.CONDAMNEE not in rendu, "la marque interne a fui vers l'appelant"
+
+
+@cas
+def un_groupe_ADCO_abime_par_le_CHECKSUM_ne_condamne_PAS_la_trame():
+    """⚠️ La distinction qui fait tenir tout le raisonnement : un ADCO tombé sur le
+    checksum ou la parité n'atteint JAMAIS `garder_adco` — `read_frame` a déjà jeté le
+    groupe et la clé n'existe pas. Ce cas-là reste un groupe perdu, pas une trame
+    perdue. Sans cette frontière, une liaison un peu bruyante ne stockerait plus rien."""
+    labels = {}
+    m._parse_label("PAPP 01230 5", labels)            # ADCO absent : jamais décodé
+    rendu = m._rendre(labels)
+    assert rendu is not None and rendu["PAPP"] == 1230
+
+
+# ─── L'HISTOIRE, bout en bout : des octets du fil jusqu'au refus ────────────
+#
+# ⚠️ Les cas ci-dessus éprouvent chaque ORGANE séparément. Ceux-ci éprouvent les
+#    JOINTURES — et c'est là que vivait le défaut : chaque pièce était juste, c'est leur
+#    enchaînement qui laissait passer.
+
+def _checksum_histo(corps: str) -> str:
+    """Le checksum TIC historique de `corps` = 'ETIQ VALEUR' (cf. tic_checksum_ok)."""
+    return chr((sum(ord(c) for c in corps) & 0x3F) + 0x20)
+
+
+def _trame(*corps: str) -> list[int]:
+    """Une trame TIC historique COMPLÈTE, octets tels qu'ils arrivent du fil."""
+    octets = [sain(STX)]
+    for c in corps:
+        octets += ligne(f"{c} {_checksum_histo(c)}")
+    return octets + [sain(ETX)]
+
+
+@cas
+def L_AMPUTATION_traverse_parite_ET_checksum_et_est_QUAND_MEME_arretee():
+    """🚨 LE CAS QUI PORTE TOUTE LA THÈSE, et le seul qui la PROUVE.
+
+    Les autres cas appellent `_parse_label` en direct ; celui-ci part des OCTETS et
+    remonte toute la chaîne. Il établit deux choses d'un coup :
+
+      1. l'angle mort EXISTE — « ADCO 061947000000 » amputé de quatre zéros devient
+         « ADCO 06194700 » et porte LE MÊME CHECKSUM (4 × 0x30 = 192, soit 0 modulo 64),
+         ce que le test vérifie au lieu de le supposer ;
+      2. la parité ne le voit pas davantage : les octets survivants sont intacts, c'est
+         leur NOMBRE qui a changé.
+
+    ⇒ Les deux contrôles historiques laissent passer, et seule la FORME de l'ADCO
+      arrête la trame. Sans ce cas, rien ne prouverait que le garde sert à quelque
+      chose : on pourrait croire le checksum suffisant.
+    """
+    entier, ampute = "ADCO 061947000000", "ADCO 06194700"
+    assert _checksum_histo(entier) == _checksum_histo(ampute), \
+        "l'angle mort du checksum n'est pas reproduit — le cas ne prouve plus rien"
+
+    port = FauxPort(_trame(ampute, "PAPP 01230", "IINST 005", "PTEC TH.."))
+    assert m.read_frame(port, m.tic_checksum_ok, m._parse_label) is m.TRAME_CONDAMNEE, \
+        "une trame dont l'ADCO a perdu des caractères a été rendue"
+
+    # ⚖️ Le témoin : la MÊME trame, ADCO entier → rendue, avec ses mesures.
+    port = FauxPort(_trame(entier, "PAPP 01230", "IINST 005", "PTEC TH.."))
+    trame = m.read_frame(port, m.tic_checksum_ok, m._parse_label)
+    assert trame is not None, "la trame saine a été condamnée"
+    assert trame["ADCO"] == "061947000000" and trame["PAPP"] == 1230
+
+
+@cas
+def le_boitier_n_ecrit_RIEN_tant_qu_il_n_a_pas_resolu_son_compteur():
+    """L'acte I de l'histoire : au démarrage on ne SAIT pas, donc on n'écrit pas.
+
+    🚨 Avant, l'amorce valait `0` — l'index d'un VRAI compteur. Un boîtier déplacé puis
+       redémarré écrivait ses premières mesures sous son ANCIEN compteur, en silence.
+    """
+    import sqlite3
+    base = sqlite3.connect(":memory:")            # une base ouverte, bien vivante
+    assert m.peut_stocker(base, None) is False, "écriture autorisée sans compteur résolu"
+    assert m.peut_stocker(base, 0) is True, "⚖️ témoin : 0 est un pdl_index VALIDE"
+
+
+@cas
+def de_la_trame_au_pdl_index_le_parcours_complet():
+    """L'acte II : première trame → ADCO décodé → PDL créé → écriture autorisée.
+
+    ⭐ Les trois pièces existaient et étaient testées séparément. C'est leur ENCHAÎNEMENT
+       qui n'était couvert nulle part — or c'est lui, le comportement du produit.
+    """
+    import pathlib
+    import tempfile
+    import db as vrai_db
+
+    port = FauxPort(_trame("ADCO 021861000000", "PAPP 01230", "IINST 005", "PTEC TH.."))
+    trame = m.read_frame(port, m.tic_checksum_ok, m._parse_label)
+    assert trame is not None
+
+    conn = vrai_db.connect(str(pathlib.Path(tempfile.mkdtemp()) / "m.db"))
+    pdl_index = None
+    assert m.peut_stocker(conn, pdl_index) is False      # avant résolution : rien
+
+    pdl_index = vrai_db.resolve_pdl(conn, trame["ADCO"], graine=0)
+    assert pdl_index == 0, "le 1er compteur d'un boîtier neuf doit être l'index 0"
+    assert m.peut_stocker(conn, pdl_index) is True       # après : le boîtier peut écrire
+    assert conn.execute("SELECT adco FROM pdl").fetchone()[0] == "021861000000"
+
+
+@cas
+def une_trame_CONDAMNEE_n_est_PAS_une_trame_ABSENTE():
+    """🚨 LE DÉFAUT TROUVÉ EN REVUE, et il recréait la panne que cette PR combat.
+
+    `read_frame` rendait `None` pour deux choses opposées : « rien n'est arrivé »
+    (timeout, liaison morte) et « tout est arrivé, mais l'identité ne tient pas ». La
+    boucle laisse `frame_ok` à faux sur le premier cas, donc `last_success_time`
+    n'avance plus, donc le watchdog relance le process au bout de 10 min — et TOUTES
+    LES 10 MINUTES tant que le compteur émet le même ADCO. C'est le mode de panne de
+    pi-0.9.12, atteint par une autre porte : sortir `frame_ok` du garde de stockage ne
+    couvrait QUE le cas `PDL_INDEX is None`.
+
+    ⭐ Une trame condamnée PROUVE que la liaison est vivante : ses groupes arrivent,
+       leur parité et leur checksum passent. Le watchdog surveille le FIL.
+
+    ⚠️ La boucle principale et le watchdog vivent sous `if __name__` et ne sont pas
+       importables : ce banc ne peut pas les faire tourner. Il tient donc le CONTRAT
+       qui rend la panne impossible — les trois retours sont DISCERNABLES — et c'est
+       `labels is None` dans la boucle qui décide du reste.
+    """
+    entier, ampute = "ADCO 061947000000", "ADCO 06194700"
+
+    condamnee = m.read_frame(FauxPort(_trame(ampute, "PTEC TH..")),
+                             m.tic_checksum_ok, m._parse_label)
+    absente = m.read_frame(FauxPort([]), m.tic_checksum_ok, m._parse_label)
+    saine = m.read_frame(FauxPort(_trame(entier, "PAPP 01230", "IINST 005", "PTEC TH..")),
+                         m.tic_checksum_ok, m._parse_label)
+
+    assert condamnee is m.TRAME_CONDAMNEE
+    assert absente is None
+    assert saine is not None and saine is not m.TRAME_CONDAMNEE
+
+    # 🚨 L'ASSERTION QUI PORTE TOUT : condamnée ≠ absente. Les confondre, c'est
+    #    `frame_ok` à faux, donc le watchdog, donc os.execv toutes les 10 min.
+    assert condamnee is not absente, \
+        "condamnée et absente confondues — le watchdog relancera le process en boucle"
+
+
+@cas
+def signaler_adco_refuse_ne_crie_qu_une_fois_par_valeur():
+    """🚨 Sans cette garde, journald est noyé : un ADCO refusé ne met pas à jour
+    `_pdl_source_adco`, donc la résolution est retentée À CHAQUE TRAME (~1/s)."""
+    vus = []
+    vrai_log = m.log
+    m.log = MagicMock()
+    m.log.error = lambda *a: vus.append(a)
+    m._dernier_adco_refuse = None
+    try:
+        for _ in range(5):
+            m.signaler_adco_refuse("\x00\x00")
+        assert len(vus) == 1, f"{len(vus)} cris pour une seule valeur"
+        m.signaler_adco_refuse("06194700")      # une AUTRE valeur : on veut le savoir
+        assert len(vus) == 2, "une valeur refusée inédite est passée sous silence"
+    finally:
+        m.log = vrai_log
+        m._dernier_adco_refuse = None
 
 
 if __name__ == "__main__":

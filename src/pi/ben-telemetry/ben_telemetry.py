@@ -328,6 +328,27 @@ def _maybe_prune() -> None:
 _last_uncabled: dict = {}
 
 
+# ⓘ Un ADCO refusé par `resolve_pdl` est une ASSERTION D'INVARIANT, pas un tamis : la
+#   trame a déjà passé le MAC ChaCha20, donc ses octets sont bien ceux que l'émetteur a
+#   émis. En arriver là veut dire que l'émetteur a émis quelque chose qui n'est pas un
+#   ADCO — firmware ancien, valeur tronquée complétée de NUL par `strncpy`, désaccord de
+#   format. Donc ERROR, la valeur en %r, et l'ADRESSE DE L'ÉMETTEUR : c'est le seul
+#   contexte qui dit QUEL boîtier aller regarder, et `db.py` ne l'a pas.
+#
+# 🚨 Garde anti-répétition : tant que la trame de boot n'est pas acquittée, l'émetteur
+#    reste en REGISTERING et la rejoue à la cadence du batch (~55 s), indéfiniment.
+_adco_refuse_par_emetteur: dict = {}
+
+
+def signaler_adco_refuse(sender_addr: int, adco: str) -> None:
+    """Crie UNE FOIS par (émetteur, valeur refusée), jamais une fois par trame."""
+    if _adco_refuse_par_emetteur.get(sender_addr) == adco:
+        return
+    _adco_refuse_par_emetteur[sender_addr] = adco
+    log.error("ADCO non conforme refusé de l'émetteur 0x%02x : %r — aucun PDL créé, "
+              "émetteur NON lié", sender_addr, adco)
+
+
 def log_uncabled(pdl_index, tlvs) -> None:
     """Logge en INFO les TLV connus-mais-non-stockés quand leur valeur change (aligné wired)."""
     for _tag, name, val, known, stored in frame_codec.interpret_tlvs(tlvs):
@@ -344,6 +365,28 @@ def on_recv_boot(decoded, rssi, snr, pdl_index, sender_addr) -> None:
     tlvs = decoded["tlvs"]
     adco = (frame_codec.interpret_tlv(frame_codec.T_ADCO, tlvs[frame_codec.T_ADCO])
             if frame_codec.T_ADCO in tlvs else "")
+    # 🚨 UNE TRAME DE BOOT QUI N'IDENTIFIE PAS SON COMPTEUR EST ÉCARTÉE EN ENTIER.
+    #
+    #    Le raisonnement n'est pas celui du filaire — ici le MAC ChaCha20 a déjà prouvé
+    #    que ces octets sont bien ceux que l'émetteur a émis. Un ADCO difforme ne dit
+    #    donc pas « la radio a abîmé la trame », il dit « L'ÉMETTEUR A MAL LU SA TIC ».
+    #    Or `ISOUSC`, `PREF` et `CONTRAT`, écrits plus bas, sortent de LA MÊME lecture
+    #    TIC : les garder reviendrait à enregistrer la configuration d'un compteur qu'on
+    #    n'a pas su nommer, sous le pdl_index du PRÉCÉDENT.
+    #
+    # ⚠️ Et le bloc `state` juste en dessous ne passe pas par `resolve_pdl` : il compare
+    #    `adco` à `state["adco"]` et, si ça diffère, EFFACE l'état (`indexes`,
+    #    `last_boot_seq`, `last_active_id`) puis retient la valeur. `'\x00\x00'` est
+    #    « non vide », donc il passait — carry-forward NTARF/EASF perdu, valeur bidon
+    #    mémorisée, et la prochaine trame de boot SAINE rejouait l'effacement puisqu'elle
+    #    différait du bidon retenu.
+    #
+    # ⓘ Rien n'est perdu de la MESURE : les trames de courbe continuent d'arriver et
+    #   `get_pdl_index` se replie sur sources.json. L'émetteur rejoue sa trame de boot
+    #   à la cadence du batch. On écarte l'IDENTITÉ, jamais la mesure.
+    if adco and not db.adco_valide(adco):
+        signaler_adco_refuse(sender_addr, adco)
+        return
     if adco and measurements_db is not None:
         # L'ADCO identifie le COMPTEUR, et cette trame est la seule à le porter. On lie
         # l'émetteur au compteur qu'il lit ; le PDL qui en sort FAIT FOI, même s'il

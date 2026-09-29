@@ -1607,16 +1607,42 @@ def _prochain_pdl(conn: sqlite3.Connection, reserves=()) -> int:
     return max(vus) + 1
 
 
+def adco_valide(adco: str) -> bool:
+    """Forme d'un ADCO : DOUZE CHIFFRES ASCII, et rien d'autre (Enedis §2.2).
+
+    ⭐ Miroir exact du `CHECK (ads ~ '^[0-9]{12}$')` posé côté cloud, mais LÀ OÙ LA
+       DONNÉE NAÎT. Public parce que le ménage des PDL fantômes doit cibler par
+       PRÉDICAT et jamais par une liste de `pdl_index` recopiée — le bon PDL est
+       presque toujours `0`, une faute de recopie détruirait la vraie courbe.
+
+    ⚠️ `isdigit()` SEUL NE SUFFIT PAS : il est vrai des chiffres Unicode ('²', '٣'…).
+       `'²' * 12` fait bien douze caractères et passe `isdigit()` — il créerait donc un
+       PDL, là où le CHECK du cloud le refuserait. C'est `isascii()` qui rend les deux
+       prédicats équivalents, pas une précaution de style.
+    """
+    return len(adco) == 12 and adco.isascii() and adco.isdigit()
+
+
 def resolve_pdl(conn: sqlite3.Connection, adco: str, *,
                 graine: int | None = None, reserves=()) -> int | None:
-    """PDL du compteur `adco` — le crée s'il est inconnu.
+    """PDL du compteur `adco` — le crée s'il est inconnu, ou None si `adco` est NON CONFORME.
 
     `graine` = l'index que sources.json attribuait à cet émetteur. Il sert UNE SEULE
     FOIS, à l'adoption : sans lui, un boîtier déjà en service verrait ses courbes
     basculer sur un nouvel index alors que tout son historique est sous l'ancien.
+
+    🚨 C'est le SEUL `INSERT INTO pdl` du dépôt, et aucune contrainte FOREIGN KEY ne
+       relie les neuf tables portant `pdl_index` à la table `pdl` : ce garde est donc le
+       point unique de la CRÉATION d'un PDL. L'ancien ne testait que le VIDE, pas la
+       FORME — et `.strip()` ne retire pas les octets NUL, si bien que `'\\x00\\x00'` le
+       passait : deux octets de rien ont créé un PDL portant 13 056 mesures.
+
+    ⓘ MUET par convention : ce module ne journalise rien (aucun `logging` dans tout
+      `db.py`). Un `None` revient à l'appelant, qui a son propre logger ET le contexte
+      utile — l'adresse de l'émetteur côté LoRa, que `db.py` n'a pas.
     """
     adco = (adco or "").strip()
-    if not adco:
+    if not adco_valide(adco):
         return None
     now = int(time.time())
     row = conn.execute("SELECT pdl_index FROM pdl WHERE adco=?", (adco,)).fetchone()
