@@ -6,9 +6,12 @@ ben_publisher — pousse les mesures du boîtier vers `ben-api`.
 Ce fichier décrit le comportement du boîtier ; le contrat de l'API et la
 politique serveur n'y figurent pas.
 
-    hello  au démarrage, puis toutes les heures (versions + compteurs).
-           S'il échoue, ON CONTINUE.
-    boucle toutes les 60 s : jusqu'à 500 points non envoyés, du plus ancien.
+    hello  au démarrage, puis une fois par JOUR (versions + compteurs).
+           S'il échoue, ON CONTINUE — et c'est le rejeu quotidien qui rattrape,
+           il n'y a pas de reprise immédiate.
+    boucle toutes les 60 s : jusqu'à BATCH points non envoyés, du plus ancien.
+           ⭐ 10 s seulement TANT QU'IL RESTE DU RETARD — sinon un boîtier à
+           courte fenêtre de connectivité ne rattrape jamais (cf. PERIOD_RETARD).
 
 La colonne `sent` de `measurements` est l'outbox : elle existe dans le schéma
 DEPUIS LE PREMIER JOUR et n'avait jamais été écrite.
