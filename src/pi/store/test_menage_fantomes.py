@@ -49,8 +49,40 @@ def malade() -> sqlite3.Connection:
         c.execute("INSERT INTO measurements(ts,pdl_index,papp,sent) VALUES(?,0,?,1)", (t, t))
     for ts, ngtf in ((0, "HC.."), (10, "HCn."), (12, "HC.."), (20, "HCn."), (21, "HC..")):
         c.execute("INSERT INTO contract_epoch VALUES(0,?,?)", (ts, ngtf))
+    # Ce qu'une époque abîmée traîne AVEC elle — `record_ngtf` écrit les quatre d'un bloc.
+    # ⚠️ Le corps porte des APOSTROPHES et `donnees` du JSON : c'est ce couple qui casse
+    #    une sauvegarde citée avec `repr()`.
+    c.execute("INSERT INTO event(id,ts,pdl_index,type,titre,corps,donnees) VALUES"
+              "('d:1',10,0,'changement_offre','Changement d''offre',"
+              "'C''est fait : votre contrat est passé de « HC.. » à « HCn. ».',"
+              "'{\"avant\": \"HC..\", \"apres\": \"HCn.\"}')")
+    c.execute("INSERT INTO event(id,ts,pdl_index,type,titre,corps,donnees) VALUES"
+              "('d:2',12,0,'changement_offre','Changement d''offre',"
+              "'C''est fait : votre contrat est passé de « HCn. » à « HC.. ».',"
+              "'{\"avant\": \"HCn.\", \"apres\": \"HC..\"}')")
+    c.execute("INSERT INTO tariff_labels VALUES(0,1,1,'HC..','HC',9)")
+    c.execute("INSERT INTO tariff_labels VALUES(0,1,1,'HCn.','HC',9)")   # le libellé chimère
+    c.execute("INSERT INTO level_profile(pdl_index,computed_ts,ngtf) VALUES(0,0,'HC..')")
     c.commit()
     return c
+
+
+def empreinte(c) -> dict:
+    """L'état COMPLET, table par table — pour prouver un retour arrière.
+
+    ⭐ Le `rowid` n'est comparé QUE là où il est l'identité : `measurements` et `lora_link`
+    n'ont AUCUNE clé primaire, et le publisher marque `sent` PAR ROWID — un rowid qui
+    bouge y serait un vrai dégât. Les autres tables ont une vraie clé primaire, et un
+    `INSERT OR REPLACE` leur réalloue un rowid que personne ne regarde ; l'exiger stable
+    ferait échouer le banc sur une restauration pourtant parfaite.
+
+    ⚠️ Ce n'est pas un assouplissement pour passer au vert : le défaut visé est le
+    DOUBLON, et il se voit entièrement dans le contenu."""
+    out = {}
+    for (nom,) in c.execute("SELECT name FROM sqlite_master WHERE type='table'"):
+        cle = "rowid, *" if nom in m.A_REATTRIBUER else "*"
+        out[nom] = sorted(tuple(r) for r in c.execute(f"SELECT {cle} FROM {nom}"))
+    return out
 
 
 @cas
@@ -150,6 +182,7 @@ def la_sauvegarde_precede_et_rejoue():
     exige qu'elles se rejouent telles quelles."""
     import tempfile
     c = malade()
+    origine = empreinte(c)
     f = tempfile.NamedTemporaryFile("w+", suffix=".sql", delete=False)
     f.close()
     n = m.sauvegarde(c, f.name)
@@ -159,10 +192,14 @@ def la_sauvegarde_precede_et_rejoue():
 
     m.menage(c, a_blanc=False)
     assert m.conforme(c) == []
-    # ⚖️ LE TÉMOIN de la sauvegarde : elle doit se REJOUER. Un fichier qu'on ne peut pas
-    #    réinjecter n'est pas une sauvegarde, c'est un souvenir.
+    # 🚨 LE VRAI CRITÈRE, et il ne se devine pas : rejouer doit rendre l'état D'ORIGINE,
+    #    à l'octet. Une sauvegarde faite de simples INSERT ne le ferait PAS — les mesures
+    #    sont DÉPLACÉES, pas supprimées, et `measurements` n'a aucune clé primaire : on
+    #    récupérerait l'exemplaire restauré sous le fantôme EN PLUS de l'exemplaire déplacé
+    #    sous le vrai PDL. Chaque ligne en double, et un banc qui ne vérifie que « les
+    #    fantômes sont revenus » ne verrait rien.
     c.executescript(sql)
-    assert m.pdls_fantomes(c) == [1, 2, 3]
+    assert empreinte(c) == origine, "le retour arriere ne rend pas l'etat d'origine"
 
 
 @cas
@@ -182,6 +219,47 @@ def LIMITE_ASSUMEE_un_retour_au_contrat_d_origine_serait_efface():
     c.commit()
     m.menage(c, a_blanc=False)
     assert lignes(c.execute("SELECT ts_start, ngtf FROM contract_epoch")) == [(0, "BASE"), (500, "TEMPO")]
+
+
+@cas
+def le_cortege_de_l_epoque_abimee_part_AVEC_elle():
+    """⚠️ `record_ngtf` écrit QUATRE choses d'un bloc : l'époque, un événement
+    `changement_offre`, une ligne `tariff_labels` et `level_profile.ngtf`. Ne supprimer
+    que l'époque laisserait « votre contrat est passé de HC.. à HCn. » dans la cloche de
+    l'app, un libellé chimère, et un `level_profile` qui ferait émettre un FAUX changement
+    d'offre à la trame suivante — en rouvrant une époque datée d'AUJOURD'HUI."""
+    c = malade()
+    c.execute("UPDATE level_profile SET ngtf='HCn.' WHERE pdl_index=0")   # dernière abîmée
+    c.commit()
+    m.menage(c, a_blanc=False)
+    assert c.execute("SELECT count(*) FROM event WHERE type='changement_offre'").fetchone()[0] == 0
+    assert lignes(c.execute("SELECT ngtf FROM tariff_labels WHERE pdl_index=0")) == [("HC..",)]
+    assert c.execute("SELECT ngtf FROM level_profile WHERE pdl_index=0").fetchone()[0] == "HC.."
+
+
+@cas
+def un_VRAI_changement_d_offre_n_est_JAMAIS_efface():
+    """⚖️ LE TÉMOIN du cortège : un événement que l'utilisateur a réellement vu passer est
+    un FAIT. Sans ce cas, un ménage qui supprimerait TOUS les `changement_offre` passerait
+    le cas ci-dessus — et effacerait le passage en Tempo de la cloche d'un boîtier."""
+    c = malade()
+    c.execute("INSERT INTO event(id,ts,pdl_index,type,titre,corps,donnees) VALUES"
+              "('vrai',30,0,'changement_offre','Changement','de BASE a TEMPO',"
+              "'{\"avant\": \"BASE\", \"apres\": \"TEMPO\"}')")
+    c.commit()
+    m.menage(c, a_blanc=False)
+    assert lignes(c.execute("SELECT id FROM event WHERE type='changement_offre'")) == [("vrai",)]
+
+
+@cas
+def AUCUN_etat_de_la_donnee_ne_fait_echouer_l_update():
+    """🚨 LE CAS QUI PROTÈGE LE PARC. Un `update.sh` qui échoue laisse `device.json` non
+    bumpé, donc l'update REJOUE toutes les 10 min — et ce serait DÉFINITIF : aucune version
+    ultérieure ne pourrait plus atteindre le boîtier. Ni un refus volontaire, ni un
+    invariant encore faux ne doivent produire ça."""
+    assert m.code_sortie({"refus": "2 PDL sains : destination indécidable"}, []) == 0
+    assert m.code_sortie({"refus": None}, ["tariff_labels : pdl_index orphelins [7]"]) == 0
+    assert m.code_sortie({"refus": None}, []) == 0
 
 
 if __name__ == "__main__":

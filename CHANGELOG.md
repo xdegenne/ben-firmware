@@ -52,7 +52,13 @@ Relevé le 30/09 sur un boîtier filaire du parc : **trois ADCO fantômes** port
 
 Le succès n'est pas « j'ai supprimé quelque chose » : sur six boîtiers du parc il n'y a rien à faire, **et c'est un succès**. Exiger un effet ferait échouer l'update partout ailleurs, `device.json` ne serait pas bumpé, et elle **rejouerait toutes les 10 min** — la mécanique exacte qui a brûlé `pi-0.9.12`. On vérifie donc « la base est conforme », vrai **avant comme après** sur un boîtier propre.
 
-⭐ Et **rien à faire ⇒ aucun service touché** : on sort avant même d'arrêter quoi que ce soit. Redémarrer un lecteur coûte des mesures (leçon de `0.9.17`).
+⭐ Et **rien à faire ⇒ aucun service touché** : on sort avant même d'arrêter quoi que ce soit. Redémarrer un lecteur coûte des mesures (leçon de `0.9.17`). ⚠️ La porte de sortie interroge **l'invariant**, pas un compte de fantômes — sinon une orpheline sans rapport ferait afficher « déjà conforme ✓ » sans que rien n'ait été vérifié.
+
+**🚨 Et la règle qui en découle, valable pour toute migration de données : AUCUN état de la DONNÉE ne fait échouer cette update.**
+
+Deux états parfaitement légitimes seraient sans cela pris pour des pannes — le **refus** (« je ne sais pas vers qui ré-attribuer »), et un **invariant encore faux** (une anomalie que ce ménage-ci ne sait pas réparer). Or un `update.sh` qui échoue laisse `device.json` non bumpé : l'update rejouerait toutes les 10 min **et ce serait définitif**, puisque aucune version ultérieure ne pourrait plus atteindre le boîtier. On rapporte, on n'échoue pas. Seuls le **préflight** (code cassé — on veut retenter au prochain tag) et « **un service arrêté n'est pas revenu** » (dégât réel) ont le droit de faire échouer.
+
+⚠️ **`ben-publisher` est arrêté lui aussi**, alors qu'il n'écrit aucune mesure : il lit un lot de `sent=0`, le **poste**, puis marque `sent=1` **par rowid**. Un lot parti sous le `pdl_index` fantôme juste avant le ménage verrait ses lignes déplacées sous le vrai PDL, puis marquées envoyées — le cloud ne les aurait jamais reçues sous le bon compteur, et plus rien ne les lui enverrait.
 
 **La marche à blanc est un banc.** Le boîtier concerné est **injoignable** — fenêtres de connectivité courtes, pas de SSH. On ne peut pas lire une marche à blanc sur place : `test_menage_fantomes.py` **reconstitue sa maladie à l'identique** (10 cas), dont le témoin « une vraie bascule de contrat survit » — sans lui, une règle qui supprimerait *tout* passerait tous les cas de suppression et effacerait le passage en Tempo d'un boîtier du parc.
 

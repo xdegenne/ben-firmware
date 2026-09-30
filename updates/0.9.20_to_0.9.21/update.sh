@@ -95,15 +95,16 @@ log "préflight OK (compile, règle éprouvée avec son témoin)"
 log "── marche à blanc ──"
 python3 "$MENAGE" --a-blanc 2>&1 | sed "s/^/[update $TR]   /" || fail "la marche à blanc a échoué"
 
+# 🚨 LA PORTE DE SORTIE INTERROGE L'INVARIANT, PAS UN COMPTE DE FANTÔMES. Compter seulement
+#    les fantômes et les époques laisserait passer « base déjà conforme ✓ » sur un boîtier
+#    portant une ORPHELINE sans rapport — un succès affiché sans que rien n'ait été vérifié.
 A_FAIRE=$(python3 - "$STORE" <<'PYEOF'
 import sqlite3, sys
 sys.path[:0] = [sys.argv[1]]
 import db, menage_fantomes as m
 with sqlite3.connect(f"file:{db.DB_PATH}?mode=ro", uri=True) as c:
     c.row_factory = sqlite3.Row
-    n = len(m.pdls_fantomes(c)) + sum(
-        len(m.epoques_bidon(c, i)) for i, in c.execute("SELECT pdl_index FROM pdl"))
-print(n)
+    print(len(m.conforme(c)))
 PYEOF
 ) || fail "base illisible — on ne touche à rien"
 
@@ -142,6 +143,15 @@ CAPS="$REPO/src/pi/capabilities.py"
 ECRIVAINS=""
 python3 "$CAPS" has tic-uart          >/dev/null 2>&1 && ECRIVAINS="$ECRIVAINS ben-tic-reader.service"
 python3 "$CAPS" has lora-tic-receiver >/dev/null 2>&1 && ECRIVAINS="$ECRIVAINS ben-telemetry.service"
+
+# 🚨 ET LE PUBLISHER, qui n'écrit pourtant aucune mesure. Il lit un lot de `sent=0`, le
+#    POSTE, puis marque `sent=1` PAR ROWID. Un lot parti sous le pdl_index FANTÔME juste
+#    avant le ménage verrait ses lignes déplacées sous le vrai PDL, puis marquées envoyées
+#    par des rowid qui n'ont pas bougé — le cloud ne les aurait JAMAIS reçues sous le bon
+#    compteur, et plus rien ne les lui enverrait. Fenêtre étroite, perte définitive.
+#    ⓘ Il est sans état : le redémarrer ne coûte rien, il reprend au premier point non envoyé.
+systemctl list-unit-files ben-publisher.service >/dev/null 2>&1 \
+    && ECRIVAINS="$ECRIVAINS ben-publisher.service"
 ECRIVAINS="${ECRIVAINS# }"
 
 # ⚠️ On n'arrête QUE ce qui tourne, et on ne redémarrera QUE ça (leçon de 0.9.17 : `restart`
@@ -169,10 +179,18 @@ python3 "$MENAGE" 2>&1 | sed "s/^/[update $TR]   /" || RC=$?
 for U in $TOURNAIENT; do sudo systemctl start "$U"; done
 [ -n "$TOURNAIENT" ] && log "écrivains redémarrés"
 
-[ "$RC" = "0" ] || fail "le ménage a échoué (code $RC) — base intacte, sauvegarde en $SAUV"
+# ⓘ « base intacte » n'est pas une formule : `menage()` ne fait son `commit()` qu'à la toute
+#   fin, et la connexion annule tout sur exception. Un échec ici n'a donc rien écrit.
+[ "$RC" = "0" ] || fail "le ménage a PLANTÉ (code $RC) — rien n'a été commité, sauvegarde en $SAUV"
 
 # ═══ CONTRÔLE D'EFFET : L'INVARIANT ═══════════════════════════════════════════════════════════
-python3 - "$STORE" <<'PYEOF' || fail "la base n'est PAS conforme après ménage — voir $SAUV"
+# 🚨 ON RAPPORTE, ON N'ÉCHOUE PAS. Une anomalie que ce ménage-ci ne sait pas réparer est un
+#    état de la DONNÉE : la base n'est ni pire qu'avant, ni urgente, et la sauvegarde existe.
+#    Échouer laisserait `device.json` non bumpé, donc l'update REJOUERAIT toutes les 10 min —
+#    et ce serait DÉFINITIF, puisque aucune version ultérieure ne pourrait plus atteindre ce
+#    boîtier. Seuls le préflight (code cassé) et « un service arrêté n'est pas revenu »
+#    (dégât réel) ont le droit de faire échouer cette update.
+if python3 - "$STORE" <<'PYEOF'
 import sqlite3, sys
 sys.path[:0] = [sys.argv[1]]
 import db, menage_fantomes as m
@@ -182,7 +200,12 @@ with sqlite3.connect(f"file:{db.DB_PATH}?mode=ro", uri=True) as c:
 if ko:
     print("\n".join("  " + k for k in ko), file=sys.stderr); sys.exit(1)
 PYEOF
-log "invariant vérifié : aucun PDL difforme, aucune époque abîmée, aucune orpheline"
+then
+    log "invariant vérifié : aucun PDL difforme, aucune époque abîmée, aucune orpheline"
+else
+    warn "invariant ENCORE FAUX après ménage — sauvegarde en $SAUV, à instruire À LA MAIN"
+    warn "(on ne fait PAS échouer l'update : elle rejouerait toutes les 10 min pour toujours)"
+fi
 
 # ⭐ Et les écrivains sont revenus dans l'état où ils étaient — ni plus, ni moins.
 for U in $TOURNAIENT; do

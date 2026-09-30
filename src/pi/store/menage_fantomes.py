@@ -12,6 +12,7 @@ ce script répare ce qui est déjà entré.
     python3 menage_fantomes.py --a-blanc    # dit ce qu'il ferait, ne touche à rien
     python3 menage_fantomes.py              # agit
 """
+import json
 import sqlite3
 import sys
 
@@ -77,7 +78,8 @@ def menage(conn, *, a_blanc: bool = True) -> dict:
                    if db.adco_valide(a or ""))
     fantomes = pdls_fantomes(conn)
     rapport = {"sains": sains, "fantomes": fantomes, "deplacees": {},
-               "supprimees": {}, "epoques": [], "refus": None}
+               "supprimees": {}, "epoques": [], "evenements": [], "ngtf_recale": None,
+               "refus": None}
 
     # 🚨 LE GARDE. Ré-attribuer suppose de savoir VERS QUI. Avec zéro ou plusieurs PDL
     #    sains, la destination est indécidable — on ne devine pas, on ne touche à rien.
@@ -110,41 +112,174 @@ def menage(conn, *, a_blanc: bool = True) -> dict:
             rapport["supprimees"]["pdl"] = rapport["supprimees"].get("pdl", 0) + 1
 
     for pdl in sains:
-        for ts, ngtf in epoques_bidon(conn, pdl):
+        purge = epoques_bidon(conn, pdl)
+        # 🚨 PAS `{n for _, n in purge}` : la purge emporte DEUX sortes de lignes — les
+        #    ABÎMÉES (`HCn.`) et leurs JUMELLES, identiques à la référence (`HC..`). Le
+        #    contrat de la jumelle est le BON : le mettre dans `abimes` ferait supprimer
+        #    le `tariff_labels` légitime en croyant retirer le chimère. Seules les valeurs
+        #    qui DIFFÈRENT de la référence sont abîmées.
+        ref = conn.execute("SELECT ngtf FROM contract_epoch WHERE pdl_index=? "
+                           "ORDER BY ts_start LIMIT 1", (pdl,)).fetchone()
+        ref = ref[0] if ref is not None else None
+        abimes = {n for _, n in purge if n != ref}
+        for ts, ngtf in purge:
             rapport["epoques"].append((pdl, ts, ngtf))
             if not a_blanc:
                 conn.execute("DELETE FROM contract_epoch WHERE pdl_index=? AND ts_start=?",
                              (pdl, ts))
+        if not purge:
+            continue
+
+        # ⚠️ Une époque abîmée ne vit pas seule : `record_ngtf` écrit AUSSI un événement
+        #    `changement_offre` et une ligne `tariff_labels`, et mémorise le contrat dans
+        #    `level_profile.ngtf`. Supprimer la seule époque laisserait « votre contrat est
+        #    passé de HC.. à HCn. » dans la cloche de l'app, et un libellé chimère.
+        for eid, donnees in list(conn.execute(
+                "SELECT id, donnees FROM event WHERE type='changement_offre' AND pdl_index=?",
+                (pdl,))):
+            try:
+                d = json.loads(donnees or "{}")
+            except Exception:
+                continue
+            # 🚨 CIBLÉ, jamais « tous les changement_offre » : un vrai changement d'offre
+            #    est un FAIT que l'utilisateur a vu passer, il ne se réécrit pas.
+            if (d.get("avant") or "") in abimes or (d.get("apres") or "") in abimes:
+                rapport["evenements"].append((pdl, eid, d))
+                if not a_blanc:
+                    conn.execute("DELETE FROM event WHERE id=?", (eid,))
+
+        for ngtf in sorted(abimes):
+            n = conn.execute("SELECT count(*) FROM tariff_labels WHERE pdl_index=? AND ngtf=?",
+                             (pdl, ngtf)).fetchone()[0]
+            if n:
+                rapport["supprimees"]["tariff_labels"] = \
+                    rapport["supprimees"].get("tariff_labels", 0) + n
+                if not a_blanc:
+                    conn.execute("DELETE FROM tariff_labels WHERE pdl_index=? AND ngtf=?",
+                                 (pdl, ngtf))
+
+        # ⭐ LE GESTE QU'ON OUBLIERAIT : `record_ngtf` est write-on-change contre
+        #    `level_profile.ngtf`, PAS contre `contract_epoch`. Le laisser à `HCn.` ferait
+        #    émettre à la trame suivante un FAUX « Changement d'offre » et rouvrirait une
+        #    époque datée d'AUJOURD'HUI — on réécrirait l'histoire en croyant la réparer.
+        row = conn.execute("SELECT ngtf FROM level_profile WHERE pdl_index=?", (pdl,)).fetchone()
+        if row is not None and (row[0] or "") in abimes:
+            reste = conn.execute("SELECT ngtf FROM contract_epoch WHERE pdl_index=? "
+                                 "ORDER BY ts_start DESC LIMIT 1", (pdl,)).fetchone()
+            if reste is not None:
+                rapport["ngtf_recale"] = (pdl, row[0], reste[0])
+                if not a_blanc:
+                    conn.execute("UPDATE level_profile SET ngtf=? WHERE pdl_index=?",
+                                 (reste[0], pdl))
     if not a_blanc:
         conn.commit()
     return rapport
 
 
-def sauvegarde(conn, chemin: str) -> int:
-    """Écrit les lignes VISÉES en `INSERT` rejouables. Rend le nombre de lignes.
+def _q(v) -> str:
+    """Cite une valeur pour SQLite.
 
-    🚨 Les bases embarquées ne sont PAS sauvegardées : une ligne supprimée par erreur est
-    perdue définitivement. On ne copie pas la base entière (des centaines de Mo) mais
-    exactement ce qu'on s'apprête à toucher — quelques Ko, qu'on garde jusqu'à validation.
+    ⚠️ `repr()` de Python N'EST PAS une citation SQL : une chaîne contenant `'` sort
+    entre guillemets DOUBLES (acceptée seulement par le repli hérité de SQLite), et une
+    chaîne contenant les deux sort avec un `\'` que SQLite REJETTE — la réinjection
+    entière échouerait sur une erreur de syntaxe. `event.corps` porte du français avec
+    apostrophes (« C'est fait : votre contrat est passé de… ») et `donnees` du JSON.
+    """
+    if v is None:
+        return "NULL"
+    if isinstance(v, (int, float)):
+        return str(v)
+    return "'" + str(v).replace("'", "''") + "'"
+
+
+def sauvegarde(conn, chemin: str) -> int:
+    """Écrit le RETOUR ARRIÈRE des lignes visées. Rend le nombre d'instructions.
+
+    🚨 Les bases embarquées ne sont PAS sauvegardées : une ligne perdue l'est pour de
+    bon. On ne copie pas la base entière (des centaines de Mo) mais exactement de quoi
+    défaire ce qu'on s'apprête à faire.
+
+    ⭐ Ce ne sont PAS que des `INSERT`. Les mesures sont DÉPLACÉES, pas supprimées, et
+    `measurements`/`lora_link` n'ont aucune clé primaire : réinsérer leurs lignes après
+    coup les mettrait en DOUBLE — l'exemplaire déplacé sous le vrai PDL, plus
+    l'exemplaire restauré sous le fantôme. Le retour arrière d'un `UPDATE` est un
+    `UPDATE`, ciblé par `rowid`, et il restaure aussi le `sent` d'origine — que le
+    ménage remet à 0.
     """
     fantomes = pdls_fantomes(conn)
     sains = [i for i, a in conn.execute("SELECT pdl_index, adco FROM pdl")
              if db.adco_valide(a or "")]
     n = 0
     with open(chemin, "w", encoding="utf-8") as f:
-        f.write("-- menage_fantomes : lignes visees, rejouables tel quel\n")
+        f.write("-- menage_fantomes : RETOUR ARRIERE. A rejouer tel quel pour defaire.\n")
         for pdl in fantomes:
-            for table in ("pdl", "emitter") + A_REATTRIBUER + A_SUPPRIMER:
-                for ligne in conn.execute(f"SELECT * FROM {table} WHERE pdl_index=?", (pdl,)):
-                    vals = ",".join("NULL" if v is None else
-                                    repr(v) if isinstance(v, str) else str(v) for v in ligne)
-                    f.write(f"INSERT INTO {table} VALUES({vals});\n")
+            for table in A_REATTRIBUER:          # déplacées → on les REMET
+                for rowid, sent in conn.execute(
+                        f"SELECT rowid, sent FROM {table} WHERE pdl_index=?", (pdl,)):
+                    f.write(f"UPDATE {table} SET pdl_index={pdl}, sent={sent} "
+                            f"WHERE rowid={rowid};\n")
                     n += 1
-        for pdl in sains:
-            for ts, ngtf in epoques_bidon(conn, pdl):
-                f.write(f"INSERT INTO contract_epoch VALUES({pdl},{ts},{ngtf!r});\n")
+            for table in ("pdl",) + A_SUPPRIMER:  # supprimées → on les REINSERE
+                cols = [c[1] for c in conn.execute(f"PRAGMA table_info({table})")]
+                for ligne in conn.execute(f"SELECT * FROM {table} WHERE pdl_index=?", (pdl,)):
+                    f.write(f"INSERT OR REPLACE INTO {table}({','.join(cols)}) VALUES("
+                            + ",".join(_q(v) for v in ligne) + ");\n")
+                    n += 1
+            for addr, adco, pi in conn.execute(   # ré-orientée → on la REORIENTE
+                    "SELECT lora_addr, adco, pdl_index FROM emitter WHERE pdl_index=?", (pdl,)):
+                f.write(f"UPDATE emitter SET adco={_q(adco)}, pdl_index={pi} "
+                        f"WHERE lora_addr={addr};\n")
                 n += 1
+        for pdl in sains:
+            purge = epoques_bidon(conn, pdl)
+            for ts, ngtf in purge:
+                f.write(f"INSERT OR REPLACE INTO contract_epoch VALUES({pdl},{ts},{_q(ngtf)});\n")
+                n += 1
+            if purge:
+                row = conn.execute("SELECT ngtf FROM level_profile WHERE pdl_index=?",
+                                   (pdl,)).fetchone()
+                if row is not None:
+                    f.write(f"UPDATE level_profile SET ngtf={_q(row[0])} "
+                            f"WHERE pdl_index={pdl};\n")
+                    n += 1
+                for eid, in conn.execute(
+                        "SELECT id FROM event WHERE type='changement_offre' AND pdl_index=?",
+                        (pdl,)):
+                    pass   # les events sont sauvés ci-dessous, avec leurs colonnes
+                cols = [c[1] for c in conn.execute("PRAGMA table_info(event)")]
+                for ligne in conn.execute(
+                        "SELECT * FROM event WHERE type='changement_offre' AND pdl_index=?",
+                        (pdl,)):
+                    f.write(f"INSERT OR REPLACE INTO event({','.join(cols)}) VALUES("
+                            + ",".join(_q(v) for v in ligne) + ");\n")
+                    n += 1
+                cols = [c[1] for c in conn.execute("PRAGMA table_info(tariff_labels)")]
+                for ligne in conn.execute(
+                        "SELECT * FROM tariff_labels WHERE pdl_index=?", (pdl,)):
+                    f.write(f"INSERT OR REPLACE INTO tariff_labels({','.join(cols)}) VALUES("
+                            + ",".join(_q(v) for v in ligne) + ");\n")
+                    n += 1
     return n
+
+
+def code_sortie(rapport: dict, invariant_ko: list) -> int:
+    """🚨 AUCUN ÉTAT DE LA DONNÉE NE FAIT ÉCHOUER CETTE UPDATE. Toujours 0.
+
+    Ce n'est pas de la complaisance, c'est la leçon de pi-0.9.12 appliquée à une migration
+    de données. Un `update.sh` qui échoue laisse `device.json` non bumpé, donc l'update
+    REJOUE toutes les 10 min — et ici ce serait DÉFINITIF, puisque aucune version ultérieure
+    ne pourrait plus atteindre le boîtier.
+
+    Deux états parfaitement légitimes seraient pris pour des pannes :
+      · le REFUS (0 ou 2+ PDL sains) — « je ne sais pas vers qui réattribuer » est voulu ;
+      · un invariant encore faux — une anomalie que ce ménage-ci ne sait pas réparer ne
+        rend la base ni pire qu'avant, ni urgente.
+
+    Ce qui DOIT faire échouer l'update vit ailleurs, dans `update.sh` : le préflight (code
+    cassé — on veut retenter au prochain tag) et « un service arrêté n'est pas revenu »
+    (dégât réel et réparable). Pas la donnée.
+    """
+    return 0
 
 
 def conforme(conn) -> list:
@@ -172,18 +307,39 @@ def conforme(conn) -> list:
 if __name__ == "__main__":
     a_blanc = "--a-blanc" in sys.argv
     with sqlite3.connect(db.DB_PATH) as c:
+        c.row_factory = sqlite3.Row
         r = menage(c, a_blanc=a_blanc)
         tete = "MARCHE A BLANC — rien n'est touche" if a_blanc else "MENAGE"
         print(f"[{tete}] pdl sains={r['sains']} fantomes={r['fantomes']}")
+
+        # 🚨 LE REFUS EST UN SUCCES, ET LE CODE DE SORTIE LE DIT.
+        #
+        #    « Je ne sais pas vers qui reattribuer, donc je ne touche a rien » est un etat
+        #    STABLE et VOULU — pas une panne. Sortir en 1 ferait echouer l'update.sh, donc
+        #    `device.json` ne serait jamais bumpe, donc l'update REJOUERAIT toutes les
+        #    10 min POUR TOUJOURS, et aucune OTA ulterieure ne passerait plus jamais sur ce
+        #    boitier. C'est exactement la mecanique qui a brule pi-0.9.12, et elle serait
+        #    ici DEFINITIVE puisque aucune version suivante ne pourrait l'atteindre.
         if r["refus"]:
-            print(f"  REFUS : {r['refus']}")
-            sys.exit(1)
-        for t, n in sorted(r["deplacees"].items()):
-            print(f"  reattribue  {n:>7} lignes  {t}")
-        for t, n in sorted(r["supprimees"].items()):
-            print(f"  supprime    {n:>7} lignes  {t}")
+            print(f"  REFUS (volontaire, rien touche) : {r['refus']}")
+            sys.exit(0)
+
+        for t_, n in sorted(r["deplacees"].items()):
+            print(f"  reattribue  {n:>7} lignes  {t_}")
+        for t_, n in sorted(r["supprimees"].items()):
+            print(f"  supprime    {n:>7} lignes  {t_}")
         for pdl, ts, ngtf in r["epoques"]:
-            print(f"  epoque purgee  pdl {pdl}  ts={ts}  ngtf={ngtf!r}")
+            print(f"  epoque purgee   pdl {pdl}  ts={ts}  ngtf={ngtf!r}")
+        for pdl, eid, don in r["evenements"]:
+            print(f"  event purge     pdl {pdl}  {don.get('avant')!r} -> {don.get('apres')!r}")
+        if r["ngtf_recale"]:
+            pdl, avant, apres = r["ngtf_recale"]
+            print(f"  level_profile   pdl {pdl}  ngtf {avant!r} -> {apres!r}")
+
         ko = conforme(c)
         print("  invariant : " + ("OK" if not ko else " / ".join(ko)))
-        sys.exit(0 if a_blanc or not ko else 1)
+
+        # ⚠️ Et meme ici : un invariant encore faux n'est PAS une raison de sortir en
+        #    erreur. La base n'est pas pire qu'avant, la sauvegarde existe, et le journal
+        #    le dit. Un etat de DONNEE ne doit jamais bloquer le parc.
+        sys.exit(code_sortie(r, ko))
