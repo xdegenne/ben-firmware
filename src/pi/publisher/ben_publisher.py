@@ -78,8 +78,8 @@ API_PORT = int(os.environ.get("BEN_API_PORT", "8443"))
 BATCH = int(os.environ.get("BEN_PUB_BATCH", "1000"))
 PERIOD = float(os.environ.get("BEN_PUB_PERIOD", "60"))
 # 🚨 LA CADENCE QUAND IL RESTE DU RETARD. Sans elle, un boîtier à courte fenêtre de
-#    connectivité ne rattrape JAMAIS : il envoyait 1 lot toutes les 60 s, soit 1000
-#    points/min, pour une production radio de 64,5/min — un débit NET de 935/min. Une
+#    connectivité ne rattrape JAMAIS : il envoyait 1 lot de 500 points toutes les 60 s,
+#    soit 500/min, pour une production radio de 64,5/min — un débit NET de 435/min. Une
 #    journée hors ligne (93 000 points) demandait donc plus de 3 h 30 de connectivité
 #    rien que pour ne pas reculer, et en dessous l'écart grandissait chaque jour.
 #
@@ -269,6 +269,29 @@ def cadence(en_attente: int) -> float:
        cadence à chaque tour.
     """
     return PERIOD_RETARD if en_attente >= BATCH else PERIOD
+
+
+def cadence_sure(conn: sqlite3.Connection) -> float:
+    """La cadence, ou la croisière si on ne sait pas mesurer le retard.
+
+    🚨 `pending_approx()` INTERROGE LA BASE, et son appelant est HORS du `try` de la
+       boucle. L'ancien `_sleep(PERIOD)` ne pouvait rien lever ; celui-ci si — verrou
+       tenu au-delà du timeout pendant que le lecteur écrit, ou erreur d'E/S sur la
+       carte SD. Sans ce garde, l'exception remonte hors de `main()` : le process meurt
+       sans passer par « arrêté proprement », systemd le relance, et on perd le backoff.
+
+    ⭐ Le repli est `PERIOD`, JAMAIS `PERIOD_RETARD` : ne pas savoir mesurer le retard
+       ne doit pas faire ACCÉLÉRER.
+
+    ⚠️ Et on n'incrémente pas `echecs`, qui parle du SERVEUR — une base locale qui
+       bronche n'est pas un serveur en panne, et la confondre ferait partir le publisher
+       en backoff long pour une raison qui n'a rien à voir.
+    """
+    try:
+        return cadence(pending_approx(conn))
+    except sqlite3.Error as e:
+        log.warning("retard illisible (%s) — cadence de croisière par défaut", e)
+        return PERIOD
 
 
 def pending_approx(conn: sqlite3.Connection) -> int:
@@ -481,10 +504,22 @@ def main() -> int:
         #    parce qu'un `count(*) WHERE sent=0` prenait 37 s sur Pi Zero. On peut donc
         #    l'interroger à chaque tour sans rien payer.
         #
-        # ⚠️ Ce chemin n'est atteint qu'APRÈS un envoi réussi : le chemin d'échec sort
-        #    plus haut par `continue`, en gardant son backoff exponentiel à gigue totale.
-        #    Un serveur en panne ne déclenche donc JAMAIS la cadence de rattrapage.
-        _sleep(cadence(pending_approx(conn)))
+        # 🚨 MAIS IL INTERROGE LA BASE, ET CE POINT EST HORS DU `try` DE LA BOUCLE.
+        #    `_sleep(PERIOD)` ne pouvait rien lever ; celui-ci si — verrou tenu au-delà
+        #    du timeout pendant que le lecteur écrit, ou erreur d'E/S sur la carte SD.
+        #    Sans ce garde, l'exception remonte hors de `main()` : le process meurt sans
+        #    passer par « arrêté proprement », systemd le relance, et on perd le backoff.
+        #
+        # ⭐ Le repli est `PERIOD`, jamais `PERIOD_RETARD` : NE PAS SAVOIR MESURER LE
+        #    RETARD NE DOIT PAS FAIRE ACCÉLÉRER. Et on ne compte pas cet échec dans
+        #    `echecs`, qui parle du SERVEUR — une base locale qui bronche n'est pas un
+        #    serveur en panne.
+        #
+        # ⓘ Ce point est atteint après un envoi réussi, ou quand il n'y avait rien à
+        #   envoyer. Le chemin d'échec, lui, sort plus haut par `continue` en gardant son
+        #   backoff exponentiel à gigue totale : un serveur en panne ne déclenche donc
+        #   JAMAIS la cadence de rattrapage.
+        _sleep(cadence_sure(conn))
 
     cli.close()
     conn.close()
