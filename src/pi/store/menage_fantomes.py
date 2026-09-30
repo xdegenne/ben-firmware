@@ -72,6 +72,25 @@ def epoques_bidon(conn, pdl_index: int) -> list:
     return [(ts, n) for ts, n in lignes[1:] if n[:2] == ref[:2]]
 
 
+def a_nettoyer(conn) -> int:
+    """Ce que ce ménage-ci sait RÉPARER — et rien d'autre. C'est la porte d'entrée.
+
+    🚨 NE PAS UTILISER `conforme()` ICI. L'invariant est plus large que le correctif : il
+    signale aussi des `pdl_index` ORPHELINS, que le ménage ne sait pas réparer. Ils
+    existent sans le moindre fantôme — sur un boîtier LoRa, après une OTA, `emitter_pdl()`
+    rend None tant que l'Arduino n'a pas réémis sa trame de boot, `ben-telemetry` se replie
+    sur l'index de `sources.json`, et les mesures atterrissent sous un index sans ligne
+    `pdl`. Gater là-dessus ferait arrêter et redémarrer le lecteur d'un boîtier qu'on n'a
+    RIEN à nettoyer — des mesures perdues pour rien, exactement la leçon de 0.9.17, et
+    l'inverse de ce que ce script promet.
+
+    ⭐ La porte dit « ai-je quelque chose à faire ? », `conforme()` dit « où en est la
+       base ? ». Les deux se rapportent, une seule décide.
+    """
+    return len(pdls_fantomes(conn)) + sum(
+        len(epoques_bidon(conn, i)) for i, in conn.execute("SELECT pdl_index FROM pdl"))
+
+
 def menage(conn, *, a_blanc: bool = True) -> dict:
     """Rend le rapport de ce qui a été fait — ou de ce qui le serait."""
     sains = sorted(i for i, a in conn.execute("SELECT pdl_index, adco FROM pdl")
@@ -89,6 +108,16 @@ def menage(conn, *, a_blanc: bool = True) -> dict:
     vrai = sains[0] if sains else None
 
     for pdl in fantomes:
+        # ⭐ Les tranches de courbe du fantôme sont SUPPRIMÉES et ses mesures DÉPLACÉES —
+        #   mais rien ne recalcule le rollup du vrai PDL, et `rollup_backfill_step` s'arrête
+        #   pour de bon une fois `rollup_state.done=1`. Sans ceci, chaque période enregistrée
+        #   sous un fantôme resterait un TROU dans tout ce qui se lit depuis `curve_rollup`
+        #   (/curve large, bandes HC/HP, coût, index par tarif) alors que les points bruts
+        #   sont bien là. On ré-ingère, borné par le nombre de lignes déplacées.
+        points = [] if a_blanc else [
+            (r[0], r[1], r[2], r[3], r[4]) for r in conn.execute(
+                "SELECT ts, src_standard, index_id, papp, index_value "
+                "FROM measurements WHERE pdl_index=?", (pdl,))]
         for t in A_REATTRIBUER:
             n = conn.execute(f"UPDATE {t} SET pdl_index=?, sent=0 WHERE pdl_index=?"
                              if not a_blanc else
@@ -103,6 +132,9 @@ def menage(conn, *, a_blanc: bool = True) -> dict:
             n = n.fetchone()[0] if a_blanc else n.rowcount
             if n:
                 rapport["supprimees"][t] = rapport["supprimees"].get(t, 0) + n
+        if not a_blanc and points:
+            db._rollup_ingest(conn, vrai, points)
+            rapport["rollup_reingere"] = rapport.get("rollup_reingere", 0) + len(points)
         if not a_blanc:
             # L'émetteur ne se supprime pas : sans lui, une trame de courbe n'aurait
             # plus où se ranger tant qu'aucune trame de boot n'est repassée.
@@ -164,8 +196,16 @@ def menage(conn, *, a_blanc: bool = True) -> dict:
         #    époque datée d'AUJOURD'HUI — on réécrirait l'histoire en croyant la réparer.
         row = conn.execute("SELECT ngtf FROM level_profile WHERE pdl_index=?", (pdl,)).fetchone()
         if row is not None and (row[0] or "") in abimes:
-            reste = conn.execute("SELECT ngtf FROM contract_epoch WHERE pdl_index=? "
-                                 "ORDER BY ts_start DESC LIMIT 1", (pdl,)).fetchone()
+            # ⚠️ EXCLURE les époques vouées à la purge. En marche à blanc rien n'est encore
+            #    supprimé : sans ce filtre, la « dernière restante » serait l'ABÎMÉE elle-même
+            #    et le journal annoncerait `'HCn.' -> 'HCn.'` là où l'exécution fait
+            #    `'HCn.' -> 'HC..'`. Ce journal est TOUT ce qu'on relira d'un boîtier
+            #    injoignable : il doit dire ce qui va réellement se passer.
+            exclus = [ts for ts, _ in purge]
+            reste = conn.execute(
+                "SELECT ngtf FROM contract_epoch WHERE pdl_index=? AND ts_start NOT IN ("
+                + ",".join("?" * len(exclus)) + ") ORDER BY ts_start DESC LIMIT 1",
+                (pdl, *exclus)).fetchone()
             if reste is not None:
                 rapport["ngtf_recale"] = (pdl, row[0], reste[0])
                 if not a_blanc:

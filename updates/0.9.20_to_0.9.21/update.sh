@@ -95,26 +95,45 @@ log "préflight OK (compile, règle éprouvée avec son témoin)"
 log "── marche à blanc ──"
 python3 "$MENAGE" --a-blanc 2>&1 | sed "s/^/[update $TR]   /" || fail "la marche à blanc a échoué"
 
-# 🚨 LA PORTE DE SORTIE INTERROGE L'INVARIANT, PAS UN COMPTE DE FANTÔMES. Compter seulement
-#    les fantômes et les époques laisserait passer « base déjà conforme ✓ » sur un boîtier
-#    portant une ORPHELINE sans rapport — un succès affiché sans que rien n'ait été vérifié.
-A_FAIRE=$(python3 - "$STORE" <<'PYEOF'
+# 🚨 LA PORTE DÉCIDE SUR CE QU'ON SAIT RÉPARER, ET SUR RIEN D'AUTRE.
+#
+#   Tentation à éviter : gater sur l'invariant complet. Il est PLUS LARGE que le correctif —
+#   il signale aussi des `pdl_index` ORPHELINS, que ce ménage ne sait pas réparer, et qui
+#   existent sans le moindre fantôme (boîtier LoRa après une OTA : `emitter_pdl()` rend None
+#   tant que l'Arduino n'a pas réémis sa trame de boot, `ben-telemetry` se replie sur l'index
+#   de `sources.json`, et les mesures atterrissent sous un index sans ligne `pdl`). On
+#   arrêterait alors le lecteur d'un boîtier qu'on n'a RIEN à nettoyer — des mesures perdues
+#   pour rien, la leçon de 0.9.17, et l'inverse de ce que ce script promet en en-tête.
+#
+# ⭐ La porte dit « ai-je quelque chose à faire ? ». L'invariant dit « où en est la base ? ».
+#    Les deux se rapportent au journal, une seule décide.
+LECTURE=$(python3 - "$STORE" <<'PYEOF'
 import sqlite3, sys
 sys.path[:0] = [sys.argv[1]]
 import db, menage_fantomes as m
 with sqlite3.connect(f"file:{db.DB_PATH}?mode=ro", uri=True) as c:
     c.row_factory = sqlite3.Row
-    print(len(m.conforme(c)))
+    print(m.a_nettoyer(c))
+    print(" / ".join(m.conforme(c)))
 PYEOF
 ) || fail "base illisible — on ne touche à rien"
+A_FAIRE=$(echo "$LECTURE" | sed -n 1p)
+RESTE=$(echo "$LECTURE" | sed -n 2p)
 
-# ⭐ RIEN À FAIRE ⇒ AUCUN SERVICE TOUCHÉ. C'est le cas de la plupart du parc.
+# ⭐ RIEN À NETTOYER ⇒ AUCUN SERVICE TOUCHÉ. C'est le cas de la plupart du parc.
 if [ "$A_FAIRE" = "0" ]; then
-    log "✓ base déjà conforme — aucun service touché"
+    if [ -n "$RESTE" ]; then
+        # ⚠️ On le DIT, on n'agit pas : ce ménage-ci ne sait pas le réparer, et la base
+        #    n'est ni pire qu'avant, ni urgente.
+        warn "rien à nettoyer ici, mais l'invariant signale : $RESTE"
+        warn "→ à instruire à la main ; AUCUN service n'a été touché"
+    else
+        log "✓ base conforme — aucun service touché"
+    fi
     log "✓ update OK"
     exit 0
 fi
-log "$A_FAIRE anomalie(s) à traiter"
+log "$A_FAIRE anomalie(s) réparable(s) à traiter"
 
 # ═══ QUELS ÉCRIVAINS ARRÊTER ? ════════════════════════════════════════════════════════════════
 #
@@ -189,9 +208,12 @@ python3 "$MENAGE" 2>&1 | sed "s/^/[update $TR]   /" || RC=$?
 for U in $TOURNAIENT; do sudo systemctl start "$U"; done
 [ -n "$TOURNAIENT" ] && log "écrivains redémarrés"
 
-# ⓘ « base intacte » n'est pas une formule : `menage()` ne fait son `commit()` qu'à la toute
-#   fin, et la connexion annule tout sur exception. Un échec ici n'a donc rien écrit.
-[ "$RC" = "0" ] || fail "le ménage a PLANTÉ (code $RC) — rien n'a été commité, sauvegarde en $SAUV"
+# ⓘ On ne PROMET rien sur l'état de la base ici. `menage()` ne commite qu'à la toute fin et
+#   la connexion annule tout sur exception — mais l'affichage et `conforme()` tournent APRÈS
+#   ce commit, donc un plantage à ce moment-là laisserait bel et bien le ménage appliqué.
+#   Affirmer « rien n'a été commité » serait faux une fois sur deux : on renvoie au journal
+#   et à la sauvegarde, qui eux ne mentent pas.
+[ "$RC" = "0" ] || fail "le ménage a PLANTÉ (code $RC) — voir le journal ci-dessus ; retour arrière : $SAUV"
 
 # ═══ CONTRÔLE D'EFFET : L'INVARIANT ═══════════════════════════════════════════════════════════
 # 🚨 ON RAPPORTE, ON N'ÉCHOUE PAS. Une anomalie que ce ménage-ci ne sait pas réparer est un

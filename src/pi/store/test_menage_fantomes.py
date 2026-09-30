@@ -262,6 +262,67 @@ def AUCUN_etat_de_la_donnee_ne_fait_echouer_l_update():
     assert m.code_sortie({"refus": None}, []) == 0
 
 
+@cas
+def un_ORPHELIN_irreparable_ne_declenche_PAS_le_menage():
+    """🚨 La PORTE et le RAPPORT ne sont pas la même question. `conforme()` signale aussi
+    des `pdl_index` orphelins, que ce ménage ne sait pas réparer — et ils existent SANS le
+    moindre fantôme : sur un boîtier LoRa, après une OTA, `emitter_pdl()` rend None tant
+    que l'Arduino n'a pas réémis sa trame de boot, `ben-telemetry` se replie sur l'index de
+    `sources.json`, et les mesures atterrissent sous un index sans ligne `pdl`.
+
+    Gater là-dessus ferait arrêter et redémarrer le lecteur d'un boîtier qu'on n'a RIEN à
+    nettoyer : des mesures perdues pour rien, la leçon de 0.9.17, et l'inverse exact de ce
+    que ce script promet en en-tête."""
+    c = db.connect(":memory:")
+    c.execute("INSERT INTO pdl VALUES(0,'061961403012',1,9)")
+    c.execute("INSERT INTO measurements(ts,pdl_index,papp,sent) VALUES(1,7,10,0)")
+    c.commit()
+    assert m.a_nettoyer(c) == 0, "on toucherait aux services pour une anomalie irreparable"
+    assert m.conforme(c), "mais l'invariant doit quand meme le SIGNALER"
+    # ⚖️ LE TÉMOIN : un vrai fantôme, lui, doit bien ouvrir la porte.
+    assert m.a_nettoyer(malade()) > 0
+
+
+@cas
+def le_ROLLUP_est_reconstruit_pour_les_mesures_deplacees():
+    """⚠️ Les tranches du fantôme sont supprimées et ses mesures déplacées — mais rien ne
+    recalcule le rollup du vrai PDL, et `rollup_backfill_step` s'arrête pour de bon une
+    fois `rollup_state.done=1`. Sans reconstruction, chaque période enregistrée sous un
+    fantôme resterait un TROU dans `/curve` large, les bandes HC/HP, le coût et l'index par
+    tarif — alors que les points bruts sont bien là."""
+    c = db.connect(":memory:")
+    c.execute("INSERT INTO pdl VALUES(0,'061961403012',1,9)")
+    c.execute("INSERT INTO pdl VALUES(1,'061961403p12',1,1)")
+    c.execute("INSERT INTO measurements(ts,pdl_index,papp,index_id,index_value,sent) "
+              "VALUES(1000,1,250,1,777,1)")
+    c.execute("INSERT INTO rollup_state(id,watermark,done) VALUES(0,0,1)")   # backfill TERMINÉ
+    c.commit()
+    m.menage(c, a_blanc=False)
+
+    tranches = lignes(c.execute("SELECT pdl_index, papp_max, papp_count, index_last "
+                                "FROM curve_rollup"))
+    assert tranches == [(0, 250, 1, 777)], f"rollup non reconstruit : {tranches}"
+
+
+@cas
+def la_marche_a_blanc_annonce_la_MEME_cible_que_l_execution():
+    """🚨 Le journal est TOUT ce qu'on relira d'un boîtier injoignable. En marche à blanc
+    rien n'est encore supprimé : sans filtrer les époques vouées à la purge, la « dernière
+    restante » serait l'ABÎMÉE elle-même, et le journal annoncerait `'HCn.' -> 'HCn.'` là
+    où l'exécution fait `'HCn.' -> 'HC..'`. Annoncer autre chose que ce qu'on fait est pire
+    que ne rien annoncer."""
+    def _base():
+        c = db.connect(":memory:")
+        c.execute("INSERT INTO pdl VALUES(0,'061961403012',1,9)")
+        for ts, ngtf in ((0, "HC.."), (10, "HCn.")):
+            c.execute("INSERT INTO contract_epoch VALUES(0,?,?)", (ts, ngtf))
+        c.execute("INSERT INTO level_profile(pdl_index,computed_ts,ngtf) VALUES(0,0,'HCn.')")
+        c.commit()
+        return c
+    assert m.menage(_base(), a_blanc=True)["ngtf_recale"] == \
+           m.menage(_base(), a_blanc=False)["ngtf_recale"] == (0, "HCn.", "HC..")
+
+
 if __name__ == "__main__":
     ko = 0
     for fn in CAS:
