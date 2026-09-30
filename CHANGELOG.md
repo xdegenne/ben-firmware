@@ -18,6 +18,60 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.9.20] — 2026-09-30
+
+**Le publisher rattrape son retard.** Un boîtier à **courte fenêtre de connectivité** ne rattrapait jamais : il divergeait, et l'écart grandissait chaque jour. Ferme [#13](https://github.com/xdegenne/ben-firmware/issues/13).
+
+> 🚨 Il envoyait **500 points toutes les 60 s** — soit 500/min — pour une production radio de **64,5/min**. Débit net : 435/min. Il lui fallait donc **plus de 3 h 30 de connectivité par jour rien que pour ne pas reculer.**
+
+**⭐ Le goulot n'était PAS la taille du lot — et c'est la mesure qui l'a tranché.**
+
+Relevé sur un Pi Zero du parc, trois essais par taille :
+
+| lot | brut | gzippé | ratio | aller-retour |
+|---|---|---|---|---|
+| 500 | 49,8 ko | 3,0 ko | ×16,6 | **206 ms** |
+| **1 000** | 99,6 ko | **5,9 ko** | ×16,9 | **400 ms** |
+| 2 000 | 200 ko | 11,8 ko | ×17,0 | 690 ms |
+
+Un lot part en ~0,4 s, puis le service dormait **60 s** : il travaillait **0,7 % du temps**.
+
+⚠️ Augmenter `BATCH` seul n'aurait presque rien gagné, et ne rien changer à `BATCH` non plus : **le sommeil se paie par lot, pas par point**, donc les deux paramètres se décident **ensemble**.
+
+| `BATCH` | sommeil | lots | rattrapage d'une journée |
+|---|---|---|---|
+| 500 | 60 s | 186 | **3 h 06** ← avant |
+| 500 | 10 s | 186 | 33 min |
+| **1 000** | **10 s** | **93** | **16 min** ← retenu |
+| 1 000 | 0 s | 93 | 37 s |
+
+**Le seuil de survie tombe de ~3 h 30 par jour à ~16 min.**
+
+**Pourquoi 10 s et pas 0** — 🚨 un sommeil nul, c'est **tout le parc à plein débit sur l'API en même temps** après une panne d'opérateur, sur une VM **DEV1-S** au budget mémoire déjà tendu. À 10 s la charge parc plafonne à **~670 points/s** pour sept boîtiers, et 16 min de rattrapage reste largement au-delà du besoin. On ne paie pas un risque serveur pour un gain qui ne sert à rien.
+
+⭐ **Et le contrôle du retard ne coûte rien** : `pending_approx()` est **O(1)** — il encadre par les `rowid`, justement parce qu'un `count(*) WHERE sent=0` prenait **37 s** sur Pi Zero — et il était **déjà** appelé à chaque lot pour la ligne de journal.
+
+**🚨 Un défaut trouvé en revue, introduit par ce correctif**
+
+`pending_approx()` interroge la base, et son appelant est **hors du `try`** de la boucle. L'ancien `_sleep(PERIOD)` ne pouvait rien lever ; le nouveau si — verrou tenu au-delà du timeout pendant que le lecteur écrit, ou erreur d'E/S sur la carte SD. Sans garde, l'exception remontait **hors de `main()`** : le process mourait sans passer par « arrêté proprement », systemd le relançait, et on perdait le backoff.
+
+`cadence_sure()` l'attrape. ⭐ Son repli est **`PERIOD`, jamais `PERIOD_RETARD`** : ne pas savoir mesurer le retard ne doit pas faire **accélérer**. ⚠️ Et `echecs` n'est pas incrémenté — ce compteur parle du **serveur** ; une base locale qui bronche n'est pas un serveur en panne.
+
+⚠️ **Le chemin d'échec est inchangé** : il sort par `continue` en gardant son backoff exponentiel à gigue totale. Un serveur en panne ne déclenche donc **jamais** la cadence de rattrapage.
+
+**Le script d'update**
+
+| | |
+|---|---|
+| ne touche **qu'un service** | `ben-publisher`. Ni les lecteurs, ni `ben-radio`, ni `ben-local-api` ne partagent de code avec ce changement |
+| ne démarre pas ce qui ne tournait pas | leçon de 0.9.17 |
+| préflight | `ast.parse` — jamais `py_compile` — **et la cadence éprouvée avec ses témoins** |
+| 🚨 contrôle d'effet **différent des versions précédentes** | `last_tic_ts` prouve qu'un **lecteur** lit ; il ne prouve **rien** sur le publisher, qui n'écrit pas dans `measurements`. Le reprendre donnerait un vert qui ne veut rien dire — le défaut de `pi-0.9.12` sous une autre forme |
+
+⭐ Ce qu'on contrôle à la place : le service est debout **et il le reste**. `is-active` juste après un `restart` ne voit pas une boucle de plantage — on regarde donc **deux fois**, à 15 s d'intervalle, et on exige que `NRestarts` n'ait pas bougé. Plus une trace d'activité au journal : un service figé sur une exception avalée resterait « active » sans plus rien faire.
+
+**Aucune migration, aucune table, aucune colonne.** Banc `test_cadence.py` : 9 cas, dont trois témoins et deux cas de terrain. Quatre sabotages joués.
+
 ### [0.9.19] — 2026-09-29
 
 **Ne jamais écrire sous un `pdl_index` deviné.** Trois portes laissaient une mesure partir en base sous un compteur qui n'était pas le sien. Ferme [#6](https://github.com/xdegenne/ben-firmware/issues/6).
