@@ -116,20 +116,6 @@ if [ "$A_FAIRE" = "0" ]; then
 fi
 log "$A_FAIRE anomalie(s) à traiter"
 
-# ═══ SAUVEGARDE — rien ne se supprime avant validation ════════════════════════════════════════
-SAUV="/var/tmp/ben-menage-fantomes-$(date -u +%Y%m%dT%H%M%SZ).sql"
-python3 - "$STORE" "$SAUV" <<'PYEOF' || fail "sauvegarde impossible — ON N'ÉCRIT RIEN"
-import sqlite3, sys
-sys.path[:0] = [sys.argv[1]]
-import db, menage_fantomes as m
-with sqlite3.connect(f"file:{db.DB_PATH}?mode=ro", uri=True) as c:
-    c.row_factory = sqlite3.Row
-    n = m.sauvegarde(c, sys.argv[2])
-print(n)
-PYEOF
-[ -s "$SAUV" ] || fail "sauvegarde vide : $SAUV — ON N'ÉCRIT RIEN"
-log "sauvegarde : $SAUV ($(wc -l < "$SAUV") lignes) — À CONSERVER jusqu'à validation"
-
 # ═══ QUELS ÉCRIVAINS ARRÊTER ? ════════════════════════════════════════════════════════════════
 #
 # ⭐ On interroge la MÊME source de vérité que le boot : `capabilities.py`. Pas
@@ -169,6 +155,30 @@ log "écrivains en cours : ${TOURNAIENT:-aucun}   (ben-radio VOLONTAIREMENT excl
 #    boîtier du parc le 29/09.
 for U in $TOURNAIENT; do sudo systemctl stop "$U"; done
 [ -n "$TOURNAIENT" ] && log "écrivains arrêtés"
+
+# ═══ SAUVEGARDE — après l'arrêt, et rien ne s'écrit avant elle ════════════════════════════════
+#
+# ⭐ APRÈS l'arrêt des écrivains, et ce n'est pas un détail : sauvegarder pendant qu'ils
+#    tournent laisse une fenêtre où une mesure naît sous le fantôme, échappe à la sauvegarde,
+#    puis se fait déplacer par le ménage. Le retour arrière ne la remettrait jamais.
+SAUV="/var/tmp/ben-menage-fantomes-$(date -u +%Y%m%dT%H%M%SZ).sql"
+if ! python3 - "$STORE" "$SAUV" <<'PYEOF'
+import sqlite3, sys
+sys.path[:0] = [sys.argv[1]]
+import db, menage_fantomes as m
+with sqlite3.connect(f"file:{db.DB_PATH}?mode=ro", uri=True) as c:
+    c.row_factory = sqlite3.Row
+    print(m.sauvegarde(c, sys.argv[2]))
+PYEOF
+then
+    for U in $TOURNAIENT; do sudo systemctl start "$U"; done
+    fail "sauvegarde impossible — ON N'ÉCRIT RIEN, écrivains redémarrés"
+fi
+if [ ! -s "$SAUV" ]; then
+    for U in $TOURNAIENT; do sudo systemctl start "$U"; done
+    fail "sauvegarde vide : $SAUV — ON N'ÉCRIT RIEN, écrivains redémarrés"
+fi
+log "sauvegarde : $SAUV ($(wc -l < "$SAUV") lignes) — À CONSERVER jusqu'à validation"
 
 # ═══ LE MÉNAGE ════════════════════════════════════════════════════════════════════════════════
 RC=0
