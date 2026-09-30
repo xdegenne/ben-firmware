@@ -72,6 +72,25 @@ def epoques_bidon(conn, pdl_index: int) -> list:
     return [(ts, n) for ts, n in lignes[1:] if n[:2] == ref[:2]]
 
 
+def refus(conn) -> str | None:
+    """Pourquoi on ne toucherait à rien — ou `None` si on peut y aller.
+
+    🚨 UNE SEULE DÉFINITION, consultée par `a_nettoyer()` ET par `menage()`. Les avoir
+    écrites deux fois a déjà produit le défaut exact que ce commentaire prévient : la porte
+    disait « il y a du travail », le ménage refusait, et entre les deux on avait arrêté les
+    trois écrivains et écrit une sauvegarde pour rien — des mesures perdues sans qu'une
+    seule ligne ne change.
+    """
+    sains = [i for i, a in conn.execute("SELECT pdl_index, adco FROM pdl")
+             if db.adco_valide(a or "")]
+    fantomes = pdls_fantomes(conn)
+    # Ré-attribuer suppose de savoir VERS QUI. Avec zéro ou plusieurs vrais compteurs, la
+    # destination est indécidable : on ne devine pas.
+    if fantomes and len(sains) != 1:
+        return f"{len(sains)} PDL sains : destination indécidable"
+    return None
+
+
 def a_nettoyer(conn) -> int:
     """Ce que ce ménage-ci sait RÉPARER — et rien d'autre. C'est la porte d'entrée.
 
@@ -87,6 +106,8 @@ def a_nettoyer(conn) -> int:
     ⭐ La porte dit « ai-je quelque chose à faire ? », `conforme()` dit « où en est la
        base ? ». Les deux se rapportent, une seule décide.
     """
+    if refus(conn):
+        return 0            # ⭐ on ne réveille PAS un boîtier pour lui dire non
     return len(pdls_fantomes(conn)) + sum(
         len(epoques_bidon(conn, i)) for i, in conn.execute("SELECT pdl_index FROM pdl"))
 
@@ -100,10 +121,9 @@ def menage(conn, *, a_blanc: bool = True) -> dict:
                "supprimees": {}, "epoques": [], "evenements": [], "ngtf_recale": None,
                "refus": None}
 
-    # 🚨 LE GARDE. Ré-attribuer suppose de savoir VERS QUI. Avec zéro ou plusieurs PDL
-    #    sains, la destination est indécidable — on ne devine pas, on ne touche à rien.
-    if fantomes and len(sains) != 1:
-        rapport["refus"] = f"{len(sains)} PDL sains : destination indécidable"
+    # 🚨 LE GARDE — même définition que celle qu'interroge `a_nettoyer()`, cf. `refus()`.
+    rapport["refus"] = refus(conn)
+    if rapport["refus"]:
         return rapport
     vrai = sains[0] if sains else None
 
@@ -249,6 +269,7 @@ def sauvegarde(conn, chemin: str) -> int:
     fantomes = pdls_fantomes(conn)
     sains = [i for i, a in conn.execute("SELECT pdl_index, adco FROM pdl")
              if db.adco_valide(a or "")]
+    vrai = sains[0] if len(sains) == 1 else None
     n = 0
     with open(chemin, "w", encoding="utf-8") as f:
         f.write("-- menage_fantomes : RETOUR ARRIERE. A rejouer tel quel pour defaire.\n")
@@ -270,6 +291,38 @@ def sauvegarde(conn, chemin: str) -> int:
                 f.write(f"UPDATE emitter SET adco={_q(adco)}, pdl_index={pi} "
                         f"WHERE lora_addr={addr};\n")
                 n += 1
+        # ⭐ LES TRANCHES DU VRAI PDL QUE LA RÉ-INGESTION VA TOUCHER. Sans elles, le retour
+        #   arrière serait INCOMPLET : il remettrait les mesures sous le fantôme et
+        #   restaurerait SES tranches, mais laisserait la contribution de ces mêmes points
+        #   dans le rollup du VRAI PDL — donc comptés DEUX FOIS dans /curve large, les
+        #   bandes HC/HP et le coût. Et comme `rollup_state.done=1`, plus rien ne les
+        #   recalculerait jamais.
+        #   Une tranche qui existait déjà se REMET telle quelle ; une tranche que la
+        #   ré-ingestion CRÉE doit se SUPPRIMER — d'où les deux formes.
+        if vrai is not None:
+            touchees = set()
+            for pdl in fantomes:
+                for ts, src, idx, papp, _ in conn.execute(
+                        "SELECT ts, src_standard, index_id, papp, index_value "
+                        "FROM measurements WHERE pdl_index=?", (pdl,)):
+                    if papp is None or idx is None:
+                        continue
+                    touchees.add(((ts // db.ROLLUP_BUCKET_SEC) * db.ROLLUP_BUCKET_SEC,
+                                  int(src or 0), idx))
+            cols = [c[1] for c in conn.execute("PRAGMA table_info(curve_rollup)")]
+            for bucket, src, idx in sorted(touchees):
+                ou = (f"pdl_index={vrai} AND bucket_ts={bucket} "
+                      f"AND src_standard={src} AND index_id={idx}")
+                ligne = conn.execute(
+                    "SELECT * FROM curve_rollup WHERE pdl_index=? AND bucket_ts=? "
+                    "AND src_standard=? AND index_id=?", (vrai, bucket, src, idx)).fetchone()
+                if ligne is None:
+                    f.write(f"DELETE FROM curve_rollup WHERE {ou};\n")
+                else:
+                    f.write(f"INSERT OR REPLACE INTO curve_rollup({','.join(cols)}) VALUES("
+                            + ",".join(_q(v) for v in ligne) + ");\n")
+                n += 1
+
         for pdl in sains:
             purge = epoques_bidon(conn, pdl)
             for ts, ngtf in purge:

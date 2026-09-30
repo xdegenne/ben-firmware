@@ -43,7 +43,11 @@ def malade() -> sqlite3.Connection:
     c.execute("INSERT INTO pdl VALUES(0,'061961403012',1,9)")
     for i, adco in enumerate(("p61961403012", "061961403p12", "0619614030q2"), start=1):
         c.execute("INSERT INTO pdl VALUES(?,?,1,1)", (i, adco))
-        c.execute("INSERT INTO measurements(ts,pdl_index,papp,sent) VALUES(?,?,?,1)", (100 + i, i, 42))
+        # ⚠️ `index_id` N'EST PAS DÉCORATIF : sans lui `_rollup_ingest` ignore le point, et
+        #    tout le chemin de reconstruction du rollup resterait NON EXERCÉ — c'est
+        #    exactement ce qui a laissé passer un retour arrière incomplet.
+        c.execute("INSERT INTO measurements(ts,pdl_index,papp,index_id,index_value,sent) "
+                  "VALUES(?,?,?,1,?,1)", (100 + i, i, 42, 5000 + i))
         c.execute("INSERT INTO level_profile(pdl_index,computed_ts) VALUES(?,0)", (i,))
     for t in range(1000):                       # le vrai compteur, qu'on ne doit PAS toucher
         c.execute("INSERT INTO measurements(ts,pdl_index,papp,sent) VALUES(?,0,?,1)", (t, t))
@@ -63,6 +67,10 @@ def malade() -> sqlite3.Connection:
     c.execute("INSERT INTO tariff_labels VALUES(0,1,1,'HC..','HC',9)")
     c.execute("INSERT INTO tariff_labels VALUES(0,1,1,'HCn.','HC',9)")   # le libellé chimère
     c.execute("INSERT INTO level_profile(pdl_index,computed_ts,ngtf) VALUES(0,0,'HC..')")
+    # Une tranche de courbe DÉJÀ construite pour le vrai compteur, dans la même fenêtre que
+    # les points fantômes : la ré-ingestion va la modifier, le retour arrière doit la rendre.
+    db._rollup_ingest(c, 0, [(101, 0, 1, 900, 4900)])
+    c.execute("INSERT INTO rollup_state(id,watermark,done) VALUES(0,0,1)")   # backfill TERMINÉ
     c.commit()
     return c
 
@@ -321,6 +329,49 @@ def la_marche_a_blanc_annonce_la_MEME_cible_que_l_execution():
         return c
     assert m.menage(_base(), a_blanc=True)["ngtf_recale"] == \
            m.menage(_base(), a_blanc=False)["ngtf_recale"] == (0, "HCn.", "HC..")
+
+
+@cas
+def la_PORTE_refuse_exactement_comme_le_MENAGE():
+    """🚨 Deux définitions du refus = le défaut qu'elles produisent. La porte disait « il y a
+    du travail », `menage()` refusait — et entre les deux on avait arrêté `ben-tic-reader`,
+    `ben-telemetry` et `ben-publisher` puis écrit une sauvegarde, pour que pas une ligne ne
+    change. Des mesures perdues pour rien, la leçon de 0.9.17 une fois de plus."""
+    for nb_sains, libelle in ((2, "deux vrais compteurs"), (0, "aucun vrai compteur")):
+        c = db.connect(":memory:")
+        for i, adco in enumerate(["061961403012", "031864467282"][:nb_sains]):
+            c.execute("INSERT INTO pdl VALUES(?,?,1,9)", (i, adco))
+        c.execute("INSERT INTO pdl VALUES(9,'061961403p12',1,1)")
+        c.execute("INSERT INTO measurements(ts,pdl_index,papp,sent) VALUES(1,9,10,1)")
+        c.commit()
+        assert m.refus(c), libelle
+        assert m.a_nettoyer(c) == 0, f"{libelle} : on reveillerait le boitier pour lui dire non"
+    # ⚖️ LE TÉMOIN : avec UN seul vrai compteur, la porte s'ouvre bien.
+    assert m.refus(malade()) is None and m.a_nettoyer(malade()) > 0
+
+
+@cas
+def le_retour_arriere_rend_AUSSI_le_rollup_du_vrai_PDL():
+    """🚨 La reconstruction du rollup écrit les points du fantôme dans les tranches du VRAI
+    compteur. Ne pas les sauvegarder laisserait ces points comptés DEUX FOIS après un retour
+    arrière — une fois sous le fantôme restauré, une fois dans le rollup du vrai PDL — dans
+    /curve large, les bandes HC/HP et le coût. Et `rollup_state.done=1` : plus rien ne les
+    recalculerait jamais.
+
+    Les deux formes comptent : une tranche qui EXISTAIT se remet telle quelle, une tranche
+    que la ré-ingestion CRÉE doit se supprimer."""
+    import tempfile
+    c = malade()
+    avant = lignes(c.execute("SELECT pdl_index,bucket_ts,papp_sum,papp_count FROM curve_rollup"))
+    assert avant, "le banc doit partir d'une tranche existante, sinon il ne teste qu'un cas"
+    f = tempfile.NamedTemporaryFile("w+", suffix=".sql", delete=False)
+    f.close()
+    m.sauvegarde(c, f.name)
+    m.menage(c, a_blanc=False)
+    pendant = lignes(c.execute("SELECT pdl_index,bucket_ts,papp_sum,papp_count FROM curve_rollup"))
+    assert pendant != avant, "le rollup du vrai PDL aurait du changer"
+    c.executescript(pathlib.Path(f.name).read_text())
+    assert lignes(c.execute("SELECT pdl_index,bucket_ts,papp_sum,papp_count FROM curve_rollup")) == avant
 
 
 if __name__ == "__main__":
