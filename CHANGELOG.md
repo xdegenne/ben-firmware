@@ -18,6 +18,48 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.9.21] — 2026-09-30
+
+**Éradiquer les fantômes déjà entrés.** `0.9.19` a fermé la porte ; celle-ci répare ce qui était **déjà dedans**. Ferme [#7](https://github.com/xdegenne/ben-firmware/issues/7).
+
+> 🚨 **C'est une migration de DONNÉES, pas une livraison de code.** Aucun `.py` de service n'est modifié — et ça change la nature du risque. Les cinq updates précédentes risquaient « le service ne repart pas », visible tout de suite. Celle-ci risque « on a supprimé la mauvaise ligne » : **irréversible**, sur des bases qui **ne sont pas sauvegardées**.
+
+**⭐ Une seule cause pour deux symptômes : le bit 6.**
+
+Un caractère de la trame TIC dont le bit 6 s'est mis à 1 — `0`→`p`, `1`→`q`, `.`→`n`. Or `0x40` vaut **64**, et le checksum TIC est `(somme & 0x3F) + 0x20` : **aveugle à tout multiple de 64**.
+
+```
+'HC..'  somme=231  checksum=0x47
+'HCn.'  somme=295  checksum=0x47     ← le même
+```
+
+Relevé le 30/09 sur un boîtier filaire du parc : **trois ADCO fantômes** portant une mesure chacun, et **quatre époques tarifaires** `HC..`→`HCn.`. Le contrôle de parité matérielle de `0.9.18` ferme cette porte — un seul bit retourné rend la parité fausse ; ici on nettoie derrière.
+
+**⭐ La règle des époques tient en une ligne.**
+
+> La **première** époque est la référence. Toute autre qui lui ressemble sur les **deux premiers caractères** part.
+
+- **Pourquoi le préfixe et pas une durée** — une époque **terminale** n'a pas de successeur, donc aucune durée mesurable. Et c'est précisément celle qui compte : c'est elle que lisent `/registers` et tout calcul de coût.
+- **Pourquoi « ressemble » et non « diffère »** — les abîmées naissent **en paire** : le lecteur rouvre une époque en revenant au vrai contrat 1 à 4 s plus tard, et cette jumelle est *identique* à la référence. La même condition emporte les deux, et il ne reste qu'une ligne là où cinq disaient la même chose.
+
+⚠️ **Ce qu'elle ne fait pas, et c'est assumé** : un **retour** au contrat d'origine (`BASE`→`TEMPO`→`BASE`) serait effacé lui aussi. Aucun boîtier du parc n'est dans ce cas — `BASE`, `TEMPO`, `HC..` et `BBR(` diffèrent tous dès le deuxième caractère — et **un banc épingle cette limite** pour qu'on ne la redécouvre pas sur le terrain.
+
+**Les mesures sont RÉ-ATTRIBUÉES, jamais supprimées.** Elles viennent du vrai compteur ; seul leur classement était faux. `sent=0` pour qu'elles repartent au cloud, qui les a reçues sous un PDL qui n'existe plus. De même `emitter` est **ré-orientée** et non supprimée : sans sa ligne, une trame de courbe n'aurait plus où se ranger tant qu'aucune trame de boot n'est repassée.
+
+🚨 **Garde** : ré-attribuer suppose de savoir **vers qui**. Avec zéro ou plusieurs PDL sains, la destination est indécidable — on sort sans rien toucher.
+
+**🚨 Le contrôle d'effet est un INVARIANT, pas un compte.**
+
+Le succès n'est pas « j'ai supprimé quelque chose » : sur six boîtiers du parc il n'y a rien à faire, **et c'est un succès**. Exiger un effet ferait échouer l'update partout ailleurs, `device.json` ne serait pas bumpé, et elle **rejouerait toutes les 10 min** — la mécanique exacte qui a brûlé `pi-0.9.12`. On vérifie donc « la base est conforme », vrai **avant comme après** sur un boîtier propre.
+
+⭐ Et **rien à faire ⇒ aucun service touché** : on sort avant même d'arrêter quoi que ce soit. Redémarrer un lecteur coûte des mesures (leçon de `0.9.17`).
+
+**La marche à blanc est un banc.** Le boîtier concerné est **injoignable** — fenêtres de connectivité courtes, pas de SSH. On ne peut pas lire une marche à blanc sur place : `test_menage_fantomes.py` **reconstitue sa maladie à l'identique** (10 cas), dont le témoin « une vraie bascule de contrat survit » — sans lui, une règle qui supprimerait *tout* passerait tous les cas de suppression et effacerait le passage en Tempo d'un boîtier du parc.
+
+⚠️ **Le hello est une FUSION** (`ON CONFLICT DO UPDATE`, jamais de `DELETE`) : nettoyer le boîtier ne nettoie **pas** le cloud, et nettoyer le cloud **avant** le boîtier se fait défaire au hello suivant. L'ordre est **boîtier d'abord, serveur ensuite**.
+
+Aucune migration de schéma, aucune table, aucune colonne.
+
 ### [0.9.20] — 2026-09-30
 
 **Le publisher rattrape son retard.** Un boîtier à **courte fenêtre de connectivité** ne rattrapait jamais : il divergeait, et l'écart grandissait chaque jour. Ferme [#13](https://github.com/xdegenne/ben-firmware/issues/13).
