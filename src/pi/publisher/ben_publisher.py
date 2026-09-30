@@ -6,9 +6,12 @@ ben_publisher — pousse les mesures du boîtier vers `ben-api`.
 Ce fichier décrit le comportement du boîtier ; le contrat de l'API et la
 politique serveur n'y figurent pas.
 
-    hello  au démarrage, puis toutes les heures (versions + compteurs).
-           S'il échoue, ON CONTINUE.
-    boucle toutes les 60 s : jusqu'à 500 points non envoyés, du plus ancien.
+    hello  au démarrage, puis une fois par JOUR (versions + compteurs).
+           S'il échoue, ON CONTINUE — et c'est le rejeu quotidien qui rattrape,
+           il n'y a pas de reprise immédiate.
+    boucle toutes les 60 s : jusqu'à BATCH points non envoyés, du plus ancien.
+           ⭐ 10 s seulement TANT QU'IL RESTE DU RETARD — sinon un boîtier à
+           courte fenêtre de connectivité ne rattrape jamais (cf. PERIOD_RETARD).
 
 La colonne `sent` de `measurements` est l'outbox : elle existe dans le schéma
 DEPUIS LE PREMIER JOUR et n'avait jamais été écrite.
@@ -75,8 +78,24 @@ from store import db  # noqa: E402
 API_HOST = os.environ.get("BEN_API_HOST", "api.benpilote.fr")
 API_PORT = int(os.environ.get("BEN_API_PORT", "8443"))
 
-BATCH = int(os.environ.get("BEN_PUB_BATCH", "500"))
+BATCH = int(os.environ.get("BEN_PUB_BATCH", "1000"))
 PERIOD = float(os.environ.get("BEN_PUB_PERIOD", "60"))
+# 🚨 LA CADENCE QUAND IL RESTE DU RETARD. Sans elle, un boîtier à courte fenêtre de
+#    connectivité ne rattrape JAMAIS : il envoyait 1 lot de 500 points toutes les 60 s,
+#    soit 500/min, pour une production radio de 64,5/min — un débit NET de 435/min. Une
+#    journée hors ligne (93 000 points) demandait donc plus de 3 h 30 de connectivité
+#    rien que pour ne pas reculer, et en dessous l'écart grandissait chaque jour.
+#
+# ⭐ Le goulot n'était PAS la taille du lot, et la mesure l'a tranché : un aller-retour
+#    coûte ~400 ms pour 1000 points (mesuré sur un Pi Zero du parc, 3 essais), contre
+#    60 s de sommeil. Le service travaillait 0,7 % du temps.
+#
+# ⚠️ Et 10 s plutôt que 0 : un sommeil nul, c'est TOUT LE PARC à plein débit sur l'API
+#    en même temps après une panne d'opérateur. À 10 s la charge parc plafonne à
+#    ~670 points/s pour sept boîtiers, et une journée de retard se résorbe quand même en
+#    ~16 min — soit largement au-delà du besoin. On ne paie pas un risque serveur pour
+#    un gain qui ne sert à rien.
+PERIOD_RETARD = float(os.environ.get("BEN_PUB_PERIOD_RETARD", "10"))
 BACKOFF_MAX = 300.0
 # Le hello est rejoué périodiquement, pas seulement au démarrage :
 #   - un NOUVEAU COMPTEUR peut apparaître en cours de route (resolve_pdl() crée un
@@ -240,6 +259,42 @@ def mark_sent(conn: sqlite3.Connection, rowids: list) -> None:
     conn.executemany("UPDATE measurements SET sent = 1 WHERE rowid = ?",
                      [(r,) for r in rowids])
     conn.commit()
+
+
+def cadence(en_attente: int) -> float:
+    """Combien de temps dormir avant le prochain lot.
+
+    ⭐ Fonction PURE, et ce n'est pas du zèle : c'est ce qui la rend éprouvable sans
+       réseau, sans base et sans Pi — la même raison qui a rendu `read_frame` testable.
+
+    ⚠️ Le seuil est `BATCH`, pas zéro. En dessous d'un lot plein il ne reste au plus
+       qu'un lot partiel : accélérer pour lui ne gagnerait rien et ferait osciller la
+       cadence à chaque tour.
+    """
+    return PERIOD_RETARD if en_attente >= BATCH else PERIOD
+
+
+def cadence_sure(conn: sqlite3.Connection) -> float:
+    """La cadence, ou la croisière si on ne sait pas mesurer le retard.
+
+    🚨 `pending_approx()` INTERROGE LA BASE, et son appelant est HORS du `try` de la
+       boucle. L'ancien `_sleep(PERIOD)` ne pouvait rien lever ; celui-ci si — verrou
+       tenu au-delà du timeout pendant que le lecteur écrit, ou erreur d'E/S sur la
+       carte SD. Sans ce garde, l'exception remonte hors de `main()` : le process meurt
+       sans passer par « arrêté proprement », systemd le relance, et on perd le backoff.
+
+    ⭐ Le repli est `PERIOD`, JAMAIS `PERIOD_RETARD` : ne pas savoir mesurer le retard
+       ne doit pas faire ACCÉLÉRER.
+
+    ⚠️ Et on n'incrémente pas `echecs`, qui parle du SERVEUR — une base locale qui
+       bronche n'est pas un serveur en panne, et la confondre ferait partir le publisher
+       en backoff long pour une raison qui n'a rien à voir.
+    """
+    try:
+        return cadence(pending_approx(conn))
+    except sqlite3.Error as e:
+        log.warning("retard illisible (%s) — cadence de croisière par défaut", e)
+        return PERIOD
 
 
 def pending_approx(conn: sqlite3.Connection) -> int:
@@ -448,7 +503,26 @@ def main() -> int:
             _sleep(delai)
             continue
 
-        _sleep(PERIOD)
+        # ⭐ GRATUIT : `pending_approx()` est O(1) — il encadre par les rowid, justement
+        #    parce qu'un `count(*) WHERE sent=0` prenait 37 s sur Pi Zero. On peut donc
+        #    l'interroger à chaque tour sans rien payer.
+        #
+        # 🚨 MAIS IL INTERROGE LA BASE, ET CE POINT EST HORS DU `try` DE LA BOUCLE.
+        #    `_sleep(PERIOD)` ne pouvait rien lever ; celui-ci si — verrou tenu au-delà
+        #    du timeout pendant que le lecteur écrit, ou erreur d'E/S sur la carte SD.
+        #    Sans ce garde, l'exception remonte hors de `main()` : le process meurt sans
+        #    passer par « arrêté proprement », systemd le relance, et on perd le backoff.
+        #
+        # ⭐ Le repli est `PERIOD`, jamais `PERIOD_RETARD` : NE PAS SAVOIR MESURER LE
+        #    RETARD NE DOIT PAS FAIRE ACCÉLÉRER. Et on ne compte pas cet échec dans
+        #    `echecs`, qui parle du SERVEUR — une base locale qui bronche n'est pas un
+        #    serveur en panne.
+        #
+        # ⓘ Ce point est atteint après un envoi réussi, ou quand il n'y avait rien à
+        #   envoyer. Le chemin d'échec, lui, sort plus haut par `continue` en gardant son
+        #   backoff exponentiel à gigue totale : un serveur en panne ne déclenche donc
+        #   JAMAIS la cadence de rattrapage.
+        _sleep(cadence_sure(conn))
 
     cli.close()
     conn.close()
