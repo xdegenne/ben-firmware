@@ -91,7 +91,38 @@ BUDGET_S = 20.0
 
 N_ERRORS = 8        # les N dernières lignes de priorité <= 3
 N_FRAMES = 20       # les N dernières trames LoRa : l'état du lien AU MOMENT où il meurt
-N_PUB = 5           # les N dernières lignes du journal de ben-publisher
+# 🚨 40, ET PAS 5. Mesuré sur ben-0012 le 2026-10-01 : un simple redémarrage systemd émet
+#    à lui seul CINQ lignes — `Stopped`, `Consumed … CPU time`, `Started`, puis les deux
+#    `INFO` de démarrage du publisher. Or la sonde ne tourne QUE là, au hello qui suit le
+#    redémarrage de l'OTA. Avec 5, elle ne remontait donc jamais rien d'autre que la bannière
+#    du redémarrage — aveugle au seul moment où elle s'exécute, et aveugle précisément aux
+#    lignes de l'ANCIEN processus, qui sont sa raison d'être.
+#    40 lignes couvrent ~40 min d'un publisher en échec (une ligne par tentative) pour ~3,5 Ko,
+#    contre un plafond serveur de 16 Ko.
+N_PUB = 40          # les N dernières lignes du journal de ben-publisher
+
+# Borne du comptage des non envoyés — voir `store()`.
+#
+# 🚨 ON LIT LA MÊME VARIABLE D'ENVIRONNEMENT QUE `ben_publisher.BATCH`, au lieu d'importer le
+#    module : `health` est importé PAR `ben_publisher`, l'importer en retour serait circulaire.
+#    Et la valeur DOIT être celle du lot, pas une constante à part — la question posée est
+#    « le prochain lot serait-il PLEIN ? », pas « combien y en a-t-il au total ».
+N_UNSENT = int(os.environ.get("BEN_PUB_BATCH", "1000"))
+
+# Budget d'OCTETS de la sonde `pub`, en plus de sa borne en lignes.
+#
+# 🚨 UNE BORNE EN LIGNES EST LA MAUVAISE UNITÉ. Les messages du publisher vont de 40 caractères
+#    (« rien à envoyer · reste ~43 ») à 200, la troncature de `msg[:200]`. Le pire cas de 40
+#    lignes est donc 40 × ~228 o = 9,1 Ko, auxquels s'ajoutent ~5 Ko pour le reste de
+#    l'instantané : on franchit les 16 Ko que le serveur accepte.
+#
+# ⚠️ ET CE N'EST PAS `pub` QU'ON PERDRAIT, C'EST TOUT. `retenirSante` (ben-api) écarte le champ
+#    `health` ENTIER au-delà de la borne — « trop volumineuse ». L'échec est donc asymétrique :
+#    une sonde trop bavarde emporte les dix-neuf autres.
+#
+# ⭐ On garde donc les lignes les PLUS RÉCENTES jusqu'à épuisement du budget. 6 Ko laissent
+#    ~10 Ko au reste, qui en consomme aujourd'hui 3,1 (ben-0001) et au pire ~5.
+PUB_BUDGET_O = 6000
 
 
 # 🚨 L'ÉCHÉANCE GLOBALE, et c'est elle qui rend le budget RÉEL.
@@ -304,6 +335,35 @@ def store(conn: sqlite3.Connection, db_path: str = DB_PATH) -> dict:
             "SELECT (SELECT max(rowid) FROM measurements), "
             "       (SELECT min(rowid) FROM measurements WHERE sent = 0)").fetchone()
         out["pending"] = 0 if top is None or low is None else max(0, top - low + 1)
+    except sqlite3.Error:
+        pass
+
+    # ⭐ LE CHIFFRE QUE `pending` NE PEUT PAS DONNER, et c'est ce qui a coûté neuf jours de
+    #    diagnostic faux sur un boîtier du parc.
+    #
+    #    `pending` ENCADRE par les rowid ; il ne COMPTE pas. Il prouve OÙ se trouve la plus
+    #    vieille ligne non envoyée — rien de plus. Une seule ligne restée à `sent = 0` sur un
+    #    vieux rowid suffit à annoncer un demi-million de points en attente alors qu'il n'y en
+    #    a qu'un. ⇒ On a lu « 566 248 en attente » et on en a déduit « un lot plein part à
+    #    chaque tour, donc il échoue », sans qu'aucune mesure ne l'étaye.
+    #
+    # ⇒ `unsent` répond à la SEULE question qui sépare les deux cas :
+    #
+    #      = N_UNSENT   un lot PLEIN existe, donc un POST est tenté, donc il ÉCHOUE
+    #                   → la raison est dans `pub`
+    #      = 0          il n'a RIEN à envoyer, donc aucun POST, donc aucun échec
+    #                   → `pending` est un artefact, et la question devient : pourquoi des
+    #                     lignes sont-elles `sent = 1` alors que le cloud ne les a pas ?
+    #      entre        il envoie des lots PARTIELS — un troisième cas, qu'on ne voyait pas
+    #
+    # ⚠️ BORNÉ, et c'est tout ce qui le rend possible : un `count(*) WHERE sent = 0` nu balaie
+    #    les millions d'entrées de l'index et prend 37 s sur un Pi Zero. Avec `LIMIT`, SQLite
+    #    s'arrête à la borne : mesuré 1,8 ms sur ben-0001 et 2,2 ms sur ben-0003, borne
+    #    RÉELLEMENT atteinte, par index COUVRANT (`idx_meas_sent` suffit, aucun accès table).
+    try:
+        out["unsent"] = conn.execute(
+            "SELECT count(*) FROM (SELECT 1 FROM measurements WHERE sent = 0 LIMIT ?)",
+            (N_UNSENT,)).fetchone()[0]
     except sqlite3.Error:
         pass
 
@@ -543,6 +603,11 @@ def publisher() -> list | None:
 
     ⚠️ C'est la sonde la plus lente de l'instantané ; elle passe donc EN DERNIER, et l'échéance
        globale la sacrifie en premier sur un boîtier en difficulté.
+
+    🚨 ET IL FAUT BEAUCOUP DE LIGNES — c'est le défaut de sa première version. `N_PUB = 5` a
+       été démenti par ben-0012 le jour même de sa livraison : le redémarrage systemd émet cinq
+       lignes à lui seul, qui ont évincé tout le reste. Une sonde qui ne tourne QU'APRÈS un
+       redémarrage doit donc lire bien au-delà de la bannière de ce redémarrage. Voir `N_PUB`.
     """
     raw = _sh("journalctl", "-u", "ben-publisher", "-n", str(N_PUB), "--no-pager", "-o", "json")
     out = []
@@ -559,7 +624,21 @@ def publisher() -> list | None:
         except (TypeError, ValueError):
             ts = 0
         out.append({"t": ts, "m": msg[:200]})
-    return out or None
+
+    # ⭐ On rogne par la TÊTE : les lignes les plus récentes sont celles qui expliquent la panne
+    #    en cours. `journalctl -n` rend déjà du plus ancien au plus récent, donc on retire du
+    #    début. Le coût d'une ligne JSON est sa longueur plus ~28 o d'habillage
+    #    (`{"t":1790855252,"m":""},`) — on mesure l'habillage réel plutôt que de le deviner.
+    budget = PUB_BUDGET_O
+    garde = []
+    for e in reversed(out):
+        cout = len(e["m"].encode("utf-8", "replace")) + 28
+        if garde and budget - cout < 0:
+            break
+        budget -= cout
+        garde.append(e)
+    garde.reverse()
+    return garde or None
 
 
 def versions(dev: dict) -> dict | None:

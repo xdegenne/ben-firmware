@@ -18,6 +18,141 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.9.24] — 2026-10-01
+
+**L'échec se signale lui-même, et la sonde voit enfin.** Ferme [#21](https://github.com/xdegenne/ben-firmware/issues/21).
+
+`pi-0.9.23` a été livrée vers 11 h. **Deux heures plus tard**, le boîtier qui motive tout ce
+chantier l'avait prise, avait envoyé son premier instantané de santé — et ne nous avait
+toujours rien appris. Les deux raisons sont des défauts de `0.9.23`, pas du boîtier.
+
+#### ① La sonde `pub` était aveugle au seul moment où elle s'exécute
+
+`N_PUB` valait 5. Voici, mot pour mot, les cinq lignes remontées à 11:47 :
+
+```
+Stopped ben-publisher.service …
+ben-publisher.service: Consumed 1.308s CPU time.
+Started ben-publisher.service …
+[INFO] démarrage — … · lots de 1000 toutes les 60 s
+[INFO] ~569526 point(s) en attente
+```
+
+🚨 Cinq lignes, cinq places : **aucune ligne de l'ancien processus** — qui est sa raison
+d'être, puisque la sonde ne tourne *qu'*au hello suivant le redémarrage de l'OTA. Or un
+redémarrage systemd émet cinq lignes à lui seul.
+
+⚖️ Le défaut ne produisait **aucune erreur** : cinq lignes valides, bien formées, vides de
+sens. Rien dans un banc fonctionnel ne pouvait s'en plaindre — c'est la **constante** qu'il
+faut lire. `N_PUB = 40` couvre ~40 min d'un publisher en échec pour ~3,5 Ko, contre un
+plafond serveur de 16 Ko.
+
+#### ② L'instantané n'arrivait qu'une fois par jour
+
+Mesuré le même jour, sur le même boîtier :
+
+| | |
+|---|---|
+| il **mesure** | dernier point à l'instant, trame LoRa toutes les 38 s |
+| il est **en ligne** | hello 204 en 17 ms, WiFi −40 dBm |
+| le publisher **tourne** | `active/running`, 0 redémarrage, charge 0,24 |
+| `pending` | **569 526** — exactement les 8,8 jours manquants, à **0,35 %** près |
+| POST de mesures | **zéro**, pendant que six autres boîtiers en font 25 en 25 min |
+| côté `ben-api` | **aucun 4xx, sur aucun boîtier** |
+
+⭐ Le serveur ne refuse rien : **le boîtier ne demande pas.** Il échoue localement, il l'écrit
+dans son journal à chaque tentative, et cette ligne restait illisible jusqu'au lendemain —
+l'instantané ne voyage qu'avec le hello, et le hello ne part qu'une fois par jour
+(`HELLO_EVERY=86400`). On attendait 24 h pour apprendre ce que le boîtier savait depuis la
+première minute.
+
+Désormais, au franchissement de `ECHECS_ERREUR`, le publisher **envoie un hello** :
+l'instantané part *pendant* la panne, avec les lignes de son propre journal.
+
+- ⚠️ Plafonné à **un par heure** (`HELLO_SUR_ECHEC_S=3600`). Sans ce plancher, un boîtier en
+  panne persistante enverrait un instantané toutes les 300 s au plafond du backoff, avec
+  jusqu'à 20 s de collecte chaque fois : un boîtier coupé du monde doit signaler, pas battre.
+- ⚠️ Le seuil est celui de l'**erreur**, pas le premier échec — une coupure de quelques
+  secondes arrive tous les jours sur les sept boîtiers. **Un seul seuil**, partagé avec
+  `niveau_echec()` : deux seraient deux choses à garder d'accord.
+- 🚨 **L'ordre est le fond.** Le hello part *après* la ligne de journal, jamais avant, parce
+  que `snapshot()` **lit** le journal. Envoyé d'abord, il partirait avec un instantané qui ne
+  contient pas l'échec qui l'a déclenché : un signalement qui ne signale rien — exactement le
+  défaut de `N_PUB = 5`.
+- ⭐ `signaler_echec()` est extraite en **fonction pure**, comme `cadence()` et
+  `niveau_echec()` : c'est ce qui permet d'éprouver le plancher horaire sans attendre une
+  heure, sans réseau et sans base. Le préflight l'éprouve **sur la cible**, avec son témoin.
+- ⚠️ `dernier_hello_echec` part de `-inf` et non de `0.0` : `time.monotonic()` part de
+  l'uptime, donc avec `0.0` le premier signalement serait immédiat sur un boîtier debout
+  depuis longtemps et retardé d'une heure sur un boîtier qui vient de démarrer — deux
+  comportements pour un seul code.
+
+#### ③ `pending` encadre, il ne compte pas — et j'avais confondu les deux
+
+`pending_approx()` vaut `max(rowid) − min(rowid WHERE sent=0) + 1`. Il prouve **où** se trouve
+la plus vieille ligne non envoyée, et rien de plus. On a lu « 566 248 en attente » et on en a
+déduit « un lot plein part à chaque tour, donc il échoue » — alors qu'**une seule** ligne
+restée à `sent = 0` sur un vieux rowid produit exactement le même chiffre.
+
+⚠️ L'accord à 0,35 % avec le trou de 8,78 jours établit la **position** de cette ligne
+(22/09 15:44), pas leur **nombre**.
+
+`health.unsent` compte, borné au lot :
+
+```sql
+SELECT count(*) FROM (SELECT 1 FROM measurements WHERE sent = 0 LIMIT 1000)
+```
+
+| `unsent` | ce qu'on sait |
+|---|---|
+| **1000** | un lot plein existe ⇒ un POST est tenté ⇒ **il échoue**, et `pub` dit pourquoi |
+| **0** | rien à envoyer ⇒ aucun POST, aucun échec ⇒ `pending` est un artefact, et la question devient : pourquoi des lignes sont-elles `sent = 1` alors que le cloud ne les a pas ? |
+| entre | des lots **partiels** — un troisième cas, qu'on ne voyait pas |
+
+- ⚠️ **Borné**, et c'est tout ce qui le rend possible : un `count(*)` nu sur `sent = 0` balaie
+  les millions d'entrées de l'index et prend **37 s** sur un Pi Zero. Mesuré avec la borne
+  *réellement* atteinte : **1,8 ms** (radio) et **2,2 ms** (filaire), par index **couvrant** —
+  `idx_meas_sent` suffit, aucun accès à la table.
+- ⚠️ La borne est lue sur `BEN_PUB_BATCH`, la **même** variable que `ben_publisher.BATCH`, pas
+  une constante à part qui divergerait au premier réglage. `health` étant importé *par*
+  `ben_publisher`, l'importer en retour serait circulaire.
+
+#### ④ « rien à envoyer » n'écrivait rien
+
+La branche était en `log.debug`, et le niveau racine est `INFO`.
+
+🚨 Un publisher qui échoue en boucle et un publisher qui n'a rien à envoyer laissaient
+**exactement la même trace : aucune.** Impossible de les séparer à distance — et c'est ce qui
+a coûté neuf jours.
+
+Elle passe en `info`, **avec le retard joint**, parce que c'est la contradiction qui informe :
+`rien à envoyer · reste ~569526` dit en une ligne que `pending` et la réalité ne s'accordent
+pas, là où les deux chiffres séparés ne disaient rien.
+
+- ⚠️ Gratuit sur un boîtier sain : à 0,74 point/s et une période de 60 s, chaque tour porte
+  ~44 points — cette branche n'y est jamais atteinte.
+- ⚠️ L'appel à `pending_approx()` y est gardé par un `try/except sqlite3.Error` : il est
+  **dans** le `try` de la boucle, donc une erreur locale compterait comme un échec **serveur**
+  et enverrait le publisher en backoff long. C'est le défaut même que `cadence_sure()` existe
+  pour éviter.
+
+#### ⚠️ Et un banc qui mentait, attrapé par mutation
+
+Le cas qui vérifie que le signalement réarme `prochain_hello` ancrait sur
+`signaler_echec(echecs`, qui matche d'abord la **définition** de la fonction, deux cents
+lignes plus haut. Le bloc extrait englobait tout `main()` et contenait le
+`prochain_hello = hello()` d'*avant* la boucle : **le cas passait avec le défaut en place.**
+
+⭐ C'est la **mutation** qui l'a trouvé, pas la relecture. **Six** mutations ont été jouées
+sur ce tag, et toutes sont attrapées : `N_PUB` remis à 5, signalement placé avant le `log`,
+`prochain_hello` non réarmé, `LIMIT` retirée du comptage, `unsent` recopiant `pending`, et
+`debug` au lieu d'`info`.
+
+Bancs : **30/30** (`test_health.py`) et **22/22** (`test_cadence.py`).
+
+ⓘ Aucune migration, aucune table, aucune colonne. Ce script ne touche à aucun service — le
+seul concerné est `ben-publisher`, que `check_update.py` redémarre à son étape 10.
+
 ### [0.9.23] — 2026-10-01
 
 **Le niveau de journalisation atteint enfin le journal.** Ferme [#18](https://github.com/xdegenne/ben-firmware/issues/18).
