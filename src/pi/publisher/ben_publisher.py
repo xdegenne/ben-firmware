@@ -600,9 +600,20 @@ def main() -> int:
     #    retardé d'une heure sur un boîtier qui vient de démarrer — deux comportements pour un
     #    seul code. `-inf` dit ce qu'on veut dire : aucun signalement n'a encore été fait.
     dernier_hello_echec = float("-inf")
+    # 🚨 UN COMPTEUR À PART, et c'est tout l'objet de la garde ci-dessous : `echecs` parle du
+    #    SERVEUR, celui-ci parle de la BASE LOCALE. Les mélanger, c'est ce qui a fait accuser
+    #    le serveur pendant neuf jours d'un disque abîmé.
+    echecs_base = 0
     while not _stop:
         try:
             rowids, points = fetch_batch(conn, BATCH)
+            # 🚨 ICI, PAS DANS LA BRANCHE 2xx — défaut affiné par la revue. `fetch_batch` a
+            #    réussi : la base se LIT, et c'est exactement ce que ce compteur mesure. Le
+            #    remettre à zéro seulement après un envoi réussi le laissait grimper pendant
+            #    toute une panne SERVEUR (ou sur une base vide), si bien que cinq `database is
+            #    locked` isolés — qui sont NORMAUX, le lecteur écrit en continu — finissaient
+            #    par déclencher un faux signalement.
+            echecs_base = 0
             if points:
                 status, body = cli.post("/measurements", {"points": points})
                 if 200 <= status < 300:
@@ -665,6 +676,34 @@ def main() -> int:
                     log.info("rien à envoyer (retard illisible : %s)", e)
             if time.monotonic() >= prochain_hello:
                 prochain_hello = hello()
+        except sqlite3.Error as e:
+            # 🚨 UNE ERREUR DE LA BASE LOCALE N'EST PAS UNE PANNE DU SERVEUR.
+            #
+            #    Mesuré sur un boîtier du parc le 2026-10-01 : `fetch_batch` levait
+            #    `database disk image is malformed` — une zone de `measurements` illisible,
+            #    probablement l'usure de la carte SD. L'exception tombait dans le `except
+            #    Exception` ci-dessous, était comptée dans `echecs`, poussait le backoff
+            #    SERVEUR à 300 s et journalisait « échec n°57 » comme un échec de publication.
+            #    Pendant neuf jours, ce boîtier a accusé le serveur d'un défaut de son disque.
+            #
+            # ⭐ Le dépôt avait déjà le précédent et ne l'avait pas appliqué ici :
+            #    `cadence_sure()` garde `pending_approx` avec exactement ce commentaire — « une
+            #    base locale qui bronche n'est pas un serveur en panne ». `fetch_batch`, lui,
+            #    n'avait aucune garde.
+            #
+            # ⚠️ On se rendort sur `PERIOD`, JAMAIS sur `PERIOD_RETARD` : ne pas savoir LIRE ne
+            #    doit pas faire accélérer. Même raisonnement que `cadence_sure()`.
+            #
+            # ⭐ Mais on SIGNALE quand même, et c'est ce qui a tout débloqué : le hello
+            #    d'escalade de 0.9.24 a livré la cause vingt secondes après l'OTA.
+            echecs_base += 1
+            log.error("base locale illisible (%s) — %d fois de suite ; le serveur n'est PAS "
+                      "en cause", e, echecs_base)
+            if signaler_echec(echecs_base, dernier_hello_echec, time.monotonic()):
+                dernier_hello_echec = time.monotonic()
+                prochain_hello = hello()
+            _sleep(PERIOD)
+            continue
         except Exception as e:
             echecs += 1
             # 🚨 GIGUE TOTALE : on tire DANS l'intervalle. Voir l'en-tête, point 3.

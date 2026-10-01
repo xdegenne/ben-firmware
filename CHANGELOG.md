@@ -18,6 +18,279 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.9.25] — 2026-10-01
+
+**On répare la base corrompue en la recopiant.** Ferme [#23](https://github.com/xdegenne/ben-firmware/issues/23).
+
+`pi-0.9.24` a livré le hello d'escalade, et il a répondu **vingt secondes après l'OTA** :
+
+```
+[15:41:07][WARNING] échec n°1 (database disk image is malformed) — nouvelle tentative dans 1 s
+[15:41:27][ERROR]   échec n°5 (database disk image is malformed) — nouvelle tentative dans 13 s
+```
+
+Ce n'était ni le réseau, ni la taille des lots, ni le serveur : une zone de la table
+`measurements` est **illisible**, et `fetch_batch` lève **avant** d'atteindre `cli.post`. Le
+serveur n'a jamais rien eu à refuser. 61 lignes `malformed` sur deux instantanés, échec n°57
+du processus précédent. Neuf jours.
+
+#### ⭐ Ce qui marche encore dit où est le dommage
+
+| ce qui marche | pourquoi |
+|---|---|
+| l'écriture — **8 322 lignes en 3 h 12, à 0,2 % du débit nominal** | ajouter écrit dans des pages **neuves**, au bout de l'arbre |
+| le hello | il lit `pdl`, `contract_epoch`, `tariff_labels` — intactes |
+| `pending`, `unsent`, `pdl.last_ts` | servis par des **index**, qui sont des arbres séparés |
+| `radio` (lit `rssi`/`snr`, non couverts par l'index) | accède aux pages de table **récentes**, et réussit |
+| **ce qui échoue** | `fetch_batch` : le seul à lire 11 colonnes **et** à partir du rowid non envoyé le plus ancien |
+
+Les écritures réussissant, la page corrompue n'est **pas** sur le chemin menant au bout de
+l'arbre : le dommage est dans la partie **ancienne**. Le publisher marche droit dessus à chaque
+tentative depuis le 22/09.
+
+ⓘ Cause probable : l'usure de la carte SD — ~64 000 lignes écrites par jour, 24 h sur 24,
+depuis le 1er août. **Aucun logiciel ne répare ça** ; le changement de carte reste nécessaire.
+Seul un boîtier est touché.
+
+#### ① La garde : une erreur locale n'est plus une panne du serveur *(tout le parc)*
+
+`fetch_batch` levait `sqlite3.DatabaseError`, c'était attrapé par le `except Exception` de la
+boucle, compté dans `echecs`, et le backoff **serveur** poussé à 300 s. Pendant neuf jours, ce
+boîtier a accusé le serveur d'un défaut de son disque.
+
+⭐ Le dépôt avait déjà le précédent et ne l'appliquait pas là : `cadence_sure()` garde
+`pending_approx` avec exactement ce commentaire — *« une base locale qui bronche n'est pas un
+serveur en panne »*. `fetch_batch` n'avait aucune garde.
+
+La branche est **avant** le `except Exception` (sinon elle ne serait jamais atteinte), elle a
+son **propre compteur**, elle se rendort sur `PERIOD` et jamais sur `PERIOD_RETARD` — ne pas
+savoir **lire** ne doit pas faire accélérer — et elle **signale** quand même.
+
+#### ② La sonde canari : deux lignes complètes *(tout le parc)*
+
+Rien ne signalait la panne parce que **tous** les champs de l'instantané qui touchent
+`measurements` sont servis par un index. Les index étaient intacts.
+
+```sql
+SELECT <les 13 colonnes> FROM measurements WHERE sent = 0 ORDER BY rowid LIMIT 1;  -- 0,56 ms
+SELECT <les 13 colonnes> FROM measurements ORDER BY rowid DESC LIMIT 1;            -- 0,31 ms
+```
+
+ⓘ Le plan de la seconde annonce `SCAN measurements`, ce qui serait normalement alarmant :
+`ORDER BY rowid DESC LIMIT 1` descend directement à la feuille la plus à droite.
+
+- ⚠️ **Ce n'est pas un détecteur complet**, et il faut le dire : un dommage au milieu des lignes
+  déjà envoyées n'est lu par personne, donc invisible. C'est une alerte précoce sur le chemin
+  de lecture du **publisher**, pas un `integrity_check` déguisé.
+- ⚠️ Le champ est émis **même quand tout va bien** (~30 o) : un champ qui n'apparaît qu'en cas
+  de panne est un champ qu'on oublie, et dont l'absence devient indiscernable du succès.
+
+#### ③ La reconstruction *(un seul boîtier)*
+
+On ne répare pas le fichier : **on en construit un sain à côté**, en recopiant ce qui est
+lisible par tranches de `rowid`, avec **dichotomie** sur les tranches qui lèvent. On ne perd
+ainsi que ce qui est réellement détruit.
+
+**Écarté, et pourquoi :**
+
+| | |
+|---|---|
+| `VACUUM INTO` | relit **toutes** les pages pour reconstruire → avorte sur le dommage |
+| `Connection.backup()` | 🚨 copie page par page **sous** les arbres : recopierait la corruption à l'identique. Le piège est qu'il **réussirait** |
+| `sqlite3 .recover` | l'outil fait pour ça — mais le binaire est **absent** des boîtiers (vérifié sur les deux modèles) |
+| `DELETE` / `UPDATE` | récrit les pages corrompues : on aggrave ce qu'on contourne |
+
+**La bascule** — lien **dur** puis `os.replace`, et l'ordre est le fond. Renommer l'original
+puis mettre la neuve ferait **deux** renommages, et entre les deux il n'existe aucun
+`measurements.db` : une mort à cet instant ferait recréer une base **vide** au redémarrage. Le
+lien dur préexiste, il ne reste qu'un geste, et `os.replace` est atomique. L'original est
+conservé en `.corrupt-<horodatage>` et **jamais** supprimé.
+
+**Les services sont dérivés des capabilities**, pas d'une liste en dur : sur un boîtier Radio,
+`ben-tic-reader` n'a rien à faire là — il y est `dead` avec **172 redémarrages**, précisément
+parce qu'il est du modèle filaire. Et on ne **redémarre** que ce qui **tournait**.
+
+⭐ `ben-certd` et `wifi-watchdog` ne sont **pas** arrêtés : mesuré en lisant `/proc/<pid>/fd`,
+seules trois unités ouvrent la base (`ben-telemetry`, `ben-publisher`, `ben-local-api`). Couper
+`wifi-watchdog` vingt minutes sur une machine injoignable serait un risque sans contrepartie.
+`ben-radio` s'arrête en **dernier** (il possède le GPIO), et c'est **explicite** — pas émergent
+de l'ordre des clés de `device.json`.
+
+#### Les quatre garde-fous
+
+1. 🚨 **Ciblage par `device.json` — exception assumée.** Un garde-fou d'identité est le seul qui
+   ne puisse pas se tromper, et un faux positif voudrait dire **arrêter les services d'un
+   boîtier de terrain sain**. Il échoue du bon côté : `device.json` illisible ⇒ on ne fait rien.
+2. 🚨 **Idempotente.** La garde de symptôme la donne presque entièrement — après réparation,
+   `--refus` lit une base saine et sort **sans rien arrêter**. Plus un **frein** de 3
+   tentatives, incrémenté **avant** le travail pour qu'un SIGKILL compte aussi.
+3. 🚨 **Un filet qui survit à SIGKILL** : un timer `systemd-run` transient, armé **avant** tout
+   arrêt, annulé au succès. Le `trap` de bash ne peut rien contre SIGKILL.
+   ⓘ Aucun risque de timeout par ailleurs, c'est mesuré : `check_update.py` appelle
+   `subprocess.run(["bash", script])` **sans** `timeout=`, et `ben-update.service` étant
+   `Type=oneshot`, systemd lui donne `TimeoutStartUSec=infinity` — le défaut global est
+   1 min 30, donc une unité ordinaire aurait été tuée à 90 s.
+4. 🚨 **Aucun état de la donnée ne fait échouer l'update.**
+
+⭐ Et la propriété qui rend tout ceci tenable : **jusqu'au `os.replace` final, rien n'est en
+jeu.** Une coupure de courant à n'importe quel moment de la recopie laisse l'original tel quel.
+
+#### Le hello est déclenché explicitement
+
+À la fin, avec le rapport de reconstruction dans `health.rebuild`. On ne se contente pas de
+celui que `check_update.py` provoque par effet de bord en redémarrant le publisher.
+
+#### Le banc, et ce que ses échecs ont appris
+
+Nouveau `test_db_rebuild.py`, **14 cas**, dont un qui fabrique une **vraie corruption de page**
+et **exige** que SQLite lève. Trois montages ont été nécessaires, et chaque échec était
+instructif :
+
+- un `count(*)` se satisfait du plus **petit index** sans toucher une seule page de table — le
+  garde-fou du banc était aveugle à ce qu'il devait garantir ;
+- un `UPDATE` pour poser la frontière `sent = 0` **retombe** sur la zone abîmée ;
+- SQLite remplit d'abord la dernière feuille **existante**, donc la ligne charnière vit
+  **avant** `page_count`, pas après.
+
+⭐ Le garde-fou du banc a refusé de passer les trois fois. Bancs : **31/31** (health),
+**22/22** (cadence), **14/14** (rebuild).
+
+#### ⚠️ Ce qui n'est pas mesuré, et une découverte au passage
+
+La **durée sur cible** n'est pas mesurée. L'essai lancé sur une copie de la base de 492 Mo d'un
+boîtier de banc a coïncidé avec un **redémarrage** de ce boîtier — `throttled=0x0`, aucune
+erreur noyau, et ce boîtier redémarre de lui-même tous les 1 à 3 jours, donc la causalité n'est
+pas établie. Seule la copie brute est retenue : **86 s pour 492 Mo**. La base visée fait 306 Mo.
+
+⭐ Et les uptimes du parc révèlent que **cinq boîtiers sur sept redémarrent tous les 3 à 5
+jours** sans que personne ne le sache — la donnée (`up`, `boot`) est dans l'instantané depuis
+0.9.22. Et le seul à **60 jours** d'uptime ininterrompu est précisément celui dont la base est
+corrompue.
+
+#### 🔍 Six défauts trouvés en revue de PR, et corrigés
+
+1. 🚨 **`refus()` ne lisait qu'UNE ligne**, alors que `fetch_batch` en lit **mille** : si la
+   page détruite n'est pas la première du lot — **le cas le plus probable**, puisque le dernier
+   lot parti s'est arrêté juste avant elle — la sonde passait et l'update sortait sans réparer.
+   **Elle aurait été inopérante sur le boîtier même pour lequel elle est faite.** La sonde
+   `read.old` de `health.py` et le contrôle d'après-bascule avaient le même trou.
+2. **La borne haute était majorée de 10 %**, sur l'idée fausse que sonder des `rowid`
+   inexistants « ne coûte rien ». La recherche retombe sur la **même feuille détruite** : sur
+   4,3 M lignes, ~430 000 lignes fantômes sondées une par une **et comptées comme perdues**.
+   La majoration était en plus inutile — `sent` est `NOT NULL DEFAULT 0`, donc la borne par
+   index est **exacte**.
+3. 🚨 **On n'arrêtait que les unités `is-active`** : une unité en cours de redémarrage ne l'est
+   pas, donc elle revenait, gardait la base ouverte, et après le `os.replace` ses écritures
+   partaient dans le fichier devenu `.corrupt-*` — **perte silencieuse**. On arrête désormais
+   **toute** la liste, et on vérifie l'**effet** : plus personne ne tient le fichier
+   (`/proc/<pid>/fd`). ⭐ Et `None` ≠ `[]` : « je n'ai pas pu regarder » ne doit jamais valoir
+   « voie libre ».
+4. **Le frein de 3 tentatives était annulé** : `_ecris_rapport` réécrivait le fichier sans le
+   champ `tentatives`.
+5. **`echecs_base` ne repartait pas de zéro** après un lot réussi : la ligne « N fois de suite »
+   mentait, et un `database is locked` isolé finissait par déclencher un signalement.
+6. **Le watermark du rollup pouvait DESCENDRE**, déclarant couvert un intervalle jamais rempli
+   — `/curve` aurait rendu du **vide** en croyant lire un rollup complet.
+
+⭐ Et au passage, la portée réelle du frein a été établie **dans le code de l'agent** : le vrai
+frein est le **bump de version**. `update.sh` sort 0 ⇒ `softwareVersion` passe à `0.9.25` ⇒ plus
+aucune transition ne correspond. Le compteur ne couvre donc que le cas où `device.json` n'est
+**pas** bumpé, c'est-à-dire un script **tué**. ⓘ Et aucune concurrence à craindre pendant les
+~20 min : `check_update.py` prend un `flock` exclusif non bloquant et sort en 0 si une autre
+instance le tient — un flock sur **descripteur**, donc relâché par le noyau même sur SIGKILL.
+
+#### 🔍 Seconde revue : deux défauts réels, et un troisième trouvé en les corrigeant
+
+🚨 **`ben-level-profiler` manquait, et son `.timer` aussi.** `levels.py` ouvre la base en
+**écriture**, son timer tire tous les jours (`Persistent=true`), et **arrêter un `.service`
+n'arrête pas son `.timer`** — il pouvait donc relancer le profileur en pleine reconstruction,
+et ses écritures seraient parties dans le fichier devenu `.corrupt-*`.
+
+⭐ Et le défaut était **structurel, pas un oubli** : ma liste dérivait de `CAP_SERVICES`, qui ne
+décrit que les **lecteurs**. Une tâche périodique n'est pas une capability — aucune dérivation
+ne l'aurait trouvée. D'où le garde-fou qui répond à la **classe** du défaut : on **re-vérifie
+qui tient le fichier juste avant la bascule**. Ce contrôle ne dépend d'aucune liste, et il
+couvre ce que je n'ai pas su énumérer. Les timers sont par ailleurs arrêtés **en premier**.
+
+ⓘ Vérifié : les seules unités qui ouvrent `measurements.db` sont `ben-telemetry`,
+`ben-tic-reader`, `ben-publisher`, `ben-local-api` et `ben-level-profiler`. `ben-certd`,
+`wifi-watchdog`, `ben-network-*` et `ben-ble-provisioner` ne la touchent pas — ma décision de
+les laisser debout tient, cette fois avec la preuve.
+
+**Toutes les tables passent par la copie par tranches.** `copie_table()` chargeait une table
+entière en mémoire et l'écrivait en une transaction ; `curve_rollup` peut dépasser 100 000
+lignes. La fonction est supprimée (du code mort dans un module critique finit par resservir).
+Bénéfice en prime : une table de métadonnée partiellement abîmée est recopiée pour ce qu'elle a
+de **lisible** au lieu d'être abandonnée en bloc.
+
+🚨 **Et cette unification a révélé un bug que rien d'autre n'aurait trouvé** : `pdl` est
+déclarée `pdl_index INTEGER PRIMARY KEY`, donc `pdl_index` **est** le `rowid`, et le premier PDL
+vaut **toujours 0**. La recopie partait de `rowid = 1` : la base reconstruite n'aurait eu
+**aucun compteur**, et sans `pdl` aucune mesure n'a de sens. On part de `min(rowid)`, ce qui
+évite en plus du travail inutile — sur un boîtier du parc, `min(rowid)` vaut **192 547**, les
+plus anciennes étant purgées.
+
+**`echecs_base` est remis à zéro après `fetch_batch`**, pas après le 2xx : la lecture réussie
+est ce que ce compteur mesure. Sinon il grimpait pendant toute une panne **serveur**.
+
+#### ⏱️ La durée, enfin mesurée — et les trois leviers du rythme
+
+| variante | débit | pire tranche | WAL final |
+|---|---|---|---|
+| pause 50 ms · commit/4 · ckpt/40 | 1 281 l/s | 4 765 ms | 5 222 Ko |
+| **sans** checkpoint explicite | 1 135 l/s — **×0,89** | 5 224 ms | 5 065 Ko |
+| **commit/10** *(retenu)* | **1 360 l/s — ×1,06** | **4 532 ms** | 8 087 Ko |
+| commit/20 | 1 339 l/s | 6 404 ms | 7 885 Ko |
+| sans pause *(dangereux)* | 1 557 l/s — ×1,22 | 4 112 ms | 8 087 Ko |
+
+⇒ **~50 minutes** pour les ~4 M lignes de 306 Mo, et c'est un **plancher** : le débit est mesuré
+au début, quand la destination est petite. Mon « ~20 min » initial n'était pas mesuré.
+
+🚨 Et deux de mes explications étaient fausses : le noyau ne laisse **jamais** 200 Mo de pages
+sales s'accumuler (`dirty_background_ratio=10` → 42 Mo ; `dirty_ratio=20` → blocage à 85 Mo), et
+le **checkpoint explicite n'est pas redondant** malgré `wal_autocheckpoint=4 Mo` — le retirer
+coûte **11 %**. Le seul levier que personne d'autre n'actionne, c'est **rendre la main** : la
+pause coûte 22 % de débit, et la **pire tranche** fait 4,5 s contre 60 s de chien de garde.
+
+#### ⚠️ Les index créés après la copie : **non**, et c'est mesuré
+
+Gain net **×1,17** seulement (2 091 l/s pour la copie, mais 1 748 une fois les trois
+`CREATE INDEX` comptés). Et le prix est inacceptable : la plus longue instruction **non
+cadençable** fait **9,5 s pour 255 000 lignes**, soit 2 à 3 minutes à pleine échelle —
+**au-delà des 60 s du chien de garde**, qu'on ne peut ni interrompre ni ralentir.
+
+#### ⭐ Deux phases : l'arrêt passe de ~50 min à quelques secondes
+
+Une fois la durée mesurée (~50 min, et non les ~20 que j'avançais sans mesure), arrêter le
+collecteur pendant toute l'opération devenait trop cher. **Le découpage se fait par
+mutabilité, pas par taille** :
+
+| | tables | pourquoi |
+|---|---|---|
+| **phase 1** — *rien d'arrêté*, ~50 min | `measurements`, `lora_link` | **append-only** : le `rowid` croît, les lignes ne changent plus (sauf `sent`) ⇒ lisibles à chaud |
+| **phase 2** — *écrivains arrêtés*, ~50 s | le delta des deux précédentes (~2 200 lignes, 2 s), puis `pdl`, `emitter`, `contract_epoch`, `tariff_labels`, `level_profile`, `rollup_state`, `curve_rollup` (~60 000 lignes, 44 s) | **modifiées sur place** : `pdl.last_seen` bouge à chaque trame, `curve_rollup` fait un `UPSERT` par tranche de 2 min |
+
+🚨 Une table modifiée sur place **ne peut pas** être recopiée en phase 1 : un delta par `rowid`
+ne verrait pas une mise à jour, et la base neuve porterait des valeurs **périmées** sans que
+personne ne le remarque. Un cas de banc l'éprouve en modifiant `pdl.last_seen` **entre** les
+deux phases et en exigeant la nouvelle valeur ; la mutation qui recopie `pdl` en phase 1 le
+fait tomber.
+
+⭐ Et ça fait s'effondrer un risque : le filet `systemd-run` ne couvre plus que la fenêtre
+courte — **15 min au lieu de 2 h**. Avec une seule phase, le danger qu'il tire *pendant*
+l'opération (réveillant les écrivains juste avant la bascule) était réel.
+
+**Mesuré sur cible** : phase 1 en 25 s *« RIEN n'a été arrêté, rien n'a été basculé »*
+(empreinte de l'original inchangée, vérifiée par un cas de banc), phase 2 en **1,8 s**, et un
+relevé externe toutes les 3 s montre les services absents **~6 s** — l'arrêt/redémarrage
+lui-même domine sur une petite base.
+
+ⓘ Deux effets de bord assumés : un `sent` qui passe à 1 pendant la phase 1 fait **renvoyer** la
+ligne, que le cloud dédoublonne (`ON CONFLICT DO NOTHING`) ; et une ligne purgée après avoir
+été recopiée **ressusciterait**, pour être purgée au cycle suivant.
+
+ⓘ Aucune migration, aucune table, aucune colonne.
+
 ### [0.9.24] — 2026-10-01
 
 **L'échec se signale lui-même, et la sonde voit enfin.** Ferme [#21](https://github.com/xdegenne/ben-firmware/issues/21).

@@ -311,13 +311,29 @@ def le_signalement_part_APRES_la_ligne_de_journal():
     ⚖️ Cas STRUCTUREL, et il n'a pas le choix de l'être : les deux ordres produisent un hello
        valide, un code de retour identique et aucune erreur. Seul le CONTENU diffère, et il
        ne diffère que sur une vraie cible. On lit donc la source."""
+    # 🚨 ON VÉRIFIE CHAQUE BRANCHE, PAS LA PREMIÈRE VENUE. Première version de ce cas : elle
+    #    prenait le premier `log.log(...)` et le premier `signaler_echec(` du corps de boucle.
+    #    Quand la garde « erreur de base locale » a été ajoutée AVANT la branche serveur, son
+    #    propre `signaler_echec` passait devant le `log.log` de l'autre branche, et le cas
+    #    tombait pour une mauvaise raison. Il y a maintenant DEUX chemins qui signalent, et
+    #    chacun doit journaliser d'abord.
     src = pathlib.Path(pub.__file__).read_text()
     corps = src[src.index("    while not _stop:"):]
-    i_log = corps.index("log.log(niveau_echec(echecs)")
-    i_sig = corps.index("signaler_echec(")
-    assert i_log < i_sig, (
-        "le hello de signalement est envoyé AVANT que l'échec soit journalisé : "
-        "l'instantané ne contiendra pas la raison qui l'a déclenché")
+    branches = ["        except" + b for b in corps.split("\n        except")[1:]]
+    vus = 0
+    for b in branches:
+        if "signaler_echec(" not in b:
+            continue
+        vus += 1
+        i_log = min((b.index(m) for m in ("log.log(", "log.error(", "log.warning(")
+                     if m in b), default=-1)
+        assert i_log >= 0, f"une branche signale sans rien journaliser :\n{b[:200]}"
+        assert i_log < b.index("signaler_echec("), (
+            "le hello de signalement est envoyé AVANT que l'échec soit journalisé : "
+            f"l'instantané ne contiendra pas la raison qui l'a déclenché\n{b[:200]}")
+    assert vus >= 2, (
+        f"{vus} branche(s) de signalement trouvée(s) : il doit y en avoir au moins deux — "
+        "l'échec SERVEUR et l'erreur de BASE LOCALE, qui ne se confondent pas")
 
 
 @cas
@@ -371,6 +387,42 @@ def RIEN_A_ENVOYER_s_ecrit_dans_le_journal():
         "racine à INFO, un `debug` n'écrit RIEN et cette branche redevient muette")
     assert "pending_approx" in appel, (
         f"la ligne ne porte pas le retard : {appel!r} — sans lui elle ne contredit rien")
+
+
+@cas
+def les_DEUX_compteurs_repartent_de_zero_apres_un_lot_reussi():
+    """🚨 Défaut trouvé en revue. `echecs` repartait de zéro, `echecs_base` NON — il comptait
+    donc tous les incidents depuis le démarrage et non les CONSÉCUTIFS. Deux conséquences :
+    la ligne « %d fois de suite » mentait, et une fois le seuil franchi un `database is
+    locked` isolé — qui est NORMAL, le lecteur écrit en continu — déclenchait un signalement.
+
+    ⭐ Un lot qui passe PROUVE que la base se lit : les deux compteurs doivent tomber.
+
+    ⚖️ Cas STRUCTUREL : les deux versions publient, rendent le même code et ne lèvent pas.
+       Seule une longue suite d'incidents espacés les distingue, et on ne peut pas la jouer
+       dans un banc."""
+    src = pathlib.Path(pub.__file__).read_text()
+    corps = src[src.index("    while not _stop:"):]
+    succes = corps[corps.index("if 200 <= status < 300:"):]
+    succes = succes[:succes.index("elif status == 403:")]
+    succes = "\n".join(l for l in succes.splitlines() if not l.lstrip().startswith("#"))
+    assert "echecs = 0" in succes, "le compteur SERVEUR ne repart pas de zéro après un 2xx"
+
+    # 🚨 ET LE COMPTEUR DE LA BASE REPART APRÈS `fetch_batch`, PAS APRÈS LE 2xx — cause
+    #    affinée en revue. `fetch_batch` a réussi : la base se LIT, et c'est tout ce que ce
+    #    compteur mesure. Le remettre à zéro seulement après un ENVOI réussi le laissait
+    #    grimper pendant toute une panne SERVEUR (ou sur une base vide), si bien que cinq
+    #    `database is locked` isolés — qui sont NORMAUX — finissaient par déclencher un faux
+    #    signalement.
+    lecture = corps[corps.index("rowids, points = fetch_batch("):]
+    lecture = lecture[:lecture.index("if points:")]
+    lecture = "\n".join(l for l in lecture.splitlines() if not l.lstrip().startswith("#"))
+    assert "echecs_base = 0" in lecture, (
+        "`echecs_base` n'est pas remis à zéro juste après `fetch_batch` : il continuera de "
+        "grimper pendant une panne serveur, et finira par déclencher un faux signalement")
+    assert "echecs_base = 0" not in succes, (
+        "`echecs_base` est remis à zéro dans la branche 2xx : redondant, et ça laisse croire "
+        "que c'est l'envoi qui prouve la lisibilité de la base")
 
 
 if __name__ == "__main__":

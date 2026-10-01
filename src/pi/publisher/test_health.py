@@ -226,9 +226,40 @@ def TOUTE_requete_sur_les_grosses_tables_porte_WHERE_pdl_index():
             #    `min(rowid) WHERE sent = 0` se résolvent en O(1) par index sans toucher au
             #    `pdl_index` — c'est la forme documentée de `pending_approx`, et la raison
             #    pour laquelle elle remplace un `count(*)` qui prend 37 secondes.
-            assert "rowid)" in autour, (
-                f"requête sur `{table}` sans WHERE pdl_index ni encadrement par rowid :"
-                f"\n    …{autour[250:420]}…")
+            # ⭐ Et la TROISIÈME, ajoutée pour la sonde canari : une lecture bornée à UNE
+            #    ligne. `LIMIT 1` arrête SQLite après la première, donc il n'y a ni balayage
+            #    complet ni tri. Mesuré sur deux boîtiers du parc :
+            #
+            #      WHERE sent = 0 ORDER BY rowid LIMIT 1     0,56 ms  (via idx_meas_sent)
+            #      ORDER BY rowid DESC LIMIT 1               0,31 ms  (feuille la plus à droite)
+            #
+            # ⚠️ ET VOICI CE QUE CETTE DISPENSE NE COUVRE PAS, parce qu'un garde-fou dont on
+            #    ignore le trou est un garde-fou qui ment : un `LIMIT 1` dont le `WHERE` porte
+            #    sur une colonne NON indexée balaierait la table jusqu'à trouver sa ligne, et
+            #    passerait ici. L'heuristique fait confiance à `LIMIT 1` pour borner le TRAVAIL,
+            #    ce qui n'est vrai que si le prédicat est servi par un index.
+            #
+            # ⇒ Le trou est fermé AILLEURS, et c'est le bon endroit : le préflight de
+            #   `update.sh` CHRONOMÈTRE la collecte sur la vraie base du boîtier. Une règle
+            #   structurelle empêche la distraction ; seule une mesure sur la cible prouve la
+            #   performance. (Même raisonnement qu'en 0.9.23 : un contrôle qui vérifie une
+            #   décision sans vérifier son effet est un contrôle qui ment.)
+            # 🚨 ET POUR CETTE DISPENSE, PAS LA FENÊTRE `autour` MAIS CE QUI SUIT LE `FROM`.
+            #    Première version de ce cas : elle cherchait `LIMIT 1` dans `autour`, donc dans
+            #    ±300 caractères. Les deux lectures canari étant des littéraux ADJACENTS, le
+            #    `LIMIT 1` de l'une couvrait l'autre : retirer la borne d'une requête ne faisait
+            #    PAS tomber le cas. Vérifié par mutation. On s'arrête donc au `SELECT` suivant.
+            # ⚠️ `LIMIT` suivi d'un ENTIER, d'une interpolation ou d'un paramètre — pas
+            #    seulement `LIMIT 1`. La sonde canari lit désormais le LOT ENTIER
+            #    (`LIMIT {N_UNSENT}`), parce qu'une lecture d'une seule ligne la rendait
+            #    borgne : le publisher en lit mille, et la page abîmée peut être la 437ᵉ.
+            #    La borne reste donc une CONSTANTE bornée, et son coût réel est mesuré par le
+            #    préflight sur la cible — c'est là qu'est fermé le trou de cette heuristique.
+            suite = src[m.end():m.end() + 250].split("SELECT")[0]
+            borne = re.search(r"LIMIT\s*(\d+|\{|\?)", suite)
+            assert "rowid)" in autour or borne, (
+                f"requête sur `{table}` sans WHERE pdl_index, sans encadrement par rowid et "
+                f"sans borne LIMIT :\n    …{autour[250:420]}…")
 
 
 @cas
