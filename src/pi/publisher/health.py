@@ -109,6 +109,9 @@ N_PUB = 40          # les N dernières lignes du journal de ben-publisher
 #    « le prochain lot serait-il PLEIN ? », pas « combien y en a-t-il au total ».
 N_UNSENT = int(os.environ.get("BEN_PUB_BATCH", "1000"))
 
+# Le compte rendu laissé par `db_rebuild.py`. Absent partout sauf sur un boîtier réparé.
+RAPPORT_REBUILD = f"{VAR}/db-rebuild.json"
+
 # Budget d'OCTETS de la sonde `pub`, en plus de sa borne en lignes.
 #
 # 🚨 UNE BORNE EN LIGNES EST LA MAUVAISE UNITÉ. Les messages du publisher vont de 40 caractères
@@ -381,6 +384,56 @@ def store(conn: sqlite3.Connection, db_path: str = DB_PATH) -> dict:
         out["events_pending"] = conn.execute(
             "SELECT count(*) FROM event WHERE sent = 0").fetchone()[0]
     except sqlite3.Error:
+        pass
+
+    # ⭐ LA SONDE CANARI — celle qui aurait trouvé ben-0012 LE PREMIER JOUR.
+    #
+    #    Le 2026-10-01, un boîtier du parc a passé neuf jours sans publier, avec une zone de
+    #    `measurements` ILLISIBLE (`database disk image is malformed`). Rien ne le signalait,
+    #    parce que TOUS les champs de cet instantané qui touchent `measurements` sont servis
+    #    par un INDEX : `pending`, `unsent`, `last_ts`. Les index étaient intacts. Seule la
+    #    lecture d'une LIGNE COMPLÈTE échouait — et personne ne la demandait.
+    #
+    # 🚨 J'avais écarté `PRAGMA quick_check` parce qu'il est RUINEUX (charge 4,50 sur un
+    #    boîtier du parc, `sshd` muet, jamais fini en 180 s). La décision restait juste — mais
+    #    j'ai écarté la CATÉGORIE au lieu de chercher la forme BORNÉE. Elle existe, et elle
+    #    coûte des microsecondes : demander DEUX lignes.
+    #
+    #      0,56 ms   la plus vieille non envoyée — celle sur laquelle le publisher bute
+    #      0,31 ms   la plus récente — celle que le lecteur vient d'écrire
+    #
+    #    ⓘ Le plan de la seconde annonce `SCAN measurements`, ce qui serait normalement
+    #      alarmant : `ORDER BY rowid DESC LIMIT 1` descend directement à la feuille la plus à
+    #      DROITE. Les 0,31 ms mesurés le confirment.
+    #
+    # ⭐ Et les deux ensemble disent OÙ est le dommage : la vieille lève et la récente passe
+    #   ⇒ dégât CONFINÉ dans les pages anciennes, réparable par recopie. Les deux lèvent
+    #   ⇒ tout le fichier est touché.
+    #
+    # ⚠️ ÉMIS MÊME QUAND TOUT VA BIEN (`{"old": "ok", "new": "ok"}`, ~30 o). Un champ qui
+    #    n'apparaît qu'en cas de panne est un champ qu'on oublie, et dont l'absence devient
+    #    indiscernable du succès — exactement le défaut qui a rendu `errors` mort-né.
+    lecture = {}
+    for cle, sql in (
+            ("old", "SELECT ts, pdl_index, base, hchc, hchp, papp, iinst, tariff, "
+                    "src_standard, index_id, index_value, inject_total, meter_ts "
+                    "FROM measurements WHERE sent = 0 ORDER BY rowid LIMIT 1"),
+            ("new", "SELECT ts, pdl_index, base, hchc, hchp, papp, iinst, tariff, "
+                    "src_standard, index_id, index_value, inject_total, meter_ts "
+                    "FROM measurements ORDER BY rowid DESC LIMIT 1")):
+        try:
+            conn.execute(sql).fetchone()
+            lecture[cle] = "ok"
+        except Exception as e:  # noqa: BLE001
+            lecture[cle] = str(e)[:120]
+    out["read"] = lecture
+
+    # Le compte rendu de la dernière reconstruction, s'il y en a eu une. Absent partout
+    # ailleurs — et c'est le seul moyen d'apprendre, depuis le cloud, ce qu'elle a perdu.
+    try:
+        with open(RAPPORT_REBUILD, encoding="utf-8") as f:
+            out["rebuild"] = json.load(f)
+    except (OSError, ValueError):
         pass
     return out
 

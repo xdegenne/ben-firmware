@@ -311,13 +311,29 @@ def le_signalement_part_APRES_la_ligne_de_journal():
     ⚖️ Cas STRUCTUREL, et il n'a pas le choix de l'être : les deux ordres produisent un hello
        valide, un code de retour identique et aucune erreur. Seul le CONTENU diffère, et il
        ne diffère que sur une vraie cible. On lit donc la source."""
+    # 🚨 ON VÉRIFIE CHAQUE BRANCHE, PAS LA PREMIÈRE VENUE. Première version de ce cas : elle
+    #    prenait le premier `log.log(...)` et le premier `signaler_echec(` du corps de boucle.
+    #    Quand la garde « erreur de base locale » a été ajoutée AVANT la branche serveur, son
+    #    propre `signaler_echec` passait devant le `log.log` de l'autre branche, et le cas
+    #    tombait pour une mauvaise raison. Il y a maintenant DEUX chemins qui signalent, et
+    #    chacun doit journaliser d'abord.
     src = pathlib.Path(pub.__file__).read_text()
     corps = src[src.index("    while not _stop:"):]
-    i_log = corps.index("log.log(niveau_echec(echecs)")
-    i_sig = corps.index("signaler_echec(")
-    assert i_log < i_sig, (
-        "le hello de signalement est envoyé AVANT que l'échec soit journalisé : "
-        "l'instantané ne contiendra pas la raison qui l'a déclenché")
+    branches = ["        except" + b for b in corps.split("\n        except")[1:]]
+    vus = 0
+    for b in branches:
+        if "signaler_echec(" not in b:
+            continue
+        vus += 1
+        i_log = min((b.index(m) for m in ("log.log(", "log.error(", "log.warning(")
+                     if m in b), default=-1)
+        assert i_log >= 0, f"une branche signale sans rien journaliser :\n{b[:200]}"
+        assert i_log < b.index("signaler_echec("), (
+            "le hello de signalement est envoyé AVANT que l'échec soit journalisé : "
+            f"l'instantané ne contiendra pas la raison qui l'a déclenché\n{b[:200]}")
+    assert vus >= 2, (
+        f"{vus} branche(s) de signalement trouvée(s) : il doit y en avoir au moins deux — "
+        "l'échec SERVEUR et l'erreur de BASE LOCALE, qui ne se confondent pas")
 
 
 @cas
