@@ -199,6 +199,66 @@ aucune transition ne correspond. Le compteur ne couvre donc que le cas où `devi
 ~20 min : `check_update.py` prend un `flock` exclusif non bloquant et sort en 0 si une autre
 instance le tient — un flock sur **descripteur**, donc relâché par le noyau même sur SIGKILL.
 
+#### 🔍 Seconde revue : deux défauts réels, et un troisième trouvé en les corrigeant
+
+🚨 **`ben-level-profiler` manquait, et son `.timer` aussi.** `levels.py` ouvre la base en
+**écriture**, son timer tire tous les jours (`Persistent=true`), et **arrêter un `.service`
+n'arrête pas son `.timer`** — il pouvait donc relancer le profileur en pleine reconstruction,
+et ses écritures seraient parties dans le fichier devenu `.corrupt-*`.
+
+⭐ Et le défaut était **structurel, pas un oubli** : ma liste dérivait de `CAP_SERVICES`, qui ne
+décrit que les **lecteurs**. Une tâche périodique n'est pas une capability — aucune dérivation
+ne l'aurait trouvée. D'où le garde-fou qui répond à la **classe** du défaut : on **re-vérifie
+qui tient le fichier juste avant la bascule**. Ce contrôle ne dépend d'aucune liste, et il
+couvre ce que je n'ai pas su énumérer. Les timers sont par ailleurs arrêtés **en premier**.
+
+ⓘ Vérifié : les seules unités qui ouvrent `measurements.db` sont `ben-telemetry`,
+`ben-tic-reader`, `ben-publisher`, `ben-local-api` et `ben-level-profiler`. `ben-certd`,
+`wifi-watchdog`, `ben-network-*` et `ben-ble-provisioner` ne la touchent pas — ma décision de
+les laisser debout tient, cette fois avec la preuve.
+
+**Toutes les tables passent par la copie par tranches.** `copie_table()` chargeait une table
+entière en mémoire et l'écrivait en une transaction ; `curve_rollup` peut dépasser 100 000
+lignes. La fonction est supprimée (du code mort dans un module critique finit par resservir).
+Bénéfice en prime : une table de métadonnée partiellement abîmée est recopiée pour ce qu'elle a
+de **lisible** au lieu d'être abandonnée en bloc.
+
+🚨 **Et cette unification a révélé un bug que rien d'autre n'aurait trouvé** : `pdl` est
+déclarée `pdl_index INTEGER PRIMARY KEY`, donc `pdl_index` **est** le `rowid`, et le premier PDL
+vaut **toujours 0**. La recopie partait de `rowid = 1` : la base reconstruite n'aurait eu
+**aucun compteur**, et sans `pdl` aucune mesure n'a de sens. On part de `min(rowid)`, ce qui
+évite en plus du travail inutile — sur un boîtier du parc, `min(rowid)` vaut **192 547**, les
+plus anciennes étant purgées.
+
+**`echecs_base` est remis à zéro après `fetch_batch`**, pas après le 2xx : la lecture réussie
+est ce que ce compteur mesure. Sinon il grimpait pendant toute une panne **serveur**.
+
+#### ⏱️ La durée, enfin mesurée — et les trois leviers du rythme
+
+| variante | débit | pire tranche | WAL final |
+|---|---|---|---|
+| pause 50 ms · commit/4 · ckpt/40 | 1 281 l/s | 4 765 ms | 5 222 Ko |
+| **sans** checkpoint explicite | 1 135 l/s — **×0,89** | 5 224 ms | 5 065 Ko |
+| **commit/10** *(retenu)* | **1 360 l/s — ×1,06** | **4 532 ms** | 8 087 Ko |
+| commit/20 | 1 339 l/s | 6 404 ms | 7 885 Ko |
+| sans pause *(dangereux)* | 1 557 l/s — ×1,22 | 4 112 ms | 8 087 Ko |
+
+⇒ **~50 minutes** pour les ~4 M lignes de 306 Mo, et c'est un **plancher** : le débit est mesuré
+au début, quand la destination est petite. Mon « ~20 min » initial n'était pas mesuré.
+
+🚨 Et deux de mes explications étaient fausses : le noyau ne laisse **jamais** 200 Mo de pages
+sales s'accumuler (`dirty_background_ratio=10` → 42 Mo ; `dirty_ratio=20` → blocage à 85 Mo), et
+le **checkpoint explicite n'est pas redondant** malgré `wal_autocheckpoint=4 Mo` — le retirer
+coûte **11 %**. Le seul levier que personne d'autre n'actionne, c'est **rendre la main** : la
+pause coûte 22 % de débit, et la **pire tranche** fait 4,5 s contre 60 s de chien de garde.
+
+#### ⚠️ Les index créés après la copie : **non**, et c'est mesuré
+
+Gain net **×1,17** seulement (2 091 l/s pour la copie, mais 1 748 une fois les trois
+`CREATE INDEX` comptés). Et le prix est inacceptable : la plus longue instruction **non
+cadençable** fait **9,5 s pour 255 000 lignes**, soit 2 à 3 minutes à pleine échelle —
+**au-delà des 60 s du chien de garde**, qu'on ne peut ni interrompre ni ralentir.
+
 ⓘ Aucune migration, aucune table, aucune colonne.
 
 ### [0.9.24] — 2026-10-01

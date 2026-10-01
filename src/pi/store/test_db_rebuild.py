@@ -241,6 +241,25 @@ def base_abimee_DANS_le_lot(n: int = 30000, repertoire: str = None,
         "ce cas ne prouverait rien")
 
 
+def reconstruit(chemin: str) -> dict:
+    """`rb.rebuild()` avec le contrôle des ouvreurs neutralisé.
+
+    🚨 POURQUOI NEUTRALISER, et pourquoi ce n'est pas tricher : le contrôle lit
+       `/proc/<pid>/fd`, et ce banc tourne sur un Mac, qui n'a pas de `/proc`. La sonde rend
+       donc `None` — « je n'ai pas pu regarder » — et la bascule est refusée, À JUSTE TITRE.
+
+    ⭐ Un cas doit éprouver UNE chose. Les cas de reconstruction neutralisent donc ce contrôle,
+      et DEUX cas dédiés l'éprouvent pour lui-même (`None` et « quelqu'un tient »). Sans cette
+      séparation, le garde-fou masquerait tout le reste et on ne saurait plus ce qui est vert.
+    """
+    vrai = rb.ouvreurs
+    rb.ouvreurs = lambda _p: []
+    try:
+        return rb.rebuild(chemin)
+    finally:
+        rb.ouvreurs = vrai
+
+
 # ── Les fonctions pures ─────────────────────────────────────────────────────────────────────
 
 @cas
@@ -379,7 +398,7 @@ def la_reconstruction_RECUPERE_tout_sauf_ce_qui_est_DETRUIT():
     c.close()
 
     rb.RAPPORT = os.path.join(d, "rapport.json")
-    res = rb.rebuild(chemin)
+    res = reconstruit(chemin)
     assert res.get("ok"), f"reconstruction refusée : {res.get('refus')}"
 
     m = res["detail"]["measurements"]
@@ -395,8 +414,14 @@ def la_reconstruction_RECUPERE_tout_sauf_ce_qui_est_DETRUIT():
         assert c.execute("SELECT count(*) FROM measurements").fetchone()[0] == m["copiees"]
         vu = c.execute("SELECT rowid, ts FROM measurements ORDER BY rowid DESC LIMIT 1").fetchone()
         assert vu == dernier, f"la dernière ligne est {vu}, elle valait {dernier}"
-        # La métadonnée a suivi — sans `pdl`, aucune mesure n'a de sens.
-        assert c.execute("SELECT count(*) FROM pdl").fetchone()[0] == 1
+        # 🚨 LA MÉTADONNÉE A SUIVI — et ce cas a attrapé un vrai bug. `pdl` est déclarée
+        #    `pdl_index INTEGER PRIMARY KEY`, donc `pdl_index` EST le `rowid`, et le premier
+        #    PDL vaut TOUJOURS 0. La recopie partait de `rowid = 1` : la base reconstruite
+        #    n'avait AUCUN compteur, et sans `pdl` aucune mesure n'a de sens.
+        assert c.execute("SELECT count(*) FROM pdl").fetchone()[0] == 1, (
+            "`pdl` est vide après reconstruction — la borne basse part-elle de 1 au lieu de "
+            "min(rowid) ? Le premier PDL a le rowid 0")
+        assert c.execute("SELECT pdl_index FROM pdl").fetchone()[0] == 0
         assert c.execute("SELECT count(*) FROM emitter").fetchone()[0] == 1
         assert c.execute("SELECT count(*) FROM lora_link").fetchone()[0] == 200
     finally:
@@ -416,8 +441,8 @@ def apres_reconstruction_une_SECONDE_passe_REFUSE():
     d = tempfile.mkdtemp()
     chemin, _ = base_abimee(10000, d)
     rb.RAPPORT = os.path.join(d, "rapport.json")
-    assert rb.rebuild(chemin).get("ok"), "la première passe a échoué"
-    second = rb.rebuild(chemin)
+    assert reconstruit(chemin).get("ok"), "la première passe a échoué"
+    second = reconstruit(chemin)
     assert not second.get("ok"), "la seconde passe a reconstruit une base saine"
     assert "sans erreur" in second.get("refus", ""), second
     shutil.rmtree(d, ignore_errors=True)
@@ -441,7 +466,7 @@ def le_ROLLUP_ne_garde_pas_de_seaux_pour_des_points_disparus():
     c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     c.close()
     rb.RAPPORT = os.path.join(d, "rapport.json")
-    res = rb.rebuild(chemin)
+    res = reconstruit(chemin)
     assert res.get("ok"), res.get("refus")
     c = sqlite3.connect(f"file:{chemin}?mode=ro", uri=True)
     try:
@@ -558,7 +583,7 @@ def rebuild_ne_LEVE_JAMAIS_sur_un_etat_de_la_donnee():
         d = tempfile.mkdtemp()
         chemin = fabrique(d)
         rb.RAPPORT = os.path.join(d, "rapport.json")
-        res = rb.rebuild(chemin)        # ne doit PAS lever
+        res = reconstruit(chemin)       # ne doit PAS lever
         assert isinstance(res, dict), f"{nom} : rebuild() ne rend pas un dict"
         assert "ok" in res, f"{nom} : {res!r}"
         shutil.rmtree(d, ignore_errors=True)
@@ -579,7 +604,7 @@ def rebuild_ne_LEVE_JAMAIS_sur_un_etat_de_la_donnee():
     vrai = rb.tables
     rb.tables = lambda conn: (_ for _ in ()).throw(RuntimeError("panne imprévue"))
     try:
-        res = rb.rebuild(chemin)
+        res = reconstruit(chemin)
     finally:
         rb.tables = vrai
     assert isinstance(res, dict) and res.get("ok") is False, (
@@ -596,7 +621,7 @@ def un_dommage_EN_FIN_de_table_est_quand_meme_reconstruit():
     d = tempfile.mkdtemp()
     chemin = base_abimee_a_la_FIN(20000, d)
     rb.RAPPORT = os.path.join(d, "rapport.json")
-    res = rb.rebuild(chemin)
+    res = reconstruit(chemin)
     assert res.get("ok"), f"refusé : {res.get('refus')}"
     m = res["detail"]["measurements"]
     assert m["copiees"] > 15000, (
@@ -663,7 +688,7 @@ def un_dommage_EN_FIN_ne_GONFLE_pas_le_nombre_de_perdues():
     d = tempfile.mkdtemp()
     chemin = base_abimee_a_la_FIN(20000, d)
     rb.RAPPORT = os.path.join(d, "rapport.json")
-    res = rb.rebuild(chemin)
+    res = reconstruit(chemin)
     assert res.get("ok"), res.get("refus")
     m = res["detail"]["measurements"]
     assert m["copiees"] + m["lignes_perdues"] == 20000, (
@@ -726,7 +751,7 @@ def le_compteur_de_TENTATIVES_survit_au_rapport():
     rb.RAPPORT = os.path.join(d, "rapport.json")
     with open(rb.RAPPORT, "w", encoding="utf-8") as f:
         f.write('{"tentatives": 2}')
-    res = rb.rebuild(chemin)
+    res = reconstruit(chemin)
     assert res.get("ok"), res.get("refus")
     with open(rb.RAPPORT, encoding="utf-8") as f:
         import json as _j
@@ -754,6 +779,111 @@ def le_watermark_du_rollup_ne_DESCEND_jamais():
         "vide sur l'intervalle jamais rempli")
     vu = conn.execute("SELECT watermark, done FROM rollup_state WHERE id=0").fetchone()
     assert vu[0] >= HAUT and vu[1] == 0, vu
+
+
+@cas
+def la_bascule_est_REFUSEE_si_quelqu_un_tient_la_base():
+    """🚨 LE GARDE-FOU QUI COUVRE CE QUE JE N'AI PAS SU ÉNUMÉRER — trouvé en revue.
+
+    `update.sh` vérifie avant de commencer que personne ne tient le fichier. Mais la
+    reconstruction dure UNE HEURE, et un timer peut tirer entre les deux : `ben-level-profiler`
+    (`levels.py`, ouverture en ÉCRITURE) a un timer quotidien, et il n'était dans AUCUNE de mes
+    listes — parce qu'il n'est pas une capability, donc aucune dérivation depuis `CAP_SERVICES`
+    ne l'aurait trouvé.
+
+    ⭐ Ce contrôle-ci ne dépend d'aucune liste : il regarde qui tient le fichier, juste avant
+      de basculer. C'est la réponse à la CLASSE du défaut, pas à son instance."""
+    d = tempfile.mkdtemp()
+    chemin, _ = base_abimee(8000, d)
+    rb.RAPPORT = os.path.join(d, "rapport.json")
+    vrai = rb.ouvreurs
+    rb.ouvreurs = lambda _p: [4242]
+    try:
+        res = rb.rebuild(chemin)
+    finally:
+        rb.ouvreurs = vrai
+    assert res.get("ok") is False, "la bascule a eu lieu alors qu'un processus tenait la base"
+    assert "réouverte" in res.get("refus", ""), res
+    # ⚖️ ET L'ORIGINAL EST INTACT : refuser ne doit rien casser.
+    assert not [f for f in os.listdir(d) if ".corrupt-" in f], \
+        "une sauvegarde a été créée alors que la bascule était refusée"
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@cas
+def la_bascule_est_REFUSEE_si_on_ne_peut_pas_VERIFIER():
+    """🚨 `None` ≠ `[]`. « Je n'ai pas pu regarder » ne doit jamais valoir « voie libre » — un
+    contrôle qui ne voit pas doit le dire, surtout celui qui autorise à remplacer une base de
+    production."""
+    d = tempfile.mkdtemp()
+    chemin, _ = base_abimee(8000, d)
+    rb.RAPPORT = os.path.join(d, "rapport.json")
+    vrai = rb.ouvreurs
+    rb.ouvreurs = lambda _p: None
+    try:
+        res = rb.rebuild(chemin)
+    finally:
+        rb.ouvreurs = vrai
+    assert res.get("ok") is False, "la bascule a eu lieu sans avoir pu vérifier"
+    assert "vérifier" in res.get("refus", ""), res
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@cas
+def le_TIMER_du_profileur_est_arrete_et_EN_PREMIER():
+    """🚨 Défaut trouvé en revue, et il était STRUCTUREL. Arrêter un `.service` N'ARRÊTE PAS
+    son `.timer` : celui-ci peut le relancer en pleine reconstruction.
+    `ben-level-profiler.timer` tire tous les jours (`Persistent=true`) et sa cible ouvre la
+    base en ÉCRITURE.
+
+    ⭐ Et ma liste ne pouvait pas le trouver : elle dérive de `CAP_SERVICES`, qui ne décrit que
+      les LECTEURS. Une tâche périodique n'est pas une capability."""
+    for caps_ in ({"lora": {}, "lora-tic-receiver": {}}, {"tic-uart": {}}, {}):
+        liste = rb.services_a_arreter({"capabilities": caps_})
+        assert "ben-level-profiler.service" in liste, liste
+        assert "ben-level-profiler.timer" in liste, (
+            f"le TIMER n'est pas arrêté : il relancera le service en pleine reconstruction "
+            f"({liste})")
+        assert liste.index("ben-level-profiler.timer") < \
+               liste.index("ben-level-profiler.service"), (
+            "le timer est arrêté APRÈS son service : entre les deux, il peut le relancer")
+
+
+@cas
+def TOUTES_les_tables_passent_par_la_copie_par_tranches():
+    """🚨 Défaut trouvé en revue. `copie_table()` chargeait une table ENTIÈRE en mémoire et
+    l'écrivait en UNE transaction. `curve_rollup` peut dépasser 100 000 lignes — exactement
+    l'accumulation qu'on prétend éviter, sur la machine qui a déjà fait mordre le chien de
+    garde.
+
+    ⭐ Bénéfice en prime : une table de métadonnée partiellement abîmée est désormais recopiée
+      pour ce qu'elle a de LISIBLE, au lieu d'être abandonnée en bloc.
+
+    ⚖️ Cas STRUCTUREL : sur une base de banc, les deux chemins donnent le même résultat."""
+    src = pathlib.Path(rb.__file__).read_text()
+    assert "def copie_table(" not in src, (
+        "`copie_table()` est encore là : du code mort dans un module critique, et quelqu'un "
+        "finira par s'en resservir")
+    corps = src[src.index("def _rebuild("):]
+    corps = corps[:corps.index("\ndef ")]
+    corps = "\n".join(l for l in corps.splitlines() if not l.lstrip().startswith("#"))
+    assert "copie_par_tranches(src, dst, t" in corps, corps[:400]
+    assert "copie_table(" not in corps, "une table est encore recopiée en bloc"
+    # Et l'effet : une base avec un gros rollup se recopie quand même.
+    d = tempfile.mkdtemp()
+    chemin, _ = base_abimee(8000, d)
+    c = db.connect(chemin)
+    c.executemany("INSERT OR REPLACE INTO curve_rollup VALUES(0,?,0,1,?,?,1,9,10,2,0)",
+                  [(1700000000 + i * 120, 1700000000 + i * 120, 1700000000 + i * 120 + 119)
+                   for i in range(3000)])
+    c.commit()
+    c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    c.close()
+    rb.RAPPORT = os.path.join(d, "rapport.json")
+    res = reconstruit(chemin)
+    assert res.get("ok"), res.get("refus")
+    assert res["petites"].get("curve_rollup") == 3000, res["petites"]
+    shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -406,11 +406,23 @@ def les_DEUX_compteurs_repartent_de_zero_apres_un_lot_reussi():
     succes = corps[corps.index("if 200 <= status < 300:"):]
     succes = succes[:succes.index("elif status == 403:")]
     succes = "\n".join(l for l in succes.splitlines() if not l.lstrip().startswith("#"))
-    assert "echecs = 0" in succes, "le compteur SERVEUR ne repart pas de zéro"
-    assert "echecs_base = 0" in succes, (
-        "le compteur de la BASE LOCALE ne repart pas de zéro après un lot réussi : il "
-        "comptera tous les incidents depuis le démarrage, et un `database is locked` isolé "
-        "finira par déclencher un signalement")
+    assert "echecs = 0" in succes, "le compteur SERVEUR ne repart pas de zéro après un 2xx"
+
+    # 🚨 ET LE COMPTEUR DE LA BASE REPART APRÈS `fetch_batch`, PAS APRÈS LE 2xx — cause
+    #    affinée en revue. `fetch_batch` a réussi : la base se LIT, et c'est tout ce que ce
+    #    compteur mesure. Le remettre à zéro seulement après un ENVOI réussi le laissait
+    #    grimper pendant toute une panne SERVEUR (ou sur une base vide), si bien que cinq
+    #    `database is locked` isolés — qui sont NORMAUX — finissaient par déclencher un faux
+    #    signalement.
+    lecture = corps[corps.index("rowids, points = fetch_batch("):]
+    lecture = lecture[:lecture.index("if points:")]
+    lecture = "\n".join(l for l in lecture.splitlines() if not l.lstrip().startswith("#"))
+    assert "echecs_base = 0" in lecture, (
+        "`echecs_base` n'est pas remis à zéro juste après `fetch_batch` : il continuera de "
+        "grimper pendant une panne serveur, et finira par déclencher un faux signalement")
+    assert "echecs_base = 0" not in succes, (
+        "`echecs_base` est remis à zéro dans la branche 2xx : redondant, et ça laisse croire "
+        "que c'est l'envoi qui prouve la lisibilité de la base")
 
 
 if __name__ == "__main__":

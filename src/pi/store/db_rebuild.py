@@ -97,37 +97,54 @@ N_LOT = int(os.environ.get("BEN_PUB_BATCH", "1000"))
 
 MARGE_DISQUE = 1.25
 
-# ═══ LE RYTHME, ET POURQUOI IL N'EST PAS NÉGOCIABLE ═════════════════════════════════════════
+# ═══ LE RYTHME — TROIS LEVIERS, ET LES TROIS SONT MESURÉS ═══════════════════════════════════
 #
 # 🚨 LE CHIEN DE GARDE MATÉRIEL EST ARMÉ À 60 SECONDES. Mesuré sur un boîtier du parc :
 #
 #       RuntimeWatchdogUSec=1min
 #       systemd[1]: Using hardware watchdog 'Broadcom BCM2835 Watchdog timer'
-#       systemd[1]: Watchdog running with a hardware timeout of 1min.
 #
-#    Si PID 1 n'arrive pas à le caresser dans la minute, le SoC fait un RESET DUR — sans
-#    journal, sans séquence d'arrêt, sans erreur noyau. C'est exactement ce qui est arrivé à un
-#    boîtier de banc pendant un essai de recopie : `throttled=0x0`, aucune trace, le journal du
-#    boot précédent s'arrête net en pleine activité normale.
+#    C'est un compteur DANS LE SoC (BCM2835). Si PID 1 ne le remet pas à zéro dans la minute,
+#    il tire la ligne de reset du circuit — aucun logiciel ne peut l'intercepter, donc pas de
+#    journal, pas de séquence d'arrêt. C'est exactement ce qui est arrivé à un boîtier de banc
+#    pendant un essai de recopie : `throttled=0x0`, aucune erreur noyau, et le journal du boot
+#    précédent s'arrête net en pleine activité normale.
 #
-# ⚠️ Et ce n'est PAS un problème de CPU, donc `nice` n'y suffit pas. `ionice` non plus :
-#    l'ordonnanceur de la carte SD est `mq-deadline`, qui N'HONORE PAS les classes d'E/S
-#    (seuls BFQ et CFQ le font) — vérifié sur la cible.
+# ⚠️ Ni `nice` (c'est de l'E/S, pas du CPU) ni `ionice` : l'ordonnanceur de la carte SD est
+#    `mq-deadline`, qui N'HONORE PAS les classes d'E/S — vérifié sur la cible.
 #
-# ⭐ LE VRAI DANGER EST L'ACCUMULATION DE PAGES SALES. Le boîtier a 427 Mo de RAM dont ~39
-#   libres et 300 en cache. Recopier des centaines de mégaoctets sans écouler laisse le noyau
-#   avec une masse de pages à écrire, et alors TOUTE écriture bloque longuement — y compris
-#   celle de systemd dans son journal. D'où trois leviers, et surtout pas `synchronous=OFF`,
-#   qui aurait AGGRAVÉ les choses en supprimant les points d'écoulement :
+# ═══ CE QUI EST DÉJÀ PRIS EN CHARGE, ET QUE JE CROYAIS À TORT DEVOIR GÉRER ═════════════════
 #
-#     ① une PAUSE entre les tranches : notre processus cesse d'être exécutable, PID 1 passe ;
-#     ② un COMMIT fréquent : les données descendent par petits paquets ;
-#     ③ un CHECKPOINT périodique : le WAL ne grossit pas jusqu'à devoir se vider d'un bloc.
+#    SQLite       journal_mode=wal · synchronous=FULL (chaque commit force l'écriture)
+#                 wal_autocheckpoint=1000 pages = 4 Mo (il checkpointe DE LUI-MÊME)
+#    le noyau     dirty_background_ratio=10 → écoulement dès 42 Mo sur 427 de RAM
+#                 dirty_ratio=20            → BLOCAGE des écrivains à 85 Mo
 #
-# Le coût total est négligeable : ~860 tranches pour 4,3 M lignes, soit +43 s de pauses.
+# ⇒ Mon explication initiale — « le noyau doit écrire 200 Mo d'un coup » — était FAUSSE : il
+#   n'en laisse jamais s'accumuler autant. Ce que personne ne fait, en revanche, c'est RENDRE
+#   LA MAIN : SQLite insère aussi vite qu'il peut, et n'a aucune raison de se brider.
+#
+# ═══ ET CE QUE LA MESURE DIT DES TROIS LEVIERS ══════════════════════════════════════════════
+#
+#    variante                          débit      pire tranche   WAL final
+#    pause 50 ms · commit/4 · ckpt/40  1 281 l/s      4 765 ms     5 222 Ko
+#    SANS checkpoint explicite         1 135 l/s      5 224 ms     5 065 Ko   ← ×0,89
+#    commit/10                         1 360 l/s      4 532 ms     8 087 Ko   ← ×1,06 RETENU
+#    commit/20                         1 339 l/s      6 404 ms     7 885 Ko
+#    SANS pause                        1 557 l/s      4 112 ms     8 087 Ko   ← ×1,22
+#
+# 🚨 LE CHECKPOINT EXPLICITE N'EST PAS REDONDANT : le retirer coûte 11 %. J'avais conclu
+#    l'inverse en raisonnant sur `wal_autocheckpoint`. Le fait était juste, la conclusion
+#    fausse — d'où la mesure.
+# ⭐ La pause coûte 22 % de débit. C'est le prix du chien de garde, et il se paie.
+# ⭐ Et la PIRE TRANCHE fait 4,5 s : on est un ordre de grandeur sous les 60 s. C'est ce
+#   chiffre, et pas le débit moyen, qui dit qu'on ne mordra pas.
+#
+# ⓘ Et surtout pas `synchronous=OFF` : non pas pour les pages sales (le noyau les borne), mais
+#   parce que la base neuve serait perdue à la moindre coupure — du travail à refaire.
 PAUSE_TRANCHE_S = float(os.environ.get("BEN_REBUILD_PAUSE", "0.05"))
-COMMIT_TRANCHES = 4        # ~20 000 lignes, soit ~1,5 Mo
-CHECKPOINT_TRANCHES = 40   # ~200 000 lignes
+COMMIT_TRANCHES = 10       # ~50 000 lignes — mesuré meilleur que 4 (+6 %) et que 20
+CHECKPOINT_TRANCHES = 40   # ~200 000 lignes ; le retirer coûte 11 %
 
 RAPPORT = "/var/lib/ben-firmware/db-rebuild.json"
 
@@ -155,7 +172,25 @@ def est_corruption(e: Exception) -> bool:
 # boîtier Radio du parc, en lisant `/proc/<pid>/fd` : exactement trois unités l'ont ouvert —
 # `ben-telemetry` (l'écrivain), `ben-publisher` et `ben-local-api`. Les deux dernières sont ici ;
 # la première vient des capabilities.
-HORS_MODELE = ("ben-publisher.service", "ben-local-api.service")
+HORS_MODELE = ("ben-publisher.service", "ben-local-api.service",
+               "ben-level-profiler.service")
+
+# 🚨 LES TIMERS D'ABORD, ET C'EST UN DÉFAUT QUE LA REVUE A TROUVÉ. Arrêter un `.service`
+#    N'ARRÊTE PAS son `.timer` : celui-ci peut le relancer EN PLEIN MILIEU de la
+#    reconstruction. `ben-level-profiler.timer` tire tous les jours (`OnUnitActiveSec=1d`,
+#    `Persistent=true`) et sa cible, `levels.py`, ouvre la base en ÉCRITURE — ses écritures
+#    partiraient dans le fichier devenu `.corrupt-*`.
+#
+# ⭐ Et le défaut était STRUCTUREL, pas un oubli de liste : ma liste venait des
+#   `capabilities`, qui ne décrivent que les LECTEURS. `ben-level-profiler` n'est pas une
+#   capability — c'est une tâche périodique. Aucune dérivation depuis `CAP_SERVICES` ne
+#   l'aurait trouvée. D'où le garde-fou de `_personne_n_ouvre()` juste avant la bascule, qui
+#   couvre ce que je n'ai pas su énumérer.
+#
+# ⓘ Vérifié : les seules unités qui ouvrent `measurements.db` sont ben-telemetry,
+#   ben-tic-reader, ben-publisher, ben-local-api et ben-level-profiler. ben-certd,
+#   wifi-watchdog, ben-network-* et ben-ble-provisioner ne la touchent pas.
+TIMERS = ("ben-level-profiler.timer",)
 
 # Le service qui possède le GPIO de la radio. Il démarre en PREMIER (cf. le commentaire de
 # `CAP_SERVICES` : « L'ORDRE compte : ben-radio d'abord »), donc il s'arrête en DERNIER.
@@ -191,7 +226,9 @@ def services_a_arreter(dev: dict) -> list:
     #    donc la contrainte au lieu d'en dépendre.
     lecteurs = [u for u in lecteurs if u != MAITRE_GPIO] + \
                [u for u in lecteurs if u == MAITRE_GPIO]
-    return list(HORS_MODELE) + lecteurs
+    # ⚠️ Les TIMERS en tête : il faut les éteindre AVANT les services, sinon un timer peut
+    #    relancer le service qu'on vient d'arrêter.
+    return list(TIMERS) + list(HORS_MODELE) + lecteurs
 
 
 def ouvreurs(db_path: str) -> list | None:
@@ -307,22 +344,11 @@ def tables(conn: sqlite3.Connection) -> list:
         "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
 
 
-def copie_table(src: sqlite3.Connection, dst: sqlite3.Connection, table: str) -> int:
-    """Recopie une table en bloc. Pour les petites tables, dont la lecture est prouvée saine :
-    le hello les lit toutes les 24 h sans incident."""
-    cols = colonnes(src, table)
-    liste = ", ".join(cols)
-    trous = ", ".join("?" * len(cols))
-    rows = list(src.execute(f"SELECT {liste} FROM {table}"))
-    if rows:
-        dst.executemany(f"INSERT OR REPLACE INTO {table} ({liste}) VALUES ({trous})", rows)
-    dst.commit()
-    return len(rows)
-
-
 def copie_par_tranches(src: sqlite3.Connection, dst: sqlite3.Connection, table: str,
-                       hi: int, depuis: int = 0) -> dict:
-    """Recopie `table` pour les `rowid` de `depuis + 1` à `hi`, en sautant ce qui est illisible.
+                       hi: int, depuis: int = None) -> dict:
+    """Recopie `table` jusqu'au `rowid` `hi`, en sautant ce qui est illisible.
+
+    `depuis = None` part de `min(rowid)` ; sinon de `depuis + 1` (recopie d'un delta).
 
     ⭐ LE CŒUR DU MODULE. On lit par tranches ; une tranche qui lève est COUPÉE EN DEUX et
       chaque moitié est retentée. On descend ainsi jusqu'aux lignes individuelles, et on ne
@@ -354,7 +380,7 @@ def copie_par_tranches(src: sqlite3.Connection, dst: sqlite3.Connection, table: 
     # dépiler dans l'ordre croissant — l'ordre d'insertion n'a pas d'importance, mais un
     # parcours monotone rend le journal lisible.
     travail = []
-    a = depuis + 1
+    a = _min_rowid(src, table) if depuis is None else depuis + 1
     while a <= hi:
         travail.append((a, min(a + CHUNK - 1, hi)))
         a += CHUNK
@@ -577,6 +603,31 @@ def _ouvre_lecture(chemin: str) -> sqlite3.Connection:
     return sqlite3.connect(f"file:{chemin}?mode=ro", uri=True)
 
 
+def _min_rowid(conn: sqlite3.Connection, table: str) -> int:
+    """La borne BASSE des `rowid`.
+
+    🚨 ON NE PART PAS DE 1, et c'est un bug qu'a révélé l'unification des tables. `pdl` est
+       déclarée `pdl_index INTEGER PRIMARY KEY`, donc `pdl_index` EST le `rowid` — et le
+       premier PDL vaut TOUJOURS 0 (invariant du projet). Partir de 1 sautait donc la ligne
+       0 : la base reconstruite n'avait AUCUN compteur, et sans `pdl` aucune mesure n'a de
+       sens. Le banc l'a attrapé sur `SELECT count(*) FROM pdl`.
+
+    ⭐ Et ça évite du travail inutile : sur un boîtier du parc, `min(rowid)` de `measurements`
+      vaut 192 547 — les plus anciennes ont été purgées. Partir de 1 balayait 38 tranches
+      vides avant de trouver la première ligne.
+
+    ⚠️ Si la borne est illisible on part de 0, ce qui est sûr : nos schémas n'utilisent jamais
+       de `rowid` négatif, et une tranche vide ne coûte qu'une requête qui ne rend rien.
+    """
+    try:
+        r = conn.execute(f"SELECT min(rowid) FROM {table}").fetchone()
+        return int(r[0]) if r and r[0] is not None else 0
+    except sqlite3.Error as e:
+        if not est_corruption(e):
+            raise
+        return 0
+
+
 def _max_rowid(conn: sqlite3.Connection, table: str) -> int:
     """La borne haute des `rowid`, même si la table est abîmée À SON EXTRÉMITÉ.
 
@@ -622,7 +673,15 @@ def _max_rowid(conn: sqlite3.Connection, table: str) -> int:
     return borne
 
 
-GROSSES = ("measurements", "lora_link")
+# 🚨 PLUS DE DISTINCTION « GROSSES / PETITES », et c'est un défaut trouvé en revue.
+#    `copie_table()` chargeait une table ENTIÈRE en mémoire et l'écrivait en UNE transaction.
+#    `curve_rollup` peut dépasser 100 000 lignes — exactement l'accumulation qu'on prétend
+#    éviter, et sur la machine qui a déjà fait mordre le chien de garde.
+#
+# ⭐ On recopie donc TOUT par tranches cadencées. Bénéfice en prime : une table de métadonnée
+#   partiellement abîmée est désormais recopiée pour ce qu'elle a de LISIBLE, au lieu d'être
+#   abandonnée en bloc.
+PAR_TRANCHES_TOUJOURS = True
 
 
 def rebuild(db_path: str = db.DB_PATH) -> dict:
@@ -677,28 +736,49 @@ def _rebuild(db_path: str) -> dict:
     dst = db.connect(neuve)          # rejoue le schéma et les migrations : structure saine
     detail, petites = {}, {}
 
-    # ⚠️ Les petites tables D'ABORD. Si la recopie longue est interrompue, l'essentiel de la
-    #    métadonnée est déjà là — et surtout `pdl`, sans qui aucune mesure n'a de sens.
-    for t in tables(src):
-        if t in GROSSES:
-            continue
-        try:
-            petites[t] = copie_table(src, dst, t)
-        except Exception as e:  # noqa: BLE001
-            # 🚨 On n'abandonne pas tout pour une table de métadonnée : le cloud en renvoie
-            #    l'instantané COMPLET au prochain hello de toute façon (cf. `send_hello`).
-            #    Perdre `pdl` serait grave, perdre `tariff_labels` se répare tout seul.
-            petites[t] = f"illisible : {e}"
-
-    for t in GROSSES:
-        if t not in tables(src):
-            continue
-        detail[t] = copie_par_tranches(src, dst, t, _max_rowid(src, t))
+    # ⚠️ Les tables de MÉTADONNÉE d'abord, les volumineuses ensuite : si la recopie longue est
+    #    interrompue, l'essentiel est déjà là — et surtout `pdl`, sans qui aucune mesure n'a
+    #    de sens.
+    VOLUMINEUSES = ("measurements", "lora_link")
+    presentes = tables(src)
+    for t in [x for x in presentes if x not in VOLUMINEUSES] + \
+             [x for x in VOLUMINEUSES if x in presentes]:
+        d = copie_par_tranches(src, dst, t, _max_rowid(src, t))
+        if t in VOLUMINEUSES:
+            detail[t] = d
+        else:
+            # Les métadonnées tiennent en une ligne de rapport : combien, et combien perdues.
+            petites[t] = d["copiees"] if not d["lignes_perdues"] else \
+                f"{d['copiees']} copiées, {d['lignes_perdues']} perdues"
 
     rollup = corrige_rollup(dst, detail.get("measurements", {}).get("ts_perdus", []))
     attendu = {t: detail[t]["copiees"] for t in detail}
     dst.close()
     src.close()
+
+    # 🚨 ON RE-VÉRIFIE JUSTE AVANT DE BASCULER, et c'est le garde-fou qui couvre ce que je
+    #    n'ai pas su énumérer. `update.sh` contrôle qu'aucun processus ne tient le fichier
+    #    AVANT de lancer la reconstruction — mais celle-ci dure une HEURE, et un timer peut
+    #    tirer entre les deux. Un contrôle fait une fois au début ne dit rien de la fin.
+    #
+    # ⭐ C'est exactement le défaut que la revue a trouvé avec `ben-level-profiler.timer` :
+    #   une unité absente de toutes mes listes, parce qu'elle n'est pas une capability. Ce
+    #   contrôle-ci ne dépend d'aucune liste — il regarde qui tient le fichier, point.
+    #
+    # ⚠️ `None` = on n'a pas pu regarder ⇒ on ne bascule pas. Un contrôle qui ne voit pas ne
+    #    doit jamais dire « voie libre ».
+    tiennent = ouvreurs(db_path)
+    if tiennent is None:
+        res = {"ok": False, "detail": detail,
+               "refus": "impossible de vérifier qui tient la base avant la bascule"}
+        _ecris_rapport(res)
+        return res
+    if tiennent:
+        res = {"ok": False, "detail": detail,
+               "refus": f"la base a été réouverte pendant la reconstruction (pid {tiennent}) "
+                        "— bascule abandonnée pour ne pas perdre ses écritures"}
+        _ecris_rapport(res)
+        return res
 
     mauvais = valide(neuve, attendu)
     if mauvais:
