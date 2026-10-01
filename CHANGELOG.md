@@ -18,6 +18,58 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.9.22] — 2026-10-01
+
+**Le boîtier joint un instantané de santé à son hello.** Ferme [#16](https://github.com/xdegenne/ben-firmware/issues/16).
+
+> 🚨 Un boîtier qui **cesse de mesurer** continue de dire bonjour. Constaté le 2026-10-01 sur un boîtier du parc : **neuf jours** sans une seule mesure, pendant lesquels il a dit bonjour chaque jour, le serveur a répondu `204`, `last_seen` est resté **frais**, il a pris deux OTA — et **rien n'a alerté**. On l'a découvert en regardant autre chose.
+
+⭐ `last_seen` confond trois états :
+
+| état | `last_seen` | visible ? |
+|---|---|---|
+| mesure **et** publie | frais | — |
+| mesure mais **ne publie pas** | ancien | oui |
+| **ne mesure plus** | **frais** | 🚨 non |
+
+Seul le troisième est une panne silencieuse. Cet instantané ne sert à rien d'autre qu'à **séparer le premier du troisième**, et à dire pourquoi.
+
+**⭐⭐ Ce qui sépare deux pannes qui se ressemblaient**
+
+Pour un boîtier **radio** devenu muet, « l'émetteur est mort » et « le récepteur est sourd » donnaient la **même** signature. Deux champs les séparent — et ils existaient déjà sans qu'on les publie :
+
+- **`silence_restarts`** : `ben-radio` le remet à 0 à chaque trame et l'incrémente quand son détecteur de silence le relance. Après des jours sans trame il est donc **grand** si le récepteur écoute vraiment, et **nul** si le détecteur n'a jamais joué.
+- **`radio.recent`** : les 20 dernières trames de `lora_link` **avec leurs horodatages**, pour **3,5 ms**. Sur un boîtier muet depuis des jours, elles datent du **jour de sa mort** — chute brutale à pleine puissance ⇒ alimentation ; dégradation progressive ⇒ antenne ou portée. **Aucun autre champ ne permet de trancher**, et l'information s'effacera à 180 jours.
+
+**Autres champs que personne ne regardait**
+
+- **`tainted`** — le drapeau **permanent** qui pilotait le test périodique de `0.9.12` (208 redémarrages de `ben-radio`, 46 % des mesures perdues). Il vaut **1024 sur les deux boîtiers éprouvés** : c'est l'état du parc, pas un incident.
+- **`wifi`** via `/proc/net/wireless`, pour 7,9 ms. ben-0001 est à **−76 dBm** contre **−31** pour ben-0003 — la question des « fenêtres de connectivité » commence peut-être là.
+- **`repo.dirty`** — un dépôt sale **bloque le `git checkout` nu de l'OTA**, piège documenté qu'on ne pouvait constater qu'en SSH.
+
+**🚨 L'innocuité prime sur le contenu**
+
+Cet instantané voyage dans le hello, qui porte les compteurs, les époques tarifaires et les libellés des sept boîtiers. **Une sonde qui lève ferait échouer le hello entier.** Chaque sonde est donc isolée et se replie sur l'**absence** de son champ — jamais sur une valeur de repli : « 0 trame reçue » et « je n'ai pas pu compter » ne veulent pas dire la même chose. Délai **par sonde** (4 s) *et* budget global (12 s), parce que le vrai risque n'est pas qu'une sonde lève mais qu'elle **pende**.
+
+**Écarté après mesure sur la cible**
+
+- 🚨 **`PRAGMA quick_check` n'est pas « coûteux », il est NUISIBLE** : sur 490 Mo il a poussé la charge d'un Pi Zero mono-cœur de **1,15 à 4,50**, rendu `sshd` muet plus d'une minute, et **ne s'est pas terminé en 180 s**.
+- 🚨 **`journalctl --since` coûtait 9 secondes pour rendre 0 octet**, là où `-n 8` seul en rendait 8 392 : les dernières erreurs existaient, elles dataient de plus de 24 h. **Filtrer par date coûtait neuf secondes pour jeter l'information utile.**
+- `systemctl status` pagine et rend de la prose localisée ⇒ `systemctl show --property=` avec **`--timestamp=unix`** obligatoire.
+- `vcgencmd get_throttled` échoue en utilisateur `ben`.
+
+⭐ **`collect_ms` et `load` sont dans le paquet** : un instantané pris en 1 s sur un boîtier au repos et un pris en 30 s sur un boîtier en détresse se ressemblent, et ne disent pas la même chose.
+
+**Éprouvé**
+
+Banc `test_health.py`, **16 cas**, verts sur Mac — où `/proc` et `systemctl` n'existent pas, donc le cas de panne, gratuit — **sur un boîtier radio et sur un boîtier filaire**. Deux défauts trouvés en lançant la collecte sur de vrais boîtiers, qu'aucun banc sur Mac n'aurait vus : `capabilities` est un **dict** dans `device.json` et pas une liste (ne garder que les listes faisait disparaître le champ en silence, alors qu'il porte la version de firmware de l'émetteur), et le cas « boîtier filaire » était vert **par accident** sur Mac faute de `/var/lib` alors qu'il échouait sur un vrai boîtier radio — `radio()` lit aux **deux** endroits, la table *et* les fichiers d'état.
+
+Coût : **4 786 ms / 576 o gzippés** en radio, **988 ms** en filaire. Le hello fait déjà 276 o gzippés, les mesures 270 Mo/an.
+
+⚠️ **Prérequis déployé AVANT ce tag** : la table `device_health` et l'API qui l'accepte (`ben-api#5`). L'ordre inverse aurait coupé l'ingestion des sept boîtiers d'un coup.
+
+Aucune migration, aucune table, aucune colonne côté boîtier.
+
 ### [0.9.21] — 2026-09-30
 
 **Éradiquer les fantômes déjà entrés.** `0.9.19` a fermé la porte ; celle-ci répare ce qui était **déjà dedans**. Ferme [#7](https://github.com/xdegenne/ben-firmware/issues/7).

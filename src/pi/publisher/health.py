@@ -69,10 +69,32 @@ N_ERRORS = 8        # les N dernières lignes de priorité <= 3
 N_FRAMES = 20       # les N dernières trames LoRa : l'état du lien AU MOMENT où il meurt
 
 
+# 🚨 L'ÉCHÉANCE GLOBALE, et c'est elle qui rend le budget RÉEL.
+#
+#    Première version : on testait le budget AVANT chaque sonde. Insuffisant — une sonde peut
+#    ensuite courir `PROBE_TIMEOUT_S` par SOUS-APPEL, et `errors()` en fait deux. Le pire cas
+#    était donc 12 + 8 = 20 s, pas 12. Mesuré sur un boîtier du parc : une collecte à 12,59 s
+#    alors que le budget était de 12 — et le préflight l'a refusée, à juste titre.
+#
+# ⭐ Chaque commande externe borne maintenant son délai au MINIMUM de son propre plafond et de
+#    ce qui reste. La durée totale est donc réellement majorée par BUDGET_S.
+_deadline = 0.0
+
+
+def _left() -> float:
+    """Ce qui reste du budget. `inf` quand aucune échéance n'est posée (appel direct d'une
+    sonde, par exemple depuis un banc)."""
+    return float("inf") if _deadline == 0.0 else _deadline - time.monotonic()
+
+
 def _sh(*cmd: str) -> str:
-    """Une commande externe, bornée. Rend '' sur n'importe quel échec."""
+    """Une commande externe, bornée par son plafond ET par l'échéance globale.
+    Rend '' sur n'importe quel échec."""
+    timeout = min(PROBE_TIMEOUT_S, _left())
+    if timeout <= 0:
+        return ""
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=PROBE_TIMEOUT_S)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return r.stdout
     except Exception:  # noqa: BLE001 — y compris TimeoutExpired et FileNotFoundError
         return ""
@@ -234,7 +256,7 @@ def store(conn: sqlite3.Connection, db_path: str = DB_PATH) -> dict:
     return out
 
 
-def radio(conn: sqlite3.Connection) -> dict | None:
+def radio(conn: sqlite3.Connection, pdl_indexes: list | None = None) -> dict | None:
     """⭐ LE CŒUR DU DIAGNOSTIC RADIO, et la seule façon de séparer deux pannes qui donnent
     sinon la MÊME signature — « l'émetteur est muet » et « le récepteur est sourd ».
 
@@ -274,16 +296,30 @@ def radio(conn: sqlite3.Connection) -> dict | None:
     if tx:
         out["tx"] = tx
 
-    try:
-        n, tmin, tmax, avg, lo, hi, snr = conn.execute(
-            "SELECT count(*), min(ts), max(ts), round(avg(rssi),1), min(rssi), max(rssi), "
-            "       round(avg(snr),1) FROM (SELECT ts, rssi, snr FROM lora_link "
-            "                               ORDER BY ts DESC LIMIT ?)", (N_FRAMES,)).fetchone()
+    # 🚨 `WHERE pdl_index = ?`, TOUJOURS, et ce n'est pas une précaution de style.
+    #
+    #    Première version sans la clause : l'index couvrant `(pdl_index, ts)` devenait
+    #    inutilisable et SQLite balayait puis triait les 145 000 lignes de `lora_link`.
+    #    Mesuré sur un boîtier du parc : **6 249 ms contre 3,5 ms**, soit 1 800×. La sonde
+    #    mangeait à elle seule la moitié du budget — et c'est la règle que le docstring de
+    #    `store()` énonce vingt lignes plus haut.
+    #
+    # ⭐ Au passage, c'est AUSSI plus utile : par compteur, on sait LEQUEL a perdu son lien.
+    recent = []
+    for i in (pdl_indexes or []):
+        try:
+            n, tmin, tmax, avg, lo, hi, snr = conn.execute(
+                "SELECT count(*), min(ts), max(ts), round(avg(rssi),1), min(rssi), "
+                "       max(rssi), round(avg(snr),1) "
+                "FROM (SELECT ts, rssi, snr FROM lora_link WHERE pdl_index = ? "
+                "      ORDER BY ts DESC LIMIT ?)", (i, N_FRAMES)).fetchone()
+        except sqlite3.Error:
+            continue
         if n:
-            out["recent"] = {"n": n, "ts_min": tmin, "ts_max": tmax, "rssi": avg,
-                             "rssi_min": lo, "rssi_max": hi, "snr": snr}
-    except sqlite3.Error:
-        pass
+            recent.append({"i": i, "n": n, "ts_min": tmin, "ts_max": tmax, "rssi": avg,
+                           "rssi_min": lo, "rssi_max": hi, "snr": snr})
+    if recent:
+        out["recent"] = recent
     return out or None
 
 
@@ -333,10 +369,19 @@ def errors() -> list | None:
     sous-tensions, soit exactement les pannes d'un boîtier radio devenu muet.
 
     🚨 PAS de `--since` : voir l'en-tête du module. On rend l'horodatage de chaque ligne,
-    c'est le LECTEUR qui juge si elle est vieille."""
+    c'est le LECTEUR qui juge si elle est vieille.
+
+    🚨 ET PAS DE `-u` NON PLUS, ce qui est contre-intuitif. Mesuré sur un boîtier du parc :
+
+        journalctl -p 3 -n 8 -o json                  0,36 s
+        journalctl -p 3 -n 8 -o json -u ben-radio     7,93 s   ← vingt fois plus
+
+    Filtrer par unité force journald à BALAYER tout le journal quand cette unité n'a aucune
+    entrée de priorité 3 — le cas normal d'un boîtier sain. Sans `-u` on lit la queue, et
+    `_SYSTEMD_UNIT` est de toute façon dans le JSON : on sait toujours d'où vient chaque ligne,
+    y compris des unités qu'on n'aurait pas pensé à lister. Moins cher ET plus large."""
     out = []
-    for source, extra in (("units", sum([["-u", u] for u in UNITS], [])),
-                          ("kernel", ["-k"])):
+    for source, extra in (("journal", []), ("kernel", ["-k"])):
         raw = _sh("journalctl", "-p", "3", "-n", str(N_ERRORS), "--no-pager",
                   "-o", "json", *extra)
         for line in raw.splitlines():
@@ -392,14 +437,26 @@ def snapshot(conn: sqlite3.Connection | None, dev: dict | None = None,
     ⚠️ Un champ ABSENT veut dire « je n'ai pas pu », jamais « ça vaut zéro ». C'est pour ça
     qu'aucune sonde n'invente de valeur de repli.
     """
+    global _deadline
     start = time.monotonic()
+    _deadline = start + BUDGET_S
     out: dict = {}
+
+    # ⚠️ La liste des PDL se lit depuis la table `pdl` — JAMAIS par un
+    #    `SELECT DISTINCT pdl_index FROM lora_link`, qui prend 16,7 s sur un Pi Zero.
+    pdl_indexes: list = []
+    if conn is not None:
+        try:
+            pdl_indexes = [i for i, in conn.execute(
+                "SELECT pdl_index FROM pdl ORDER BY pdl_index")]
+        except sqlite3.Error:
+            pass
 
     probes = (("host", host),
               ("wifi", wifi),
               ("dev", lambda: versions(dev or {})),
               ("store", lambda: store(conn, db_path) if conn is not None else None),
-              ("radio", lambda: radio(conn) if conn is not None else None),
+              ("radio", lambda: radio(conn, pdl_indexes) if conn is not None else None),
               ("repo", repo),
               ("units", units),
               ("errors", errors))
@@ -420,6 +477,7 @@ def snapshot(conn: sqlite3.Connection | None, dev: dict | None = None,
         else:
             out[name] = value
 
+    _deadline = 0.0
     out["collect_ms"] = int((time.monotonic() - start) * 1000)
     return out
 

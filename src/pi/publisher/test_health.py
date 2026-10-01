@@ -105,6 +105,44 @@ def le_budget_borne_une_sonde_qui_PEND():
 
 
 @cas
+def le_budget_borne_aussi_les_SOUS_APPELS():
+    """🚨 LE DÉFAUT QUE LE PRÉFLIGHT A TROUVÉ SUR LA CIBLE, et que le cas précédent ne voyait
+    pas — il détourne les sondes, donc jamais `_sh`.
+
+    Première version : le budget était testé AVANT chaque sonde. Insuffisant — une sonde peut
+    ensuite courir `PROBE_TIMEOUT_S` par SOUS-APPEL, et `errors()` en fait deux. Le pire cas
+    réel était 12 + 8 = 20 s. Mesuré sur un boîtier du parc : une collecte à **12,59 s** pour
+    un budget de 12 — `git` avait expiré à 4 s et les deux `journalctl` à 4 s chacun.
+
+    ⚖️ Ce cas utilise une VRAIE commande externe : c'est le seul moyen de prouver que `_sh`
+    borne son délai à ce qui RESTE du budget, et pas seulement à son propre plafond."""
+    vrais = health.host, health.wifi, health.units
+    health.host = health.wifi = lambda: None
+    health.units = lambda: {"x": health._sh("sleep", "10")}   # 10 s de sommeil, deux fois
+    budget, plafond = health.BUDGET_S, health.PROBE_TIMEOUT_S
+    health.BUDGET_S, health.PROBE_TIMEOUT_S = 1.0, 10.0
+    try:
+        t0 = time.monotonic()
+        health.snapshot(None, None, "/n/existe/pas.db")
+        duree = time.monotonic() - t0
+    finally:
+        health.host, health.wifi, health.units = vrais
+        health.BUDGET_S, health.PROBE_TIMEOUT_S = budget, plafond
+    assert duree < 3.0, (
+        f"la collecte a duré {duree:.1f} s pour un budget de 1 s : `_sh` ignore l'échéance")
+
+
+@cas
+def l_echeance_est_RELACHEE_apres_la_collecte():
+    """⚠️ `_deadline` est un état de module. L'oublier posée ferait que le PROCHAIN appel
+    direct d'une sonde — un banc, le mode ligne de commande — se croirait déjà hors budget et
+    ne ferait plus rien, sans rien dire."""
+    health.snapshot(None, None, "/n/existe/pas.db")
+    assert health._deadline == 0.0
+    assert health._left() == float("inf"), "hors collecte, une sonde n'a pas d'échéance"
+
+
+@cas
 def l_instantane_est_SERIALISABLE_en_JSON():
     """🚨 Il part dans le corps d'une requête JSON. Une valeur non sérialisable — un `Decimal`,
     un `datetime`, un `bytes` venu d'une colonne SQLite — ferait lever `json.dumps` DANS le
@@ -123,8 +161,8 @@ def TEMOIN_un_boitier_qui_mesure_rend_son_dernier_horodatage():
     out = health.snapshot(base_radio(), None)
     assert out["pdl"] == [{"i": 0, "last_ts": 1790840049}], out.get("pdl")
     assert out["emitter"][0]["addr"] == 31
-    assert out["radio"]["recent"]["n"] == 20, "les 20 dernières trames, pas toutes"
-    assert out["radio"]["recent"]["ts_max"] == 1790841160
+    assert out["radio"]["recent"][0]["n"] == 20, "les 20 dernières trames, pas toutes"
+    assert out["radio"]["recent"][0]["ts_max"] == 1790841160
 
 
 @cas
@@ -134,11 +172,57 @@ def les_trames_rendues_sont_les_PLUS_RECENTES_et_datees():
     alimentation, dégradation progressive ⇒ antenne. L'ordre `DESC` n'est donc pas un détail :
     rendre les 20 PREMIÈRES trames donnerait l'état du lien à sa naissance."""
     out = health.snapshot(base_radio(), None)
-    r = out["radio"]["recent"]
+    r = out["radio"]["recent"][0]
     assert r["ts_min"] == 1790840400 and r["ts_max"] == 1790841160
     # Les 20 dernières ont les rssi les plus BAS (la base les fait décroître) : si on avait
     # pris les 20 premières, la moyenne serait autour de -69, pas de -79.
     assert r["rssi_min"] == -89 and r["rssi_max"] == -70, r
+
+
+@cas
+def TOUTE_requete_sur_les_grosses_tables_porte_WHERE_pdl_index():
+    """🚨 LE DÉFAUT TROUVÉ PAR LE PRÉFLIGHT SUR LA CIBLE, et aucun banc fonctionnel ne
+    l'aurait vu : la requête rendait le bon résultat, elle le rendait 1 800× trop lentement.
+
+    Sans `WHERE pdl_index = ?`, l'index couvrant `(pdl_index, ts)` devient inutilisable et
+    SQLite balaie puis trie toute la table. Mesuré sur un boîtier du parc : **6 249 ms contre
+    3,5 ms** — la sonde mangeait la moitié du budget à elle seule.
+
+    ⭐ Ce cas est donc STRUCTUREL, pas fonctionnel : sur une base de banc à 30 lignes, les deux
+    formes sont indiscernables. On vérifie le SQL lui-même, parce que c'est la seule façon
+    d'attraper une régression de performance sans un Pi Zero sous la main."""
+    import re
+    # ⚠️ On retire les COMMENTAIRES avant d'analyser : l'en-tête du module cite des requêtes
+    #    en contre-exemple (« JAMAIS `SELECT DISTINCT pdl_index FROM lora_link`, 16,7 s »), et
+    #    un test qui se déclenche sur sa propre mise en garde ne vérifie rien.
+    src = "\n".join(l for l in pathlib.Path(health.__file__).read_text().splitlines()
+                    if not l.lstrip().startswith("#"))
+    for table in ("measurements", "lora_link", "curve_rollup"):
+        for m in re.finditer(rf"FROM {table}\b", src):
+            # ⚠️ Une FENÊTRE autour de l'occurrence, pas seulement ce qui suit : dans
+            #    `max(rowid) FROM measurements` la dispense est AVANT le FROM. C'est une
+            #    heuristique assumée — son rôle est d'empêcher une régression distraite,
+            #    pas d'analyser du SQL.
+            autour = src[max(0, m.start() - 300):m.end() + 300]
+            if "pdl_index = ?" in autour or "pdl_index=?" in autour:
+                continue
+            # ⭐ La SEULE autre forme admise : un encadrement par `rowid`. `max(rowid)` et
+            #    `min(rowid) WHERE sent = 0` se résolvent en O(1) par index sans toucher au
+            #    `pdl_index` — c'est la forme documentée de `pending_approx`, et la raison
+            #    pour laquelle elle remplace un `count(*)` qui prend 37 secondes.
+            assert "rowid)" in autour, (
+                f"requête sur `{table}` sans WHERE pdl_index ni encadrement par rowid :"
+                f"\n    …{autour[250:420]}…")
+
+
+@cas
+def le_resume_radio_est_PAR_COMPTEUR():
+    """⭐ Conséquence utile du correctif : on sait LEQUEL des compteurs a perdu son lien, au
+    lieu d'un agrégat qui les mélange."""
+    out = health.snapshot(base_radio(), None)
+    r = out["radio"]["recent"]
+    assert isinstance(r, list) and r[0]["i"] == 0, r
+    assert r[0]["n"] == 20 and r[0]["ts_max"] == 1790841160
 
 
 @cas
