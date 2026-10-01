@@ -52,7 +52,28 @@
 #      lignes déjà envoyées, personne ne le lit et la sonde ne le voit pas. C'est une alerte
 #      précoce sur le chemin de lecture du PUBLISHER, pas un `integrity_check` déguisé.
 #
-#   ── ③ LA RECONSTRUCTION, CIBLÉE (UN SEUL BOÎTIER) ────────────────────────────────────────
+#   ── ③ LA RECONSTRUCTION, CIBLÉE, EN DEUX PHASES (UN SEUL BOÎTIER) ────────────────────────
+#
+#   ⭐ LE DÉCOUPAGE SE FAIT PAR MUTABILITÉ, PAS PAR TAILLE, et c'est ce qui permet de ne
+#     pratiquement pas arrêter le collecteur :
+#
+#       phase 1   RIEN D'ARRÊTÉ     `measurements` + `lora_link` jusqu'au rowid relevé au
+#                 ~50 min           départ. Append-only : le rowid croît, les lignes ne
+#                                   changent plus (sauf `sent`), donc lisibles à chaud.
+#
+#       phase 2   écrivains         le DELTA de ces deux tables (~2 200 lignes, 2 s), PUIS
+#                 arrêtés, ~50 s    toutes les tables MODIFIÉES SUR PLACE (`pdl.last_seen`,
+#                                   `emitter.updated_ts`, `curve_rollup` ~60 000 lignes en
+#                                   44 s, `level_profile`), la validation et la bascule.
+#
+#     🚨 Une table modifiée sur place NE PEUT PAS être recopiée en phase 1 : un delta par
+#        `rowid` ne verrait pas une mise à jour, et la base neuve porterait des valeurs
+#        périmées sans que personne ne le remarque.
+#
+#   ⚠️ Mesuré : ~1 360 lignes/s sur un Pi Zero, soit ~50 min pour les ~4 M lignes de 306 Mo.
+#      Et c'est un PLANCHER — le débit est mesuré au début, quand la destination est petite.
+#      L'arrêt, lui, passe de 50 min à ~50 s.
+
 #
 #   On ne répare pas le fichier : on en construit un SAIN à côté, en recopiant ce qui est
 #   lisible, par tranches de `rowid` avec dichotomie sur les tranches qui lèvent. On ne perd
@@ -142,22 +163,14 @@ BASE=${BEN_REBUILD_DB:-}
 #   SIGKILL — pas de verrou fantôme.
 MAX_TENTATIVES=${BEN_REBUILD_MAX:-3}
 
-# ⚠️ LE FILET DOIT ÊTRE PLUS LONG QUE LE PIRE CAS DE LA RECONSTRUCTION. S'il se déclenchait
-#    PENDANT, les écrivains réouvriraient la base et la bascule leur ferait écrire dans
-#    l'ancien inode — leurs mesures partiraient dans un fichier que plus personne ne lit.
+# ⚠️ LE FILET NE COUVRE QUE LA PHASE 2, et c'est le gain du découpage. La phase 1 dure ~50 min
+#    SANS RIEN ARRÊTER : il n'y a donc rien à relever pendant ce temps. Seule la phase 2 arrête
+#    les écrivains, et elle dure ~50 s (delta ~2 200 lignes + curve_rollup ~60 000).
 #
-# ⚠️ ET LA DURÉE RÉELLE N'EST PAS MESURÉE, il faut le dire. L'essai lancé sur une copie de la
-#    base de 492 Mo d'un boîtier de banc a coïncidé avec un REDÉMARRAGE de ce boîtier (sans
-#    sous-tension enregistrée, sans erreur noyau — et ce boîtier redémarre de lui-même tous les
-#    1 à 3 jours, donc la causalité n'est pas établie). On n'a retenu que la copie brute :
-#    86 s pour 492 Mo. La base visée fait 306 Mo pour ~4,3 M lignes.
-#
-# ⭐ Deux heures est donc VOLONTAIREMENT LARGE, et un filet trop court serait le vrai danger :
-#   il réveillerait les écrivains PENDANT l'opération, et la bascule leur ferait écrire dans
-#   l'ancien inode. Le surcoût d'un filet long est borné, parce que l'autre mode de panne —
-#   un REDÉMARRAGE en cours de route — se répare tout seul : systemd relance les services au
-#   boot, et rien n'a été basculé.
-FILET_S=${BEN_REBUILD_FILET_S:-7200}
+# ⭐ Un filet de 15 min est donc à la fois large (18× la durée attendue) et sûr : avec l'ancien
+#   dispositif en une seule phase, il fallait 2 h et le risque qu'il tire PENDANT l'opération
+#   — réveillant les écrivains juste avant la bascule — était réel. Il s'effondre ici.
+FILET_S=${BEN_REBUILD_FILET_S:-900}
 FILET=ben-db-rebuild-filet
 
 log()  { echo "[update → pi-0.9.25] $*"; }
@@ -341,6 +354,27 @@ tmp = '$RAPPORT.tmp'
 with open(tmp, 'w') as f: json.dump(d, f, ensure_ascii=False)
 os.replace(tmp, '$RAPPORT')" || warn "compteur de tentatives non écrit"
 
+# ═══ PHASE 1 — À CHAUD, RIEN N'EST ARRÊTÉ ═════════════════════════════════════════════════════
+#
+# ⭐ C'est 99,9 % du volume, et ça se fait collecteur en marche : ~4 M lignes de `measurements`
+#   contre ~60 000 de `curve_rollup` et une dizaine pour tout le reste. Pendant ces ~50 min, le
+#   boîtier mesure, écrit, publie et répond à l'app.
+#
+# ⭐ Pourquoi c'est sûr malgré les écrivains : on ne lit que des plages de `rowid ≤ R0` dans des
+#   tables APPEND-ONLY, où ces lignes ne changent plus. Les tables modifiées SUR PLACE
+#   (`pdl.last_seen`, `curve_rollup`, `level_profile`…) sont recopiées en phase 2, parce qu'un
+#   delta par `rowid` ne verrait pas une mise à jour.
+log "phase 1 : recopie à chaud, aucun service arrêté (comptez ~50 min sur 300 Mo)"
+python3 "$STORE/db_rebuild.py" --phase1 $BASE || warn "la phase 1 a rendu une erreur"
+
+# 🚨 Si la phase 1 n'a rien laissé, on n'arrête RIEN. Inutile de couper le collecteur pour une
+#    phase 2 qui refusera faute d'état.
+if [ ! -f "$VAR/db-rebuild.state.json" ]; then
+    warn "la phase 1 n'a pas abouti — aucun service n'a été arrêté, rien n'a été basculé"
+    log "✓ update OK"
+    exit 0
+fi
+
 # ── La liste des services : DÉRIVÉE DES CAPABILITIES, puis filtrée sur ceux qui TOURNENT ──
 #
 # 🚨 Pas une liste en dur : sur un boîtier Radio, `ben-tic-reader` (capability `tic-uart`) n'a
@@ -382,6 +416,7 @@ relever() {
 trap relever EXIT INT TERM
 
 # ── L'opération ──
+log "phase 2 : arrêt des services qui tiennent la base — ~50 s"
 log "arrêt des services qui tiennent la base (ben-certd et wifi-watchdog restent debout)"
 xargs -r sudo systemctl stop < "$LISTE.tous" || warn "un arrêt a échoué"
 
@@ -405,8 +440,8 @@ elif [ -n "${OUVREURS// /}" ]; then
         warn "  pid $pid : $(ps -o unit=,comm= -p "$pid" 2>/dev/null | head -1)"
     done
 else
-    log "✓ personne ne tient plus la base — on peut reconstruire"
-    python3 "$STORE/db_rebuild.py" --rebuild $BASE || warn "la reconstruction a rendu une erreur"
+    log "✓ personne ne tient plus la base — phase 2 (delta + tables mutables + bascule)"
+    python3 "$STORE/db_rebuild.py" --phase2 $BASE || warn "la phase 2 a rendu une erreur"
 fi
 
 trap - EXIT INT TERM

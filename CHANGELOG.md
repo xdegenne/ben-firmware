@@ -259,6 +259,36 @@ Gain net **×1,17** seulement (2 091 l/s pour la copie, mais 1 748 une fois les 
 cadençable** fait **9,5 s pour 255 000 lignes**, soit 2 à 3 minutes à pleine échelle —
 **au-delà des 60 s du chien de garde**, qu'on ne peut ni interrompre ni ralentir.
 
+#### ⭐ Deux phases : l'arrêt passe de ~50 min à quelques secondes
+
+Une fois la durée mesurée (~50 min, et non les ~20 que j'avançais sans mesure), arrêter le
+collecteur pendant toute l'opération devenait trop cher. **Le découpage se fait par
+mutabilité, pas par taille** :
+
+| | tables | pourquoi |
+|---|---|---|
+| **phase 1** — *rien d'arrêté*, ~50 min | `measurements`, `lora_link` | **append-only** : le `rowid` croît, les lignes ne changent plus (sauf `sent`) ⇒ lisibles à chaud |
+| **phase 2** — *écrivains arrêtés*, ~50 s | le delta des deux précédentes (~2 200 lignes, 2 s), puis `pdl`, `emitter`, `contract_epoch`, `tariff_labels`, `level_profile`, `rollup_state`, `curve_rollup` (~60 000 lignes, 44 s) | **modifiées sur place** : `pdl.last_seen` bouge à chaque trame, `curve_rollup` fait un `UPSERT` par tranche de 2 min |
+
+🚨 Une table modifiée sur place **ne peut pas** être recopiée en phase 1 : un delta par `rowid`
+ne verrait pas une mise à jour, et la base neuve porterait des valeurs **périmées** sans que
+personne ne le remarque. Un cas de banc l'éprouve en modifiant `pdl.last_seen` **entre** les
+deux phases et en exigeant la nouvelle valeur ; la mutation qui recopie `pdl` en phase 1 le
+fait tomber.
+
+⭐ Et ça fait s'effondrer un risque : le filet `systemd-run` ne couvre plus que la fenêtre
+courte — **15 min au lieu de 2 h**. Avec une seule phase, le danger qu'il tire *pendant*
+l'opération (réveillant les écrivains juste avant la bascule) était réel.
+
+**Mesuré sur cible** : phase 1 en 25 s *« RIEN n'a été arrêté, rien n'a été basculé »*
+(empreinte de l'original inchangée, vérifiée par un cas de banc), phase 2 en **1,8 s**, et un
+relevé externe toutes les 3 s montre les services absents **~6 s** — l'arrêt/redémarrage
+lui-même domine sur une petite base.
+
+ⓘ Deux effets de bord assumés : un `sent` qui passe à 1 pendant la phase 1 fait **renvoyer** la
+ligne, que le cloud dédoublonne (`ON CONFLICT DO NOTHING`) ; et une ligne purgée après avoir
+été recopiée **ressusciterait**, pour être purgée au cycle suivant.
+
 ⓘ Aucune migration, aucune table, aucune colonne.
 
 ### [0.9.24] — 2026-10-01

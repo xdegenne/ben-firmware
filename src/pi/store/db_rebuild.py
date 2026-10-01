@@ -681,33 +681,61 @@ def _max_rowid(conn: sqlite3.Connection, table: str) -> int:
 # ⭐ On recopie donc TOUT par tranches cadencées. Bénéfice en prime : une table de métadonnée
 #   partiellement abîmée est désormais recopiée pour ce qu'elle a de LISIBLE, au lieu d'être
 #   abandonnée en bloc.
-PAR_TRANCHES_TOUJOURS = True
+# ── Quelles tables, dans quelle phase ────────────────────────────────────────────────────────
+#
+# 🚨 LE DÉCOUPAGE SE FAIT PAR MUTABILITÉ, PAS PAR TAILLE. C'est ce qui permet de recopier
+#    l'essentiel SANS ARRÊTER LE COLLECTEUR.
+#
+#      APPEND_ONLY   le `rowid` croît, les lignes ne changent plus (sauf `sent`)
+#                    ⇒ recopiables À CHAUD : on lit des plages de rowid ≤ R0, et peu importe
+#                      que chaque tranche voie un instantané différent
+#
+#      tout le reste MODIFIÉ SUR PLACE : `pdl.last_seen` bouge à chaque trame, `emitter.
+#                    updated_ts` aussi, `curve_rollup` fait un UPSERT par tranche de 2 min,
+#                    `level_profile` est réécrit par ben-level-profiler
+#                    ⇒ une logique de delta (`rowid > R0`) NE VERRAIT PAS une mise à jour,
+#                      donc ces tables se recopient EN PHASE 2, écrivains arrêtés
+#
+# ⭐ Et c'est 99,9 % du volume qui tombe dans la première catégorie : ~4 M lignes de
+#   `measurements` contre ~60 000 de `curve_rollup` et une dizaine pour tout le reste.
+APPEND_ONLY = ("measurements", "lora_link")
+
+ETAT = "/var/lib/ben-firmware/db-rebuild.state.json"
 
 
-def rebuild(db_path: str = db.DB_PATH) -> dict:
-    """Recopie ce qui est lisible dans un fichier neuf, valide, et bascule.
+def _ouvre_lecture_ro(chemin: str) -> sqlite3.Connection:
+    return sqlite3.connect(f"file:{chemin}?mode=ro", uri=True)
 
-    À n'appeler QUE tous les services arrêtés — `update.sh` s'en charge et le vérifie.
 
-    🚨 NE LÈVE JAMAIS, et c'est garanti PAR LE CODE et plus seulement par la docstring. Un
-       défaut trouvé en répétant l'opération sur cible le démentait : `_max_rowid` levait hors
-       de tout `try`. Et la conséquence n'était pas « un message d'erreur » mais une update qui
-       échoue, donc `device.json` non bumpé, donc REJEU toutes les 10 minutes avec arrêt des
-       services à chaque passage — la mécanique qui a brûlé pi-0.9.12.
+def _fusionne(a: dict, b: dict) -> dict:
+    """Additionne deux comptes rendus de `copie_par_tranches`."""
+    return {"copiees": a["copiees"] + b["copiees"],
+            "perdues": a["perdues"] + b["perdues"],
+            "lignes_perdues": a["lignes_perdues"] + b["lignes_perdues"],
+            "ts_perdus": a["ts_perdus"] + b["ts_perdus"]}
+
+
+# ── Phase 1 : À CHAUD, rien d'arrêté ────────────────────────────────────────────────────────
+
+def phase1(db_path: str = db.DB_PATH) -> dict:
+    """Recopie les tables append-only, LE COLLECTEUR EN MARCHE.
+
+    🚨 NE TOUCHE NI À L'ORIGINAL, NI À AUCUN SERVICE, NI À LA BASCULE. Elle dure ~50 min sur
+       une base de 306 Mo, et pendant tout ce temps le boîtier mesure, écrit, publie et répond
+       à l'app. C'est la raison d'être du découpage en deux phases.
+
+    ⭐ Pourquoi c'est sûr malgré les écrivains : on ne lit que des plages de `rowid ≤ R0` dans
+      des tables append-only, où ces lignes ne changent plus. Chaque tranche est sa propre
+      transaction de lecture et voit donc un instantané différent — sans conséquence.
+
+    ⚠️ Un `sent` peut passer à 1 entre-temps : la ligne sera recopiée avec un `sent = 0`
+       périmé, donc RENVOYÉE au cloud, qui la dédoublonne (`ON CONFLICT DO NOTHING`).
+    ⚠️ `prune()` pourrait supprimer une ligne déjà recopiée : elle RESSUSCITERAIT dans la base
+       neuve et serait purgée au cycle suivant. Sans conséquence.
     """
-    try:
-        return _rebuild(db_path)
-    except Exception as e:  # noqa: BLE001
-        res = {"ok": False, "refus": f"erreur inattendue ({type(e).__name__}: {e})"}
-        _ecris_rapport(res)
-        return res
-
-
-def _rebuild(db_path: str) -> dict:
     t0 = time.monotonic()
     neuve = db_path + ".rebuild"
-
-    src = _ouvre_lecture(db_path)
+    src = _ouvre_lecture_ro(db_path)
     pourquoi = refus(src, db_path)
     if pourquoi:
         src.close()
@@ -715,17 +743,53 @@ def _rebuild(db_path: str) -> dict:
         _ecris_rapport(res)
         return res
 
-    # On repart toujours de zéro : un fichier laissé par une tentative précédente contiendrait
-    # un état dont on ne sait rien.
+    # On repart toujours de zéro : un fichier laissé par une tentative tuée contiendrait un
+    # état dont on ne sait rien.
     for suffixe in ("", "-wal", "-shm"):
         try:
             os.unlink(neuve + suffixe)
         except FileNotFoundError:
             pass
 
-    # Le WAL de l'original, rapatrié dans le fichier. Pas indispensable — une connexion en
-    # lecture voit déjà le WAL — mais explicite, et ça évite de laisser traîner un `-wal` qui
-    # ne correspondra plus à rien après la bascule.
+    dst = db.connect(neuve)          # rejoue le schéma et les migrations : structure saine
+    presentes = tables(src)
+    bornes, detail = {}, {}
+    for t in [x for x in APPEND_ONLY if x in presentes]:
+        bornes[t] = _max_rowid(src, t)
+        detail[t] = copie_par_tranches(src, dst, t, bornes[t])
+    dst.close()
+    src.close()
+
+    etat = {"neuve": neuve, "bornes": bornes, "detail": detail,
+            "phase1_ms": int((time.monotonic() - t0) * 1000)}
+    tmp = ETAT + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(etat, f, ensure_ascii=False)
+    os.replace(tmp, ETAT)            # atomique : pas d'état à moitié écrit
+    return {"ok": True, **etat}
+
+
+# ── Phase 2 : écrivains arrêtés, et c'est COURT ──────────────────────────────────────────────
+
+def phase2(db_path: str = db.DB_PATH) -> dict:
+    """Le delta, les tables mutables, la validation, la bascule. Écrivains ARRÊTÉS.
+
+    ⭐ ~50 s : le delta d'une heure de mesures fait ~2 200 lignes (2 s), `curve_rollup` ~60 000
+      (44 s), le reste une dizaine de lignes. Contre ~50 min si on arrêtait tout.
+    """
+    t0 = time.monotonic()
+    try:
+        with open(ETAT, encoding="utf-8") as f:
+            etat = json.load(f)
+    except (OSError, ValueError) as e:
+        return {"ok": False, "refus": f"état de la phase 1 illisible ({e})"}
+    neuve = etat["neuve"]
+    if not os.path.exists(neuve):
+        return {"ok": False, "refus": "la base reconstruite a disparu entre les deux phases"}
+
+    # Les écrivains sont arrêtés : on rapatrie le WAL de l'original dans son fichier. Pas
+    # indispensable (une connexion en lecture voit déjà le WAL) mais explicite, et ça évite de
+    # laisser un `-wal` qui ne correspondra plus à rien après la bascule.
     try:
         w = sqlite3.connect(db_path, timeout=30.0)
         w.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -733,40 +797,38 @@ def _rebuild(db_path: str) -> dict:
     except sqlite3.Error:
         pass
 
-    dst = db.connect(neuve)          # rejoue le schéma et les migrations : structure saine
-    detail, petites = {}, {}
-
-    # ⚠️ Les tables de MÉTADONNÉE d'abord, les volumineuses ensuite : si la recopie longue est
-    #    interrompue, l'essentiel est déjà là — et surtout `pdl`, sans qui aucune mesure n'a
-    #    de sens.
-    VOLUMINEUSES = ("measurements", "lora_link")
+    src = _ouvre_lecture_ro(db_path)
+    dst = db.connect(neuve)
     presentes = tables(src)
-    for t in [x for x in presentes if x not in VOLUMINEUSES] + \
-             [x for x in VOLUMINEUSES if x in presentes]:
+    detail = dict(etat["detail"])
+
+    # ① Le DELTA des tables append-only : ce qui est arrivé pendant la phase 1.
+    for t, borne in etat["bornes"].items():
+        if t not in presentes:
+            continue
+        d = copie_par_tranches(src, dst, t, _max_rowid(src, t), depuis=borne)
+        detail[t] = _fusionne(detail.get(t, {"copiees": 0, "perdues": [],
+                                             "lignes_perdues": 0, "ts_perdus": []}), d)
+
+    # ② Les tables MODIFIÉES SUR PLACE, recopiées maintenant et pas avant — une mise à jour
+    #    survenue pendant la phase 1 ne se verrait pas dans un delta par `rowid`.
+    petites = {}
+    for t in [x for x in presentes if x not in APPEND_ONLY]:
         d = copie_par_tranches(src, dst, t, _max_rowid(src, t))
-        if t in VOLUMINEUSES:
-            detail[t] = d
-        else:
-            # Les métadonnées tiennent en une ligne de rapport : combien, et combien perdues.
-            petites[t] = d["copiees"] if not d["lignes_perdues"] else \
-                f"{d['copiees']} copiées, {d['lignes_perdues']} perdues"
+        petites[t] = d["copiees"] if not d["lignes_perdues"] else \
+            f"{d['copiees']} copiées, {d['lignes_perdues']} perdues"
 
     rollup = corrige_rollup(dst, detail.get("measurements", {}).get("ts_perdus", []))
     attendu = {t: detail[t]["copiees"] for t in detail}
     dst.close()
     src.close()
 
-    # 🚨 ON RE-VÉRIFIE JUSTE AVANT DE BASCULER, et c'est le garde-fou qui couvre ce que je
-    #    n'ai pas su énumérer. `update.sh` contrôle qu'aucun processus ne tient le fichier
-    #    AVANT de lancer la reconstruction — mais celle-ci dure une HEURE, et un timer peut
-    #    tirer entre les deux. Un contrôle fait une fois au début ne dit rien de la fin.
+    # 🚨 ON RE-VÉRIFIE QUI TIENT LA BASE JUSTE AVANT DE BASCULER. `update.sh` l'a contrôlé
+    #    avant la phase 2, mais ce contrôle-ci ne dépend d'AUCUNE liste de services — c'est la
+    #    réponse à la classe de défaut qu'était `ben-level-profiler.timer`, absent de toutes
+    #    mes listes parce qu'il n'est pas une capability.
     #
-    # ⭐ C'est exactement le défaut que la revue a trouvé avec `ben-level-profiler.timer` :
-    #   une unité absente de toutes mes listes, parce qu'elle n'est pas une capability. Ce
-    #   contrôle-ci ne dépend d'aucune liste — il regarde qui tient le fichier, point.
-    #
-    # ⚠️ `None` = on n'a pas pu regarder ⇒ on ne bascule pas. Un contrôle qui ne voit pas ne
-    #    doit jamais dire « voie libre ».
+    # ⚠️ `None` = on n'a pas pu regarder ⇒ on ne bascule pas.
     tiennent = ouvreurs(db_path)
     if tiennent is None:
         res = {"ok": False, "detail": detail,
@@ -783,18 +845,47 @@ def _rebuild(db_path: str) -> dict:
     mauvais = valide(neuve, attendu)
     if mauvais:
         # 🚨 ON NE BASCULE PAS, ET ON NE SUPPRIME RIEN. L'original est intact, la base neuve
-        #    reste sur le disque pour qu'on puisse l'examiner au prochain passage. L'update
-        #    réussit quand même : aucun état de la donnée ne doit la faire échouer.
+        #    reste sur le disque pour examen. L'update réussit quand même : aucun état de la
+        #    donnée ne doit la faire échouer.
         res = {"ok": False, "refus": f"validation refusée — {mauvais}", "detail": detail}
         _ecris_rapport(res)
         return res
 
     sauvegarde = bascule(db_path, neuve)
+    try:
+        os.unlink(ETAT)
+    except FileNotFoundError:
+        pass
     res = {"ok": True, "at": int(time.time()), "detail": detail, "rollup": rollup,
            "sauvegarde": sauvegarde, "petites": petites,
-           "ms": int((time.monotonic() - t0) * 1000)}
+           "phase1_ms": etat.get("phase1_ms"),
+           "ms": (etat.get("phase1_ms") or 0) + int((time.monotonic() - t0) * 1000),
+           "phase2_ms": int((time.monotonic() - t0) * 1000)}
     _ecris_rapport(res)
     return res
+
+
+def rebuild(db_path: str = db.DB_PATH) -> dict:
+    """Les deux phases enchaînées, pour l'usage en un coup (bancs, essais).
+
+    🚨 NE LÈVE JAMAIS, et c'est garanti PAR LE CODE et pas seulement par la docstring. Un
+       défaut trouvé en répétant l'opération sur cible le démentait : `_max_rowid` levait hors
+       de tout `try`. Et la conséquence n'était pas « un message d'erreur » mais une update qui
+       échoue, donc `device.json` non bumpé, donc REJEU toutes les 10 minutes avec arrêt des
+       services à chaque passage — la mécanique qui a brûlé pi-0.9.12.
+
+    ⚠️ En production, `update.sh` appelle les DEUX PHASES SÉPARÉMENT et n'arrête les services
+       qu'entre elles. Enchaîner ici garderait le collecteur arrêté pendant ~50 min.
+    """
+    try:
+        un = phase1(db_path)
+        if not un.get("ok"):
+            return un
+        return phase2(db_path)
+    except Exception as e:  # noqa: BLE001
+        res = {"ok": False, "refus": f"erreur inattendue ({type(e).__name__}: {e})"}
+        _ecris_rapport(res)
+        return res
 
 
 def _ecris_rapport(res: dict) -> None:
@@ -809,6 +900,7 @@ def _ecris_rapport(res: dict) -> None:
         "ok": bool(res.get("ok")),
         "sauvegarde": os.path.basename(res.get("sauvegarde") or ""),
         "ms": res.get("ms"),
+        "ms_phase2": res.get("phase2_ms"),
         "rollup": (res.get("rollup") or {}).get("seaux_supprimes"),
     }
     for t, v in (res.get("detail") or {}).items():
@@ -819,9 +911,7 @@ def _ecris_rapport(res: dict) -> None:
 
     # 🚨 LE COMPTEUR DE TENTATIVES DOIT SURVIVRE — défaut trouvé en revue, et il annulait le
     #    frein. `update.sh` écrit `tentatives` dans CE fichier avant de travailler ; en le
-    #    réécrivant de zéro, on remettait le compteur à 0. Un boîtier qui redémarre après chaque
-    #    reconstruction (chien de garde, brownout) aurait donc rejoué l'opération INDÉFINIMENT,
-    #    toutes les 10 minutes, en arrêtant ses services à chaque passage.
+    #    réécrivant de zéro, on remettait le compteur à 0.
     try:
         with open(RAPPORT, encoding="utf-8") as f:
             ancien = json.load(f)
@@ -840,22 +930,20 @@ def _ecris_rapport(res: dict) -> None:
 def main(argv: list) -> int:
     """🚨 SORT TOUJOURS EN 0 SUR UN ÉTAT DE LA DONNÉE. Seul un mauvais argument — donc un
     défaut de CODE — rend autre chose. Règle posée en 0.9.21 : une update qui échoue laisse
-    `device.json` non bumpé, donc elle REJOUE toutes les 10 min, services arrêtés comprises.
+    `device.json` non bumpé, donc elle REJOUE toutes les 10 minutes, arrêt des services compris.
     """
-    if not 2 <= len(argv) <= 3 or argv[1] not in ("--rebuild", "--refus", "--services",
-                                                  "--ouvreurs"):
-        print("usage: db_rebuild.py --rebuild|--refus|--services|--ouvreurs [chemin]",
-              file=sys.stderr)
+    ACTIONS = ("--phase1", "--phase2", "--rebuild", "--refus", "--services", "--ouvreurs")
+    if not 2 <= len(argv) <= 3 or argv[1] not in ACTIONS:
+        print(f"usage: db_rebuild.py {'|'.join(ACTIONS)} [chemin]", file=sys.stderr)
         return 2
-    # ⚠️ Le chemin optionnel est une AFFORDANCE D'ESSAI, et elle a une raison précise : la
-    #    séquence « arrêt des services → reconstruction → bascule → redémarrage → hello » est
-    #    le geste le plus risqué qu'on livre, et il part sur un boîtier INJOIGNABLE. Sans ce
-    #    paramètre, on ne pourrait le répéter qu'en touchant une vraie base de production.
-    #    Avec, on le répète sur une base jetable de quelques mégaoctets.
+    # ⚠️ Le chemin optionnel est une AFFORDANCE D'ESSAI : la séquence « arrêt → reconstruction
+    #    → bascule → redémarrage → hello » est le geste le plus risqué qu'on livre, et il part
+    #    sur un boîtier INJOIGNABLE. Sans ce paramètre, on ne pourrait le répéter qu'en
+    #    touchant une vraie base de production.
     #    ⭐ Il vit ICI et pas dans `db.py` : surcharger `DB_PATH` pour tout le firmware
-    #      exposerait les sept boîtiers au risque qu'une variable mal posée fasse écrire
-    #      ailleurs. Ce module est le seul qui en a besoin.
+    #      exposerait les sept boîtiers au risque d'une variable mal posée.
     chemin = argv[2] if len(argv) == 3 else db.DB_PATH
+
     if argv[1] == "--services":
         # Une unité par ligne, dans l'ORDRE D'ARRÊT. `update.sh` les relance en ordre inverse.
         for u in services_a_arreter(caps.load_device()):
@@ -874,25 +962,32 @@ def main(argv: list) -> int:
     if argv[1] == "--refus":
         # Sonde SANS EFFET, pour que `update.sh` puisse décider avant d'arrêter quoi que ce
         # soit. ⭐ On n'arrête pas les services d'un boîtier sain pour constater qu'il est sain.
-        src = _ouvre_lecture(chemin)
+        src = _ouvre_lecture_ro(chemin)
         pourquoi = refus(src, chemin)
         src.close()
         print(pourquoi or "")
         return 0
-    res = rebuild(chemin)
+
+    res = {"--phase1": phase1, "--phase2": phase2, "--rebuild": rebuild}[argv[1]](chemin)
     if res.get("refus"):
         print(f"  ⚠ {res['refus']}", file=sys.stderr)
         return 0
     for t, v in res.get("detail", {}).items():
         print(f"  {t} : {v['copiees']} copiées, {v['lignes_perdues']} perdues "
               f"({len(v['perdues'])} zone(s))", file=sys.stderr)
+    if argv[1] == "--phase1":
+        print(f"  phase 1 terminée en {res['phase1_ms'] / 1000:.0f} s — RIEN n'a été arrêté, "
+              "rien n'a été basculé", file=sys.stderr)
+        return 0
     illisibles = [t for t, v in res.get("petites", {}).items() if isinstance(v, str)]
     if illisibles:
-        print(f"  ⚠ métadonnées illisibles : {', '.join(illisibles)}", file=sys.stderr)
+        print(f"  ⚠ métadonnées partiellement perdues : {', '.join(illisibles)}",
+              file=sys.stderr)
     print(f"  original conservé : {os.path.basename(res['sauvegarde'])}", file=sys.stderr)
     print(f"  rollup : {res['rollup']['seaux_supprimes']} seau(x) à reconstruire",
           file=sys.stderr)
-    print(f"  durée : {res['ms'] / 1000:.0f} s", file=sys.stderr)
+    print(f"  phase 2 : {res['phase2_ms'] / 1000:.0f} s d'arrêt "
+          f"(total {res['ms'] / 1000:.0f} s)", file=sys.stderr)
     return 0
 
 

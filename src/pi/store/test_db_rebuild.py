@@ -252,12 +252,31 @@ def reconstruit(chemin: str) -> dict:
       et DEUX cas dédiés l'éprouvent pour lui-même (`None` et « quelqu'un tient »). Sans cette
       séparation, le garde-fou masquerait tout le reste et on ne saurait plus ce qui est vert.
     """
-    vrai = rb.ouvreurs
-    rb.ouvreurs = lambda _p: []
+    d = os.path.dirname(chemin)
+    vrai, rb.ouvreurs = rb.ouvreurs, lambda _p: []
+    # ⚠️ `RAPPORT` et `ETAT` sont des chemins ABSOLUS de la cible (/var/lib/ben-firmware). Il
+    #    faut détourner LES DEUX, sinon la phase 1 échoue sur un FileNotFoundError et tous les
+    #    cas tombent pour une raison qui n'a rien à voir avec ce qu'ils éprouvent.
+    vr, ve = rb.RAPPORT, rb.ETAT
+    rb.RAPPORT, rb.ETAT = os.path.join(d, "rapport.json"), os.path.join(d, "etat.json")
     try:
         return rb.rebuild(chemin)
     finally:
-        rb.ouvreurs = vrai
+        rb.ouvreurs, rb.RAPPORT, rb.ETAT = vrai, vr, ve
+
+
+def _detourne(chemin: str):
+    """Détourne RAPPORT/ETAT vers le répertoire d'essai et neutralise le contrôle /proc."""
+    d = os.path.dirname(chemin)
+    sauv = (rb.ouvreurs, rb.RAPPORT, rb.ETAT)
+    rb.ouvreurs = lambda _p: []
+    rb.RAPPORT = os.path.join(d, "rapport.json")
+    rb.ETAT = os.path.join(d, "etat.json")
+    return sauv
+
+
+def _restaure(sauv):
+    rb.ouvreurs, rb.RAPPORT, rb.ETAT = sauv
 
 
 # ── Les fonctions pures ─────────────────────────────────────────────────────────────────────
@@ -397,7 +416,6 @@ def la_reconstruction_RECUPERE_tout_sauf_ce_qui_est_DETRUIT():
     dernier = c.execute("SELECT rowid, ts FROM measurements ORDER BY rowid DESC LIMIT 1").fetchone()
     c.close()
 
-    rb.RAPPORT = os.path.join(d, "rapport.json")
     res = reconstruit(chemin)
     assert res.get("ok"), f"reconstruction refusée : {res.get('refus')}"
 
@@ -440,7 +458,6 @@ def apres_reconstruction_une_SECONDE_passe_REFUSE():
     boîtier déjà réparé, en boucle."""
     d = tempfile.mkdtemp()
     chemin, _ = base_abimee(10000, d)
-    rb.RAPPORT = os.path.join(d, "rapport.json")
     assert reconstruit(chemin).get("ok"), "la première passe a échoué"
     second = reconstruit(chemin)
     assert not second.get("ok"), "la seconde passe a reconstruit une base saine"
@@ -465,7 +482,6 @@ def le_ROLLUP_ne_garde_pas_de_seaux_pour_des_points_disparus():
     c.commit()
     c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     c.close()
-    rb.RAPPORT = os.path.join(d, "rapport.json")
     res = reconstruit(chemin)
     assert res.get("ok"), res.get("refus")
     c = sqlite3.connect(f"file:{chemin}?mode=ro", uri=True)
@@ -620,7 +636,6 @@ def un_dommage_EN_FIN_de_table_est_quand_meme_reconstruit():
     la carte SD vient de solliciter."""
     d = tempfile.mkdtemp()
     chemin = base_abimee_a_la_FIN(20000, d)
-    rb.RAPPORT = os.path.join(d, "rapport.json")
     res = reconstruit(chemin)
     assert res.get("ok"), f"refusé : {res.get('refus')}"
     m = res["detail"]["measurements"]
@@ -687,7 +702,6 @@ def un_dommage_EN_FIN_ne_GONFLE_pas_le_nombre_de_perdues():
     """⭐ L'effet du cas précédent, mesuré là où il compte : le rapport doit dire la vérité."""
     d = tempfile.mkdtemp()
     chemin = base_abimee_a_la_FIN(20000, d)
-    rb.RAPPORT = os.path.join(d, "rapport.json")
     res = reconstruit(chemin)
     assert res.get("ok"), res.get("refus")
     m = res["detail"]["measurements"]
@@ -749,6 +763,7 @@ def le_compteur_de_TENTATIVES_survit_au_rapport():
     d = tempfile.mkdtemp()
     chemin, _ = base_abimee(8000, d)
     rb.RAPPORT = os.path.join(d, "rapport.json")
+    rb.ETAT = os.path.join(d, "etat.json")
     with open(rb.RAPPORT, "w", encoding="utf-8") as f:
         f.write('{"tentatives": 2}')
     res = reconstruit(chemin)
@@ -796,6 +811,7 @@ def la_bascule_est_REFUSEE_si_quelqu_un_tient_la_base():
     d = tempfile.mkdtemp()
     chemin, _ = base_abimee(8000, d)
     rb.RAPPORT = os.path.join(d, "rapport.json")
+    rb.ETAT = os.path.join(d, "etat.json")
     vrai = rb.ouvreurs
     rb.ouvreurs = lambda _p: [4242]
     try:
@@ -818,6 +834,7 @@ def la_bascule_est_REFUSEE_si_on_ne_peut_pas_VERIFIER():
     d = tempfile.mkdtemp()
     chemin, _ = base_abimee(8000, d)
     rb.RAPPORT = os.path.join(d, "rapport.json")
+    rb.ETAT = os.path.join(d, "etat.json")
     vrai = rb.ouvreurs
     rb.ouvreurs = lambda _p: None
     try:
@@ -864,11 +881,12 @@ def TOUTES_les_tables_passent_par_la_copie_par_tranches():
     assert "def copie_table(" not in src, (
         "`copie_table()` est encore là : du code mort dans un module critique, et quelqu'un "
         "finira par s'en resservir")
-    corps = src[src.index("def _rebuild("):]
-    corps = corps[:corps.index("\ndef ")]
-    corps = "\n".join(l for l in corps.splitlines() if not l.lstrip().startswith("#"))
-    assert "copie_par_tranches(src, dst, t" in corps, corps[:400]
-    assert "copie_table(" not in corps, "une table est encore recopiée en bloc"
+    for fn in ("def phase1(", "def phase2("):
+        corps = src[src.index(fn):]
+        corps = corps[:corps.index("\ndef ")]
+        corps = "\n".join(l for l in corps.splitlines() if not l.lstrip().startswith("#"))
+        assert "copie_par_tranches(" in corps, f"{fn} ne recopie pas par tranches"
+        assert "copie_table(" not in corps, f"{fn} recopie encore une table en bloc"
     # Et l'effet : une base avec un gros rollup se recopie quand même.
     d = tempfile.mkdtemp()
     chemin, _ = base_abimee(8000, d)
@@ -879,10 +897,122 @@ def TOUTES_les_tables_passent_par_la_copie_par_tranches():
     c.commit()
     c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     c.close()
-    rb.RAPPORT = os.path.join(d, "rapport.json")
     res = reconstruit(chemin)
     assert res.get("ok"), res.get("refus")
     assert res["petites"].get("curve_rollup") == 3000, res["petites"]
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@cas
+def la_phase1_ne_touche_NI_l_original_NI_la_bascule():
+    """⭐ C'EST TOUTE LA RAISON D'ÊTRE DU DÉCOUPAGE. La phase 1 dure ~50 min sur une base de
+    306 Mo, et pendant tout ce temps le boîtier doit continuer de mesurer, écrire, publier et
+    répondre à l'app. Elle ne doit donc rien arrêter et rien remplacer.
+
+    ⚖️ On le vérifie par l'EMPREINTE de l'original : aucune hypothèse sur ce que fait le code,
+       on compare les octets."""
+    import hashlib
+    d = tempfile.mkdtemp()
+    chemin, _ = base_abimee(8000, d)
+    avant = hashlib.sha256(pathlib.Path(chemin).read_bytes()).hexdigest()
+    sauv = _detourne(chemin)
+    try:
+        res = rb.phase1(chemin)
+    finally:
+        _restaure(sauv)
+    assert res.get("ok"), res.get("refus")
+    apres = hashlib.sha256(pathlib.Path(chemin).read_bytes()).hexdigest()
+    assert avant == apres, "la phase 1 a MODIFIÉ l'original"
+    assert not [f for f in os.listdir(d) if ".corrupt-" in f], \
+        "la phase 1 a basculé : elle ne doit jamais remplacer la base"
+    assert os.path.exists(chemin + ".rebuild"), "la base neuve n'a pas été créée"
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@cas
+def le_DELTA_arrive_pendant_la_phase1_est_RECUPERE():
+    """⭐ LE CŒUR DU DÉCOUPAGE : les mesures écrites PENDANT la phase 1 ne doivent pas être
+    perdues. La phase 2 recopie ce qui est au-delà du `rowid` relevé au départ."""
+    d = tempfile.mkdtemp()
+    chemin, _ = base_abimee(8000, d)
+    sauv = _detourne(chemin)
+    try:
+        assert rb.phase1(chemin).get("ok")
+        # Le collecteur a tourné pendant la phase 1 : 500 mesures de plus.
+        c = sqlite3.connect(chemin, timeout=30.0)
+        c.executemany("INSERT INTO measurements(ts,pdl_index,papp,sent) VALUES(?,0,?,0)",
+                      [(1799000000 + i, 777) for i in range(500)])
+        c.commit()
+        c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        c.close()
+        res = rb.phase2(chemin)
+    finally:
+        _restaure(sauv)
+    assert res.get("ok"), res.get("refus")
+    c = sqlite3.connect(f"file:{chemin}?mode=ro", uri=True)
+    try:
+        n = c.execute("SELECT count(*) FROM measurements WHERE papp = 777").fetchone()[0]
+    finally:
+        c.close()
+    assert n == 500, (
+        f"{n} des 500 mesures arrivées pendant la phase 1 ont été recopiées — le delta est "
+        "perdu, et avec lui tout ce que le boîtier a mesuré pendant l'heure")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@cas
+def une_table_MODIFIEE_SUR_PLACE_est_recopiee_en_PHASE_2():
+    """🚨 LE CAS QUI JUSTIFIE QUE LE DÉCOUPAGE SE FASSE PAR MUTABILITÉ ET NON PAR TAILLE.
+
+    `pdl.last_seen` est réécrit à chaque trame, `emitter.updated_ts` aussi, `curve_rollup` fait
+    un UPSERT par tranche de 2 min, `level_profile` est réécrit par ben-level-profiler. Une
+    logique de delta par `rowid` NE VERRAIT PAS ces mises à jour : si on recopiait ces tables
+    en phase 1, la base neuve porterait des valeurs PÉRIMÉES, et personne ne le remarquerait.
+
+    ⇒ Elles sont donc recopiées en phase 2, écrivains arrêtés. On l'éprouve en modifiant la
+      valeur ENTRE les deux phases et en exigeant la NOUVELLE."""
+    d = tempfile.mkdtemp()
+    chemin, _ = base_abimee(8000, d)
+    sauv = _detourne(chemin)
+    try:
+        assert rb.phase1(chemin).get("ok")
+        c = sqlite3.connect(chemin, timeout=30.0)
+        c.execute("UPDATE pdl SET last_seen = 1799999999 WHERE pdl_index = 0")
+        c.execute("INSERT OR REPLACE INTO curve_rollup "
+                  "VALUES(0,1799000040,0,1,1799000040,1799000159,5,50,100,20,0)")
+        c.commit()
+        c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        c.close()
+        res = rb.phase2(chemin)
+    finally:
+        _restaure(sauv)
+    assert res.get("ok"), res.get("refus")
+    c = sqlite3.connect(f"file:{chemin}?mode=ro", uri=True)
+    try:
+        vu = c.execute("SELECT last_seen FROM pdl WHERE pdl_index = 0").fetchone()[0]
+        seau = c.execute("SELECT papp_count FROM curve_rollup "
+                         "WHERE bucket_ts = 1799000040").fetchone()
+    finally:
+        c.close()
+    assert vu == 1799999999, (
+        f"`pdl.last_seen` vaut {vu} au lieu de 1799999999 : la table a été recopiée en phase 1, "
+        "donc avec une valeur périmée — et aucun delta par rowid ne l'aurait rattrapée")
+    assert seau and seau[0] == 20, f"le seau de rollup modifié n'a pas suivi : {seau!r}"
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@cas
+def phase2_SANS_phase1_refuse():
+    """⚖️ Le témoin du dispositif : sans l'état de la phase 1, on ne sait pas quel `rowid`
+    borne le delta ni où est la base neuve. Il faut refuser, pas deviner."""
+    d = tempfile.mkdtemp()
+    chemin, _ = base_abimee(4000, d)
+    sauv = _detourne(chemin)
+    try:
+        res = rb.phase2(chemin)       # aucun état écrit
+    finally:
+        _restaure(sauv)
+    assert res.get("ok") is False and "phase 1" in res.get("refus", ""), res
     shutil.rmtree(d, ignore_errors=True)
 
 
