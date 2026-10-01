@@ -249,10 +249,17 @@ def TOUTE_requete_sur_les_grosses_tables_porte_WHERE_pdl_index():
             #    ±300 caractères. Les deux lectures canari étant des littéraux ADJACENTS, le
             #    `LIMIT 1` de l'une couvrait l'autre : retirer la borne d'une requête ne faisait
             #    PAS tomber le cas. Vérifié par mutation. On s'arrête donc au `SELECT` suivant.
+            # ⚠️ `LIMIT` suivi d'un ENTIER, d'une interpolation ou d'un paramètre — pas
+            #    seulement `LIMIT 1`. La sonde canari lit désormais le LOT ENTIER
+            #    (`LIMIT {N_UNSENT}`), parce qu'une lecture d'une seule ligne la rendait
+            #    borgne : le publisher en lit mille, et la page abîmée peut être la 437ᵉ.
+            #    La borne reste donc une CONSTANTE bornée, et son coût réel est mesuré par le
+            #    préflight sur la cible — c'est là qu'est fermé le trou de cette heuristique.
             suite = src[m.end():m.end() + 250].split("SELECT")[0]
-            assert "rowid)" in autour or "LIMIT 1" in suite, (
+            borne = re.search(r"LIMIT\s*(\d+|\{|\?)", suite)
+            assert "rowid)" in autour or borne, (
                 f"requête sur `{table}` sans WHERE pdl_index, sans encadrement par rowid et "
-                f"sans borne à une ligne :\n    …{autour[250:420]}…")
+                f"sans borne LIMIT :\n    …{autour[250:420]}…")
 
 
 @cas

@@ -86,6 +86,15 @@ MAX_ZONES_ABIMEES = 200
 
 # Marge de disque exigée, en plus de la taille de la base. On écrit un second fichier de même
 # taille ; le lien dur vers l'original ne coûte rien.
+# Les colonnes que lit le publisher. 🚨 Une par une, pas `*` : c'est la LECTURE DE LIGNE
+# COMPLÈTE qu'on veut reproduire, et `*` masquerait un ajout de colonne.
+COLS_MEASUREMENTS = ("ts, pdl_index, base, hchc, hchp, papp, iinst, tariff, src_standard, "
+                     "index_id, index_value, inject_total, meter_ts")
+
+# La taille du lot du publisher — MÊME variable d'environnement que `ben_publisher.BATCH`.
+# ⭐ C'est elle qui définit le symptôme : « le prochain lot du publisher passe-t-il ? »
+N_LOT = int(os.environ.get("BEN_PUB_BATCH", "1000"))
+
 MARGE_DISQUE = 1.25
 
 # ═══ LE RYTHME, ET POURQUOI IL N'EST PAS NÉGOCIABLE ═════════════════════════════════════════
@@ -185,6 +194,50 @@ def services_a_arreter(dev: dict) -> list:
     return list(HORS_MODELE) + lecteurs
 
 
+def ouvreurs(db_path: str) -> list | None:
+    """Les processus qui tiennent `db_path` OUVERT, lus dans `/proc/<pid>/fd`.
+
+    🚨 DÉFAUT TROUVÉ EN REVUE, et c'est une perte de données SILENCIEUSE. `update.sh` arrêtait
+       les services listés comme ACTIFS — mais une unité en cours de redémarrage n'est pas
+       `active`, donc elle était ignorée, elle revenait, elle gardait la base ouverte, et après
+       le `os.replace` ses écritures partaient dans le fichier devenu `.corrupt-*`. Les mesures
+       de cet intervalle étaient perdues sans que rien ne le dise.
+
+    ⭐ On ne vérifie donc plus une DÉCISION (« j'ai demandé l'arrêt ») mais son EFFET
+      (« personne ne tient plus le fichier »). C'est l'invariant réel, et c'est celui qu'on a
+      mesuré pour établir la liste : trois unités seulement ouvrent la base.
+
+    🚨 `None` ≠ `[]`, ET LA DIFFÉRENCE EST TOUT. Une liste VIDE veut dire « j'ai regardé,
+       personne ne tient le fichier » ; `None` veut dire « JE N'AI PAS PU REGARDER ». Les
+       confondre autoriserait une bascule sous un écrivain sur tout système où `/proc` est
+       absent ou illisible — un contrôle qui ne peut pas voir doit dire qu'il ne voit pas, pas
+       répondre « voie libre ».
+
+    ⚠️ Demande les droits root pour voir les descripteurs des autres utilisateurs — appelé sous
+       `sudo` par `update.sh`. Sans eux on ne verrait que ses propres descripteurs, donc on
+       conclurait à tort.
+    """
+    cible = os.path.realpath(db_path)
+    vus = []
+    try:
+        pids = [d for d in os.listdir("/proc") if d.isdigit()]
+    except OSError:
+        return None          # pas de /proc : on ne sait PAS, et on le dit
+    for pid in pids:
+        rep = f"/proc/{pid}/fd"
+        try:
+            for fd in os.listdir(rep):
+                try:
+                    if os.path.realpath(os.path.join(rep, fd)).startswith(cible):
+                        vus.append(int(pid))
+                        break
+                except OSError:
+                    continue
+        except OSError:
+            continue          # processus disparu, ou pas les droits
+    return sorted(set(vus))
+
+
 # ── Ce qui empêche d'agir ────────────────────────────────────────────────────────────────────
 
 def refus(conn: sqlite3.Connection, db_path: str) -> str | None:
@@ -193,18 +246,32 @@ def refus(conn: sqlite3.Connection, db_path: str) -> str | None:
     🚨 UNE SEULE DÉFINITION, consultée par le préflight ET par `phase1()` — comme `refus()`
        de `menage_fantomes.py`. Deux définitions divergeraient à la première correction.
     """
-    # ① Le symptôme doit être RÉEL. Reconstruire une base saine serait un geste gratuit et
-    #    risqué sur un boîtier de terrain.
-    try:
-        conn.execute("SELECT ts, pdl_index, papp, iinst, src_standard, index_id, "
-                     "index_value, inject_total, tariff, meter_ts FROM measurements "
-                     "WHERE sent = 0 ORDER BY rowid LIMIT 1").fetchone()
-        conn.execute("SELECT ts, pdl_index, papp, iinst, src_standard, index_id, "
-                     "index_value, inject_total, tariff, meter_ts FROM measurements "
-                     "ORDER BY rowid DESC LIMIT 1").fetchone()
-    except Exception as e:  # noqa: BLE001
-        if not est_corruption(e):
-            return f"erreur non structurelle en lisant la base ({e}) — on ne touche à rien"
+    # ① LE SYMPTÔME DOIT ÊTRE RÉEL — et il se juge sur CE QUE LIT LE PUBLISHER, pas sur une
+    #    ligne.
+    #
+    # 🚨 DÉFAUT TROUVÉ EN REVUE, et il rendait cette update INOPÉRANTE sur le boîtier même pour
+    #    lequel elle est faite. La première version lisait UNE ligne (`LIMIT 1`) ; or
+    #    `fetch_batch` en lit **mille**, étalées sur une dizaine de pages. Si la page détruite
+    #    n'est pas celle qui porte la plus vieille ligne non envoyée mais, disons, la 437ᵉ du
+    #    lot, alors la sonde passait, `refus()` disait « rien à reconstruire », et le boîtier
+    #    restait bloqué — exactement l'état qu'on vient passer une journée à diagnostiquer.
+    #
+    # ⚠️ Et ce cas est le PLUS PROBABLE : le dernier lot parti s'est arrêté juste avant la page
+    #    abîmée, donc la frontière `sent = 0` tombe quelque part AVANT elle, pas dessus.
+    #
+    # ⭐ On exécute donc la requête du publisher, à l'identique, `LIMIT` comprise. Mesuré sur un
+    #   Pi Zero : 131 ms pour 1 000 lignes — le prix d'une seule décision, et elle est juste.
+    #   On ITÈRE sans accumuler (`for _ in …`) : mêmes pages touchées, aucune mémoire retenue.
+    for sql in (f"SELECT {COLS_MEASUREMENTS} FROM measurements "
+                f"WHERE sent = 0 ORDER BY rowid LIMIT {N_LOT}",
+                f"SELECT {COLS_MEASUREMENTS} FROM measurements ORDER BY rowid DESC LIMIT 1"):
+        try:
+            for _ in conn.execute(sql):
+                pass
+        except Exception as e:  # noqa: BLE001
+            if not est_corruption(e):
+                return f"erreur non structurelle en lisant la base ({e}) — on ne touche à rien"
+            break
     else:
         return "la base se lit sans erreur — rien à reconstruire"
 
@@ -465,7 +532,20 @@ def corrige_rollup(conn: sqlite3.Connection, ts_perdus: list) -> dict:
     b1 = (haut // bucket) * bucket
     n = conn.execute("DELETE FROM curve_rollup WHERE bucket_ts BETWEEN ? AND ?",
                      (b0, b1)).rowcount
+    # 🚨 LE WATERMARK NE DOIT JAMAIS DESCENDRE — défaut trouvé en revue.
+    #
+    #    `watermark` est la borne BASSE couverte : « le rollup est complet pour
+    #    [watermark, now] ». Le poser à `b1 + bucket` sans regarder la valeur courante le fait
+    #    DESCENDRE quand le backfill n'était pas encore arrivé jusqu'au trou. On déclarerait
+    #    alors couvert un intervalle [nouveau, courant) qui n'a JAMAIS été rempli — et `/curve`
+    #    rendrait des données VIDES sur cette fenêtre, en croyant lire un rollup complet.
+    #
+    # ⭐ Un watermark PLUS HAUT revendique MOINS de couverture : c'est le sens sûr. On prend
+    #   donc le maximum, et le backfill redescendra de lui-même.
+    courant = conn.execute("SELECT watermark FROM rollup_state WHERE id = 0").fetchone()
     nouveau = b1 + bucket
+    if courant and courant[0] is not None:
+        nouveau = max(int(courant[0]), nouveau)
     conn.execute("INSERT INTO rollup_state (id, watermark, done) VALUES (0, ?, 0) "
                  "ON CONFLICT(id) DO UPDATE SET watermark = ?, done = 0",
                  (nouveau, nouveau))
@@ -497,12 +577,6 @@ def _ouvre_lecture(chemin: str) -> sqlite3.Connection:
     return sqlite3.connect(f"file:{chemin}?mode=ro", uri=True)
 
 
-# Marge ajoutée quand la borne haute vient d'un index et non de la table. Lire une plage de
-# `rowid` qui n'existe pas ne coûte rien et ne rend rien — surestimer est donc SANS DANGER,
-# alors que sous-estimer PERDRAIT les lignes au-delà, en silence.
-MARGE_BORNE = 1.10
-
-
 def _max_rowid(conn: sqlite3.Connection, table: str) -> int:
     """La borne haute des `rowid`, même si la table est abîmée À SON EXTRÉMITÉ.
 
@@ -519,8 +593,16 @@ def _max_rowid(conn: sqlite3.Connection, table: str) -> int:
       `(sent)` contient implicitement le `rowid` en dernière colonne, donc la dernière entrée
       de chaque valeur de `sent` donne un `rowid` sans jamais toucher la table.
 
-    ⚠️ Et on MAJORE le résultat : une plage de `rowid` inexistante se lit sans rien rendre,
-       donc surestimer est gratuit — tandis que sous-estimer perdrait des lignes EN SILENCE.
+    ⭐ ET LA BORNE EST EXACTE, pas majorée. `sent` est déclaré `INTEGER NOT NULL DEFAULT 0` :
+      toute ligne porte donc 0 ou 1, et le maximum des deux est le vrai maximum.
+
+    🚨 UNE MAJORATION SERAIT NUISIBLE, contrairement à ce que j'avais écrit — défaut trouvé en
+       revue. Je supposais que lire une plage de `rowid` inexistante « ne coûte rien et ne rend
+       rien ». FAUX : la recherche descend l'arbre vers la droite et retombe sur la MÊME feuille
+       détruite, donc chaque sonde LÈVE. Avec 10 % de marge sur 4,3 M lignes, c'était ~430 000
+       lignes fantômes à sonder une par une par dichotomie — des centaines de milliers de
+       requêtes, et surtout **430 000 lignes comptées comme PERDUES** alors qu'elles n'ont
+       jamais existé. Le rapport aurait été faux d'un ordre de grandeur.
     """
     try:
         r = conn.execute(f"SELECT max(rowid) FROM {table}").fetchone()
@@ -537,7 +619,7 @@ def _max_rowid(conn: sqlite3.Connection, table: str) -> int:
             continue
         if r and r[0]:
             borne = max(borne, int(r[0]))
-    return int(borne * MARGE_BORNE) if borne else 0
+    return borne
 
 
 GROSSES = ("measurements", "lora_link")
@@ -654,6 +736,20 @@ def _ecris_rapport(res: dict) -> None:
                       "plages": v["perdues"][:5]}
     if res.get("refus"):
         compact["refus"] = str(res["refus"])[:200]
+
+    # 🚨 LE COMPTEUR DE TENTATIVES DOIT SURVIVRE — défaut trouvé en revue, et il annulait le
+    #    frein. `update.sh` écrit `tentatives` dans CE fichier avant de travailler ; en le
+    #    réécrivant de zéro, on remettait le compteur à 0. Un boîtier qui redémarre après chaque
+    #    reconstruction (chien de garde, brownout) aurait donc rejoué l'opération INDÉFINIMENT,
+    #    toutes les 10 minutes, en arrêtant ses services à chaque passage.
+    try:
+        with open(RAPPORT, encoding="utf-8") as f:
+            ancien = json.load(f)
+        if isinstance(ancien, dict) and "tentatives" in ancien:
+            compact["tentatives"] = ancien["tentatives"]
+    except (OSError, ValueError):
+        pass
+
     try:
         with open(RAPPORT, "w", encoding="utf-8") as f:
             json.dump(compact, f, ensure_ascii=False)
@@ -666,8 +762,10 @@ def main(argv: list) -> int:
     défaut de CODE — rend autre chose. Règle posée en 0.9.21 : une update qui échoue laisse
     `device.json` non bumpé, donc elle REJOUE toutes les 10 min, services arrêtés comprises.
     """
-    if not 2 <= len(argv) <= 3 or argv[1] not in ("--rebuild", "--refus", "--services"):
-        print("usage: db_rebuild.py --rebuild|--refus|--services [chemin]", file=sys.stderr)
+    if not 2 <= len(argv) <= 3 or argv[1] not in ("--rebuild", "--refus", "--services",
+                                                  "--ouvreurs"):
+        print("usage: db_rebuild.py --rebuild|--refus|--services|--ouvreurs [chemin]",
+              file=sys.stderr)
         return 2
     # ⚠️ Le chemin optionnel est une AFFORDANCE D'ESSAI, et elle a une raison précise : la
     #    séquence « arrêt des services → reconstruction → bascule → redémarrage → hello » est
@@ -682,6 +780,16 @@ def main(argv: list) -> int:
         # Une unité par ligne, dans l'ORDRE D'ARRÊT. `update.sh` les relance en ordre inverse.
         for u in services_a_arreter(caps.load_device()):
             print(u)
+        return 0
+    if argv[1] == "--ouvreurs":
+        # Un PID par ligne. AUCUNE ligne = personne ne tient le fichier. La ligne littérale
+        # `indetermine` = on n'a pas pu regarder, et l'appelant NE DOIT PAS conclure.
+        vus = ouvreurs(chemin)
+        if vus is None:
+            print("indetermine")
+            return 0
+        for pid in vus:
+            print(pid)
         return 0
     if argv[1] == "--refus":
         # Sonde SANS EFFET, pour que `update.sh` puisse décider avant d'arrêter quoi que ce

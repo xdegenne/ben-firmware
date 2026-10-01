@@ -413,16 +413,28 @@ def store(conn: sqlite3.Connection, db_path: str = DB_PATH) -> dict:
     # ⚠️ ÉMIS MÊME QUAND TOUT VA BIEN (`{"old": "ok", "new": "ok"}`, ~30 o). Un champ qui
     #    n'apparaît qu'en cas de panne est un champ qu'on oublie, et dont l'absence devient
     #    indiscernable du succès — exactement le défaut qui a rendu `errors` mort-né.
+    # 🚨 `old` LIT LE LOT ENTIER, PAS UNE LIGNE — défaut trouvé en revue, et il rendait la
+    #    sonde borgne là où elle doit voir. `fetch_batch` lit MILLE lignes, étalées sur une
+    #    dizaine de pages : si la page détruite n'est pas celle de la plus vieille ligne non
+    #    envoyée mais la 437ᵉ du lot, une lecture d'UNE ligne passe et la sonde annonce « ok »
+    #    pendant que le publisher échoue à chaque tentative.
+    #
+    # ⚠️ Et c'est le cas LE PLUS PROBABLE : le dernier lot parti s'est arrêté juste avant la
+    #    page abîmée, donc la frontière `sent = 0` tombe AVANT elle, pas dessus.
+    #
+    # ⭐ On exécute donc la requête du publisher à l'identique, `LIMIT` comprise, et on ITÈRE
+    #   sans accumuler : mêmes pages touchées, aucune mémoire retenue. Mesuré 131 ms pour
+    #   1 000 lignes sur un Pi Zero — une fois par hello.
+    COLS = ("ts, pdl_index, base, hchc, hchp, papp, iinst, tariff, src_standard, "
+            "index_id, index_value, inject_total, meter_ts")
     lecture = {}
     for cle, sql in (
-            ("old", "SELECT ts, pdl_index, base, hchc, hchp, papp, iinst, tariff, "
-                    "src_standard, index_id, index_value, inject_total, meter_ts "
-                    "FROM measurements WHERE sent = 0 ORDER BY rowid LIMIT 1"),
-            ("new", "SELECT ts, pdl_index, base, hchc, hchp, papp, iinst, tariff, "
-                    "src_standard, index_id, index_value, inject_total, meter_ts "
-                    "FROM measurements ORDER BY rowid DESC LIMIT 1")):
+            ("old", f"SELECT {COLS} FROM measurements WHERE sent = 0 "
+                    f"ORDER BY rowid LIMIT {N_UNSENT}"),
+            ("new", f"SELECT {COLS} FROM measurements ORDER BY rowid DESC LIMIT 1")):
         try:
-            conn.execute(sql).fetchone()
+            for _ in conn.execute(sql):
+                pass
             lecture[cle] = "ok"
         except Exception as e:  # noqa: BLE001
             lecture[cle] = str(e)[:120]

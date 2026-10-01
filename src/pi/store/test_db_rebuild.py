@@ -186,6 +186,61 @@ def base_abimee_a_la_FIN(n: int = 30000, repertoire: str = None) -> str:
         "`max(rowid)` : ce cas ne prouverait rien")
 
 
+def base_abimee_DANS_le_lot(n: int = 30000, repertoire: str = None,
+                            decalage: int = 300) -> tuple:
+    """Le dommage est dans le LOT du publisher, mais PAS sur sa première ligne.
+
+    🚨 LE CAS QUI A ÉCHAPPÉ AU PREMIER BANC, trouvé en revue — et il rendait l'update
+       INOPÉRANTE sur le boîtier même pour lequel elle est faite. `fetch_batch` lit MILLE
+       lignes ; si la page détruite porte la 300ᵉ et non la 1ʳᵉ, une sonde qui ne lit qu'UNE
+       ligne passe, `refus()` annonce « rien à reconstruire », et le boîtier reste bloqué.
+
+    ⚠️ Et c'est le cas LE PLUS PROBABLE sur le terrain : le dernier lot parti s'est arrêté
+       juste AVANT la page abîmée, donc la frontière `sent = 0` tombe avant elle, pas dessus.
+
+    Montage : on marque `sent = 1`, on insère `decalage` lignes non envoyées, on relève
+    `page_count`, puis on insère le reste — et on brouille autour de ce relevé.
+    Renvoie `(chemin, rowid_frontiere)`.
+    """
+    d = repertoire or tempfile.mkdtemp()
+    chemin = os.path.join(d, "measurements.db")
+    envoyees = n * 2 // 3
+    c = db.connect(chemin)
+    c.execute("INSERT INTO pdl VALUES(0,'000000000001',1790000000,1790099999)")
+    c.executemany("INSERT INTO measurements(ts,pdl_index,papp,sent) VALUES(?,0,?,1)",
+                  [(1790000000 + i, 100 + (i % 500)) for i in range(envoyees)])
+    c.commit()
+    c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    c.executemany("INSERT INTO measurements(ts,pdl_index,papp,sent) VALUES(?,0,?,0)",
+                  [(1790000000 + envoyees + i, 100 + (i % 500)) for i in range(decalage)])
+    c.commit()
+    c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    repere = c.execute("PRAGMA page_count").fetchone()[0]
+    c.executemany("INSERT INTO measurements(ts,pdl_index,papp,sent) VALUES(?,0,?,0)",
+                  [(1790000000 + envoyees + decalage + i, 100 + (i % 500))
+                   for i in range(n - envoyees - decalage)])
+    c.commit()
+    c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    c.close()
+
+    intact = chemin + ".intact"
+    shutil.copy(chemin, intact)
+    for debut, larg in ((repere - 2, 6), (repere - 5, 12), (repere - 10, 30)):
+        shutil.copy(intact, chemin)
+        brouille(chemin, max(2, debut), larg)
+        # ⚖️ LA PRÉMISSE : la PREMIÈRE ligne du lot doit se lire, et le LOT doit lever.
+        une = not _leve(chemin, f"SELECT {COLS} FROM measurements WHERE sent = 0 "
+                                "ORDER BY rowid LIMIT 1")
+        lot = _leve(chemin, f"SELECT {COLS} FROM measurements WHERE sent = 0 "
+                            f"ORDER BY rowid LIMIT {rb.N_LOT}")
+        if une and lot:
+            os.unlink(intact)
+            return chemin, envoyees + 1
+    raise AssertionError(
+        "impossible de placer le dommage DANS le lot sans toucher sa première ligne : "
+        "ce cas ne prouverait rien")
+
+
 # ── Les fonctions pures ─────────────────────────────────────────────────────────────────────
 
 @cas
@@ -553,6 +608,152 @@ def un_dommage_EN_FIN_de_table_est_quand_meme_reconstruit():
     finally:
         c.close()
     shutil.rmtree(d, ignore_errors=True)
+
+
+@cas
+def refus_LIT_LE_LOT_ENTIER_pas_une_ligne():
+    """🚨 LE DÉFAUT LE PLUS GRAVE TROUVÉ EN REVUE : l'update aurait été INOPÉRANTE sur le
+    boîtier même pour lequel elle est faite.
+
+    `fetch_batch` lit mille lignes. Une sonde qui n'en lit qu'une passe dès que la page
+    détruite n'est pas la première du lot — et c'est le cas le plus probable.
+
+    ⚖️ Le témoin est DANS le cas : on vérifie que la lecture d'UNE ligne réussit. Sans ça, on
+       ne saurait pas si `refus()` accepte pour la bonne raison."""
+    d = tempfile.mkdtemp()
+    chemin, _ = base_abimee_DANS_le_lot(30000, d)
+    # Le témoin : une seule ligne se lit sans erreur.
+    assert not _leve(chemin, f"SELECT {COLS} FROM measurements WHERE sent = 0 "
+                             "ORDER BY rowid LIMIT 1"), \
+        "la première ligne du lot lève : le montage ne prouve pas ce qu'on veut"
+    c = sqlite3.connect(f"file:{chemin}?mode=ro", uri=True)
+    pourquoi = rb.refus(c, chemin)
+    c.close()
+    assert pourquoi is None, (
+        f"refus() a laissé passer une base abîmée : {pourquoi!r} — le boîtier resterait bloqué")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@cas
+def la_borne_haute_est_EXACTE_et_non_majoree():
+    """🚨 J'avais majoré de 10 %, en supposant que lire une plage de `rowid` inexistante « ne
+    coûte rien et ne rend rien ». FAUX, et trouvé en revue : la recherche descend vers la
+    droite et retombe sur la MÊME feuille détruite, donc chaque sonde LÈVE. Sur 4,3 M lignes
+    c'était ~430 000 lignes fantômes sondées une par une, et surtout **comptées comme
+    PERDUES** — un rapport faux d'un ordre de grandeur.
+
+    ⭐ Et la majoration était inutile : `sent` est `INTEGER NOT NULL DEFAULT 0`, donc toute
+      ligne porte 0 ou 1 et le maximum des deux index EST le vrai maximum."""
+    d = tempfile.mkdtemp()
+    chemin = base_abimee_a_la_FIN(20000, d)
+    c = sqlite3.connect(f"file:{chemin}?mode=ro", uri=True)
+    try:
+        borne = rb._max_rowid(c, "measurements")
+    finally:
+        c.close()
+    assert borne == 20000, (
+        f"borne = {borne}, attendu exactement 20000 — une majoration ferait sonder des lignes "
+        "inexistantes sur la feuille détruite, et les compterait comme perdues")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@cas
+def un_dommage_EN_FIN_ne_GONFLE_pas_le_nombre_de_perdues():
+    """⭐ L'effet du cas précédent, mesuré là où il compte : le rapport doit dire la vérité."""
+    d = tempfile.mkdtemp()
+    chemin = base_abimee_a_la_FIN(20000, d)
+    rb.RAPPORT = os.path.join(d, "rapport.json")
+    res = rb.rebuild(chemin)
+    assert res.get("ok"), res.get("refus")
+    m = res["detail"]["measurements"]
+    assert m["copiees"] + m["lignes_perdues"] == 20000, (
+        f"{m['copiees']} copiées + {m['lignes_perdues']} perdues != 20000 : le compte est "
+        "faux, donc le rapport ment")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@cas
+def les_OUVREURS_du_fichier_sont_vus():
+    """🚨 ON VÉRIFIE L'EFFET, PAS LA DÉCISION — défaut trouvé en revue, et c'était une perte de
+    données SILENCIEUSE. `update.sh` n'arrêtait que les unités `is-active` ; une unité en cours
+    de REDÉMARRAGE ne l'est pas, donc elle était ignorée, revenait, gardait la base ouverte, et
+    après le `os.replace` ses écritures partaient dans le fichier devenu `.corrupt-*`.
+
+    ⇒ L'invariant réel n'est pas « j'ai demandé l'arrêt » mais « personne ne tient le
+      fichier », et il se lit dans /proc/<pid>/fd."""
+    d = tempfile.mkdtemp()
+    chemin, _ = base(2000, d)
+
+    # 🚨 `None` ≠ `[]`, ET LA DIFFÉRENCE EST TOUT. Une liste vide dit « j'ai regardé, personne
+    #    ne tient le fichier » ; `None` dit « JE N'AI PAS PU REGARDER ». Les confondre
+    #    autoriserait une bascule sous un écrivain partout où `/proc` est absent — et ce banc
+    #    tourne justement sur un Mac, qui n'en a pas. C'est ce qui a révélé le défaut.
+    if not os.path.isdir("/proc"):
+        c = sqlite3.connect(chemin)
+        try:
+            assert rb.ouvreurs(chemin) is None, (
+                "sans /proc, la sonde rend une liste au lieu de `None` : `update.sh` "
+                "concluerait « voie libre » alors qu'elle n'a rien pu voir")
+        finally:
+            c.close()
+        shutil.rmtree(d, ignore_errors=True)
+        return
+
+    c = sqlite3.connect(chemin)            # NOUS tenons le fichier ouvert
+    try:
+        vus = rb.ouvreurs(chemin)
+        assert vus is not None, "/proc existe mais la sonde rend `None`"
+        assert os.getpid() in vus, (
+            f"notre propre processus n'est pas vu comme ouvreur ({vus}) — le contrôle serait "
+            "aveugle et laisserait basculer sous un écrivain")
+    finally:
+        c.close()
+    # ⚖️ LE TÉMOIN : une fois fermé, plus personne. Sans lui, une fonction qui rendrait
+    #    toujours notre pid passerait le cas ci-dessus et bloquerait toute reconstruction.
+    assert os.getpid() not in (rb.ouvreurs(chemin) or []), \
+        "le fichier est encore vu comme ouvert après fermeture"
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@cas
+def le_compteur_de_TENTATIVES_survit_au_rapport():
+    """🚨 Défaut trouvé en revue : `_ecris_rapport` réécrivait le fichier de zéro, donc le
+    compteur que `update.sh` y avait posé AVANT de travailler repartait à 0. Un boîtier qui
+    redémarre après chaque reconstruction (chien de garde, brownout) aurait rejoué
+    l'opération indéfiniment, en arrêtant ses services à chaque passage."""
+    d = tempfile.mkdtemp()
+    chemin, _ = base_abimee(8000, d)
+    rb.RAPPORT = os.path.join(d, "rapport.json")
+    with open(rb.RAPPORT, "w", encoding="utf-8") as f:
+        f.write('{"tentatives": 2}')
+    res = rb.rebuild(chemin)
+    assert res.get("ok"), res.get("refus")
+    with open(rb.RAPPORT, encoding="utf-8") as f:
+        import json as _j
+        ecrit = _j.load(f)
+    assert ecrit.get("tentatives") == 2, (
+        f"`tentatives` vaut {ecrit.get('tentatives')!r} après le rapport — le frein est annulé")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@cas
+def le_watermark_du_rollup_ne_DESCEND_jamais():
+    """🚨 Défaut trouvé en revue. `watermark` est la borne BASSE couverte : « complet pour
+    [watermark, now] ». Le poser sous la valeur courante déclarerait couvert un intervalle
+    JAMAIS rempli — et `/curve` rendrait des données VIDES sur cette fenêtre en croyant lire
+    un rollup complet.
+
+    ⭐ Un watermark PLUS HAUT revendique MOINS de couverture : c'est le sens sûr."""
+    conn = db.connect(":memory:")
+    HAUT = 1790500000
+    conn.execute("INSERT INTO rollup_state VALUES(0, ?, 0)", (HAUT,))
+    conn.commit()
+    res = rb.corrige_rollup(conn, [1790000000, 1790000500])   # un trou BIEN plus ancien
+    assert res["watermark"] >= HAUT, (
+        f"le watermark est descendu à {res['watermark']} (était {HAUT}) : /curve rendrait du "
+        "vide sur l'intervalle jamais rempli")
+    vu = conn.execute("SELECT watermark, done FROM rollup_state WHERE id=0").fetchone()
+    assert vu[0] >= HAUT and vu[1] == 0, vu
 
 
 if __name__ == "__main__":

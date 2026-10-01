@@ -167,6 +167,38 @@ jours** sans que personne ne le sache — la donnée (`up`, `boot`) est dans l'i
 0.9.22. Et le seul à **60 jours** d'uptime ininterrompu est précisément celui dont la base est
 corrompue.
 
+#### 🔍 Six défauts trouvés en revue de PR, et corrigés
+
+1. 🚨 **`refus()` ne lisait qu'UNE ligne**, alors que `fetch_batch` en lit **mille** : si la
+   page détruite n'est pas la première du lot — **le cas le plus probable**, puisque le dernier
+   lot parti s'est arrêté juste avant elle — la sonde passait et l'update sortait sans réparer.
+   **Elle aurait été inopérante sur le boîtier même pour lequel elle est faite.** La sonde
+   `read.old` de `health.py` et le contrôle d'après-bascule avaient le même trou.
+2. **La borne haute était majorée de 10 %**, sur l'idée fausse que sonder des `rowid`
+   inexistants « ne coûte rien ». La recherche retombe sur la **même feuille détruite** : sur
+   4,3 M lignes, ~430 000 lignes fantômes sondées une par une **et comptées comme perdues**.
+   La majoration était en plus inutile — `sent` est `NOT NULL DEFAULT 0`, donc la borne par
+   index est **exacte**.
+3. 🚨 **On n'arrêtait que les unités `is-active`** : une unité en cours de redémarrage ne l'est
+   pas, donc elle revenait, gardait la base ouverte, et après le `os.replace` ses écritures
+   partaient dans le fichier devenu `.corrupt-*` — **perte silencieuse**. On arrête désormais
+   **toute** la liste, et on vérifie l'**effet** : plus personne ne tient le fichier
+   (`/proc/<pid>/fd`). ⭐ Et `None` ≠ `[]` : « je n'ai pas pu regarder » ne doit jamais valoir
+   « voie libre ».
+4. **Le frein de 3 tentatives était annulé** : `_ecris_rapport` réécrivait le fichier sans le
+   champ `tentatives`.
+5. **`echecs_base` ne repartait pas de zéro** après un lot réussi : la ligne « N fois de suite »
+   mentait, et un `database is locked` isolé finissait par déclencher un signalement.
+6. **Le watermark du rollup pouvait DESCENDRE**, déclarant couvert un intervalle jamais rempli
+   — `/curve` aurait rendu du **vide** en croyant lire un rollup complet.
+
+⭐ Et au passage, la portée réelle du frein a été établie **dans le code de l'agent** : le vrai
+frein est le **bump de version**. `update.sh` sort 0 ⇒ `softwareVersion` passe à `0.9.25` ⇒ plus
+aucune transition ne correspond. Le compteur ne couvre donc que le cas où `device.json` n'est
+**pas** bumpé, c'est-à-dire un script **tué**. ⓘ Et aucune concurrence à craindre pendant les
+~20 min : `check_update.py` prend un `flock` exclusif non bloquant et sort en 0 si une autre
+instance le tient — un flock sur **descripteur**, donc relâché par le noyau même sur SIGKILL.
+
 ⓘ Aucune migration, aucune table, aucune colonne.
 
 ### [0.9.24] — 2026-10-01

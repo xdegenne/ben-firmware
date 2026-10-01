@@ -389,6 +389,30 @@ def RIEN_A_ENVOYER_s_ecrit_dans_le_journal():
         f"la ligne ne porte pas le retard : {appel!r} — sans lui elle ne contredit rien")
 
 
+@cas
+def les_DEUX_compteurs_repartent_de_zero_apres_un_lot_reussi():
+    """🚨 Défaut trouvé en revue. `echecs` repartait de zéro, `echecs_base` NON — il comptait
+    donc tous les incidents depuis le démarrage et non les CONSÉCUTIFS. Deux conséquences :
+    la ligne « %d fois de suite » mentait, et une fois le seuil franchi un `database is
+    locked` isolé — qui est NORMAL, le lecteur écrit en continu — déclenchait un signalement.
+
+    ⭐ Un lot qui passe PROUVE que la base se lit : les deux compteurs doivent tomber.
+
+    ⚖️ Cas STRUCTUREL : les deux versions publient, rendent le même code et ne lèvent pas.
+       Seule une longue suite d'incidents espacés les distingue, et on ne peut pas la jouer
+       dans un banc."""
+    src = pathlib.Path(pub.__file__).read_text()
+    corps = src[src.index("    while not _stop:"):]
+    succes = corps[corps.index("if 200 <= status < 300:"):]
+    succes = succes[:succes.index("elif status == 403:")]
+    succes = "\n".join(l for l in succes.splitlines() if not l.lstrip().startswith("#"))
+    assert "echecs = 0" in succes, "le compteur SERVEUR ne repart pas de zéro"
+    assert "echecs_base = 0" in succes, (
+        "le compteur de la BASE LOCALE ne repart pas de zéro après un lot réussi : il "
+        "comptera tous les incidents depuis le démarrage, et un `database is locked` isolé "
+        "finira par déclencher un signalement")
+
+
 if __name__ == "__main__":
     ko = 0
     for fn in CAS:

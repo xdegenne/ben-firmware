@@ -118,8 +118,28 @@ CIBLE=${BEN_REBUILD_CIBLE:-ben-0012}
 # jetable, au lieu de n'avoir jamais déroulé le geste le plus risqué qu'on livre.
 BASE=${BEN_REBUILD_DB:-}
 
-# Au-delà, on ne fait plus que rapporter. Une opération de ~20 min retentée toutes les 10 min
-# sur un boîtier qui n'y arrive pas est une boucle, pas une réparation.
+# Au-delà, on ne fait plus que rapporter.
+#
+# 🚨 ET IL NE COUVRE QU'UN SEUL CAS, plus étroit que je ne le croyais — vérifié dans le code de
+#    l'agent. Le VRAI frein est le bump de version : `update.sh` sort 0 ⇒ `check_update.py`
+#    écrit `softwareVersion = 0.9.25` ⇒ au tick suivant plus aucune transition ne correspond et
+#    il journalise « Already up to date ». La transition est CONSOMMÉE.
+#
+#    ⇒ Ce compteur ne sert donc que quand `device.json` N'EST PAS bumpé, c'est-à-dire quand le
+#      script est TUÉ avant la fin. C'est exactement le cas que le filet couvre côté services,
+#      et celui-ci le couvre côté travail.
+#
+# ⚠️ COROLLAIRE À CONNAÎTRE : si la reconstruction est ABANDONNÉE en sortant 0 (validation
+#    refusée, ou quelqu'un tient encore la base), la version est bumpée quand même et il n'y a
+#    PAS de seconde chance — le boîtier reste abîmé jusqu'à un nouveau tag. C'est assumé :
+#    sortir non-zéro pour obtenir un rejeu rejouerait l'ARRÊT DES SERVICES toutes les 10
+#    minutes, ce qui est bien pire. Et on le voit, parce que le `refus` part dans
+#    `health.rebuild`.
+#
+# ⓘ Pas de concurrence à craindre pendant les ~20 min : `check_update.py` prend un `flock`
+#   exclusif non bloquant sur /var/lib/ben-firmware/update.lock et sort en 0 si une autre
+#   instance le tient. Et c'est un flock sur DESCRIPTEUR, donc relâché par le noyau même sur
+#   SIGKILL — pas de verrou fantôme.
 MAX_TENTATIVES=${BEN_REBUILD_MAX:-3}
 
 # ⚠️ LE FILET DOIT ÊTRE PLUS LONG QUE LE PIRE CAS DE LA RECONSTRUCTION. S'il se déclenchait
@@ -328,13 +348,22 @@ os.replace(tmp, '$RAPPORT')" || warn "compteur de tentatives non écrit"
 #    de ce modèle.
 # 🚨 Et on ne REDÉMARRE que ce qui tournait : relancer une unité délibérément arrêtée serait
 #    changer un état qu'on ne nous a pas demandé de changer.
-: > "$LISTE"
+#
+# 🚨 MAIS ON ARRÊTE TOUTE LA LISTE, PAS SEULEMENT LES ACTIFS — défaut trouvé en revue, et
+#    c'était une perte de données SILENCIEUSE. Une unité en cours de redémarrage n'est pas
+#    `is-active` : elle était donc ignorée, elle revenait, elle gardait la base ouverte, et
+#    après le `os.replace` ses écritures partaient dans le fichier devenu `.corrupt-*`. Arrêter
+#    une unité déjà arrêtée ne coûte rien ; ne pas l'arrêter coûte des mesures.
+python3 "$STORE/db_rebuild.py" --services > "$LISTE.tous"
+: > "$LISTE.start"
 while read -r u; do
     [ -n "$u" ] || continue
-    if systemctl is-active --quiet "$u"; then echo "$u" >> "$LISTE"; fi
-done < <(python3 "$STORE/db_rebuild.py" --services)
-tac "$LISTE" > "$LISTE.start"
-log "services concernés : $(tr '\n' ' ' < "$LISTE")"
+    if systemctl is-active --quiet "$u"; then echo "$u" >> "$LISTE.start.brut"; fi
+done < "$LISTE.tous"
+[ -f "$LISTE.start.brut" ] && tac "$LISTE.start.brut" > "$LISTE.start" && rm -f "$LISTE.start.brut"
+cp "$LISTE.tous" "$LISTE"
+log "à arrêter : $(tr '\n' ' ' < "$LISTE.tous")"
+log "à relever : $(tr '\n' ' ' < "$LISTE.start")"
 
 # ── Le filet, ARMÉ AVANT TOUT ARRÊT ──
 sudo systemctl stop "$FILET.timer" >/dev/null 2>&1 || true
@@ -346,15 +375,39 @@ else
 fi
 
 relever() {
-    xargs -r sudo systemctl start < "$LISTE.start" >/dev/null 2>&1 || true
+    [ -f "$LISTE.start" ] && xargs -r sudo systemctl start < "$LISTE.start" >/dev/null 2>&1
     sudo systemctl stop "$FILET.timer" >/dev/null 2>&1 || true
+    return 0
 }
 trap relever EXIT INT TERM
 
 # ── L'opération ──
 log "arrêt des services qui tiennent la base (ben-certd et wifi-watchdog restent debout)"
-xargs -r sudo systemctl stop < "$LISTE" || warn "un arrêt a échoué — on continue"
-python3 "$STORE/db_rebuild.py" --rebuild $BASE || warn "la reconstruction a rendu une erreur"
+xargs -r sudo systemctl stop < "$LISTE.tous" || warn "un arrêt a échoué"
+
+# 🚨 ON VÉRIFIE L'EFFET, PAS LA DÉCISION. « J'ai demandé l'arrêt » ne prouve rien : l'invariant
+#    réel est que PERSONNE ne tient plus le fichier. On le lit dans /proc/<pid>/fd, sous sudo
+#    (il faut les droits pour voir les descripteurs des autres utilisateurs).
+#
+# ⚠️ Et si quelqu'un le tient encore, ON NE RECONSTRUIT PAS : basculer sous un écrivain ferait
+#    partir ses mesures dans le fichier devenu `.corrupt-*`, en silence. Le `trap` relève les
+#    services, et l'update sort en 0 — la prochaine passe retentera.
+# ⚠️ `indetermine` = la sonde n'a pas pu regarder (/proc absent ou illisible). On traite ça
+#    comme un refus : un contrôle qui ne voit pas ne doit jamais dire « voie libre ».
+OUVREURS=$(sudo python3 "$STORE/db_rebuild.py" --ouvreurs $BASE 2>/dev/null | tr '\n' ' ')
+if [ "${OUVREURS// /}" = "indetermine" ]; then
+    warn "impossible de vérifier qui tient la base (/proc illisible) — RECONSTRUCTION ABANDONNÉE"
+    warn "(un contrôle qui ne voit pas ne doit pas conclure que la voie est libre)"
+elif [ -n "${OUVREURS// /}" ]; then
+    warn "la base est encore ouverte par le(s) pid $OUVREURS — RECONSTRUCTION ABANDONNÉE"
+    warn "(basculer sous un écrivain perdrait ses mesures en silence)"
+    for pid in $OUVREURS; do
+        warn "  pid $pid : $(ps -o unit=,comm= -p "$pid" 2>/dev/null | head -1)"
+    done
+else
+    log "✓ personne ne tient plus la base — on peut reconstruire"
+    python3 "$STORE/db_rebuild.py" --rebuild $BASE || warn "la reconstruction a rendu une erreur"
+fi
 
 trap - EXIT INT TERM
 relever

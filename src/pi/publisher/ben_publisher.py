@@ -612,6 +612,13 @@ def main() -> int:
                 if 200 <= status < 300:
                     mark_sent(conn, rowids)
                     echecs = 0
+                    # 🚨 LES DEUX COMPTEURS REPARTENT DE ZÉRO — défaut trouvé en revue.
+                    #    Sans cette ligne, `echecs_base` comptait TOUS les incidents depuis le
+                    #    démarrage et non les consécutifs : la ligne « %d fois de suite »
+                    #    mentait, et une fois le seuil franchi un `database is locked` isolé
+                    #    — qui est NORMAL, le lecteur écrit en continu — déclenchait un
+                    #    signalement. Un lot qui passe prouve que la base se lit.
+                    echecs_base = 0
                     # ⚠️ `inserted < envoyé` est NORMAL et permanent, ce n'est PAS un
                     # défaut : 8,2 % des points du boîtier partagent leur (pdl_index,
                     # ts) avec un voisin — mesuré sur ben-0001, 449 403 sur 5,46 M.
