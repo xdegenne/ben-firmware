@@ -367,8 +367,13 @@ os.replace(tmp, '$RAPPORT')" || warn "compteur de tentatives non écrit"
 log "phase 1 : recopie à chaud, aucun service arrêté (comptez ~50 min sur 300 Mo)"
 python3 "$STORE/db_rebuild.py" --phase1 $BASE || warn "la phase 1 a rendu une erreur"
 
-# 🚨 Si la phase 1 n'a rien laissé, on n'arrête RIEN. Inutile de couper le collecteur pour une
-#    phase 2 qui refusera faute d'état.
+# 🚨 SI LA PHASE 1 N'A RIEN LAISSÉ, ON N'ARRÊTE RIEN.
+#
+# ⭐ Et la présence du fichier est un signal FIABLE, parce que `phase1()` efface tout état
+#   précédent AVANT le moindre contrôle : il n'existe donc QUE si la phase 1 qui vient de
+#   tourner est allée au bout. C'était un défaut trouvé en revue — avant, un état laissé par un
+#   passage tué faisait arrêter les services alors que la phase 1 venait de refuser, et la
+#   phase 2 tournait sur des bornes qui ne correspondaient plus à rien.
 if [ ! -f "$VAR/db-rebuild.state.json" ]; then
     warn "la phase 1 n'a pas abouti — aucun service n'a été arrêté, rien n'a été basculé"
     log "✓ update OK"

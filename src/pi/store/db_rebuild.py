@@ -628,7 +628,7 @@ def _min_rowid(conn: sqlite3.Connection, table: str) -> int:
         return 0
 
 
-def _max_rowid(conn: sqlite3.Connection, table: str) -> int:
+def _max_rowid(conn: sqlite3.Connection, table: str) -> int | None:
     """La borne haute des `rowid`, même si la table est abîmée À SON EXTRÉMITÉ.
 
     🚨 DÉFAUT TROUVÉ EN RÉPÉTANT L'OPÉRATION SUR CIBLE, et aucun banc ne l'avait vu parce que
@@ -646,6 +646,17 @@ def _max_rowid(conn: sqlite3.Connection, table: str) -> int:
 
     ⭐ ET LA BORNE EST EXACTE, pas majorée. `sent` est déclaré `INTEGER NOT NULL DEFAULT 0` :
       toute ligne porte donc 0 ou 1, et le maximum des deux est le vrai maximum.
+
+    🚨 `None` = ON N'A PAS PU DÉTERMINER LA BORNE, et ce n'est PAS 0 — défaut trouvé en revue.
+       Le repli par index ne fonctionne que pour les tables qui ont une colonne `sent`, donc
+       `measurements` et `lora_link`. Pour `curve_rollup`, `pdl` ou `level_profile`, si la page
+       la plus à droite est abîmée, les deux requêtes de repli échouent. Rendre 0 faisait
+       recopier la table À VIDE, et le rapport l'annonçait comme « 0 lignes copiées, 0
+       perdues » — une perte TOTALE présentée comme un succès.
+       ⚠️ Et les conséquences sont graves et silencieuses : un `curve_rollup` vide avec un
+          `rollup_state` qui affirme couvrir ces dates fait rendre à `/curve` des fenêtres
+          VIDES — et cette page est réécrite toutes les 2 min, donc c'est le cas probable. Un
+          `pdl` vide serait pire : plus aucune mesure n'aurait de sens.
 
     🚨 UNE MAJORATION SERAIT NUISIBLE, contrairement à ce que j'avais écrit — défaut trouvé en
        revue. Je supposais que lire une plage de `rowid` inexistante « ne coûte rien et ne rend
@@ -670,7 +681,7 @@ def _max_rowid(conn: sqlite3.Connection, table: str) -> int:
             continue
         if r and r[0]:
             borne = max(borne, int(r[0]))
-    return borne
+    return borne or None
 
 
 # 🚨 PLUS DE DISTINCTION « GROSSES / PETITES », et c'est un défaut trouvé en revue.
@@ -707,6 +718,28 @@ def _ouvre_lecture_ro(chemin: str) -> sqlite3.Connection:
     return sqlite3.connect(f"file:{chemin}?mode=ro", uri=True)
 
 
+# Sans ces tables, la base neuve n'a aucun sens : `pdl` nomme les compteurs, et `measurements`
+# est la donnée. Si l'une est illisible, on ne bascule pas.
+INDISPENSABLES = ("pdl", "measurements")
+
+
+def _jette_la_neuve(neuve: str) -> None:
+    """Supprime la base reconstruite inutilisable.
+
+    🚨 ~300 Mo SUR LA CARTE SD D'UN BOÎTIER QU'ON NE PEUT PAS ATTEINDRE — et mon commentaire
+       précédent disait qu'on la gardait « pour qu'on puisse l'examiner ». C'est une fiction :
+       personne n'ira l'examiner, puisque personne ne peut s'y connecter. Et comme `update.sh`
+       sort en 0, la version est bumpée et aucun passage ultérieur ne viendra la nettoyer.
+       Le rapport dans `health.rebuild` dit déjà POURQUOI on a renoncé ; le fichier, lui, ne
+       sert qu'à remplir la carte.
+    """
+    for suffixe in ("", "-wal", "-shm"):
+        try:
+            os.unlink(neuve + suffixe)
+        except (FileNotFoundError, OSError):
+            pass
+
+
 def _fusionne(a: dict, b: dict) -> dict:
     """Additionne deux comptes rendus de `copie_par_tranches`."""
     return {"copiees": a["copiees"] + b["copiees"],
@@ -718,6 +751,34 @@ def _fusionne(a: dict, b: dict) -> dict:
 # ── Phase 1 : À CHAUD, rien d'arrêté ────────────────────────────────────────────────────────
 
 def phase1(db_path: str = db.DB_PATH) -> dict:
+    """Recopie les tables append-only, LE COLLECTEUR EN MARCHE. NE LÈVE JAMAIS."""
+    return _filet(_phase1, db_path)
+
+
+def phase2(db_path: str = db.DB_PATH) -> dict:
+    """Le delta, les tables mutables, la validation, la bascule. NE LÈVE JAMAIS."""
+    return _filet(_phase2, db_path)
+
+
+def _filet(fn, db_path: str) -> dict:
+    """🚨 AUCUNE EXCEPTION NE DOIT SORTIR D'UNE PHASE — défaut trouvé en revue.
+
+    Seul `rebuild()` portait ce filet, et la production ne l'appelle plus : `update.sh` appelle
+    les deux phases SÉPARÉMENT. Une exception imprévue (le `RuntimeError` au-delà de 200 zones
+    abîmées, un `OSError` dans `bascule()`) produisait donc une traceback et AUCUN RAPPORT —
+    or `update.sh` sort en 0, la version est bumpée, et on perdait le seul moyen de savoir à
+    distance pourquoi le boîtier reste cassé.
+    """
+    try:
+        return fn(db_path)
+    except Exception as e:  # noqa: BLE001
+        res = {"ok": False, "refus": f"erreur inattendue ({type(e).__name__}: {e})"}
+        _ecris_rapport(res)
+        _jette_la_neuve(db_path + ".rebuild")
+        return res
+
+
+def _phase1(db_path: str) -> dict:
     """Recopie les tables append-only, LE COLLECTEUR EN MARCHE.
 
     🚨 NE TOUCHE NI À L'ORIGINAL, NI À AUCUN SERVICE, NI À LA BASCULE. Elle dure ~50 min sur
@@ -735,6 +796,24 @@ def phase1(db_path: str = db.DB_PATH) -> dict:
     """
     t0 = time.monotonic()
     neuve = db_path + ".rebuild"
+
+    # 🚨 ON EFFACE L'ÉTAT PRÉCÉDENT EN PREMIER, AVANT LE MOINDRE CONTRÔLE — défaut trouvé en
+    #    revue, et la première correction était au mauvais endroit : placée après le contrôle
+    #    de symptôme, elle laissait l'état survivre à un REFUS. Le banc l'a attrapée.
+    #
+    #    `update.sh` décide d'arrêter les services sur la seule PRÉSENCE de
+    #    `db-rebuild.state.json`. Scénario : passage 1 tué en phase 2 ; au passage 2 la phase 1
+    #    refuse (base saine, disque plein) — et les services seraient arrêtés quand même, puis
+    #    la phase 2 tournerait sur des bornes qui ne correspondent plus à rien.
+    #
+    # ⇒ L'état n'existe QUE si la phase 1 en cours est allée au bout. C'est l'invariant, et il
+    #   ne tient que si l'effacement précède TOUT chemin de sortie.
+    for chemin in (ETAT, ETAT + ".tmp"):
+        try:
+            os.unlink(chemin)
+        except FileNotFoundError:
+            pass
+
     src = _ouvre_lecture_ro(db_path)
     pourquoi = refus(src, db_path)
     if pourquoi:
@@ -743,20 +822,28 @@ def phase1(db_path: str = db.DB_PATH) -> dict:
         _ecris_rapport(res)
         return res
 
-    # On repart toujours de zéro : un fichier laissé par une tentative tuée contiendrait un
-    # état dont on ne sait rien.
-    for suffixe in ("", "-wal", "-shm"):
-        try:
-            os.unlink(neuve + suffixe)
-        except FileNotFoundError:
-            pass
+    # La base neuve d'une tentative précédente : un fichier dont on ne sait rien.
+    _jette_la_neuve(neuve)
 
     dst = db.connect(neuve)          # rejoue le schéma et les migrations : structure saine
     presentes = tables(src)
     bornes, detail = {}, {}
     for t in [x for x in APPEND_ONLY if x in presentes]:
-        bornes[t] = _max_rowid(src, t)
-        detail[t] = copie_par_tranches(src, dst, t, bornes[t])
+        hi = _max_rowid(src, t)
+        if hi is None:
+            # 🚨 Borne haute indéterminable : on ne sait pas jusqu'où copier, donc on
+            #    n'invente pas. Recopier « jusqu'à 0 » rendrait une table VIDE en annonçant
+            #    zéro perte.
+            dst.close()
+            src.close()
+            res = {"ok": False,
+                   "refus": f"borne haute de `{t}` indéterminable (page la plus à droite "
+                            "abîmée, et aucun index ne permet de la retrouver)"}
+            _ecris_rapport(res)
+            _jette_la_neuve(neuve)
+            return res
+        bornes[t] = hi
+        detail[t] = copie_par_tranches(src, dst, t, hi)
     dst.close()
     src.close()
 
@@ -771,7 +858,7 @@ def phase1(db_path: str = db.DB_PATH) -> dict:
 
 # ── Phase 2 : écrivains arrêtés, et c'est COURT ──────────────────────────────────────────────
 
-def phase2(db_path: str = db.DB_PATH) -> dict:
+def _phase2(db_path: str) -> dict:
     """Le delta, les tables mutables, la validation, la bascule. Écrivains ARRÊTÉS.
 
     ⭐ ~50 s : le delta d'une heure de mesures fait ~2 200 lignes (2 s), `curve_rollup` ~60 000
@@ -812,23 +899,61 @@ def phase2(db_path: str = db.DB_PATH) -> dict:
 
     # ② Les tables MODIFIÉES SUR PLACE, recopiées maintenant et pas avant — une mise à jour
     #    survenue pendant la phase 1 ne se verrait pas dans un delta par `rowid`.
-    petites = {}
+    petites, illisibles = {}, []
     for t in [x for x in presentes if x not in APPEND_ONLY]:
-        d = copie_par_tranches(src, dst, t, _max_rowid(src, t))
+        hi = _max_rowid(src, t)
+        if hi is None:
+            # 🚨 « Je ne sais pas » n'est PAS « la table est vide ». On le DIT, au lieu de
+            #    recopier zéro ligne et d'annoncer zéro perte.
+            petites[t] = "ILLISIBLE : borne haute indéterminable"
+            illisibles.append(t)
+            continue
+        d = copie_par_tranches(src, dst, t, hi)
         petites[t] = d["copiees"] if not d["lignes_perdues"] else \
             f"{d['copiees']} copiées, {d['lignes_perdues']} perdues"
+
+    # 🚨 ET SI UNE TABLE INDISPENSABLE EST ILLISIBLE, ON NE BASCULE PAS. Un `pdl` vide fait
+    #    perdre le sens de toutes les mesures ; un `curve_rollup` vide, combiné à un
+    #    `rollup_state` qui affirme couvrir ces dates, fait rendre à `/curve` des fenêtres
+    #    VIDES. Mieux vaut une base abîmée qu'on sait abîmée qu'une base saine qui ment.
+    manquantes = [t for t in illisibles if t in INDISPENSABLES]
+    if manquantes:
+        dst.close()
+        src.close()
+        res = {"ok": False, "detail": detail, "petites": petites,
+               "refus": f"table(s) indispensable(s) illisible(s) : {', '.join(manquantes)} "
+                        "— bascule abandonnée"}
+        _ecris_rapport(res)
+        _jette_la_neuve(neuve)
+        return res
 
     rollup = corrige_rollup(dst, detail.get("measurements", {}).get("ts_perdus", []))
     attendu = {t: detail[t]["copiees"] for t in detail}
     dst.close()
     src.close()
 
-    # 🚨 ON RE-VÉRIFIE QUI TIENT LA BASE JUSTE AVANT DE BASCULER. `update.sh` l'a contrôlé
-    #    avant la phase 2, mais ce contrôle-ci ne dépend d'AUCUNE liste de services — c'est la
-    #    réponse à la classe de défaut qu'était `ben-level-profiler.timer`, absent de toutes
-    #    mes listes parce qu'il n'est pas une capability.
+    mauvais = valide(neuve, attendu)
+    if mauvais:
+        # 🚨 ON NE BASCULE PAS. L'original est intact. L'update réussit quand même : aucun état
+        #    de la donnée ne doit la faire échouer.
+        res = {"ok": False, "refus": f"validation refusée — {mauvais}", "detail": detail}
+        _ecris_rapport(res)
+        _jette_la_neuve(neuve)
+        return res
+
+    # 🚨 LE CONTRÔLE DES OUVREURS VIENT ICI, JUSTE AVANT LA BASCULE — défaut trouvé en revue.
     #
-    # ⚠️ `None` = on n'a pas pu regarder ⇒ on ne bascule pas.
+    #    Il était AVANT `valide()`, qui lance un `integrity_check` complet sur la base neuve.
+    #    Si la phase 2 dépasse le délai du filet, celui-ci relance les services PENDANT la
+    #    validation : `ben-telemetry` se remet à écrire dans l'original, la bascule passe quand
+    #    même, et ses mesures partent dans le `.corrupt-*` sans que rien ne le dise.
+    #
+    # ⭐ Un contrôle d'état n'est valable qu'à l'instant où on s'en sert. Celui-ci doit donc
+    #   coller à la bascule, pas la précéder de plusieurs minutes.
+    #
+    # ⚠️ Et ce contrôle ne dépend d'AUCUNE liste de services : c'est la réponse à la classe de
+    #    défaut qu'était `ben-level-profiler.timer`, absent de toutes mes listes parce qu'il
+    #    n'est pas une capability. `None` = on n'a pas pu regarder ⇒ on ne bascule pas.
     tiennent = ouvreurs(db_path)
     if tiennent is None:
         res = {"ok": False, "detail": detail,
@@ -839,15 +964,6 @@ def phase2(db_path: str = db.DB_PATH) -> dict:
         res = {"ok": False, "detail": detail,
                "refus": f"la base a été réouverte pendant la reconstruction (pid {tiennent}) "
                         "— bascule abandonnée pour ne pas perdre ses écritures"}
-        _ecris_rapport(res)
-        return res
-
-    mauvais = valide(neuve, attendu)
-    if mauvais:
-        # 🚨 ON NE BASCULE PAS, ET ON NE SUPPRIME RIEN. L'original est intact, la base neuve
-        #    reste sur le disque pour examen. L'update réussit quand même : aucun état de la
-        #    donnée ne doit la faire échouer.
-        res = {"ok": False, "refus": f"validation refusée — {mauvais}", "detail": detail}
         _ecris_rapport(res)
         return res
 
@@ -877,15 +993,10 @@ def rebuild(db_path: str = db.DB_PATH) -> dict:
     ⚠️ En production, `update.sh` appelle les DEUX PHASES SÉPARÉMENT et n'arrête les services
        qu'entre elles. Enchaîner ici garderait le collecteur arrêté pendant ~50 min.
     """
-    try:
-        un = phase1(db_path)
-        if not un.get("ok"):
-            return un
-        return phase2(db_path)
-    except Exception as e:  # noqa: BLE001
-        res = {"ok": False, "refus": f"erreur inattendue ({type(e).__name__}: {e})"}
-        _ecris_rapport(res)
-        return res
+    un = phase1(db_path)
+    if not un.get("ok"):
+        return un
+    return phase2(db_path)
 
 
 def _ecris_rapport(res: dict) -> None:

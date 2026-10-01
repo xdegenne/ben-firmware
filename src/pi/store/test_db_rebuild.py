@@ -881,7 +881,10 @@ def TOUTES_les_tables_passent_par_la_copie_par_tranches():
     assert "def copie_table(" not in src, (
         "`copie_table()` est encore là : du code mort dans un module critique, et quelqu'un "
         "finira par s'en resservir")
-    for fn in ("def phase1(", "def phase2("):
+    # ⚠️ `_phase1` / `_phase2` : les noms publics ne sont plus que des enveloppes, depuis que
+    #    chaque phase porte le filet qui empêche toute exception de sortir (défaut trouvé en
+    #    revue : seul `rebuild()` l'avait, et la production ne l'appelle plus).
+    for fn in ("def _phase1(", "def _phase2("):
         corps = src[src.index(fn):]
         corps = corps[:corps.index("\ndef ")]
         corps = "\n".join(l for l in corps.splitlines() if not l.lstrip().startswith("#"))
@@ -1014,6 +1017,158 @@ def phase2_SANS_phase1_refuse():
         _restaure(sauv)
     assert res.get("ok") is False and "phase 1" in res.get("refus", ""), res
     shutil.rmtree(d, ignore_errors=True)
+
+
+class _ConnAbimee:
+    """Une connexion dont `max(rowid)` lève sur une table donnée. Outil de banc.
+
+    ⭐ Pourquoi un bouchon et pas une vraie corruption : le défaut concerne les tables SANS
+      colonne `sent` (`curve_rollup`, `pdl`, `level_profile`), et placer précisément le
+      dommage sur la page la plus à droite d'une petite table dépend d'une disposition de
+      pages qu'on ne contrôle pas sans `dbstat`. Ce qu'on éprouve ici est le REPLI, et il
+      s'éprouve exactement.
+    """
+
+    def __init__(self, table):
+        self.table = table
+
+    def execute(self, sql, *a):
+        if f"FROM {self.table}" in sql and "max(rowid)" in sql:
+            if "sent" in sql:
+                raise sqlite3.OperationalError("no such column: sent")
+            raise sqlite3.DatabaseError("database disk image is malformed")
+        raise AssertionError(f"requête inattendue : {sql}")
+
+
+@cas
+def une_borne_INDETERMINABLE_rend_None_et_pas_zero():
+    """🚨 « JE NE SAIS PAS » N'EST PAS « LA TABLE EST VIDE » — défaut trouvé en revue.
+
+    Le repli par index ne marche que pour les tables qui ont une colonne `sent`, donc
+    `measurements` et `lora_link`. Pour `curve_rollup`, `pdl` ou `level_profile`, si la page la
+    plus à droite est abîmée, les deux requêtes de repli échouent sur `no such column: sent`.
+
+    Rendre 0 faisait recopier la table À VIDE, et le rapport l'annonçait « 0 copiées, 0
+    perdues » — une perte TOTALE présentée comme un succès. ⚠️ Et un `curve_rollup` vide avec
+    un `rollup_state` qui affirme couvrir ces dates fait rendre à `/curve` des fenêtres VIDES ;
+    cette page est réécrite toutes les 2 min, donc c'est le cas probable."""
+    assert rb._max_rowid(_ConnAbimee("curve_rollup"), "curve_rollup") is None, (
+        "la borne rend 0 au lieu de None : la table serait recopiée à vide, et le rapport "
+        "annoncerait zéro perte")
+    # ⚖️ LE TÉMOIN : sur une table SAINE, la borne est bien un entier.
+    conn = db.connect(":memory:")
+    conn.execute("INSERT INTO pdl VALUES(0,'000000000001',1,2)")
+    conn.commit()
+    assert rb._max_rowid(conn, "pdl") == 0, "la borne d'une table saine doit être un entier"
+
+
+@cas
+def une_table_INDISPENSABLE_illisible_fait_REFUSER_la_bascule():
+    """🚨 Mieux vaut une base abîmée qu'on SAIT abîmée qu'une base saine qui MENT. Sans `pdl`,
+    aucune mesure n'a de sens ; et un `curve_rollup` vide ferait rendre du vide à `/curve`."""
+    d = tempfile.mkdtemp()
+    chemin, _ = base_abimee(8000, d)
+    sauv = _detourne(chemin)
+    vrai_max = rb._max_rowid
+    try:
+        assert rb.phase1(chemin).get("ok")
+        rb._max_rowid = lambda c, t: None if t == "pdl" else vrai_max(c, t)
+        res = rb.phase2(chemin)
+    finally:
+        rb._max_rowid = vrai_max
+        _restaure(sauv)
+    assert res.get("ok") is False, "la bascule a eu lieu avec un `pdl` illisible"
+    assert "pdl" in res.get("refus", ""), res
+    assert not [f for f in os.listdir(d) if ".corrupt-" in f], "une bascule a eu lieu"
+    # ⭐ Et les ~300 Mo de base neuve inutilisable sont libérés : sur un boîtier injoignable,
+    #   « on la garde pour l'examiner » est une fiction.
+    assert not os.path.exists(chemin + ".rebuild"), \
+        "la base neuve inutilisable reste sur la carte SD"
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@cas
+def le_controle_des_OUVREURS_vient_APRES_la_validation():
+    """🚨 UN CONTRÔLE D'ÉTAT N'EST VALABLE QU'À L'INSTANT OÙ ON S'EN SERT — défaut trouvé en
+    revue.
+
+    Il était AVANT `valide()`, qui lance un `integrity_check` complet sur la base neuve. Si la
+    phase 2 dépasse le délai du filet `systemd-run`, celui-ci relance les services PENDANT la
+    validation : `ben-telemetry` se remet à écrire dans l'original, la bascule passe quand
+    même, et ses mesures partent dans le `.corrupt-*` sans que rien ne le dise.
+
+    ⚖️ Cas STRUCTUREL : les deux ordres donnent le même résultat quand rien ne se passe entre
+       les deux. Seule une relance au mauvais moment les distingue, et on ne peut pas la
+       provoquer ici."""
+    src = pathlib.Path(rb.__file__).read_text()
+    corps = src[src.index("def _phase2("):]
+    corps = corps[:corps.index("\ndef ")]
+    corps = "\n".join(l for l in corps.splitlines() if not l.lstrip().startswith("#"))
+    i_val = corps.index("mauvais = valide(")
+    i_ouv = corps.index("tiennent = ouvreurs(")
+    i_bas = corps.index("bascule(db_path")
+    assert i_val < i_ouv < i_bas, (
+        "l'ordre doit être valide() → ouvreurs() → bascule() : le contrôle d'état doit coller "
+        f"à la bascule (valide={i_val}, ouvreurs={i_ouv}, bascule={i_bas})")
+
+
+@cas
+def la_phase1_EFFACE_un_etat_perime():
+    """🚨 Défaut trouvé en revue, et il pouvait faire arrêter les services pour rien.
+    `update.sh` décide d'arrêter sur la seule PRÉSENCE de l'état, et la phase 1 ne supprimait
+    jamais un fichier laissé par un passage tué. Scénario : passage 1 tué en phase 2 ; au
+    passage 2 la phase 1 refuse (disque) — et les services étaient arrêtés quand même, puis la
+    phase 2 tournait sur des bornes qui ne correspondaient plus."""
+    d = tempfile.mkdtemp()
+    chemin, _ = base(2000, d)              # base SAINE : la phase 1 va refuser
+    sauv = _detourne(chemin)
+    try:
+        with open(rb.ETAT, "w", encoding="utf-8") as f:
+            f.write('{"neuve": "/perime", "bornes": {}, "detail": {}}')
+        res = rb.phase1(chemin)
+        reste = os.path.exists(rb.ETAT)
+    finally:
+        _restaure(sauv)
+    assert res.get("ok") is False, "une base saine a été acceptée"
+    assert not reste, (
+        "l'état périmé survit à un refus de la phase 1 : `update.sh` arrêterait les services "
+        "et la phase 2 tournerait sur des bornes qui ne correspondent à rien")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@cas
+def une_exception_dans_une_PHASE_laisse_quand_meme_un_rapport():
+    """🚨 Défaut trouvé en revue. Seul `rebuild()` portait le filet, et la production ne
+    l'appelle plus : `update.sh` appelle les deux phases SÉPARÉMENT. Une exception imprévue
+    (le `RuntimeError` au-delà de 200 zones abîmées, un `OSError` dans `bascule()`) produisait
+    une traceback et AUCUN RAPPORT — or `update.sh` sort en 0, la version est bumpée, et on
+    perdait le seul moyen de savoir à distance pourquoi le boîtier reste cassé."""
+    import json as _j
+    for phase, casse in (("phase1", "tables"), ("phase2", "corrige_rollup")):
+        d = tempfile.mkdtemp()
+        chemin, _ = base_abimee(6000, d)
+        sauv = _detourne(chemin)
+        vrai = getattr(rb, casse)
+        try:
+            if phase == "phase2":
+                assert rb.phase1(chemin).get("ok")
+            setattr(rb, casse, lambda *a, **k: (_ for _ in ()).throw(
+                RuntimeError("panne imprévue")))
+            res = getattr(rb, phase)(chemin)
+            rapport = rb.RAPPORT
+            neuve = chemin + ".rebuild"
+            reste = os.path.exists(neuve)
+        finally:
+            setattr(rb, casse, vrai)
+            _restaure(sauv)
+        assert isinstance(res, dict) and res.get("ok") is False, f"{phase} : {res!r}"
+        assert "imprévue" in res.get("refus", ""), f"{phase} : {res!r}"
+        with open(rapport, encoding="utf-8") as f:
+            ecrit = _j.load(f)
+        assert ecrit.get("ok") is False and "imprévue" in ecrit.get("refus", ""), (
+            f"{phase} : aucun rapport utilisable sur le disque ({ecrit!r})")
+        assert not reste, f"{phase} : les ~300 Mo de base neuve restent sur la carte SD"
+        shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":

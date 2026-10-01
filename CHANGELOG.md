@@ -289,6 +289,38 @@ lui-même domine sur une petite base.
 ligne, que le cloud dédoublonne (`ON CONFLICT DO NOTHING`) ; et une ligne purgée après avoir
 été recopiée **ressusciterait**, pour être purgée au cycle suivant.
 
+#### 🔍 Troisième revue : quatre défauts du découpage en deux phases
+
+1. 🚨 **Le contrôle « qui tient la base » venait trop tôt** — avant `valide()`, qui lance un
+   `integrity_check` complet. Si la phase 2 dépasse le délai du filet, celui-ci relance les
+   services **pendant** la validation : `ben-telemetry` se remet à écrire dans l'original, la
+   bascule passe quand même, et ses mesures partent dans le `.corrupt-*` **sans que rien ne le
+   dise**. ⭐ Un contrôle d'état n'est valable qu'à l'instant où on s'en sert : il colle
+   maintenant à la bascule. Ordre imposé par un cas structurel —
+   `valide()` → `ouvreurs()` → `bascule()`.
+2. 🚨 **« Je ne sais pas » n'était pas distingué de « la table est vide ».** Le repli de
+   `_max_rowid` interroge `sent`, colonne que seules `measurements` et `lora_link` possèdent.
+   Pour `curve_rollup`, `pdl` ou `level_profile`, les deux requêtes échouaient sur
+   `no such column: sent`, la borne tombait à **0**, et la table était recopiée **à vide** — le
+   rapport annonçant « 0 copiées, 0 perdues ». Une perte **totale** présentée comme un succès.
+   ⚠️ Et un `curve_rollup` vide avec un `rollup_state` qui affirme couvrir ces dates fait rendre
+   à `/curve` des fenêtres **vides** ; cette page est réécrite toutes les 2 min, donc c'était le
+   cas probable. Un `pdl` vide serait pire. ⇒ La borne rend `None`, la table est déclarée
+   **illisible**, et si elle est **indispensable** (`pdl`, `measurements`) **on ne bascule pas**.
+3. **Un état périmé pouvait déclencher l'arrêt.** `update.sh` décide sur la seule présence de
+   `db-rebuild.state.json`, et la phase 1 ne l'effaçait jamais. ⇒ Elle l'efface désormais
+   **avant le moindre contrôle**. ⭐ Ma première correction était au mauvais endroit — placée
+   après le contrôle de symptôme, elle laissait l'état survivre à un **refus**. Le banc l'a
+   attrapée.
+4. **Une exception imprévue ne laissait aucun rapport.** Seul `rebuild()` portait le filet, et
+   la production ne l'appelle plus. Un `RuntimeError` (au-delà de 200 zones) ou un `OSError`
+   dans `bascule()` produisait une traceback et **rien** — or `update.sh` sort en 0, la version
+   est bumpée, et on perdait le seul moyen de savoir à distance pourquoi le boîtier reste cassé.
+   ⇒ Les deux phases portent le même filet. Et les ~300 Mo de base neuve inutilisable sont
+   **libérés** : « on la garde pour l'examiner » était une fiction sur une machine injoignable.
+
+**Bancs : 36/36**, cinq mutations nouvelles, toutes attrapées.
+
 ⓘ Aucune migration, aucune table, aucune colonne.
 
 ### [0.9.24] — 2026-10-01
