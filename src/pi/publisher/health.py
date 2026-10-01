@@ -161,9 +161,27 @@ def host() -> dict:
             mem[cles[p[0][:-1]]] = int(p[1]) // 1024
     if mem:
         out["mem"] = mem
-    # 🚨 Le noyau teinté est un DRAPEAU PERMANENT. C'est lui qui pilotait le test périodique
-    #    de 0.9.12 : 208 redémarrages de `ben-radio`, 46 % des mesures perdues. Il vaut 1024
-    #    (TAINT_WARN) sur un boîtier du parc au moment où on écrit ces lignes. 1,5 ms.
+    # Le noyau teinté, en masque de bits brut — on stocke le FAIT, on décode à la lecture.
+    #
+    # ⚠️ LE PLANCHER D'UN RASPBERRY PI EST 1024, ET CE N'EST PAS UN INCIDENT. Vérifié sur un
+    #    boîtier du parc : bit 10 = `C`, « un pilote staging a été chargé », et le noyau nomme
+    #    les coupables — `snd_bcm2835`, `vc_sm_cma`, `bcm2835_mmal_vchiq`, `bcm2835_isp`.
+    #    C'est l'état normal de Raspberry Pi OS, donc 1024 sur les sept boîtiers.
+    #
+    # ⭐ CE QUI COMPTE EST DONC TOUT BIT AU-DELÀ DE CE PLANCHER :
+    #
+    #        128 (bit  7) D  le noyau est MORT récemment (OOPS/BUG) — vécu sur un boîtier
+    #        512 (bit  9) W  le noyau a émis un WARNING
+    #      16384 (bit 14) L  SOFT LOCKUP — la signature même d'un SPI figé
+    #         16 (bit  4) M  machine check exception
+    #
+    #    Donc 1152 = Pi normal + oops noyau. ⚠️ Une version antérieure de ce commentaire
+    #    annonçait « 1024 = TAINT_WARN » : c'est FAUX, TAINT_WARN est le bit 9 (512). La
+    #    valeur lue n'a jamais changé, seule l'interprétation était erronée.
+    #
+    # ⓘ Le drapeau est PERMANENT : c'est ce qui a fait de lui un mauvais signal de santé en
+    #   0.9.12, où il pilotait un test périodique — 208 redémarrages de `ben-radio`, 46 % des
+    #   mesures perdues. On le RAPPORTE, on ne décide rien avec. 1,5 ms.
     tainted = _read("/proc/sys/kernel/tainted").strip()
     if tainted.isdigit():
         out["tainted"] = int(tainted)

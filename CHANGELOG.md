@@ -43,7 +43,7 @@ Pour un boîtier **radio** devenu muet, « l'émetteur est mort » et « le réc
 
 **Autres champs que personne ne regardait**
 
-- **`tainted`** — le drapeau **permanent** qui pilotait le test périodique de `0.9.12` (208 redémarrages de `ben-radio`, 46 % des mesures perdues). Il vaut **1024 sur les deux boîtiers éprouvés** : c'est l'état du parc, pas un incident.
+- **`tainted`** — le masque de bits du noyau, **brut**. ⚠️ Le plancher d'un Raspberry Pi est **1024** (bit 10 `C`, pilotes *staging* : `snd_bcm2835`, `vc_sm_cma`, `bcm2835_isp`…) : c'est l'état normal, pas un incident, et ce sera 1024 sur les sept boîtiers. ⭐ **Ce qui compte est tout bit au-delà** — `128` (le noyau est mort, OOPS/BUG), `16384` (*soft lockup*, la signature d'un SPI figé), `512` (WARNING). Donc `1152` = Pi normal **plus** un oops. ⓘ Le drapeau est permanent : c'est ce qui en faisait un mauvais signal de santé en `0.9.12`, où il pilotait un test périodique (208 redémarrages de `ben-radio`). On le **rapporte**, on ne décide rien avec.
 - **`wifi`** via `/proc/net/wireless`, pour 7,9 ms. ben-0001 est à **−76 dBm** contre **−31** pour ben-0003 — la question des « fenêtres de connectivité » commence peut-être là.
 - **`repo.dirty`** — un dépôt sale **bloque le `git checkout` nu de l'OTA**, piège documenté qu'on ne pouvait constater qu'en SSH.
 
