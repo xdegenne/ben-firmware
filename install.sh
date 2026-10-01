@@ -16,7 +16,7 @@ REPO_PATH="/opt/ben/repo"
 # == latest. §8 écrit un device.json CAPABILITIES-based (via caps_for_model) → un device neuf naît
 # directement en capabilities (+ watchdog durci pour un lora). Le parc EXISTANT migre par OTA
 # (0.5.0/0.6.0 → 0.6.1 → 0.7.0). Le chantier ben-ops (workflow opérateur) reste à part.
-INITIAL_TAG="pi-0.9.21"
+INITIAL_TAG="pi-0.9.22"
 # Version écrite dans device.json — DOIT correspondre au tag checkout, sinon
 # l'OTA re-grimpe depuis une version périmée. Dérivée de INITIAL_TAG pour
 # qu'elles ne puissent jamais diverger (ex. pi-0.0.28 → 0.0.28).
@@ -108,8 +108,16 @@ if ! id -u ben &>/dev/null; then
     useradd --system --create-home --shell /bin/bash ben
 fi
 # dialout : /dev/ttyAMA0 (TIC). gpio + spi : LoRa receiver via raspi_lora + RPi.GPIO.
-usermod -aG dialout,gpio,spi ben
-echo "[3/13] User ben OK (dialout, gpio, spi)"
+#
+# 🚨 systemd-journal : SANS LUI, `journalctl` NE REND RIEN à `ben`. Mesuré le 2026-10-01 sur
+#    un boîtier du parc — « No journal files were opened due to insufficient permissions »,
+#    sur stderr, donc invisible pour qui ne lit que stdout. L'instantané de santé du hello en
+#    dépendait : son champ `errors` était mort-né sur TOUS les boîtiers, et les essais
+#    passaient parce qu'on les lançait en `pi`, qui est dans `adm`.
+#    ⭐ C'est là qu'on perd les lignes NOYAU — blocages SPI, sous-tensions, et le
+#       `brcmfmac: resumed on timeout` du pilote WiFi qu'on a découvert ce jour-là.
+usermod -aG dialout,gpio,spi,systemd-journal ben
+echo "[3/13] User ben OK (dialout, gpio, spi, systemd-journal)"
 
 # --------------------------------------------------------------------------
 # 4. Configure sudo rights
