@@ -284,6 +284,57 @@ def cadence(en_attente: int) -> float:
     return PERIOD_RETARD if en_attente >= BATCH else PERIOD
 
 
+# Niveau Python → priorité syslog. C'est la table de `sd_journal_print`.
+PRIORITE_SYSLOG = {
+    logging.CRITICAL: 2,   # crit
+    logging.ERROR:    3,   # err
+    logging.WARNING:  4,   # warning
+    logging.INFO:     6,   # info
+    logging.DEBUG:    7,   # debug
+}
+
+
+class _FormatJournal(logging.Formatter):
+    """Préfixe chaque ligne de `<N>`, la priorité syslog que systemd lit sur stderr.
+
+    🚨 SANS CE PRÉFIXE, LE NIVEAU PYTHON N'ATTEINT JAMAIS LE JOURNAL — et c'est un défaut
+       qui a coûté un diagnostic entier.
+
+       `logging.basicConfig()` écrit du texte brut sur stderr. systemd capte stderr et range
+       TOUT à une priorité FIXE : `SyslogLevel=6` (info) par défaut, vérifié sur l'unité. Le
+       niveau Python ne change donc que le TEXTE de la ligne, pas sa priorité.
+
+       Mesuré sur un boîtier du parc, sur un vrai échec de publication :
+
+           [2026-09-23 03:22:51][WARNING] échec n°1 ([Errno -3] Temporary failure in name…
+                                 ↑ le texte dit WARNING        →  PRIORITY=6
+
+       ⇒ `health.errors()` interroge `journalctl -p 3`. Il ne voyait RIEN de ce que le
+         publisher dit de ses pannes, et monter `log.warning` en `log.error` n'y aurait rien
+         changé : les deux auraient atterri en priorité 6.
+
+    ⭐ Le préfixe `<N>` est le mécanisme documenté de systemd (`SyslogLevelPrefix=yes`, actif
+       par défaut) : il le lit, il l'applique, et il le RETIRE du message. Vérifié sur la
+       cible — `<4>` donne `PRIORITY=4`, `<3>` donne `PRIORITY=3`.
+
+    ⚠️ Zéro dépendance : pas de `python-systemd` à embarquer sur sept boîtiers pour ça.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        return "<%d>%s" % (PRIORITE_SYSLOG.get(record.levelno, 6), super().format(record))
+
+
+def installer_journal(niveau: int = logging.INFO) -> logging.Logger:
+    """Branche la journalisation sur stderr AVEC la priorité syslog. Rend la racine."""
+    h = logging.StreamHandler(sys.stderr)
+    h.setFormatter(_FormatJournal("[%(asctime)s][%(levelname)s] %(message)s",
+                                  datefmt="%Y-%m-%d %H:%M:%S"))
+    racine = logging.getLogger()
+    racine.handlers[:] = [h]       # on REMPLACE : pas de ligne en double
+    racine.setLevel(niveau)
+    return racine
+
+
 def niveau_echec(echecs: int) -> int:
     """Le niveau de journalisation d'un échec de publication. Fonction PURE.
 
@@ -477,10 +528,7 @@ def _on_signal(signum, _frame):
 
 
 def main() -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(asctime)s][%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S")
+    installer_journal()
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
@@ -542,8 +590,19 @@ def main() -> int:
                     echecs = max(echecs, 6)
                     raise RuntimeError("refusé par le serveur")
                 else:
-                    log.warning("HTTP %d %s", status, body[:200])
-                    raise RuntimeError(f"HTTP {status}")
+                    # 🚨 LE CORPS VOYAGE AVEC L'EXCEPTION, il ne reste pas dans un `warning`.
+                    #
+                    #    Première version : l'explication du serveur n'était QUE dans ce
+                    #    `log.warning`, et la ligne escaladée en `error` au bout de cinq
+                    #    échecs ne disait que « HTTP 400 ». Or c'est précisément l'explication
+                    #    qui manque quand on diagnostique à distance — savoir qu'un lot est
+                    #    refusé sans savoir POURQUOI, c'est le même angle mort que #18
+                    #    prétendait fermer.
+                    #
+                    # ⚠️ Un 400 ou un 413 ne se résout pas en réessayant : le lot est
+                    #    malformé ou trop gros, et le boîtier bouclera dessus. Le corps est
+                    #    la seule chose qui dira laquelle des deux.
+                    raise RuntimeError(f"HTTP {status} {body[:200]}")
             else:
                 log.debug("rien à envoyer")
             if time.monotonic() >= prochain_hello:

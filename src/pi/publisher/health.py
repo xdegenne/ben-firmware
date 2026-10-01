@@ -80,9 +80,9 @@ PROBE_TIMEOUT_S = 4.0
 #    occupée, charge à 1,9. Le coût de `journalctl` dépend de l'état du cache du journal, et
 #    l'instantané ne tourne QU'UNE FOIS PAR JOUR : il est donc toujours du mauvais côté.
 #
-# ⚠️ Avec 12 s, la marge était d'une seconde et demie sur le pire cas observé — et c'est `pub`,
-#    la DERNIÈRE sonde, qui aurait été sacrifiée la première. Soit précisément le champ ajouté
-#    pour diagnostiquer le boîtier qu'on n'arrive pas à diagnostiquer.
+# ⚠️ Avec 12 s, la marge était d'une seconde et demie sur le pire cas observé — et c'est
+#    `errors`, la DERNIÈRE sonde, qui aurait été sacrifiée la première. Soit précisément le
+#    champ qui porte les erreurs de service et de noyau.
 #
 # ⓘ Ce que coûte un budget plus large : le hello part AVANT la boucle de publication, donc la
 #   collecte retarde d'autant le premier lot après un redémarrage du publisher. 20 s une fois

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# update.sh — 0.9.22 → pi-0.9.23 : LE BOÎTIER JOINT UN INSTANTANÉ DE SANTÉ À SON HELLO.
+# update.sh — 0.9.22 → pi-0.9.23 : LE NIVEAU DE JOURNALISATION ATTEINT ENFIN LE JOURNAL.
 #
 # ═══ CE QUE LIVRE CETTE VERSION ═══════════════════════════════════════════════════════════════
 #
-#   UN ÉCHEC QUI PERSISTE EST UNE ERREUR, ET IL FAUT QUE ÇA SE VOIE.
+#   UN ÉCHEC QUI PERSISTE EST UNE ERREUR — ET IL FAUT QUE LE JOURNAL LE SACHE.
 #
 #   `pi-0.9.22` a livré l'instantané de santé, et il a démenti trois diagnostics successifs
 #   sur le boîtier qui motivait tout le chantier :
@@ -19,12 +19,27 @@
 #     journalisait TOUS ses échecs en `log.warning`, soit la priorité syslog 4 — un cran sous
 #     le `-p 3` de la sonde `errors`. La seule ligne qui expliquait tout était sous le seuil.
 #
-#   ⭐ LE CORRECTIF N'EST PAS DANS LA SONDE, IL EST DANS LE PUBLISHER. Au-delà de
-#      `ECHECS_ERREUR` échecs consécutifs, l'échec passe en `log.error`. Un réseau cligne :
-#      échouer une fois n'est pas une erreur. Mais au-delà, ce boîtier ne livre plus ses
-#      données, et c'est l'état le plus grave qu'il puisse connaître sans être mort.
-#      Monter le niveau coûte ZÉRO et rend la panne visible — à la sonde comme à qui lit le
-#      journal directement.
+#   🚨 ET LE PREMIER CORRECTIF ÉCRIT POUR CE TAG NE SERVAIT À RIEN. Monter `log.warning` en
+#      `log.error` ne change que le TEXTE : `logging.basicConfig()` écrit sur stderr, et
+#      systemd range tout ce qui vient de stderr à une priorité FIXE (`SyslogLevel=6`).
+#      Mesuré sur un boîtier du parc, sur un vrai échec :
+#
+#          [2026-09-23 03:22:51][WARNING] échec n°1 ([Errno -3] Temporary failure…
+#                                ↑ le texte dit WARNING        →  PRIORITY=6
+#
+#   ⭐ LE VRAI CORRECTIF EST LE PRÉFIXE `<N>` : le mécanisme de systemd
+#      (`SyslogLevelPrefix=yes`, actif par défaut) qui lit la priorité en tête de ligne,
+#      l'applique, et la retire du message. Vérifié sur la cible — `<4>` donne `PRIORITY=4`,
+#      `<3>` donne `PRIORITY=3`. Zéro dépendance : pas de `python-systemd` à embarquer.
+#
+#   ⭐ ET LA DÉCISION, qui ne vaut que posée sur ce socle : au-delà de `ECHECS_ERREUR` échecs
+#      consécutifs, l'échec passe en `log.error`, donc en priorité 3, donc visible à la sonde.
+#      Un réseau cligne — échouer une fois n'est pas une erreur. Au-delà, ce boîtier ne livre
+#      plus ses données, et c'est l'état le plus grave qu'il puisse connaître sans être mort.
+#
+#   ⚠️ Et l'explication du serveur VOYAGE désormais avec l'exception : la ligne escaladée
+#      portait « HTTP 400 » sans le corps, soit un refus sans sa raison. Or un 400 ou un 413
+#      ne se résout PAS en réessayant, et le corps est la seule chose qui dira lequel.
 #
 #   ⚠️ Et pas `error` dès le premier échec : un niveau qui crie tout le temps ne garde plus
 #      rien, on cesse de le regarder. Même raisonnement que la gigue totale.
@@ -85,28 +100,62 @@ grep -q 'payload\["health"\]' "$PUB/ben_publisher.py" \
     || fail "ben_publisher.py ne joint pas health au hello"
 log "préflight : fichiers présents, compilent, et l'instantané est bien branché au hello"
 
-# 🚨 ON ÉPROUVE LA DÉCISION LIVRÉE PAR CE TAG, AVEC SON TÉMOIN. C'est elle le correctif : un
-#    `niveau_echec` qui rendrait TOUJOURS `warning` laisserait la panne invisible exactement
-#    comme avant, et aucun contrôle de service ne le verrait. Et un qui rendrait TOUJOURS
-#    `error` noierait le journal d'erreurs pour des coupures de quelques secondes — le niveau
-#    `error` ne voudrait plus rien dire, ce qui est l'autre façon de rendre la panne invisible.
-python3 - "$PUB" "$REPO/src/pi" <<'PYEOF' || fail "le niveau de journalisation ne se comporte pas comme attendu"
-import logging, sys
+# 🚨 ON ÉPROUVE L'EFFET, PAS LA DÉCISION — ET C'EST LA LEÇON DE pi-0.9.23.
+#
+#    La version précédente de ce contrôle n'éprouvait que `niveau_echec()`, une fonction
+#    PURE, JUSTE... ET SANS AUCUN EFFET. Car `logging.basicConfig()` écrivait du texte brut
+#    sur stderr, et systemd range tout ce qui vient de stderr à une priorité FIXE
+#    (`SyslogLevel=6`). Le niveau Python ne changeait que le TEXTE de la ligne. Mesuré sur un
+#    boîtier du parc, sur un vrai échec :
+#
+#        [2026-09-23 03:22:51][WARNING] échec n°1 ([Errno -3] Temporary failure…
+#                              ↑ le texte dit WARNING        →  PRIORITY=6
+#
+#    ⇒ `health.errors()` interroge `journalctl -p 3` : il ne voyait RIEN des pannes du
+#      publisher, et le banc comme le préflight étaient VERTS. Un contrôle qui vérifie une
+#      décision sans vérifier son effet est un contrôle qui ment.
+#
+# ⭐ On vérifie donc la SORTIE RÉELLE du formateur : un WARNING doit porter `<4>`, un ERROR
+#    `<3>`. C'est ce préfixe que systemd lit (`SyslogLevelPrefix=yes`, actif par défaut),
+#    applique, puis retire du message — vérifié sur la cible.
+python3 - "$PUB" "$REPO/src/pi" <<'PYEOF' || fail "le niveau de journalisation n'atteint pas le journal"
+import io, logging, math, sys
 sys.path[:0] = [sys.argv[1], sys.argv[2]]
 import ben_publisher as pub
 ko = []
+
+# ── L'EFFET : la ligne porte-t-elle sa priorité syslog ? ──
+racine = pub.installer_journal()
+tampon = io.StringIO()
+racine.handlers[0].stream = tampon
+logging.getLogger("preflight").warning("avertissement")
+logging.getLogger("preflight").error("erreur")
+lignes = [l for l in tampon.getvalue().splitlines() if l]
+if len(lignes) != 2:
+    ko.append(f"{len(lignes)} ligne(s) émise(s) au lieu de 2 — gestionnaires en double ?")
+else:
+    if not lignes[0].startswith("<4>"):
+        ko.append(f"un WARNING ne porte pas <4> : {lignes[0][:60]!r} — invisible au journal")
+    if not lignes[1].startswith("<3>"):
+        ko.append(f"une ERREUR ne porte pas <3> : {lignes[1][:60]!r} — invisible à `-p 3`")
+
+# ── LA DÉCISION, avec son témoin ──
 if pub.niveau_echec(pub.ECHECS_ERREUR) != logging.ERROR:
     ko.append("un échec PERSISTANT n'est pas remonté en ERROR — la panne reste invisible")
 if pub.niveau_echec(1) != logging.WARNING:
     ko.append("TÉMOIN : un échec ISOLÉ passe en ERROR — le journal va crier pour rien")
-import math
 if not pub.ECHECS_ERREUR < math.ceil(math.log2(pub.BACKOFF_MAX)):
     ko.append(f"seuil {pub.ECHECS_ERREUR} au-delà du plafond de backoff : la panne ne serait "
               "visible qu'après des dizaines de minutes")
+
+# ── LA TABLE : un décalage d'un cran rendrait tout invisible en gardant l'illusion ──
+if not pub.PRIORITE_SYSLOG[logging.ERROR] <= 3 < pub.PRIORITE_SYSLOG[logging.WARNING]:
+    ko.append("la table des priorités ne place pas ERROR sous le seuil `-p 3`")
+
 if ko:
     print("\n".join("  " + k for k in ko), file=sys.stderr); sys.exit(1)
 PYEOF
-log "✓ niveau de journalisation éprouvé avec son témoin"
+log "✓ journalisation éprouvée : la priorité syslog atteint bien le journal"
 
 # 🚨 ON EXÉCUTE LA COLLECTE SUR CE BOÎTIER-CI, sur sa VRAIE base, en LECTURE SEULE.
 #
