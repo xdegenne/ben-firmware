@@ -259,6 +259,120 @@ def la_charge_parc_reste_bornee():
     assert par_boitier * PARC < 2000, f"{par_boitier * PARC:.0f} points/s pour le parc"
 
 
+@cas
+def un_echec_qui_PERSISTE_declenche_un_hello():
+    """🚨 LE CAS QUI VIENT DE COÛTER NEUF JOURS. Mesuré sur ben-0012 le 2026-10-01 : le
+    boîtier mesurait, le lien était debout (hello en 17 ms, HTTP 204), `ben-publisher`
+    tournait sans un seul plantage — et 566 248 points n'étaient pas partis depuis le 22/09.
+
+    La raison était écrite dans son journal à CHAQUE tentative. Elle était illisible parce
+    que l'instantané de santé ne voyage qu'avec le hello, et que le hello ne part qu'une fois
+    par jour. On attendait 24 h pour apprendre ce que le boîtier savait depuis la première
+    minute.
+
+    ⭐ Au franchissement du seuil d'erreur, l'échec se signale lui-même."""
+    assert pub.signaler_echec(pub.ECHECS_ERREUR, float("-inf"), 1000.0)
+
+
+@cas
+def un_echec_ISOLE_ne_declenche_PAS_de_hello():
+    """⚖️ L'autre bord, et c'est lui qui empêche le remède d'être pire que le mal : une
+    coupure de quelques secondes arrive tous les jours, sur les sept boîtiers. Si le premier
+    échec déclenchait un instantané, le parc entier se mettrait à battre — et `snapshot()`
+    coûte jusqu'à 20 s de collecte.
+
+    Le seuil est celui de l'ERREUR, le même que `niveau_echec()` : un seul seuil, pas deux à
+    garder d'accord."""
+    for n in range(1, pub.ECHECS_ERREUR):
+        assert not pub.signaler_echec(n, float("-inf"), 1000.0), f"échec n°{n} a signalé"
+
+
+@cas
+def une_panne_CONTINUE_ne_signale_qu_une_fois_par_heure():
+    """🚨 Sans plancher, un boîtier en panne persistante enverrait un hello à CHAQUE tentative
+    — soit un instantané toutes les 300 s au plafond du backoff, avec jusqu'à 20 s de collecte
+    à chaque fois. Un boîtier coupé du monde doit signaler, pas battre."""
+    t0 = 100_000.0
+    assert pub.signaler_echec(99, float("-inf"), t0), "le premier signalement doit partir"
+    # Juste après, et même bien plus tard dans l'heure : silence.
+    assert not pub.signaler_echec(99, t0, t0 + 1)
+    assert not pub.signaler_echec(99, t0, t0 + pub.HELLO_SUR_ECHEC_S - 1)
+    # À l'échéance : on signale de nouveau.
+    assert pub.signaler_echec(99, t0, t0 + pub.HELLO_SUR_ECHEC_S)
+
+
+@cas
+def le_signalement_part_APRES_la_ligne_de_journal():
+    """🚨 L'ORDRE EST LE FOND, PAS LA FORME. `snapshot()` LIT le journal. Envoyé avant le
+    `log.log`, le hello partirait avec un instantané qui ne contient pas l'échec qui l'a
+    déclenché : un signalement qui ne signale rien — exactement le défaut de `N_PUB = 5`,
+    une sonde qui rend des données valides et vides de sens.
+
+    ⚖️ Cas STRUCTUREL, et il n'a pas le choix de l'être : les deux ordres produisent un hello
+       valide, un code de retour identique et aucune erreur. Seul le CONTENU diffère, et il
+       ne diffère que sur une vraie cible. On lit donc la source."""
+    src = pathlib.Path(pub.__file__).read_text()
+    corps = src[src.index("    while not _stop:"):]
+    i_log = corps.index("log.log(niveau_echec(echecs)")
+    i_sig = corps.index("signaler_echec(")
+    assert i_log < i_sig, (
+        "le hello de signalement est envoyé AVANT que l'échec soit journalisé : "
+        "l'instantané ne contiendra pas la raison qui l'a déclenché")
+
+
+@cas
+def le_signalement_repousse_le_battement_QUOTIDIEN():
+    """⚠️ Le hello de signalement doit réarmer `prochain_hello`, sinon le battement quotidien
+    vient se superposer au signalement et on paie deux collectes pour une information.
+
+    ⚖️ Structurel pour la même raison : les deux versions marchent."""
+    # 🚨 ON ANCRE SUR L'APPEL, PAS SUR LE NOM. Première version de ce cas : elle cherchait
+    #    `signaler_echec(echecs`, qui matche d'abord la DÉFINITION de la fonction, deux cents
+    #    lignes plus haut. Le bloc extrait englobait alors tout `main()` jusqu'au premier
+    #    `cli.close()`, y compris le `prochain_hello = hello()` d'AVANT la boucle — le cas
+    #    passait donc même avec le défaut en place. Vérifié par mutation : il ne tombait pas.
+    src = pathlib.Path(pub.__file__).read_text()
+    corps = src[src.index("    while not _stop:"):]
+    bloc = corps[corps.index("if signaler_echec("):]
+    bloc = bloc[:bloc.index("cli.close()")]
+    assert "prochain_hello = hello()" in bloc, (
+        "le signalement n'affecte pas `prochain_hello` — le hello quotidien se superposera "
+        f"à l'instantané de panne. Bloc lu : {bloc!r}")
+
+
+@cas
+def RIEN_A_ENVOYER_s_ecrit_dans_le_journal():
+    """🚨 LE SILENCE QUI REND LES DEUX PANNES INDISCERNABLES.
+
+    La branche « rien à envoyer » était en `log.debug`. Le niveau racine est `INFO`, donc elle
+    n'écrivait RIEN. Conséquence mesurée sur un boîtier du parc : un publisher qui échoue en
+    boucle et un publisher qui n'a rien à envoyer laissaient exactement la même trace —
+    aucune. Neuf jours de diagnostic sans pouvoir séparer les deux cas.
+
+    ⭐ Et le retard doit voyager avec, parce que c'est la CONTRADICTION qui informe :
+      « rien à envoyer · reste ~569526 » dit en une ligne que `pending` et la réalité ne
+      s'accordent pas. Les deux chiffres séparés ne disaient rien.
+
+    ⚠️ Gratuit sur un boîtier sain : à 0,74 point/s et une période de 60 s, chaque tour porte
+       ~44 points — cette branche n'y est jamais atteinte.
+
+    ⚖️ Cas STRUCTUREL : `log.debug` et `log.info` s'exécutent tous deux sans erreur et rendent
+       `None`. Seul le NIVEAU diffère, et il ne se voit que dans un vrai journal."""
+    src = pathlib.Path(pub.__file__).read_text()
+    corps = src[src.index("    while not _stop:"):]
+
+    # L'appel qui PORTE le message : on part du message et on remonte au `log.` le plus proche.
+    i = corps.index('"rien à envoyer')
+    debut = corps.rindex("log.", 0, i)
+    appel = corps[debut:corps.index(")", i) + 1]
+
+    assert appel.startswith("log.info("), (
+        f"« rien à envoyer » est journalisé par {appel.split('(')[0]!r} : avec un niveau "
+        "racine à INFO, un `debug` n'écrit RIEN et cette branche redevient muette")
+    assert "pending_approx" in appel, (
+        f"la ligne ne porte pas le retard : {appel!r} — sans lui elle ne contredit rien")
+
+
 if __name__ == "__main__":
     ko = 0
     for fn in CAS:

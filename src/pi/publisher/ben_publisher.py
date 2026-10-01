@@ -133,6 +133,24 @@ ECHECS_ERREUR = int(os.environ.get("BEN_PUB_ECHECS_ERREUR", "5"))
 # d'une table vide. Cf. docs/chantier-ingestion-cloud.md.
 HELLO_EVERY = float(os.environ.get("BEN_PUB_HELLO_EVERY", "86400"))
 
+# Plancher entre deux hellos déclenchés par un ÉCHEC.
+#
+# 🚨 POURQUOI UN HELLO SUR ÉCHEC — mesuré sur ben-0012 le 2026-10-01. Le boîtier mesurait,
+#    le lien était debout (hello en 17 ms), le publisher tournait sans un seul plantage, et
+#    NEUF JOURS de données ne partaient pas. La raison était écrite dans son journal à chaque
+#    tentative, et personne ne pouvait la lire : l'instantané de santé ne voyage qu'avec le
+#    hello, et le hello ne part qu'une fois par jour. On attendait 24 h pour apprendre une
+#    chose que le boîtier savait depuis la première minute.
+#
+# ⭐ L'ÉCHEC SE SIGNALE DE LUI-MÊME. Au franchissement du seuil d'erreur, le publisher envoie
+#    un hello : l'instantané part donc PENDANT la panne, avec les lignes de son propre journal.
+#
+# ⚠️ Plafonné à un par heure, et JAMAIS plus d'un par panne continue : un boîtier coupé du
+#    monde ne doit pas se mettre à battre. Le coût, c'est `snapshot()` (≤ 20 s) une fois
+#    l'heure — et sur un lien mort le hello échoue sans rien coûter de plus (`hello()` ne lève
+#    jamais).
+HELLO_SUR_ECHEC_S = float(os.environ.get("BEN_PUB_HELLO_SUR_ECHEC", "3600"))
+
 CERT_DIR = os.environ.get("BEN_CERT_DIR", "/etc/ben-firmware/certs")
 DEVICE_JSON = caps.DEVICE_JSON
 
@@ -333,6 +351,21 @@ def installer_journal(niveau: int = logging.INFO) -> logging.Logger:
     racine.handlers[:] = [h]       # on REMPLACE : pas de ligne en double
     racine.setLevel(niveau)
     return racine
+
+
+def signaler_echec(echecs: int, dernier: float, maintenant: float) -> bool:
+    """Faut-il dépenser un hello pour signaler cet échec ?
+
+    ⭐ Fonction PURE, pour la même raison que `cadence()` : la décision s'éprouve sans réseau,
+       sans base et sans Pi. C'est ce qui permet de vérifier le plancher horaire sans attendre
+       une heure.
+
+    ⚠️ Le seuil est celui de l'ERREUR, pas le premier échec. Une coupure de quelques secondes
+       arrive tous les jours sur tous les boîtiers ; elle ne mérite pas un instantané de santé.
+       On ne signale que ce qui PERSISTE — la même frontière que `niveau_echec()`, et c'est
+       voulu : un seul seuil, pas deux à garder d'accord.
+    """
+    return echecs >= ECHECS_ERREUR and maintenant - dernier >= HELLO_SUR_ECHEC_S
 
 
 def niveau_echec(echecs: int) -> int:
@@ -562,6 +595,11 @@ def main() -> int:
 
     prochain_hello = hello()
     echecs = 0
+    # ⚠️ `-inf` et non `0.0` : `time.monotonic()` part de l'uptime, pas de zéro. Avec `0.0`,
+    #    le tout premier signalement serait immédiat sur un boîtier debout depuis longtemps et
+    #    retardé d'une heure sur un boîtier qui vient de démarrer — deux comportements pour un
+    #    seul code. `-inf` dit ce qu'on veut dire : aucun signalement n'a encore été fait.
+    dernier_hello_echec = float("-inf")
     while not _stop:
         try:
             rowids, points = fetch_batch(conn, BATCH)
@@ -604,7 +642,27 @@ def main() -> int:
                     #    la seule chose qui dira laquelle des deux.
                     raise RuntimeError(f"HTTP {status} {body[:200]}")
             else:
-                log.debug("rien à envoyer")
+                # 🚨 `info`, ET PAS `debug` — le niveau racine est INFO, donc `debug` n'écrit
+                #    RIEN. La branche « rien à envoyer » était donc totalement MUETTE, et un
+                #    publisher qui échoue en boucle produisait exactement la même trace qu'un
+                #    publisher qui n'a rien à envoyer : aucune. Impossible de les séparer à
+                #    distance, et c'est ce qui a coûté neuf jours sur un boîtier du parc.
+                #
+                # ⭐ Et on y joint le retard, parce que c'est la CONTRADICTION qui informe :
+                #    « rien à envoyer · reste ~569526 » dit en une ligne que `pending` et la
+                #    réalité ne s'accordent pas. Les deux chiffres séparés ne disaient rien.
+                #
+                # ⚠️ Ne coûte rien sur un boîtier sain : à 0,74 point/s et une période de 60 s,
+                #    chaque tour porte ~44 points — cette branche n'y est jamais atteinte.
+                #
+                # 🚨 `pending_approx()` interroge la base, et nous sommes DANS le `try` de la
+                #    boucle : une erreur locale compterait comme un échec SERVEUR et ferait
+                #    partir le publisher en backoff long. C'est exactement le défaut que
+                #    `cadence_sure()` existe pour éviter.
+                try:
+                    log.info("rien à envoyer · reste ~%d", pending_approx(conn))
+                except sqlite3.Error as e:
+                    log.info("rien à envoyer (retard illisible : %s)", e)
             if time.monotonic() >= prochain_hello:
                 prochain_hello = hello()
         except Exception as e:
@@ -614,6 +672,21 @@ def main() -> int:
             # Le niveau dépend de la PERSISTANCE — cf. `niveau_echec()`.
             log.log(niveau_echec(echecs),
                     "échec n°%d (%s) — nouvelle tentative dans %.0f s", echecs, e, delai)
+
+            # 🚨 APRÈS le `log`, JAMAIS AVANT : `snapshot()` lit le journal. Envoyé d'abord,
+            #    le hello partirait avec un instantané qui ne contient pas l'échec qui l'a
+            #    déclenché — un signalement qui ne signale rien.
+            #
+            # ⚠️ Et AVANT `cli.close()` : si l'échec était un refus HTTP, la connexion est
+            #    saine et le hello la réutilise. Si c'était la socket, `post()` la rouvre
+            #    d'elle-même une fois.
+            #
+            # ⭐ `prochain_hello` est repoussé par `hello()` : le battement quotidien ne vient
+            #    pas se superposer au signalement.
+            if signaler_echec(echecs, dernier_hello_echec, time.monotonic()):
+                dernier_hello_echec = time.monotonic()
+                prochain_hello = hello()
+
             cli.close()
             _sleep(delai)
             continue

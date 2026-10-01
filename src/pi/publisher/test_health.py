@@ -49,6 +49,12 @@ def base_radio() -> sqlite3.Connection:
     return c
 
 
+def base_nue() -> sqlite3.Connection:
+    """Une base au schéma réel, SANS aucune mesure — les cas `unsent` les posent eux-mêmes,
+    parce que c'est la RÉPARTITION de `sent` qu'ils éprouvent, pas la présence de données."""
+    return db.connect(":memory:")
+
+
 # ── L'innocuité, qui est tout l'enjeu ────────────────────────────────────────
 
 @cas
@@ -510,6 +516,128 @@ def la_sonde_du_publisher_n_a_PAS_de_filtre_de_priorite():
     assert "-p" not in cmd, (
         "la sonde porte un filtre de priorité — ruineux sur un boîtier silencieux, qui est "
         f"le cas qu'on veut diagnostiquer : {cmd}")
+
+
+@cas
+def unsent_COMPTE_la_ou_pending_ENCADRE():
+    """🚨 LE GLISSEMENT QUI A COÛTÉ NEUF JOURS DE DIAGNOSTIC FAUX.
+
+    `pending` vaut `max(rowid) - min(rowid WHERE sent=0) + 1`. Il prouve OÙ se trouve la plus
+    vieille ligne non envoyée — rien de plus. On a lu « 566 248 en attente » sur un boîtier du
+    parc et on en a déduit « un lot plein part à chaque tour, donc il échoue », alors qu'une
+    SEULE ligne restée à `sent = 0` sur un vieux rowid produit exactement le même chiffre.
+
+    ⭐ Ce cas construit précisément cette base : 500 lignes, UNE SEULE non envoyée, et la plus
+      vieille. `pending` annonce 500, `unsent` répond 1. Les deux ont raison, et seul le second
+      répond à la question « un POST est-il tenté ? »."""
+    conn = base_nue()
+    for i in range(500):
+        conn.execute("INSERT INTO measurements(ts, pdl_index, papp, sent) VALUES (?,?,?,?)",
+                     (1790000000 + i, 0, 100, 0 if i == 0 else 1))
+    conn.commit()
+    out = health.store(conn, "/inexistant")
+    assert out["pending"] == 500, f"pending = {out['pending']}, attendu 500 (encadrement)"
+    assert out["unsent"] == 1, (
+        f"unsent = {out['unsent']}, attendu 1 — c'est tout l'intérêt du champ : il COMPTE, "
+        "là où `pending` encadre")
+
+
+@cas
+def unsent_est_BORNE_au_lot():
+    """⚠️ SANS LA BORNE, LE CHAMP SERAIT INUTILISABLE : un `count(*) WHERE sent = 0` nu balaie
+    les millions d'entrées de l'index et prend 37 SECONDES sur un Pi Zero (mesuré le
+    2026-09-19). Il serait collecté à chaque hello.
+
+    ⭐ Et la borne n'est pas un compromis : la question posée est « le prochain lot serait-il
+      PLEIN ? », pas « combien y en a-t-il au total ». La réponse utile est donc saturée par
+      construction — `unsent == N_UNSENT` veut dire « au moins un lot plein ».
+
+    ⚠️ La borne est lue sur `BEN_PUB_BATCH`, la MÊME variable que `ben_publisher.BATCH`, et
+       non sur une constante à part qui divergerait au premier réglage."""
+    conn = base_nue()
+    n = health.N_UNSENT + 50
+    conn.executemany("INSERT INTO measurements(ts, pdl_index, papp, sent) VALUES (?,?,?,0)",
+                     [(1790000000 + i, 0, 100) for i in range(n)])
+    conn.commit()
+    out = health.store(conn, "/inexistant")
+    assert out["unsent"] == health.N_UNSENT, (
+        f"unsent = {out['unsent']} pour {n} lignes non envoyées : la borne "
+        f"{health.N_UNSENT} n'est pas respectée — le champ balaiera toute la table")
+
+
+@cas
+def unsent_vaut_ZERO_quand_tout_est_parti():
+    """⚖️ LE TÉMOIN, et il n'est pas décoratif : un champ qui rendrait toujours la borne
+    passerait le cas précédent et ne distinguerait plus rien. C'est le cas le plus fréquent du
+    parc — six boîtiers sur sept sont à jour."""
+    conn = base_nue()
+    conn.executemany("INSERT INTO measurements(ts, pdl_index, papp, sent) VALUES (?,?,?,1)",
+                     [(1790000000 + i, 0, 100) for i in range(10)])
+    conn.commit()
+    out = health.store(conn, "/inexistant")
+    assert out["unsent"] == 0, f"unsent = {out['unsent']} alors que tout est marqué envoyé"
+
+
+@cas
+def la_sonde_du_publisher_SURVIT_a_la_banniere_de_redemarrage():
+    """🚨 LE DÉFAUT DE LA PREMIÈRE VERSION, DÉMENTI PAR LE TERRAIN LE JOUR DE SA LIVRAISON.
+
+    `N_PUB` valait 5. Or un redémarrage systemd émet CINQ lignes à lui seul. Voici ce que
+    ben-0012 a réellement remonté à son premier hello en 0.9.23, le 2026-10-01 à 11:47 :
+
+        Stopped ben-publisher.service …
+        ben-publisher.service: Consumed 1.308s CPU time.
+        Started ben-publisher.service …
+        [INFO] démarrage — ben-0012 → … · lots de 1000 toutes les 60 s
+        [INFO] ~569526 point(s) en attente
+
+    Cinq lignes, cinq places : AUCUNE ligne de l'ancien processus. Or la sonde ne tourne QUE
+    là, au hello qui suit le redémarrage de l'OTA — et ce sont justement les lignes de l'ancien
+    processus qui sont sa raison d'être. Elle était aveugle au seul moment où elle existe.
+
+    ⚖️ Cas STRUCTUREL, et il doit l'être : le défaut ne produisait aucune erreur. La sonde
+       rendait cinq lignes valides, bien formées, parfaitement inutiles. Rien dans un banc
+       fonctionnel ne pouvait s'en plaindre — il faut lire la CONSTANTE."""
+    BANNIERE = 5  # Stopped · Consumed CPU · Started · 2 × INFO de démarrage
+    assert health.N_PUB > BANNIERE, (
+        f"N_PUB = {health.N_PUB} : la bannière de redémarrage ({BANNIERE} lignes) consomme "
+        "tout le quota, la sonde ne verra jamais l'ancien processus")
+    # Une marge d'une seule ligne ne diagnostique rien : il faut la tendance des échecs, et
+    # le publisher écrit une ligne par tentative.
+    assert health.N_PUB >= BANNIERE + 15, (
+        f"N_PUB = {health.N_PUB} : {health.N_PUB - BANNIERE} ligne(s) utile(s) après la "
+        "bannière, trop peu pour voir une suite d'échecs")
+
+
+@cas
+def la_sonde_du_publisher_est_bornee_en_OCTETS_pas_seulement_en_lignes():
+    """🚨 L'ÉCHEC EST ASYMÉTRIQUE : `retenirSante` (ben-api) écarte le champ `health` ENTIER
+    au-delà de 16 Ko — « trop volumineuse ». Une sonde trop bavarde n'emporte donc pas que
+    son propre champ, elle emporte les dix-neuf autres.
+
+    Et une borne en LIGNES est la mauvaise unité : les messages du publisher vont de 40
+    caractères (« rien à envoyer · reste ~43 ») à 200, la troncature de `msg[:200]`. 40 lignes
+    pleines font 9,1 Ko, et le reste de l'instantané en consomme 3,1 à 5.
+
+    ⭐ On garde les lignes les PLUS RÉCENTES : ce sont elles qui expliquent la panne en cours."""
+    vrai = health._sh
+    long = "x" * 300          # tronqué à 200 par la sonde
+    health._sh = lambda *a: "".join(
+        '{"MESSAGE":"%s","__REALTIME_TIMESTAMP":"%d000000"}\n' % (long, 1790850000 + i)
+        for i in range(health.N_PUB))
+    try:
+        lignes = health.publisher()
+    finally:
+        health._sh = vrai
+    import json as _j
+    taille = len(_j.dumps(lignes, separators=(",", ":")).encode())
+    assert taille <= health.PUB_BUDGET_O + 260, (
+        f"la sonde rend {taille} o pour un budget de {health.PUB_BUDGET_O} — avec le reste de "
+        "l'instantané on franchit les 16 Ko du serveur, qui écarte alors TOUT le champ")
+    assert lignes, "la sonde ne rend plus rien : le budget a tout mangé"
+    # ⭐ Les plus RÉCENTES, pas les premières venues.
+    assert lignes[-1]["t"] == 1790850000 + health.N_PUB - 1, (
+        "ce ne sont pas les lignes les plus récentes qui sont conservées")
 
 
 @cas
