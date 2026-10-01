@@ -502,8 +502,18 @@ def on_ne_remplace_JAMAIS_une_base_par_une_base_VIDE():
     d = tempfile.mkdtemp()
     vide = os.path.join(d, "vide.db")
     db.connect(vide).close()
-    assert rb.valide(vide, {"measurements": 0}), "une base vide a été acceptée"
-    assert rb.valide(vide, {"measurements": 5}), "un comptage faux a été accepté"
+    # ⚠️ `attendu` porte maintenant {copiees, rowid_max} par table : on ne compte plus les
+    #    lignes (`count(*)` coûte ~37 s sur Pi Zero et n'est pas cadençable), on vérifie le
+    #    plus grand `rowid` réellement inséré.
+    assert rb.valide(vide, {"measurements": {"copiees": 5, "rowid_max": 42}}), \
+        "une base vide a été acceptée alors que 5 lignes étaient annoncées"
+    assert rb.valide(vide, {"measurements": {"copiees": 5, "rowid_max": 0}}), \
+        "le témoin ne voit pas 5 lignes annoncées pour un max(rowid) nul"
+    assert rb.valide(vide, {"table_absente": {"copiees": 1, "rowid_max": 1}}), \
+        "une table ABSENTE du schéma a été acceptée"
+    # ⚖️ Et le témoin inverse : une base vide dont on n'attend rien est... toujours refusée,
+    #    parce que `pdl` y est vide et qu'aucune mesure n'aurait de sens.
+    assert rb.valide(vide, {}), "une base sans aucun compteur a été acceptée"
     shutil.rmtree(d, ignore_errors=True)
 
 
@@ -1169,6 +1179,82 @@ def une_exception_dans_une_PHASE_laisse_quand_meme_un_rapport():
             f"{phase} : aucun rapport utilisable sur le disque ({ecrit!r})")
         assert not reste, f"{phase} : les ~300 Mo de base neuve restent sur la carte SD"
         shutil.rmtree(d, ignore_errors=True)
+
+
+@cas
+def le_rapport_dit_la_PERIODE_perdue_et_nomme_le_majorant():
+    """🚨 `lignes_perdues` N'EST PAS UN NOMBRE DE LIGNES, et le rapport le faisait lire comme
+    un chiffre exact. C'est `Σ (b − a + 1)` sur les plages de `rowid` abîmées, donc un compte
+    de NUMÉROS : `prune()` en a supprimé au fil du temps, et ces TROUS sont comptés comme des
+    pertes. C'est un MAJORANT, et on ne peut pas faire mieux — savoir combien de lignes
+    existaient là supposerait de les lire, ce qui est exactement ce qui échoue.
+
+    ⭐ En revanche la PÉRIODE est exacte : elle vient des horodatages des lignes qui ENCADRENT
+      chaque zone, et elles sont lisibles. « 5 minutes de courbe » dit à l'opérateur ce que
+      « 304 » ne dit pas."""
+    import json as _j
+    d = tempfile.mkdtemp()
+    chemin, _ = base_abimee(12000, d)
+    sauv = _detourne(chemin)
+    try:
+        res = rb.rebuild(chemin)
+        rapport = rb.RAPPORT
+    finally:
+        _restaure(sauv)
+    assert res.get("ok"), res.get("refus")
+    m = res["detail"]["measurements"]
+    assert m["rowids_perdus"] > 0, "aucune perte ? le montage ne prouve rien"
+    assert m["perdu_du"] and m["perdu_au"], (
+        "la période perdue n'est pas calculée — le rapport ne dirait que des `rowid`, et "
+        "personne ne sait ce que « 304 rowid » représente en courbe")
+    assert m["perdu_du"] <= m["perdu_au"], (m["perdu_du"], m["perdu_au"])
+    with open(rapport, encoding="utf-8") as f:
+        ecrit = _j.load(f)["measurements"]
+    assert "rowids_perdus" in ecrit, (
+        "le rapport parle encore de `perdues` : il laisse croire à un compte de lignes exact")
+    assert ecrit.get("perdu_du") and ecrit.get("perdu_au"), ecrit
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@cas
+def la_validation_ECHANTILLONNE_tout_le_fichier():
+    """🚨 C'EST LA PIÈCE QUI DÉCIDE DE REMPLACER LA BASE DE PRODUCTION, et elle n'a pas le
+    droit de ne rien éprouver du volume.
+
+    `integrity_check` est écarté parce qu'il est NON CADENÇABLE et dure des minutes — mesuré
+    sur la cible : 13,7 s à 15 Mo, 47,1 s à 37 Mo, **75,1 s à 66 Mo**, donc ~5 min 50 pour les
+    306 Mo de la cible, contre un chien de garde de 60 s. Et `count(*)` tombe sous le même
+    couperet (~37 s, non cadençable).
+
+    ⭐ À la place, un ÉCHANTILLON de lignes à `rowid` régulièrement répartis : chaque lecture
+      est une instruction unitaire, donc un point où le processus rend la main, et 500 lectures
+      touchent 500 FEUILLES DIFFÉRENTES sur tout le fichier pour ~150 ms.
+
+    ⚖️ On l'éprouve en abîmant la base NEUVE après sa construction : sans échantillon, la
+       validation ne verrait rien et la bascule aurait lieu."""
+    d = tempfile.mkdtemp()
+    chemin, _ = base_abimee(20000, d)
+    sauv = _detourne(chemin)
+    try:
+        assert rb.phase1(chemin).get("ok")
+        neuve = chemin + ".rebuild"
+        # On abîme LA BASE NEUVE au milieu — le cas qu'une carte mourante produirait en
+        # corrompant nos propres écritures pendant la copie.
+        c = sqlite3.connect(neuve, timeout=30.0)
+        c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        npages = c.execute("PRAGMA page_count").fetchone()[0]
+        c.close()
+        brouille(neuve, max(2, npages // 2), 12)
+        res = rb.phase2(chemin)
+    finally:
+        _restaure(sauv)
+    assert res.get("ok") is False, (
+        "la bascule a eu lieu avec une base neuve ABÎMÉE — la validation n'éprouve rien du "
+        "volume, et on aurait remplacé la production par un fichier corrompu")
+    assert "illisible" in res.get("refus", "") or "max(rowid)" in res.get("refus", ""), res
+    # ⚖️ ET L'ORIGINAL EST INTACT : refuser ne doit rien casser.
+    assert not [f for f in os.listdir(d) if ".corrupt-" in f], "une bascule a eu lieu"
+    shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":

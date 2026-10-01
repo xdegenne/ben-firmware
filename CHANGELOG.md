@@ -321,6 +321,48 @@ ligne, que le cloud dédoublonne (`ON CONFLICT DO NOTHING`) ; et une ligne purg�
 
 **Bancs : 36/36**, cinq mutations nouvelles, toutes attrapées.
 
+#### ⚠️ `integrity_check` écarté — mesuré, pas supposé
+
+| lignes | taille | `integrity_check` | `quick_check` |
+|---|---|---|---|
+| 204 994 | 15 Mo | 13,7 s | 1,6 s |
+| 504 994 | 37 Mo | 47,1 s | 4,3 s |
+| 904 994 | 66 Mo | **75,1 s** | 7,4 s |
+
+Linéaire ⇒ **~5 min 50** pour les 306 Mo visés, en **une seule instruction** qu'on ne peut ni
+interrompre ni ralentir, contre un chien de garde de **60 s**. C'est la forme qui a fait faire
+un reset dur à un boîtier de banc, et l'argument même pour lequel on a refusé les
+`CREATE INDEX` en fin de copie. ⚠️ `count(*)` tombe sous le même couperet (~37 s).
+
+ⓘ Et je dois corriger une affirmation : j'avais écrit que `quick_check` « n'avait jamais fini en
+180 s » sur 490 Mo. La pente donne **~55 s**. L'écart venait de la **contention** — ce test-là
+tournait sur la base de production, écrivains actifs. L'affirmation était trop forte.
+
+**À la place, le minimum acceptable**, tout en lectures **unitaires** donc cadençables : le
+schéma complet · `max(rowid)` conforme à ce qui a été **réellement inséré** · les deux lectures
+canari · `pdl` non vide · et un **échantillon de 500 lignes à `rowid` régulièrement répartis**,
+qui touche 500 feuilles différentes sur tout le fichier pour **~150 ms**.
+
+🚨 Et ce que ça **ne** couvre pas, parce qu'un contrôle dont on ignore le trou est un contrôle
+qui ment : 500 pages sur ~75 000 c'est **0,7 %** — on attrape un dommage **étendu**, pas une
+page isolée ; rien sur les structures internes de SQLite ; et les pages qu'on vient d'écrire
+sont souvent encore en cache, donc les relire teste moins la carte qu'il n'y paraît. Le pari est
+explicite : le mode de panne réaliste d'une carte mourante est un dommage étendu.
+
+#### ⚠️ `lignes_perdues` était un majorant présenté comme un compte
+
+C'est `Σ (b − a + 1)` sur les plages de `rowid` abîmées — donc un compte de **numéros**. Les
+`rowid` supprimés par `prune()` sont des **trous** comptés comme des pertes. Renommé
+**`rowids_perdus`**, et on ne peut pas faire mieux : savoir combien de lignes existaient là
+supposerait de les lire.
+
+⭐ En revanche la **période** est exacte, parce qu'elle vient des horodatages des lignes qui
+**encadrent** chaque zone — déjà calculés pour corriger le rollup, et jamais rapportés. Le
+rapport porte désormais `perdu_du` / `perdu_au` : *« 5 minutes de courbe »* dit à l'opérateur ce
+que *« 304 »* ne dit pas.
+
+**Bancs : 38/38.**
+
 ⓘ Aucune migration, aucune table, aucune colonne.
 
 ### [0.9.24] — 2026-10-01

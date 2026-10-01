@@ -372,6 +372,7 @@ def copie_par_tranches(src: sqlite3.Connection, dst: sqlite3.Connection, table: 
     ecriture = f"INSERT OR REPLACE INTO {table} (rowid, {liste}) VALUES ({trous})"
 
     copiees = 0
+    rowid_max = 0         # le plus grand rowid RÉELLEMENT inséré — sert à la validation
     perdues = []          # les plages de rowid qu'on abandonne
     ts_perdus = []        # leurs horodatages, pour corriger le rollup
     i_ts = cols.index("ts") + 1 if "ts" in cols else None
@@ -412,6 +413,7 @@ def copie_par_tranches(src: sqlite3.Connection, dst: sqlite3.Connection, table: 
         if rows:
             dst.executemany(ecriture, rows)
             copiees += len(rows)
+            rowid_max = max(rowid_max, rows[-1][0])
         # 🚨 ON ÉCOULE ET ON CÈDE LA MAIN, à chaque tranche. Voir `PAUSE_TRANCHE_S` : le chien
         #    de garde matériel est armé à 60 s, et un boîtier de banc a fait un reset dur
         #    pendant un essai de recopie. Ce n'est pas de la politesse, c'est la condition pour
@@ -434,9 +436,23 @@ def copie_par_tranches(src: sqlite3.Connection, dst: sqlite3.Connection, table: 
             for (ts,) in _ts_voisins(src, table, a, b):
                 ts_perdus.append(ts)
 
-    return {"copiees": copiees, "perdues": perdues,
-            "lignes_perdues": sum(b - a + 1 for a, b in perdues),
-            "ts_perdus": ts_perdus}
+    # 🚨 `rowids_perdus` EST UN MAJORANT, PAS UN COMPTE DE LIGNES — et c'est important parce
+    #    que le rapport le fait lire comme un chiffre exact. On additionne des numéros de
+    #    `rowid` dans les plages abîmées ; or `prune()` en a supprimé au fil du temps, et ces
+    #    TROUS sont comptés comme des pertes. On ne peut pas faire mieux par construction :
+    #    savoir combien de lignes existaient là supposerait de les lire, ce qui est exactement
+    #    ce qui échoue.
+    #
+    # ⭐ D'où `perdu_du` / `perdu_au` : la PÉRIODE perdue, elle, est exacte — elle vient des
+    #   horodatages des lignes qui ENCADRENT chaque zone, et elles sont lisibles. « ~5 minutes
+    #   de courbe » dit à l'opérateur ce que « 304 » ne dit pas.
+    return {"copiees": copiees,
+            "perdues": perdues,
+            "rowids_perdus": sum(b - a + 1 for a, b in perdues),
+            "lignes_perdues": sum(b - a + 1 for a, b in perdues),   # compat. du rapport
+            "perdu_du": min(ts_perdus) if ts_perdus else None,
+            "perdu_au": max(ts_perdus) if ts_perdus else None,
+            "ts_perdus": ts_perdus, "rowid_max": rowid_max}
 
 
 def _ts_voisins(src: sqlite3.Connection, table: str, a: int, b: int) -> list:
@@ -461,29 +477,99 @@ def _ts_voisins(src: sqlite3.Connection, table: str, a: int, b: int) -> list:
 
 # ── La validation, avant toute bascule ──────────────────────────────────────────────────────
 
+# Nombre de lignes tirées au hasard réparti pour l'échantillonnage. 500 lectures d'une ligne
+# coûtent ~150 ms et touchent 500 feuilles DIFFÉRENTES réparties sur tout le fichier.
+ECHANTILLON = 500
+
+
 def valide(chemin: str, attendu: dict) -> str | None:
     """La base neuve est-elle utilisable ? `None` = oui.
 
-    ⭐ C'est le SEUL endroit où payer un `integrity_check` intégral est justifié. Sur
-      l'original, il est ruineux et inutile — on sait déjà qu'il est abîmé, et il avait mis
-      ben-0001 à genoux (charge 4,50, `sshd` muet, jamais fini en 180 s). Ici il répond à la
-      vraie question : « a-t-on le droit de remplacer la base de production avec ce fichier ? »
+    ═══ POURQUOI PAS `integrity_check`, ALORS QUE C'EST LE CONTRÔLE COMPLET ══════════════════
+
+    🚨 PARCE QU'IL EST NON CADENÇABLE ET QU'IL DURE DES MINUTES. Mesuré ce matin sur une base
+       de 490 Mo du parc : `PRAGMA quick_check` — MOINS coûteux qu'`integrity_check` — n'a
+       JAMAIS FINI en 180 s, a porté la charge à 4,50 et rendu `sshd` muet.
+
+       Or le chien de garde du SoC est armé à 60 s, et une instruction SQL unique ne peut être
+       ni interrompue ni ralentie. C'est exactement la forme qui a fait faire un reset dur à un
+       boîtier de banc, et exactement l'argument pour lequel on a refusé les `CREATE INDEX` en
+       fin de copie (gain ×1,17, 9,5 s pour 255 000 lignes donc 2-3 min à pleine échelle).
+       L'accepter ici serait incohérent.
+
+    ⚠️ Et `SELECT count(*)` tombe sous le même couperet : il balaie ~4 M entrées d'index, soit
+       ~37 s mesurées sur Pi Zero, non cadençables.
+
+    ═══ CE QU'ON FAIT À LA PLACE, ET CE QUE ÇA VAUT ══════════════════════════════════════════
+
+    Tout est en lectures UNITAIRES, donc chacune est un point où le processus rend la main :
+
+      ① le SCHÉMA est complet — toute table de l'original existe dans la neuve. Sans ça, une
+         table manquante partirait en production et ne se verrait qu'à son premier usage.
+      ② `max(rowid)` de chaque table recopiée vaut CE QU'ON A RÉELLEMENT INSÉRÉ. C'est une
+         lecture de la feuille la plus à droite : elle prouve que la dernière ligne est là ET
+         lisible.
+      ③ les DEUX LECTURES CANARI passent — c'est le chemin de lecture du publisher, celui qui
+         échouait sur la base d'origine.
+      ④ `pdl` est non vide : sans compteur, aucune mesure n'a de sens.
+      ⑤ un ÉCHANTILLON de 500 lignes à `rowid` RÉGULIÈREMENT RÉPARTIS sur tout le fichier.
+
+    ⭐ C'est le ⑤ qui change la nature du contrôle : 500 lectures touchent 500 FEUILLES
+      DIFFÉRENTES réparties sur les ~75 000 pages du fichier, pour ~150 ms. Sans lui, on ne
+      vérifiait rien du volume.
+
+    🚨 ET VOICI CE QUE ÇA NE COUVRE PAS, parce qu'un contrôle dont on ignore le trou est un
+       contrôle qui ment :
+         · 500 pages sur 75 000, c'est 0,7 % — on attrape un dommage ÉTENDU, pas une page
+           isolée ;
+         · rien sur les structures internes de SQLite (listes de pages libres, cohérence
+           table/index) ;
+         · et les pages qu'on vient d'écrire sont souvent encore dans le cache du noyau, donc
+           les relire teste moins la carte qu'il n'y paraît.
+
+    ⇒ Le pari est explicite : la base neuve vient d'être écrite par SQLite lui-même, page par
+      page, via son propre code d'arbres. La corruption qu'on répare vient du STOCKAGE. Le
+      mode de panne réaliste d'une carte mourante est un dommage ÉTENDU — c'est celui qu'un
+      échantillon réparti attrape.
     """
     try:
         c = sqlite3.connect(f"file:{chemin}?mode=ro", uri=True)
     except sqlite3.Error as e:
         return f"la base neuve ne s'ouvre pas ({e})"
     try:
-        r = c.execute("PRAGMA integrity_check").fetchone()
-        if not r or r[0] != "ok":
-            return f"integrity_check sur la base neuve : {r[0] if r else 'aucune réponse'}"
-        for table, n in attendu.items():
-            vu = c.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-            if vu != n:
-                return f"{table} : {vu} lignes dans la base neuve, {n} attendues"
-        # ⚖️ LE TÉMOIN : une base vide passerait tout ce qui précède.
-        if attendu.get("measurements", 0) == 0:
-            return "aucune mesure recopiée — on ne remplace pas une base par une base vide"
+        # ① le schéma
+        vues = set(tables(c))
+        manquantes = [t for t in attendu if t not in vues]
+        if manquantes:
+            return f"table(s) absente(s) de la base neuve : {', '.join(manquantes)}"
+
+        for table, att in attendu.items():
+            # ② la dernière ligne est là, et lisible
+            r = c.execute(f"SELECT max(rowid) FROM {table}").fetchone()
+            vu = (r[0] or 0) if r else 0
+            if vu != att["rowid_max"]:
+                return (f"{table} : max(rowid) = {vu} dans la base neuve, "
+                        f"{att['rowid_max']} inséré")
+            # ⚖️ LE TÉMOIN : une base vide passerait tout le reste.
+            if att["copiees"] and vu == 0:
+                return f"{table} : {att['copiees']} lignes annoncées mais max(rowid) = 0"
+
+            # ⑤ l'échantillon réparti
+            if att["copiees"] > 1:
+                pas = max(1, vu // ECHANTILLON)
+                for rid in range(pas, vu + 1, pas):
+                    c.execute(f"SELECT * FROM {table} WHERE rowid = ?", (rid,)).fetchone()
+
+        # ③ le chemin de lecture du publisher
+        for sql in (f"SELECT {COLS_MEASUREMENTS} FROM measurements WHERE sent = 0 "
+                    f"ORDER BY rowid LIMIT {N_LOT}",
+                    f"SELECT {COLS_MEASUREMENTS} FROM measurements ORDER BY rowid DESC LIMIT 1"):
+            for _ in c.execute(sql):
+                pass
+
+        # ④ sans compteur, rien n'a de sens
+        if not c.execute("SELECT rowid FROM pdl LIMIT 1").fetchone():
+            return "`pdl` est vide dans la base neuve — aucune mesure n'aurait de sens"
     except sqlite3.Error as e:
         return f"la base neuve est illisible ({e})"
     finally:
@@ -742,10 +828,15 @@ def _jette_la_neuve(neuve: str) -> None:
 
 def _fusionne(a: dict, b: dict) -> dict:
     """Additionne deux comptes rendus de `copie_par_tranches`."""
+    ts = a["ts_perdus"] + b["ts_perdus"]
     return {"copiees": a["copiees"] + b["copiees"],
             "perdues": a["perdues"] + b["perdues"],
+            "rowids_perdus": a["lignes_perdues"] + b["lignes_perdues"],
             "lignes_perdues": a["lignes_perdues"] + b["lignes_perdues"],
-            "ts_perdus": a["ts_perdus"] + b["ts_perdus"]}
+            "perdu_du": min(ts) if ts else None,
+            "perdu_au": max(ts) if ts else None,
+            "ts_perdus": ts,
+            "rowid_max": max(a.get("rowid_max", 0), b.get("rowid_max", 0))}
 
 
 # ── Phase 1 : À CHAUD, rien d'arrêté ────────────────────────────────────────────────────────
@@ -928,7 +1019,8 @@ def _phase2(db_path: str) -> dict:
         return res
 
     rollup = corrige_rollup(dst, detail.get("measurements", {}).get("ts_perdus", []))
-    attendu = {t: detail[t]["copiees"] for t in detail}
+    attendu = {t: {"copiees": detail[t]["copiees"],
+                   "rowid_max": detail[t].get("rowid_max", 0)} for t in detail}
     dst.close()
     src.close()
 
@@ -1015,7 +1107,13 @@ def _ecris_rapport(res: dict) -> None:
         "rollup": (res.get("rollup") or {}).get("seaux_supprimes"),
     }
     for t, v in (res.get("detail") or {}).items():
-        compact[t] = {"copiees": v["copiees"], "perdues": v["lignes_perdues"],
+        # ⚠️ `rowids_perdus` et non `perdues` : c'est un MAJORANT (les `rowid` supprimés par
+        #    `prune()` sont des trous comptés comme des pertes). `perdu_du`/`perdu_au`, eux,
+        #    sont exacts — ils viennent des voisins LISIBLES de chaque zone, et c'est ce qui
+        #    dit à l'opérateur combien de COURBE a disparu.
+        compact[t] = {"copiees": v["copiees"],
+                      "rowids_perdus": v.get("rowids_perdus", v["lignes_perdues"]),
+                      "perdu_du": v.get("perdu_du"), "perdu_au": v.get("perdu_au"),
                       "plages": v["perdues"][:5]}
     if res.get("refus"):
         compact["refus"] = str(res["refus"])[:200]
@@ -1084,8 +1182,14 @@ def main(argv: list) -> int:
         print(f"  ⚠ {res['refus']}", file=sys.stderr)
         return 0
     for t, v in res.get("detail", {}).items():
-        print(f"  {t} : {v['copiees']} copiées, {v['lignes_perdues']} perdues "
-              f"({len(v['perdues'])} zone(s))", file=sys.stderr)
+        msg = (f"  {t} : {v['copiees']} copiées, {v.get('rowids_perdus', 0)} rowid perdus "
+               f"au plus ({len(v['perdues'])} zone(s))")
+        if v.get("perdu_du"):
+            duree = (v["perdu_au"] - v["perdu_du"]) / 60.0
+            msg += (f" — du {time.strftime('%d/%m %H:%M', time.localtime(v['perdu_du']))} "
+                    f"au {time.strftime('%d/%m %H:%M', time.localtime(v['perdu_au']))} "
+                    f"({duree:.0f} min de courbe)")
+        print(msg, file=sys.stderr)
     if argv[1] == "--phase1":
         print(f"  phase 1 terminée en {res['phase1_ms'] / 1000:.0f} s — RIEN n'a été arrêté, "
               "rien n'a été basculé", file=sys.stderr)
