@@ -37,6 +37,18 @@
 #      Un réseau cligne — échouer une fois n'est pas une erreur. Au-delà, ce boîtier ne livre
 #      plus ses données, et c'est l'état le plus grave qu'il puisse connaître sans être mort.
 #
+#   ⭐ ET LA SONDE `pub` : les 5 dernières lignes du journal de ben-publisher, SANS filtre de
+#      priorité. Elle n'est pas redondante avec `errors` — c'est une question de MOMENT. Le
+#      hello part JUSTE APRÈS le redémarrage du publisher par l'OTA : à cet instant le nouveau
+#      processus a `echecs = 0`, donc aucune ligne en priorité 3 n'existe encore, et celles de
+#      l'ANCIEN sont en PRIORITY=6 sur tout boîtier antérieur à ce tag. Sans `pub`, la cause
+#      d'une panne de publication n'arriverait qu'au hello SUIVANT, sous 24 h.
+#      ⚠️ Sans filtre de priorité, et c'est ce qui la rend SÛRE : `-u` ne dégénère en balayage
+#         complet que s'il n'y a AUCUNE correspondance (7,93 s mesurés sur `-u ben-radio -p 3`).
+#         Les lignes INFO du publisher en garantissent toujours une.
+#      ⚠️ Elle passe EN DERNIER : l'ordre des sondes est une liste de priorité, et l'échéance
+#         globale sacrifie la dernière en premier.
+#
 #   ⚠️ Et l'explication du serveur VOYAGE désormais avec l'exception : la ligne escaladée
 #      portait « HTTP 400 » sans le corps, soit un refus sans sa raison. Or un 400 ou un 413
 #      ne se résout PAS en réessayant, et le corps est la seule chose qui dira lequel.
@@ -214,7 +226,7 @@ except Exception as e:                      # noqa: BLE001
 if "dev" not in snap:
     ko.append("`dev` absent : `versions()` est cassée (fonction pure de device.json)")
 AU_DELA_DU_SOCLE = {"wifi", "dev", "db", "pdl", "pending", "emitter", "events_pending",
-                    "radio", "repo", "units", "errors"}
+                    "radio", "repo", "units", "errors", "pub"}
 if not (AU_DELA_DU_SOCLE & set(snap)):
     ko.append(f"AUCUNE sonde au-delà du socle n'a rapporté ({sorted(snap)}) — "
               "l'assemblage ne marche pas")
@@ -246,6 +258,13 @@ if "errors" not in snap:
     avertissements.append("`errors` absent — `ben` ne lit pas le journal (groupe "
                           "systemd-journal) ou aucune entrée de priorité <= 3 ; "
                           "les erreurs NOYAU manqueront au diagnostic")
+# 🚨 LA SONDE QUI DONNE LA RÉPONSE AU PREMIER HELLO. Le hello part juste après le
+#    redémarrage du publisher par l'OTA : à cet instant `echecs = 0`, aucune ligne en
+#    priorité 3 n'existe encore, et celles de l'ancien processus sont en PRIORITY=6. Sans
+#    `pub`, la cause d'une panne de publication n'arriverait qu'au hello SUIVANT, sous 24 h.
+if "pub" not in snap:
+    avertissements.append("`pub` absent — le journal de ben-publisher est illisible ; la "
+                          "cause d'une panne de publication n'arrivera qu'au hello suivant")
 if conn is not None and "pdl" not in snap:
     avertissements.append("`pdl` absent alors que la base est ouverte — base verrouillée, "
                           "ou aucun compteur enregistré")

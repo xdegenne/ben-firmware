@@ -69,11 +69,19 @@ Au-delà de `ECHECS_ERREUR` (5) échecs consécutifs, l'échec passe en `log.err
 
 La ligne escaladée portait `HTTP 400` **sans le corps** — un refus sans sa raison, soit le même angle mort. Or un 400 ou un 413 **ne se résout pas en réessayant** : le lot est malformé ou trop gros, et le corps est la seule chose qui dira lequel.
 
-**⚠️ Ce qui a été abandonné en route**
+**⭐ Et la sonde `pub`, abandonnée puis rétablie**
 
-Une sonde `pub` qui lisait les 5 dernières lignes du journal de `ben-publisher`. Elle marchait — 26 cas verts sur les deux modèles — mais coûtait ~2,9 s/jour et portait un risque réel : `journalctl -u` **dégénère en balayage complet** quand l'unité est silencieuse (7,93 s contre 0,36 s), soit exactement le cas d'un boîtier en panne.
+Les 5 dernières lignes du journal de `ben-publisher`, **sans filtre de priorité**.
 
-⇒ Le *pourquoi* est réglé par ce correctif ; le nombre de points réellement insérés l'est **côté serveur** (`ben-api#8`), où le chiffre est déjà calculé.
+Je l'avais retirée au motif qu'`errors()` remonte déjà la priorité 3. ⚠️ **C'est faux pour le moment qui compte** : le hello part **juste après** le redémarrage du publisher par l'OTA. À cet instant le nouveau processus a `echecs = 0` — aucune ligne en priorité 3 n'existe encore — et celles de l'**ancien** processus sont en `PRIORITY=6` sur tout boîtier antérieur à ce tag.
+
+⇒ Sans `pub`, la cause d'une panne de publication n'arriverait qu'au hello **suivant**, donc **sous 24 h**. Avec, elle arrive au **premier**, quelques minutes après l'OTA.
+
+⚠️ **Et sans filtre de priorité, c'est ce qui la rend sûre.** `-u` ne dégénère en balayage complet que s'il n'y a **aucune** correspondance — journald parcourt alors tout le journal pour n'en trouver aucune, et c'est de là que venaient les **7,93 s** de `-u ben-radio -p 3`. Les lignes INFO du publisher garantissent toujours une correspondance : la lecture reste une lecture de **queue**.
+
+⚠️ Elle passe **en dernier** : l'ordre des sondes est une liste de priorité, et l'échéance globale sacrifie la dernière en premier. Sur un boîtier en difficulté, mieux vaut perdre son journal de publisher que l'état de ses services.
+
+ⓘ Le nombre de points réellement insérés, lui, est journalisé **côté serveur** (`ben-api#8`) — là où le chiffre était déjà calculé et jeté.
 
 **Budget de collecte : 12 → 20 s**
 

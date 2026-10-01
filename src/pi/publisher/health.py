@@ -91,6 +91,7 @@ BUDGET_S = 20.0
 
 N_ERRORS = 8        # les N dernières lignes de priorité <= 3
 N_FRAMES = 20       # les N dernières trames LoRa : l'état du lien AU MOMENT où il meurt
+N_PUB = 5           # les N dernières lignes du journal de ben-publisher
 
 
 # 🚨 L'ÉCHÉANCE GLOBALE, et c'est elle qui rend le budget RÉEL.
@@ -504,6 +505,63 @@ def errors() -> list | None:
     return out or None
 
 
+def publisher() -> list | None:
+    """Les dernières lignes du journal de `ben-publisher`, SANS filtre de priorité.
+
+    🚨 POURQUOI, ALORS QUE `errors()` REMONTE DÉJÀ LA PRIORITÉ 3 — c'est une question de
+       MOMENT, et elle a été tranchée par le terrain.
+
+       Le hello part JUSTE APRÈS le redémarrage du publisher par l'OTA (`check_update.py`,
+       étape 10). À cet instant le nouveau processus a `echecs = 0` : aucune ligne en
+       priorité 3 n'existe encore, et il faudra ~1 minute d'échecs pour qu'elle apparaisse.
+       Quant aux lignes de l'ANCIEN processus, elles sont en `PRIORITY=6` sur tout boîtier
+       antérieur à 0.9.23.
+
+       ⇒ Sans cette sonde, la cause d'une panne de publication n'arrive qu'au hello SUIVANT,
+         donc sous 24 h. Avec, elle arrive au PREMIER — quelques minutes après l'OTA.
+
+    ⭐ Et sur un boîtier SAIN ses lignes INFO sont elles-mêmes le diagnostic :
+
+        [INFO] envoyé 86 · inséré 79 · reste ~0
+
+       `inséré` y dit ce que `pending` ne dit pas : si le serveur a vraiment retenu les points
+       ou s'il les absorbe comme doublons.
+
+    ⚠️ SANS FILTRE DE PRIORITÉ, ET C'EST CE QUI LA REND SÛRE. Mesuré sur un boîtier du parc :
+
+        -u ben-publisher -n 5                  2,94 s   ← retenu
+        -u ben-publisher -p 4 -n 10            0,57 s
+        -u ben-radio     -p 3 -n 8             7,93 s   🚨
+        -p 3 -n 8        (sans -u)             0,36 s
+
+       🚨 `-u` ne dégénère en balayage complet que s'il n'y a AUCUNE correspondance : journald
+          parcourt alors tout le journal pour n'en trouver aucune. C'est de là que venaient les
+          7,93 s — `-u ben-radio -p 3` sur une unité sans erreur. Sans filtre de priorité, les
+          lignes INFO du publisher garantissent toujours une correspondance, donc la lecture
+          reste une lecture de QUEUE. ⇒ Ajouter `-p 4` serait plus rapide sur un boîtier bavard
+          et ruineux sur un boîtier silencieux ; ne rien filtrer est le choix sûr.
+
+    ⚠️ C'est la sonde la plus lente de l'instantané ; elle passe donc EN DERNIER, et l'échéance
+       globale la sacrifie en premier sur un boîtier en difficulté.
+    """
+    raw = _sh("journalctl", "-u", "ben-publisher", "-n", str(N_PUB), "--no-pager", "-o", "json")
+    out = []
+    for line in raw.splitlines():
+        try:
+            d = json.loads(line)
+        except Exception:  # noqa: BLE001
+            continue
+        msg = d.get("MESSAGE")
+        if not isinstance(msg, str):
+            continue
+        try:
+            ts = int(int(d.get("__REALTIME_TIMESTAMP", 0)) / 1_000_000)
+        except (TypeError, ValueError):
+            ts = 0
+        out.append({"t": ts, "m": msg[:200]})
+    return out or None
+
+
 def versions(dev: dict) -> dict | None:
     """Ce que le boîtier CROIT être. À recouper avec `repo.tag` : les deux divergent si une
     update a échoué entre le checkout et le bump de `device.json`."""
@@ -562,7 +620,10 @@ def snapshot(conn: sqlite3.Connection | None, dev: dict | None = None,
               ("radio", lambda: radio(conn, pdl_indexes) if conn is not None else None),
               ("repo", repo),
               ("units", units),
-              ("errors", errors))
+              ("errors", errors),
+              # ⚠️ EN DERNIER : la plus lente (~2,9 s), et celle dont l'absence coûte le
+              #    moins — les autres champs disent déjà l'essentiel.
+              ("pub", publisher))
 
     for name, probe in probes:
         if time.monotonic() - start >= BUDGET_S:
