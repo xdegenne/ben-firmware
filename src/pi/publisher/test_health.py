@@ -216,6 +216,36 @@ def TOUTE_requete_sur_les_grosses_tables_porte_WHERE_pdl_index():
 
 
 @cas
+def AUCUNE_sonde_ne_peut_ECRIRE_sur_le_boitier():
+    """🚨 LE DÉFAUT LE PLUS GRAVE DE TOUTE CETTE ISSUE, et il venait du diagnostic lui-même.
+
+    `git status` rafraîchit l'index au passage, donc il prend `.git/index.lock`. Or `_sh` tue
+    par SIGKILL au délai, et `repo` est la 6ᵉ sonde sur 8 — sur un boîtier chargé elle hérite
+    de moins d'une seconde. Un git tué laisse le verrou. Ensuite, vérifié sur un boîtier du
+    parc (git 2.47.3) :
+
+        git checkout t1         → fatal: Unable to create '.git/index.lock': File exists.
+        git status --porcelain  → (vide, SUCCÈS)
+
+    `checkout_tag` étant en `check=True`, l'agent sort en 1, `device.json` n'est pas bumpé, et
+    l'update REJOUE toutes les 10 min pour toujours. 🚨 Et la sonde SURVIT au verrou : elle
+    rapporterait `dirty: false` pendant que toute l'OTA est morte — elle masquerait le blocage
+    qu'elle existe pour révéler.
+
+    ⭐ Ce cas est STRUCTUREL : on ne peut pas reproduire une course au verrou dans un banc. On
+    vérifie donc que TOUT appel à `git` porte `--no-optional-locks`, et c'est la seule forme
+    de garde qui tienne dans le temps."""
+    src = "\n".join(l for l in pathlib.Path(health.__file__).read_text().splitlines()
+                    if not l.lstrip().startswith("#"))
+    appels = [l for l in src.splitlines() if '"git"' in l]
+    assert appels, "plus aucun appel à git ? le cas doit être revu, pas supprimé"
+    for l in appels:
+        assert '"--no-optional-locks"' in l, (
+            "appel à git SANS --no-optional-locks — il peut laisser un .git/index.lock "
+            f"et bloquer l'OTA du boîtier à vie :\n    {l.strip()}")
+
+
+@cas
 def le_resume_radio_est_PAR_COMPTEUR():
     """⭐ Conséquence utile du correctif : on sait LEQUEL des compteurs a perdu son lien, au
     lieu d'un agrégat qui les mélange."""

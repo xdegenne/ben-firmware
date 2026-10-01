@@ -100,10 +100,32 @@ except Exception as e:                      # noqa: BLE001
     ko.append(f"l'instantané n'est PAS sérialisable en JSON : {e}")
     brut = ""
 
-# ⚖️ LE TÉMOIN : un instantané qui ne contiendrait QUE `collect_ms` passerait tous les
-#    contrôles ci-dessus — et on aurait instrumenté sept boîtiers pour rien.
-if len(snap) < 3:
-    ko.append(f"instantané quasi VIDE ({sorted(snap)}) — les sondes ne rapportent rien")
+# ⚖️ LE TÉMOIN — et la première version, `len(snap) < 3`, NE POUVAIT JAMAIS ÉCHOUER.
+#
+#    `host()` verse à lui seul jusqu'à SEPT clés à plat (up, boot, temp, load, mem, tainted,
+#    disk_mb), plus `collect_ms`. Le compte était donc toujours >= 3, même si `store`, `radio`,
+#    `units`, `errors` ET `repo` revenaient tous vides. On aurait livré à sept boîtiers un
+#    diagnostic qui ne diagnostique rien, avec un témoin vert.
+#
+# ⭐ On exige donc des clés NOMMÉES, et on choisit celles qui ne peuvent pas manquer pour une
+#    raison d'ENVIRONNEMENT :
+#
+#    · `dev` est une fonction PURE du `device.json` que l'agent lit déjà pour connaître sa
+#      propre version. Si elle manque, c'est `versions()` qui est cassée — un défaut de CODE,
+#      donc un tag à refaire, donc un échec légitime.
+#    · ⭐ et au moins UNE sonde au-delà de `host` : c'est l'ASSEMBLAGE qu'on éprouve, pas une
+#      sonde en particulier. Un module qui ne rendrait que le socle passerait tout le reste.
+#
+# ⚠️ `units` et `pdl` sont en AVERTISSEMENT, pas en échec : `systemctl` peut expirer et la base
+#    peut être verrouillée. Les exiger ferait échouer l'update sur un boîtier simplement
+#    chargé — donc rejeu toutes les 10 min, la mécanique de pi-0.9.12.
+if "dev" not in snap:
+    ko.append("`dev` absent : `versions()` est cassée (fonction pure de device.json)")
+AU_DELA_DU_SOCLE = {"wifi", "dev", "db", "pdl", "pending", "emitter", "events_pending",
+                    "radio", "repo", "units", "errors"}
+if not (AU_DELA_DU_SOCLE & set(snap)):
+    ko.append(f"AUCUNE sonde au-delà du socle n'a rapporté ({sorted(snap)}) — "
+              "l'assemblage ne marche pas")
 
 # 🚨 CE QUI AVERTIT SANS FAIRE ÉCHOUER, et la distinction n'est pas de la mollesse.
 #
@@ -122,6 +144,12 @@ if len(brut) > 16 * 1024:
 if duree > 10:
     avertissements.append(f"collecte lente sur ce boîtier : {duree:.1f} s pour un budget de "
                           f"{health.BUDGET_S:.0f} s — les sondes chères seront perdues")
+if "units" not in snap:
+    avertissements.append("`units` absent — systemctl a expiré ; l'état des services "
+                          "manquera au diagnostic de ce boîtier")
+if conn is not None and "pdl" not in snap:
+    avertissements.append("`pdl` absent alors que la base est ouverte — base verrouillée, "
+                          "ou aucun compteur enregistré")
 
 print(f"  champs : {', '.join(sorted(k for k in snap if k != 'collect_ms'))}", file=sys.stderr)
 print(f"  {len(brut)} o bruts · collecte {snap.get('collect_ms')} ms", file=sys.stderr)

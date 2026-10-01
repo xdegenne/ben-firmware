@@ -190,11 +190,37 @@ def repo(path: str = "/opt/ben/repo") -> dict | None:
 
     ⚠️ C'est la sonde la plus chère de tout l'instantané : ~1,15 s pour les deux appels git.
     Elle les vaut, une fois par jour, parce qu'elle est le SEUL moyen de voir à distance un
-    boîtier dont l'OTA ne passera plus jamais."""
-    tag = _sh("git", "-C", path, "describe", "--tags", "--always").strip()
+    boîtier dont l'OTA ne passera plus jamais.
+
+    🚨 `--no-optional-locks` N'EST PAS UNE OPTION DE CONFORT : SANS LUI, CETTE SONDE PEUT
+       BLOQUER L'OTA DU BOÎTIER DÉFINITIVEMENT.
+
+       `git status` prend `.git/index.lock` pour rafraîchir l'index au passage. Or `_sh` tue
+       la commande par SIGKILL quand le délai expire — et `repo` passe après `host`, `store`
+       et `radio`, donc avec moins d'une seconde devant elle sur un boîtier chargé. Un git
+       tué n'a aucun gestionnaire de nettoyage : **le fichier de verrou reste**.
+
+       Après quoi, vérifié sur un boîtier du parc (git 2.47.3) :
+
+           git checkout t1         → fatal: Unable to create '.git/index.lock': File exists.
+           git status --porcelain  → (vide, SUCCÈS)
+
+       ⇒ `update_lib.checkout_tag` est en `check=True`, donc `check_update.py` sort en 1,
+         `device.json` n'est pas bumpé, et l'update REJOUE toutes les 10 min POUR TOUJOURS.
+         Plus aucune version n'atteint ce boîtier jusqu'à une intervention en SSH.
+
+    🚨 ET LE PIRE : la sonde SURVIT au verrou qu'elle a posé. `git status` réussit quand
+       même, donc elle continuerait à rapporter `dirty: false` et le bon `tag` pendant que
+       toutes les OTA échouent — elle MASQUERAIT précisément le blocage qu'elle existe pour
+       révéler. Un garde-fou plus destructeur que la panne qu'il traite est un défaut, pas
+       une protection (la leçon du verrou taint de 0.9.12, sous une autre forme).
+    """
+    tag = _sh("git", "--no-optional-locks", "-C", path,
+              "describe", "--tags", "--always").strip()
     if not tag:
         return None
-    return {"tag": tag, "dirty": bool(_sh("git", "-C", path, "status", "--porcelain").strip())}
+    dirty = _sh("git", "--no-optional-locks", "-C", path, "status", "--porcelain")
+    return {"tag": tag, "dirty": bool(dirty.strip())}
 
 
 def store(conn: sqlite3.Connection, db_path: str = DB_PATH) -> dict:
