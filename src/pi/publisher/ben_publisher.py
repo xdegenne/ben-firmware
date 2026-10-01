@@ -69,6 +69,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # src/pi
 import capabilities as caps  # noqa: E402
+import health  # noqa: E402
 from store import db  # noqa: E402
 
 # ── Réglages ──────────────────────────────────────────────────────────────────
@@ -403,6 +404,29 @@ def send_hello(cli: Client, conn: sqlite3.Connection, dev: dict) -> None:
                "contract_epoch": epochs,
                "tariff_labels": labels,
                "meter_profile": profile}
+
+    # ── L'instantané de santé (#16) ───────────────────────────────────────────
+    #
+    # 🚨 POURQUOI ICI, dans une requête qu'on qualifie soi-même de « purement
+    #    informative » : un boîtier qui CESSE DE MESURER continue de dire bonjour.
+    #    `last_seen` reste frais côté cloud, l'OTA passe, et rien ne le signale.
+    #    Constaté le 2026-10-01 sur un boîtier du parc — NEUF JOURS de silence,
+    #    découverts par hasard, sur une machine injoignable (ni SSH ni VPN).
+    #
+    # ⭐ Coût mesuré sur un Pi Zero du parc : ~2,4 s de collecte, 169 o gzippés —
+    #    contre 276 o pour le hello lui-même et 270 Mo/an de mesures.
+    #
+    # ⚠️ `snapshot()` NE LÈVE JAMAIS : chaque sonde y est isolée et se replie sur
+    #    l'absence de son champ. Le `try` ci-dessous est une ceinture de plus, pas
+    #    une excuse — si un jour il attrape quelque chose, c'est health.py qui a un
+    #    défaut, et le hello doit partir quand même.
+    try:
+        snap = health.snapshot(conn, dev, db.DB_PATH)
+    except Exception as e:  # noqa: BLE001
+        log.warning("santé illisible (%s) — hello envoyé sans", e)
+        snap = None
+    if snap:
+        payload["health"] = snap
     status, body = cli.post("/hello", payload)
     if 200 <= status < 300:
         log.info("hello OK — %d compteur(s) déclaré(s)", len(pdls))
