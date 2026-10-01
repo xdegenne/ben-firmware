@@ -20,42 +20,51 @@ Deux pistes indépendantes :
 
 ### [0.9.23] — 2026-10-01
 
-**Un champ né d'un échec de diagnostic.** Ferme [#18](https://github.com/xdegenne/ben-firmware/issues/18).
+**Un échec qui persiste est une erreur, pas un avertissement.** Ferme [#18](https://github.com/xdegenne/ben-firmware/issues/18).
 
-`pi-0.9.22` a livré l'instantané de santé, et il a immédiatement **démenti trois diagnostics successifs** sur le boîtier qui motivait tout le chantier :
+`pi-0.9.22` a livré l'instantané de santé, et il a **démenti trois diagnostics successifs** sur le boîtier qui motivait tout le chantier :
 
 ```
 il MESURE              une trame toutes les 38 s, à l'instant
 il est EN LIGNE        hello 204 en 17 ms, WiFi à −40 dBm
 le publisher TOURNE    active/running, 0 redémarrage
-pending                566 248 points — soit 8,8 jours, l'écart exact observé
+pending                566 248 points — 8,8 jours, l'écart exact observé
 ce qui part            RIEN, aucun POST en quatre minutes
 ```
 
 ⇒ Ni « fenêtres de connectivité courtes », ni « arrêt de mesure », ni « émetteur mort ». **Il mesure et ne publie pas** — le deuxième des trois états que `last_seen` confond, celui qu'on croyait déjà visible.
 
-🚨 **Et la raison était invisible à la sonde.** `ben_publisher.py` journalise ses échecs en `log.warning` — priorité syslog **4**, un cran sous le `-p 3` d'`errors()`. Le seul boîtier qu'on cherchait à diagnostiquer, et la ligne qui explique tout juste sous le seuil qu'on avait choisi.
+🚨 **Et le diagnostic à distance ne pouvait pas voir POURQUOI.** `ben_publisher.py` journalisait **tous** ses échecs en `log.warning`, soit la priorité syslog **4** — un cran sous le `-p 3` de la sonde `errors`. La seule ligne qui expliquait tout était sous le seuil.
 
-D'où le champ **`pub`** : les 5 dernières lignes du journal de `ben-publisher`, horodatées. ⭐ Sur un boîtier **sain**, ses lignes INFO sont elles-mêmes le diagnostic — `envoyé 86 · inséré 79 · reste ~0`.
+**⭐ Le correctif n'est pas dans la sonde, il est dans le publisher**
 
-**⚠️ Sans filtre de priorité, et c'est contre-intuitif**
+Au-delà de `ECHECS_ERREUR` échecs consécutifs, l'échec passe en `log.error`. Un réseau cligne : échouer une fois n'est pas une erreur. Mais au-delà, **ce boîtier ne livre plus ses données** — l'état le plus grave qu'il puisse connaître sans être mort. Monter le niveau coûte **zéro** et rend la panne visible, à la sonde comme à qui lit le journal directement.
+
+⚠️ Et pas `error` dès le premier échec : un niveau qui crie tout le temps ne garde plus rien, on cesse de le regarder. Même raisonnement que la gigue totale. Seuil à **5** — de l'ordre de la minute cumulée — et **strictement sous le plafond de backoff** (~9 échecs), sinon la panne ne serait visible qu'après des dizaines de minutes de silence. Un cas de banc l'exige.
+
+⭐ La décision est extraite en **fonction pure** (`niveau_echec`), comme `cadence` : c'est ce qui la rend éprouvable sans réseau ni base, et le préflight de l'update **l'éprouve sur la cible avec son témoin**.
+
+**⚠️ Ce qui a été ABANDONNÉ en route**
+
+Une sonde `pub` qui lisait les 5 dernières lignes du journal de `ben-publisher`. Elle marchait — éprouvée sur les deux modèles — mais coûtait **~2,9 s par jour** et portait un risque réel : `journalctl -u` **dégénère en balayage complet** quand l'unité est silencieuse, soit exactement le cas d'un boîtier en panne.
 
 ```
--u ben-publisher -n 5                  2,94 s   ← retenu
--u ben-publisher -p 4 -n 10            0,57 s
--u ben-radio     -p 3 -n 8             7,93 s   🚨
--p 3 -n 8        (sans -u)             0,36 s
+-u ben-publisher -n 5          2,94 s
+-u ben-radio -p 3 -n 8         7,93 s   🚨 aucune correspondance ⇒ balayage
+-p 3 -n 8  (sans -u)           0,36 s
 ```
 
-🚨 **`-u` est bon marché quand il y a des correspondances, ruineux quand il n'y en a pas** : journald balaie alors tout le journal — c'est de là que venaient les 7,93 s. Or le publisher journalise en INFO **chaque minute**, donc `-n 5` sans filtre trouve toujours et ne peut jamais dégénérer. Ajouter `-p 4` serait plus rapide sur un boîtier bavard et **ruineux sur un boîtier silencieux** — exactement le cas qu'on veut diagnostiquer.
+⇒ Les deux informations qu'elle apportait sont **mieux placées ailleurs** : le *pourquoi* par ce correctif, et le nombre de points réellement insérés **côté serveur** (`ben-api#8`), où le chiffre est déjà calculé.
 
-⚠️ C'est la sonde **la plus lente** (~2,9 s) : elle passe **en dernier**, et l'échéance globale la sacrifie en premier sur un boîtier en difficulté. C'est le bon arbitrage — les autres champs disent déjà l'essentiel.
+**Budget de collecte : 12 → 20 s**
+
+⚠️ Le coût **varie de 2 à 10 s sur le même boîtier** selon l'état du cache du journal — trois passages consécutifs à 2 029 / 1 998 / 2 088 ms quand le même code venait d'en mettre 9 655. Avec 12 s la marge était d'une seconde et demie sur le pire cas observé, et c'était la dernière sonde qui aurait été sacrifiée.
 
 **ⓘ Corrige aussi le commentaire sur `tainted`**
 
-Il annonçait « 1024 = TAINT_WARN ». Faux deux fois : `TAINT_WARN` est le bit **9** (512), et **1024 est le bit 10** — « un pilote *staging* a été chargé », soit `snd_bcm2835`, `vc_sm_cma`, `bcm2835_mmal_vchiq`, `bcm2835_isp`. C'est l'état **normal** de Raspberry Pi OS : 1024 est le **plancher**, et le présenter comme remarquable était trompeur.
+Il annonçait « 1024 = TAINT_WARN ». Faux deux fois : `TAINT_WARN` est le bit **9** (512), et **1024 est le bit 10** — pilotes *staging* (`snd_bcm2835`, `vc_sm_cma`, `bcm2835_isp`), soit l'état **normal** de Raspberry Pi OS. 1024 est le **plancher**, et le présenter comme remarquable était trompeur.
 
-⭐ Ce qui compte est tout bit **au-delà** : `128` = le noyau est mort récemment (OOPS/BUG), `16384` = *soft lockup* (la signature d'un SPI figé), `512` = WARNING. Donc `1152` = Pi normal **plus** un oops. La valeur lue n'a jamais changé — seule l'interprétation était fausse.
+⭐ Ce qui compte est tout bit **au-delà** : `128` = le noyau est mort (OOPS/BUG), `16384` = *soft lockup* (la signature d'un SPI figé). Donc `1152` = Pi normal **plus** un oops. La valeur lue n'a jamais changé — seule l'interprétation était fausse.
 
 Aucune migration, aucune table, aucune colonne.
 
