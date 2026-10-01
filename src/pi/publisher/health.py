@@ -51,10 +51,20 @@ import subprocess
 import time
 
 # Les unités qu'on interroge. On ne décide PAS ce qui devrait tourner — c'est une décision de
-# `check_network` à partir des capabilities. On rapporte ce qu'on trouve, et une unité absente
-# se signale d'elle-même par son absence du rapport.
+# `check_network` à partir des capabilities. On rapporte ce qu'on trouve.
+#
+# 🚨 UNIQUEMENT DES UNITÉS QUE LE DÉPÔT LIVRE (`config/systemd/`). `systemctl show` répond
+#    pour n'importe quel nom, même inventé, en le rendant `inactive/dead` : interroger une
+#    unité qui n'est pas du produit produit donc un faux service mort dans chaque instantané
+#    du parc. `ben-recognizer` y figurait — c'est une EXPÉRIMENTATION, présente sur un seul
+#    boîtier, absente du dépôt. Un banc structurel vérifie désormais cette liste contre
+#    `config/systemd/`, pour qu'elle ne redérive pas.
+#
+# ⚠️ Et seulement les services DURABLES : les oneshots (`ben-network-check`,
+#    `ben-network-recovery`, `ben-update`, `ben-ble-provisioner`) sont `inactive/dead` entre
+#    deux exécutions par construction — leur état n'apprend rien.
 UNITS = ("ben-radio", "ben-telemetry", "ben-tic-reader", "ben-publisher",
-         "ben-local-api", "ben-certd", "ben-recognizer")
+         "ben-local-api", "ben-certd", "wifi-watchdog")
 
 VAR = "/var/lib/ben-firmware"
 DB_PATH = f"{VAR}/measurements.db"
@@ -331,19 +341,30 @@ def radio(conn: sqlite3.Connection, pdl_indexes: list | None = None) -> dict | N
     #    `store()` énonce vingt lignes plus haut.
     #
     # ⭐ Au passage, c'est AUSSI plus utile : par compteur, on sait LEQUEL a perdu son lien.
+    # 🚨 LA SÉRIE, PAS UN AGRÉGAT — sinon ce champ ne répond pas à la question qui le
+    #    justifie. Tout l'intérêt est de distinguer une CHUTE BRUTALE (alimentation, cf. la
+    #    diode BAT85 de ben01) d'une DÉGRADATION PROGRESSIVE (antenne, portée). Or
+    #    min/max/moyenne sur 20 trames rendent ces deux cas presque identiques :
+    #
+    #        chute   : -65 ×19 puis -95   → min -95  max -65  moy -66,5
+    #        déclin  : -65 … -95 linéaire → min -95  max -65  moy -80,0
+    #
+    #    Mêmes bornes, et seule la moyenne diffère — il faudrait savoir à quoi s'attendre
+    #    pour la lire. L'ORDRE DANS LE TEMPS tranche sans ambiguïté, et il ne coûte rien.
+    #
+    # ⭐ En tableaux de tableaux, pas en objets : `[[ts, rssi, snr], …]` pèse trois fois
+    #    moins que la même chose avec des clés répétées vingt fois. Les agrégats
+    #    disparaissent — ils se recalculent depuis la série, l'inverse est faux.
     recent = []
     for i in (pdl_indexes or []):
         try:
-            n, tmin, tmax, avg, lo, hi, snr = conn.execute(
-                "SELECT count(*), min(ts), max(ts), round(avg(rssi),1), min(rssi), "
-                "       max(rssi), round(avg(snr),1) "
-                "FROM (SELECT ts, rssi, snr FROM lora_link WHERE pdl_index = ? "
-                "      ORDER BY ts DESC LIMIT ?)", (i, N_FRAMES)).fetchone()
+            frames = [[ts, rssi, snr] for ts, rssi, snr in conn.execute(
+                "SELECT ts, rssi, snr FROM lora_link WHERE pdl_index = ? "
+                "ORDER BY ts DESC LIMIT ?", (i, N_FRAMES))]
         except sqlite3.Error:
             continue
-        if n:
-            recent.append({"i": i, "n": n, "ts_min": tmin, "ts_max": tmax, "rssi": avg,
-                           "rssi_min": lo, "rssi_max": hi, "snr": snr})
+        if frames:
+            recent.append({"i": i, "frames": frames})
     if recent:
         out["recent"] = recent
     return out or None
@@ -355,7 +376,8 @@ def units() -> list | None:
     ⚠️ Et `--timestamp=unix` est obligatoire, sinon `ExecMainStartTimestamp` sort en
        « Mon 2026-09-28 17:23:48 CEST », du texte localisé inutilisable."""
     raw = _sh("systemctl", "show", "--timestamp=unix", "--no-pager",
-              "--property=Id,ActiveState,SubState,NRestarts,ExecMainStartTimestamp",
+              "--property=Id,LoadState,ActiveState,SubState,NRestarts,"
+              "ExecMainStartTimestamp",
               *[u + ".service" for u in UNITS])
     if not raw:
         return None
@@ -377,6 +399,16 @@ def units() -> list | None:
         if not name:
             continue
         entry = {"n": name, "a": b.get("ActiveState"), "s": b.get("SubState")}
+        # ⭐ `LoadState` seulement quand il n'est PAS « loaded », et c'est volontaire :
+        #    `systemctl show` répond pour une unité qui n'existe pas, en la rendant
+        #    `inactive/dead` — indistinguable d'un service arrêté. Or l'écart est une
+        #    information : `ben-recognizer` est `loaded` sur un boîtier du parc et
+        #    `not-found` sur un autre, alors qu'il n'est dans AUCUN tag du dépôt. C'est
+        #    de la DÉRIVE DE PARC, et la masquer (en retirant l'unité de la liste ou en
+        #    filtrant les not-found) nous priverait du seul moyen de la voir.
+        load = b.get("LoadState")
+        if load and load != "loaded":
+            entry["load"] = load
         r = (b.get("NRestarts") or "").strip()
         if r.isdigit():
             # 🚨 `NRestarts` est le champ qui aurait crié en 0.9.12 : 208 redémarrages.
@@ -407,9 +439,16 @@ def errors() -> list | None:
     `_SYSTEMD_UNIT` est de toute façon dans le JSON : on sait toujours d'où vient chaque ligne,
     y compris des unités qu'on n'aurait pas pensé à lister. Moins cher ET plus large."""
     out = []
-    for source, extra in (("journal", []), ("kernel", ["-k"])):
-        raw = _sh("journalctl", "-p", "3", "-n", str(N_ERRORS), "--no-pager",
+    # ⚠️ Le PREMIER appel est sans `-k`, mais il inclut QUAND MÊME les lignes noyau : sans
+    #    filtre, chaque erreur noyau apparaissait DEUX FOIS (une sous `journal`, une sous
+    #    `kernel`) et consommait les créneaux du premier appel. Observé sur un boîtier du
+    #    parc : les trois dernières lignes de priorité 3 étaient TOUTES du WiFi noyau, donc
+    #    aucune erreur de service ne pouvait remonter. On en demande donc PLUS au premier
+    #    appel et on écarte le noyau à la lecture — journalctl n'a pas de négation de champ.
+    for source, extra, limite in (("journal", [], N_ERRORS * 2), ("kernel", ["-k"], 5)):
+        raw = _sh("journalctl", "-p", "3", "-n", str(limite), "--no-pager",
                   "-o", "json", *extra)
+        garde = 0
         for line in raw.splitlines():
             try:
                 d = json.loads(line)
@@ -418,6 +457,12 @@ def errors() -> list | None:
             msg = d.get("MESSAGE")
             if not isinstance(msg, str):
                 continue        # un MESSAGE binaire existe ; il n'a rien à faire dans du JSON
+            if source == "journal":
+                if d.get("_TRANSPORT") == "kernel":
+                    continue    # le second appel s'en occupe, et mieux
+                if garde >= N_ERRORS:
+                    continue
+                garde += 1
             try:
                 ts = int(int(d.get("__REALTIME_TIMESTAMP", 0)) / 1_000_000)
             except (TypeError, ValueError):

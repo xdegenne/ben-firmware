@@ -161,22 +161,32 @@ def TEMOIN_un_boitier_qui_mesure_rend_son_dernier_horodatage():
     out = health.snapshot(base_radio(), None)
     assert out["pdl"] == [{"i": 0, "last_ts": 1790840049}], out.get("pdl")
     assert out["emitter"][0]["addr"] == 31
-    assert out["radio"]["recent"][0]["n"] == 20, "les 20 dernières trames, pas toutes"
-    assert out["radio"]["recent"][0]["ts_max"] == 1790841160
+    f = out["radio"]["recent"][0]["frames"]
+    assert len(f) == 20, "les 20 dernières trames, pas toutes"
+    assert f[0][0] == 1790841160, "la plus RÉCENTE en tête"
 
 
 @cas
 def les_trames_rendues_sont_les_PLUS_RECENTES_et_datees():
     """⭐⭐ Le champ qui porte tout le diagnostic rétroactif. Sur un boîtier muet depuis des
-    jours, ces trames datent du JOUR DE SA MORT — chute brutale à pleine puissance ⇒
-    alimentation, dégradation progressive ⇒ antenne. L'ordre `DESC` n'est donc pas un détail :
-    rendre les 20 PREMIÈRES trames donnerait l'état du lien à sa naissance."""
+    jours, ces trames datent du JOUR DE SA MORT.
+
+    🚨 ET C'EST LA SÉRIE QUI TRANCHE, PAS UN AGRÉGAT. Première version : on envoyait
+    count/min/max/moyenne. Or une chute brutale et un déclin progressif donnent les MÊMES
+    bornes — seule la moyenne diffère, et il faudrait savoir à quoi s'attendre pour la lire :
+
+        chute  : -65 ×19 puis -95   → min -95  max -65  moy -66,5
+        déclin : -65 … -95 linéaire → min -95  max -65  moy -80,0
+
+    Le champ ne répondait donc pas à la question qui le justifie. Avec l'ordre dans le temps,
+    les deux cas sont évidents à l'œil."""
     out = health.snapshot(base_radio(), None)
-    r = out["radio"]["recent"][0]
-    assert r["ts_min"] == 1790840400 and r["ts_max"] == 1790841160
-    # Les 20 dernières ont les rssi les plus BAS (la base les fait décroître) : si on avait
-    # pris les 20 premières, la moyenne serait autour de -69, pas de -79.
-    assert r["rssi_min"] == -89 and r["rssi_max"] == -70, r
+    f = out["radio"]["recent"][0]["frames"]
+    # ⚖️ L'ordre DESC n'est pas un détail : rendre les 20 PREMIÈRES trames donnerait l'état
+    #    du lien à sa NAISSANCE. La base fait décroître le rssi, donc la plus récente est la
+    #    plus faible — si l'ordre était inversé, f[0][1] vaudrait -60.
+    assert f[0][0] > f[-1][0], "la plus récente doit être en tête"
+    assert f[0][1] == -89 and f[-1][1] == -70, f[:2]
 
 
 @cas
@@ -216,6 +226,52 @@ def TOUTE_requete_sur_les_grosses_tables_porte_WHERE_pdl_index():
 
 
 @cas
+def le_provisioning_donne_a_ben_l_acces_au_JOURNAL():
+    """🚨 Sans le groupe `systemd-journal`, `journalctl` ne rend RIEN à `ben` — et le dit sur
+    STDERR, que `_sh` jette. Le champ `errors` était donc mort-né sur TOUS les boîtiers, et
+    les essais passaient parce qu'on les lançait en `pi`, qui est dans `adm`.
+
+    Mesuré le 2026-10-01 : `id ben` → dialout, spi, gpio, rien d'autre. Et
+    `sudo -u ben journalctl` → « No journal files were opened due to insufficient
+    permissions ».
+
+    ⭐ C'est le champ le plus utile de l'instantané : les lignes NOYAU (blocages SPI,
+    sous-tensions, `brcmfmac: resumed on timeout` du pilote WiFi). Ce cas est structurel —
+    il garde le provisioning, parce qu'un boîtier neuf ne doit pas repartir sans cet accès."""
+    racine = pathlib.Path(health.__file__).resolve().parents[3]
+    inst = racine / "install.sh"
+    if not inst.is_file():
+        return                      # arbre d'essai hors dépôt
+    ligne = [l for l in inst.read_text().splitlines()
+             if l.startswith("usermod -aG") and " ben" in l]
+    assert ligne, "install.sh ne pose plus de groupes à `ben` ? le cas doit être revu"
+    assert "systemd-journal" in ligne[0], (
+        "install.sh ne met pas `ben` dans systemd-journal — `errors` sera vide sur tout "
+        f"boîtier neuf :\n    {ligne[0]}")
+
+
+@cas
+def on_n_interroge_QUE_des_unites_que_le_depot_LIVRE():
+    """🚨 `systemctl show` répond pour N'IMPORTE QUEL nom, même inventé, en le rendant
+    `inactive/dead`. Interroger une unité qui n'est pas du produit fabrique donc un faux
+    service mort dans chaque instantané du parc.
+
+    `ben-recognizer` y figurait : une EXPÉRIMENTATION, présente sur un seul boîtier et absente
+    du dépôt. Elle se voyait `loaded/inactive` sur celui-là et `not-found` sur l'autre — du
+    bruit dans les deux cas, pour quelque chose qu'on n'a pas à chercher.
+
+    ⚖️ Ce cas est le garde-fou de la LISTE, pas du code : c'est elle qui dérive."""
+    systemd = pathlib.Path(health.__file__).resolve().parents[3] / "config" / "systemd"
+    if not systemd.is_dir():
+        return                      # arbre d'essai hors dépôt : rien à vérifier
+    livrees = {f.stem for f in systemd.glob("*.service")}
+    for u in health.UNITS:
+        assert u in livrees, (
+            f"`{u}` est interrogé mais le dépôt ne le livre pas "
+            f"(absent de config/systemd/) — ce serait un faux service mort")
+
+
+@cas
 def AUCUNE_sonde_ne_peut_ECRIRE_sur_le_boitier():
     """🚨 LE DÉFAUT LE PLUS GRAVE DE TOUTE CETTE ISSUE, et il venait du diagnostic lui-même.
 
@@ -252,7 +308,7 @@ def le_resume_radio_est_PAR_COMPTEUR():
     out = health.snapshot(base_radio(), None)
     r = out["radio"]["recent"]
     assert isinstance(r, list) and r[0]["i"] == 0, r
-    assert r[0]["n"] == 20 and r[0]["ts_max"] == 1790841160
+    assert len(r[0]["frames"]) == 20
 
 
 @cas

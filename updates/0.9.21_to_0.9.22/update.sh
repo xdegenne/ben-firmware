@@ -147,6 +147,13 @@ if duree > 10:
 if "units" not in snap:
     avertissements.append("`units` absent — systemctl a expiré ; l'état des services "
                           "manquera au diagnostic de ce boîtier")
+# 🚨 Celui-ci manquait, et c'est pour ça que `errors` est resté mort-né sans que rien ne le
+#    dise : il dépend de l'appartenance de `ben` au groupe `systemd-journal`, ajoutée plus
+#    bas dans ce script mais effective seulement au redémarrage du publisher.
+if "errors" not in snap:
+    avertissements.append("`errors` absent — `ben` ne lit pas le journal (groupe "
+                          "systemd-journal) ou aucune entrée de priorité <= 3 ; "
+                          "les erreurs NOYAU manqueront au diagnostic")
 if conn is not None and "pdl" not in snap:
     avertissements.append("`pdl` absent alors que la base est ouverte — base verrouillée, "
                           "ou aucun compteur enregistré")
@@ -160,6 +167,34 @@ if ko:
     sys.exit(1)
 PYEOF
 log "✓ collecte éprouvée sur CE boîtier : objet sérialisable, non vide, dans le budget"
+
+# ═══ L'ACCÈS AU JOURNAL — le seul geste de ce script ═════════════════════════════════════════
+#
+# 🚨 SANS LE GROUPE `systemd-journal`, `journalctl` NE REND RIEN À `ben`.
+#
+#    Mesuré sur un boîtier du parc : `id ben` → dialout, spi, gpio, et rien d'autre.
+#    `sudo -u ben journalctl` répond « No journal files were opened due to insufficient
+#    permissions » — SUR STDERR, que `_sh` jette. Donc `errors` rendait None partout, en
+#    silence. Et les essais passaient parce qu'on les lançait en `pi`, qui est dans `adm`.
+#
+# ⭐ C'est le champ le plus utile de tout l'instantané qui était mort-né : les lignes NOYAU
+#    (blocages SPI, sous-tensions, `brcmfmac: resumed on timeout` du pilote WiFi) ne
+#    remontaient pas. `install.sh` est corrigé pour les boîtiers NEUFS ; celui-ci répare
+#    les SEPT qui existent.
+#
+# ⚠️ L'appartenance à un groupe est lue au DÉMARRAGE du processus : elle ne prendra effet
+#    qu'au redémarrage de ben-publisher — que `check_update.py` fait de toute façon à son
+#    étape 10, juste après ce script.
+if id -nG ben 2>/dev/null | tr ' ' '\n' | grep -qx systemd-journal; then
+    log "ben est déjà dans systemd-journal"
+elif sudo usermod -aG systemd-journal ben 2>/dev/null; then
+    log "✓ ben ajouté au groupe systemd-journal — effectif au redémarrage du publisher"
+else
+    # ⚠️ On AVERTIT sans faire échouer : un groupe manquant dégrade UN champ de diagnostic.
+    #    Échouer ici laisserait device.json non bumpé, donc rejeu toutes les 10 min — pour
+    #    une update dont tout le reste est en place.
+    warn "impossible d'ajouter ben à systemd-journal — le champ `errors` restera vide"
+fi
 
 # ═══ CONTRÔLE D'EFFET ═════════════════════════════════════════════════════════════════════════
 #

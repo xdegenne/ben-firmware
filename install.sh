@@ -108,8 +108,16 @@ if ! id -u ben &>/dev/null; then
     useradd --system --create-home --shell /bin/bash ben
 fi
 # dialout : /dev/ttyAMA0 (TIC). gpio + spi : LoRa receiver via raspi_lora + RPi.GPIO.
-usermod -aG dialout,gpio,spi ben
-echo "[3/13] User ben OK (dialout, gpio, spi)"
+#
+# 🚨 systemd-journal : SANS LUI, `journalctl` NE REND RIEN à `ben`. Mesuré le 2026-10-01 sur
+#    un boîtier du parc — « No journal files were opened due to insufficient permissions »,
+#    sur stderr, donc invisible pour qui ne lit que stdout. L'instantané de santé du hello en
+#    dépendait : son champ `errors` était mort-né sur TOUS les boîtiers, et les essais
+#    passaient parce qu'on les lançait en `pi`, qui est dans `adm`.
+#    ⭐ C'est là qu'on perd les lignes NOYAU — blocages SPI, sous-tensions, et le
+#       `brcmfmac: resumed on timeout` du pilote WiFi qu'on a découvert ce jour-là.
+usermod -aG dialout,gpio,spi,systemd-journal ben
+echo "[3/13] User ben OK (dialout, gpio, spi, systemd-journal)"
 
 # --------------------------------------------------------------------------
 # 4. Configure sudo rights
