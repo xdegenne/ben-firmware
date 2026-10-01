@@ -452,6 +452,80 @@ def un_MESSAGE_de_journal_NON_TEXTE_est_ecarte():
 
 
 @cas
+def le_journal_du_PUBLISHER_est_remonte():
+    """🚨 LA SONDE QUI DONNE LA RÉPONSE AU PREMIER HELLO, PAS AU SUIVANT.
+
+    Le hello part JUSTE APRÈS le redémarrage du publisher par l'OTA. À cet instant le nouveau
+    processus a `echecs = 0` : aucune ligne en priorité 3 n'existe encore, et celles de
+    l'ancien processus sont en `PRIORITY=6` sur tout boîtier antérieur à 0.9.23.
+
+    ⇒ Sans cette sonde, la cause d'une panne de publication n'arrive qu'au hello SUIVANT, donc
+      sous 24 h. C'est ce qui a motivé de la rétablir après l'avoir retirée.
+
+    ⭐ Et sur un boîtier sain, les lignes INFO sont elles-mêmes le diagnostic : `inséré` y dit
+      ce que `pending` ne dit pas — si le serveur a retenu les points ou les absorbe en
+      doublons."""
+    vrai = health._sh
+    health._sh = lambda *a: (
+        '{"MESSAGE":"envoyé 86 · inséré 79 · reste ~0",'
+        '"__REALTIME_TIMESTAMP":"1790850000000000"}\n'
+        '{"MESSAGE":"échec n°3 (timed out) — nouvelle tentative dans 6 s",'
+        '"__REALTIME_TIMESTAMP":"1790850060000000"}\n')
+    try:
+        lignes = health.publisher()
+    finally:
+        health._sh = vrai
+    assert lignes and len(lignes) == 2, lignes
+    assert lignes[0]["t"] == 1790850000 and "envoyé 86" in lignes[0]["m"]
+    # ⭐ La ligne de backoff : sur un boîtier antérieur à 0.9.23 elle est en PRIORITY=6, donc
+    #    invisible à `errors()`. C'est exactement ce que cette sonde va chercher.
+    assert "échec n°3" in lignes[1]["m"]
+
+
+@cas
+def la_sonde_du_publisher_n_a_PAS_de_filtre_de_priorite():
+    """🚨 CONTRE-INTUITIF, ET C'EST CE QUI LA REND SÛRE. Mesuré sur la cible :
+
+        -u ben-publisher -n 5                  2,94 s   ← retenu
+        -u ben-publisher -p 4 -n 10            0,57 s
+        -u ben-radio     -p 3 -n 8             7,93 s   🚨
+
+    `-u` ne dégénère en balayage complet que s'il n'y a AUCUNE correspondance : journald
+    parcourt alors tout le journal pour n'en trouver aucune. Sans filtre de priorité, les
+    lignes INFO du publisher garantissent toujours une correspondance — la lecture reste une
+    lecture de queue. Ajouter `-p 4` serait plus rapide sur un boîtier bavard et RUINEUX sur un
+    boîtier silencieux, soit exactement le cas qu'on veut diagnostiquer.
+
+    ⚖️ Cas STRUCTUREL : on ne peut pas reproduire un balayage de journal dans un banc."""
+    vus = []
+    vrai = health._sh
+    health._sh = lambda *a: (vus.append(a), "")[1]
+    try:
+        health.publisher()
+    finally:
+        health._sh = vrai
+    assert vus, "la sonde n'appelle plus journalctl ? le cas doit être revu"
+    cmd = vus[0]
+    assert "-u" in cmd and "ben-publisher" in cmd, cmd
+    assert "-p" not in cmd, (
+        "la sonde porte un filtre de priorité — ruineux sur un boîtier silencieux, qui est "
+        f"le cas qu'on veut diagnostiquer : {cmd}")
+
+
+@cas
+def la_sonde_du_publisher_passe_EN_DERNIER():
+    """⚠️ L'ORDRE DES SONDES EST UNE LISTE DE PRIORITÉ : l'échéance globale sacrifie la
+    dernière en premier. `pub` est la plus lente (~2,9 s) et celle dont l'absence coûte le
+    moins — sur un boîtier en difficulté, mieux vaut perdre son journal de publisher que
+    l'état de ses services ou ses compteurs."""
+    import inspect
+    src = inspect.getsource(health.snapshot)
+    noms = [l.split('("')[1].split('"')[0]
+            for l in src.splitlines() if l.strip().startswith('("')]
+    assert noms and noms[-1] == "pub", f"`pub` n'est pas la dernière sonde : {noms}"
+
+
+@cas
 def un_message_tres_long_est_TRONQUE():
     """Une ligne de journal peut faire des kilo-octets. Huit d'entre elles suffiraient à faire
     sauter la borne de 16 Kio du serveur, et c'est tout l'instantané qui serait alors écarté —
