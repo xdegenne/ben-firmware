@@ -110,6 +110,49 @@ def une_base_qui_repond_garde_la_decision_normale():
     assert pub.cadence_sure(_BaseEnRetard()) == pub.PERIOD_RETARD
 
 
+# ── Le niveau de journalisation d'un échec ───────────────────────────────────
+
+@cas
+def un_echec_qui_PERSISTE_est_une_ERREUR():
+    """🚨 LE DÉFAUT QUI A COÛTÉ UN DIAGNOSTIC ENTIER. Tous les échecs de publication étaient
+    en `warning`, donc en priorité syslog 4 — un cran sous le `-p 3` de l'instantané de santé.
+
+    Un boîtier du parc MESURAIT (une trame toutes les 38 s), était EN LIGNE (hello en 17 ms,
+    WiFi à -40 dBm), son publisher TOURNAIT (0 redémarrage), il avait **566 248 points en
+    attente** et n'envoyait RIEN. Le diagnostic à distance ne pouvait pas voir POURQUOI :
+    la seule ligne qui l'expliquait était sous le seuil (#18).
+
+    ⭐ Monter le niveau coûte zéro et rend la panne visible — à la sonde comme à qui lit le
+       journal directement."""
+    import logging
+    assert pub.niveau_echec(pub.ECHECS_ERREUR) == logging.ERROR
+    assert pub.niveau_echec(pub.ECHECS_ERREUR + 50) == logging.ERROR
+
+
+@cas
+def un_echec_ISOLE_reste_un_avertissement():
+    """⚖️ LE TÉMOIN, et il n'est pas décoratif : un réseau cligne. Passer en `error` dès le
+    premier échec remplirait le journal d'erreurs pour des coupures de quelques secondes — et
+    un niveau qui crie tout le temps ne garde plus rien, on cesse de le regarder. C'est le même
+    raisonnement que la gigue totale."""
+    import logging
+    assert pub.niveau_echec(1) == logging.WARNING
+    assert pub.niveau_echec(pub.ECHECS_ERREUR - 1) == logging.WARNING
+
+
+@cas
+def le_seuil_d_erreur_est_FRANCHI_avant_le_plafond_du_backoff():
+    """⚠️ Si le seuil était au-delà du plafond de backoff, il ne servirait à rien : le boîtier
+    atteint `BACKOFF_MAX` à partir de ~9 échecs et n'« avance » plus. Un seuil à 20 ne se
+    verrait donc jamais plus tôt qu'un seuil à 9 — mais il retarderait la visibilité de
+    plusieurs dizaines de minutes."""
+    import math
+    plafond = math.ceil(math.log2(pub.BACKOFF_MAX))     # ~9 : 2**9 = 512 > 300
+    assert pub.ECHECS_ERREUR < plafond, (
+        f"seuil {pub.ECHECS_ERREUR} >= {plafond} : la panne ne serait visible qu'après "
+        "des dizaines de minutes de silence")
+
+
 # ── Ce que ça donne sur le terrain ───────────────────────────────────────────
 
 @cas

@@ -18,6 +18,47 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.9.23] — 2026-10-01
+
+**Un champ né d'un échec de diagnostic.** Ferme [#18](https://github.com/xdegenne/ben-firmware/issues/18).
+
+`pi-0.9.22` a livré l'instantané de santé, et il a immédiatement **démenti trois diagnostics successifs** sur le boîtier qui motivait tout le chantier :
+
+```
+il MESURE              une trame toutes les 38 s, à l'instant
+il est EN LIGNE        hello 204 en 17 ms, WiFi à −40 dBm
+le publisher TOURNE    active/running, 0 redémarrage
+pending                566 248 points — soit 8,8 jours, l'écart exact observé
+ce qui part            RIEN, aucun POST en quatre minutes
+```
+
+⇒ Ni « fenêtres de connectivité courtes », ni « arrêt de mesure », ni « émetteur mort ». **Il mesure et ne publie pas** — le deuxième des trois états que `last_seen` confond, celui qu'on croyait déjà visible.
+
+🚨 **Et la raison était invisible à la sonde.** `ben_publisher.py` journalise ses échecs en `log.warning` — priorité syslog **4**, un cran sous le `-p 3` d'`errors()`. Le seul boîtier qu'on cherchait à diagnostiquer, et la ligne qui explique tout juste sous le seuil qu'on avait choisi.
+
+D'où le champ **`pub`** : les 5 dernières lignes du journal de `ben-publisher`, horodatées. ⭐ Sur un boîtier **sain**, ses lignes INFO sont elles-mêmes le diagnostic — `envoyé 86 · inséré 79 · reste ~0`.
+
+**⚠️ Sans filtre de priorité, et c'est contre-intuitif**
+
+```
+-u ben-publisher -n 5                  2,94 s   ← retenu
+-u ben-publisher -p 4 -n 10            0,57 s
+-u ben-radio     -p 3 -n 8             7,93 s   🚨
+-p 3 -n 8        (sans -u)             0,36 s
+```
+
+🚨 **`-u` est bon marché quand il y a des correspondances, ruineux quand il n'y en a pas** : journald balaie alors tout le journal — c'est de là que venaient les 7,93 s. Or le publisher journalise en INFO **chaque minute**, donc `-n 5` sans filtre trouve toujours et ne peut jamais dégénérer. Ajouter `-p 4` serait plus rapide sur un boîtier bavard et **ruineux sur un boîtier silencieux** — exactement le cas qu'on veut diagnostiquer.
+
+⚠️ C'est la sonde **la plus lente** (~2,9 s) : elle passe **en dernier**, et l'échéance globale la sacrifie en premier sur un boîtier en difficulté. C'est le bon arbitrage — les autres champs disent déjà l'essentiel.
+
+**ⓘ Corrige aussi le commentaire sur `tainted`**
+
+Il annonçait « 1024 = TAINT_WARN ». Faux deux fois : `TAINT_WARN` est le bit **9** (512), et **1024 est le bit 10** — « un pilote *staging* a été chargé », soit `snd_bcm2835`, `vc_sm_cma`, `bcm2835_mmal_vchiq`, `bcm2835_isp`. C'est l'état **normal** de Raspberry Pi OS : 1024 est le **plancher**, et le présenter comme remarquable était trompeur.
+
+⭐ Ce qui compte est tout bit **au-delà** : `128` = le noyau est mort récemment (OOPS/BUG), `16384` = *soft lockup* (la signature d'un SPI figé), `512` = WARNING. Donc `1152` = Pi normal **plus** un oops. La valeur lue n'a jamais changé — seule l'interprétation était fausse.
+
+Aucune migration, aucune table, aucune colonne.
+
 ### [0.9.22] — 2026-10-01
 
 **Le boîtier joint un instantané de santé à son hello.** Ferme [#16](https://github.com/xdegenne/ben-firmware/issues/16).

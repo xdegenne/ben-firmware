@@ -98,6 +98,15 @@ PERIOD = float(os.environ.get("BEN_PUB_PERIOD", "60"))
 #    un gain qui ne sert à rien.
 PERIOD_RETARD = float(os.environ.get("BEN_PUB_PERIOD_RETARD", "10"))
 BACKOFF_MAX = 300.0
+
+# Au-delà de ce nombre d'échecs consécutifs, l'échec de publication passe de `warning` à
+# `error`. 🚨 POURQUOI UN SEUIL ET PAS « error » TOUT DE SUITE : un réseau cligne, et une
+# panne de quelques secondes ne doit pas remplir le journal d'erreurs — sinon le niveau
+# `error` ne veut plus rien dire et on cesse de le regarder.
+#
+# ⭐ POURQUOI 5 : avec la gigue totale `uniform(0, min(2**n, 300))`, cinq échecs représentent
+#    déjà de l'ordre de la minute cumulée. Ce n'est plus un clignement, c'est un état.
+ECHECS_ERREUR = int(os.environ.get("BEN_PUB_ECHECS_ERREUR", "5"))
 # Le hello est rejoué périodiquement, pas seulement au démarrage :
 #   - un NOUVEAU COMPTEUR peut apparaître en cours de route (resolve_pdl() crée un
 #     pdl_index dès qu'un ADCO inconnu se présente : changement de compteur, nouvel
@@ -273,6 +282,28 @@ def cadence(en_attente: int) -> float:
        cadence à chaque tour.
     """
     return PERIOD_RETARD if en_attente >= BATCH else PERIOD
+
+
+def niveau_echec(echecs: int) -> int:
+    """Le niveau de journalisation d'un échec de publication. Fonction PURE.
+
+    🚨 UN ÉCHEC ISOLÉ EST UN AVERTISSEMENT, UN ÉCHEC QUI PERSISTE EST UNE ERREUR.
+
+    Un réseau cligne : échouer une ou deux fois est normal et ne doit pas crier. Au-delà du
+    seuil, ce boîtier NE LIVRE PLUS SES DONNÉES — l'état le plus grave qu'il puisse connaître
+    sans être mort.
+
+    ⭐ CE N'EST PAS UN DÉTAIL DE JOURNALISATION. Tout était en `warning`, donc en priorité
+       syslog 4 — un cran sous le `-p 3` de l'instantané de santé. Un boîtier du parc mesurait,
+       était en ligne, son publisher tournait, il avait 566 248 points en attente et n'envoyait
+       RIEN : le diagnostic à distance ne pouvait pas voir POURQUOI, parce que la seule ligne
+       qui l'expliquait était sous le seuil (#18).
+
+    ⚠️ Et pas `error` dès le premier échec : sinon le niveau `error` ne veut plus rien dire, et
+       on cesse de le regarder. C'est le même raisonnement que la gigue — un garde-fou qui crie
+       tout le temps ne garde plus rien.
+    """
+    return logging.ERROR if echecs >= ECHECS_ERREUR else logging.WARNING
 
 
 def cadence_sure(conn: sqlite3.Connection) -> float:
@@ -521,8 +552,9 @@ def main() -> int:
             echecs += 1
             # 🚨 GIGUE TOTALE : on tire DANS l'intervalle. Voir l'en-tête, point 3.
             delai = random.uniform(0, min(2 ** echecs, BACKOFF_MAX))
-            log.warning("échec n°%d (%s) — nouvelle tentative dans %.0f s",
-                        echecs, e, delai)
+            # Le niveau dépend de la PERSISTANCE — cf. `niveau_echec()`.
+            log.log(niveau_echec(echecs),
+                    "échec n°%d (%s) — nouvelle tentative dans %.0f s", echecs, e, delai)
             cli.close()
             _sleep(delai)
             continue
