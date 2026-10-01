@@ -18,6 +18,73 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.9.23] — 2026-10-01
+
+**Le niveau de journalisation atteint enfin le journal.** Ferme [#18](https://github.com/xdegenne/ben-firmware/issues/18).
+
+`pi-0.9.22` a livré l'instantané de santé, et il a **démenti trois diagnostics successifs** sur le boîtier qui motivait tout le chantier :
+
+```
+il MESURE              une trame toutes les 38 s, à l'instant
+il est EN LIGNE        hello 204 en 17 ms, WiFi à −40 dBm
+le publisher TOURNE    active/running, 0 redémarrage
+pending                566 248 points — 8,8 jours, l'écart exact observé
+ce qui part            RIEN, aucun POST en quatre minutes
+```
+
+⇒ Ni « fenêtres de connectivité courtes », ni « arrêt de mesure », ni « émetteur mort ». **Il mesure et ne publie pas.** Et le diagnostic à distance ne pouvait pas voir pourquoi.
+
+**🚨 Le premier correctif écrit pour cette version ne servait à rien**
+
+Monter `log.warning` en `log.error` ne change que le **texte**. `logging.basicConfig()` écrit sur stderr, et systemd range tout ce qui vient de stderr à une priorité **fixe** (`SyslogLevel=6`). Mesuré sur un boîtier du parc, sur un vrai échec :
+
+```
+[2026-09-23 03:22:51][WARNING] échec n°1 ([Errno -3] Temporary failure in name…
+                      ↑ le texte dit WARNING          →  PRIORITY=6
+```
+
+⇒ `health.errors()` interroge `journalctl -p 3`. Il ne voyait **rien** de ce que le publisher dit de ses pannes — et le banc comme le préflight étaient **verts**, parce qu'ils n'éprouvaient que `niveau_echec()`, une fonction juste et sans effet.
+
+> ⭐ **Un contrôle qui vérifie une décision sans vérifier son effet est un contrôle qui ment.**
+
+**⭐ Le vrai correctif : le préfixe `<N>`**
+
+Le mécanisme documenté de systemd (`SyslogLevelPrefix=yes`, actif par défaut) : il lit la priorité en tête de ligne, l'applique, et la **retire** du message. Vérifié sur la cible avec le vrai `installer_journal()` :
+
+```
+PRIORITY=6  [INFO]    …
+PRIORITY=4  [WARNING] … echec n 1 (timed out)
+PRIORITY=3  [ERROR]   … echec n 7 (HTTP 400 lot malforme)
+```
+
+⚠️ **Zéro dépendance** : pas de `python-systemd` à embarquer sur sept boîtiers pour ça.
+
+**Et la décision, qui ne vaut que posée sur ce socle**
+
+Au-delà de `ECHECS_ERREUR` (5) échecs consécutifs, l'échec passe en `log.error`, donc en priorité 3, donc **visible à la sonde**. Un réseau cligne : échouer une fois n'est pas une erreur. Au-delà, ce boîtier **ne livre plus ses données** — l'état le plus grave qu'il puisse connaître sans être mort.
+
+⚠️ Seuil **strictement sous le plafond de backoff** (~9 échecs) : au-delà le boîtier n'avance plus, et un seuil plus haut ne se verrait jamais plus tôt tout en retardant la visibilité de dizaines de minutes. Un cas de banc l'exige.
+
+**⚠️ L'explication du serveur voyage avec l'exception**
+
+La ligne escaladée portait `HTTP 400` **sans le corps** — un refus sans sa raison, soit le même angle mort. Or un 400 ou un 413 **ne se résout pas en réessayant** : le lot est malformé ou trop gros, et le corps est la seule chose qui dira lequel.
+
+**⚠️ Ce qui a été abandonné en route**
+
+Une sonde `pub` qui lisait les 5 dernières lignes du journal de `ben-publisher`. Elle marchait — 26 cas verts sur les deux modèles — mais coûtait ~2,9 s/jour et portait un risque réel : `journalctl -u` **dégénère en balayage complet** quand l'unité est silencieuse (7,93 s contre 0,36 s), soit exactement le cas d'un boîtier en panne.
+
+⇒ Le *pourquoi* est réglé par ce correctif ; le nombre de points réellement insérés l'est **côté serveur** (`ben-api#8`), où le chiffre est déjà calculé.
+
+**Budget de collecte : 12 → 20 s**
+
+⚠️ Le coût **varie de 2 à 10 s sur le même boîtier** selon l'état du cache du journal — trois passages consécutifs à 2 029 / 1 998 / 2 088 ms quand le même code venait d'en mettre 9 655. Avec 12 s, la marge était d'une seconde et demie.
+
+**ⓘ Corrige aussi le commentaire sur `tainted`**
+
+Il annonçait « 1024 = TAINT_WARN ». **Faux deux fois** : `TAINT_WARN` est le bit **9** (512), et **1024 est le bit 10** — pilotes *staging* (`snd_bcm2835`, `vc_sm_cma`, `bcm2835_isp`), soit l'état **normal** de Raspberry Pi OS. 1024 est le **plancher**. ⭐ Ce qui compte est tout bit **au-delà** : `128` = noyau mort (OOPS/BUG), `16384` = *soft lockup* (signature d'un SPI figé).
+
+Aucune migration, aucune table, aucune colonne.
+
 ### [0.9.22] — 2026-10-01
 
 **Le boîtier joint un instantané de santé à son hello.** Ferme [#16](https://github.com/xdegenne/ben-firmware/issues/16).

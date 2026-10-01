@@ -110,6 +110,127 @@ def une_base_qui_repond_garde_la_decision_normale():
     assert pub.cadence_sure(_BaseEnRetard()) == pub.PERIOD_RETARD
 
 
+# ── Le niveau de journalisation d'un échec ───────────────────────────────────
+
+@cas
+def un_echec_qui_PERSISTE_est_une_ERREUR():
+    """🚨 LE DÉFAUT QUI A COÛTÉ UN DIAGNOSTIC ENTIER. Tous les échecs de publication étaient
+    en `warning`, donc en priorité syslog 4 — un cran sous le `-p 3` de l'instantané de santé.
+
+    Un boîtier du parc MESURAIT (une trame toutes les 38 s), était EN LIGNE (hello en 17 ms,
+    WiFi à -40 dBm), son publisher TOURNAIT (0 redémarrage), il avait **566 248 points en
+    attente** et n'envoyait RIEN. Le diagnostic à distance ne pouvait pas voir POURQUOI :
+    la seule ligne qui l'expliquait était sous le seuil (#18).
+
+    ⭐ Monter le niveau coûte zéro et rend la panne visible — à la sonde comme à qui lit le
+       journal directement."""
+    import logging
+    assert pub.niveau_echec(pub.ECHECS_ERREUR) == logging.ERROR
+    assert pub.niveau_echec(pub.ECHECS_ERREUR + 50) == logging.ERROR
+
+
+@cas
+def un_echec_ISOLE_reste_un_avertissement():
+    """⚖️ LE TÉMOIN, et il n'est pas décoratif : un réseau cligne. Passer en `error` dès le
+    premier échec remplirait le journal d'erreurs pour des coupures de quelques secondes — et
+    un niveau qui crie tout le temps ne garde plus rien, on cesse de le regarder. C'est le même
+    raisonnement que la gigue totale."""
+    import logging
+    assert pub.niveau_echec(1) == logging.WARNING
+    assert pub.niveau_echec(pub.ECHECS_ERREUR - 1) == logging.WARNING
+
+
+@cas
+def le_seuil_d_erreur_est_FRANCHI_avant_le_plafond_du_backoff():
+    """⚠️ Si le seuil était au-delà du plafond de backoff, il ne servirait à rien : le boîtier
+    atteint `BACKOFF_MAX` à partir de ~9 échecs et n'« avance » plus. Un seuil à 20 ne se
+    verrait donc jamais plus tôt qu'un seuil à 9 — mais il retarderait la visibilité de
+    plusieurs dizaines de minutes."""
+    import math
+    plafond = math.ceil(math.log2(pub.BACKOFF_MAX))     # ~9 : 2**9 = 512 > 300
+    assert pub.ECHECS_ERREUR < plafond, (
+        f"seuil {pub.ECHECS_ERREUR} >= {plafond} : la panne ne serait visible qu'après "
+        "des dizaines de minutes de silence")
+
+
+# ── Le niveau Python doit ATTEINDRE le journal ───────────────────────────────
+
+@cas
+def chaque_ligne_porte_sa_PRIORITE_SYSLOG():
+    """🚨 LE DÉFAUT QUI A FAIT ÉCHOUER TOUT UN DIAGNOSTIC, ET QUE LE BANC PRÉCÉDENT NE VOYAIT
+    PAS — il n'éprouvait que `niveau_echec`, une fonction juste et sans effet.
+
+    `logging.basicConfig()` écrit du texte brut sur stderr. systemd capte stderr et range TOUT
+    à une priorité FIXE (`SyslogLevel=6` par défaut, vérifié sur l'unité). Le niveau Python ne
+    changeait donc que le TEXTE. Mesuré sur un vrai échec, sur un boîtier du parc :
+
+        [2026-09-23 03:22:51][WARNING] échec n°1 ([Errno -3] Temporary failure…
+                              ↑ le texte dit WARNING        →  PRIORITY=6
+
+    ⇒ `health.errors()` interroge `journalctl -p 3` : il ne voyait RIEN des pannes du
+      publisher, et passer `warning` en `error` n'y aurait rien changé.
+
+    ⭐ Le préfixe `<N>` est le mécanisme de systemd (`SyslogLevelPrefix=yes`, actif par
+       défaut) : vérifié sur la cible, `<4>` donne `PRIORITY=4` et `<3>` donne `PRIORITY=3`,
+       et systemd retire le préfixe du message."""
+    import io
+    import logging
+    racine = pub.installer_journal()
+    tampon = io.StringIO()
+    racine.handlers[0].stream = tampon
+    logging.getLogger("essai").warning("un avertissement")
+    logging.getLogger("essai").error("une erreur")
+    lignes = [l for l in tampon.getvalue().splitlines() if l]
+    assert len(lignes) == 2, lignes
+    assert lignes[0].startswith("<4>"), f"WARNING doit porter <4> : {lignes[0]!r}"
+    assert lignes[1].startswith("<3>"), f"ERROR doit porter <3> : {lignes[1]!r}"
+
+
+@cas
+def la_table_des_priorites_est_celle_de_SYSLOG():
+    """⚖️ LE TÉMOIN de la table : une correspondance décalée d'un cran rendrait les erreurs
+    invisibles à `-p 3` tout en donnant l'illusion que le correctif est en place. Ce sont les
+    valeurs de `sd_journal_print`, pas un choix."""
+    import logging
+    assert pub.PRIORITE_SYSLOG[logging.ERROR] == 3     # err
+    assert pub.PRIORITE_SYSLOG[logging.WARNING] == 4   # warning
+    assert pub.PRIORITE_SYSLOG[logging.INFO] == 6      # info
+    # 🚨 C'est `-p 3` que la sonde interroge : ERROR doit être <= 3, et WARNING au-dessus.
+    assert pub.PRIORITE_SYSLOG[logging.ERROR] <= 3 < pub.PRIORITE_SYSLOG[logging.WARNING]
+
+
+@cas
+def installer_journal_ne_DOUBLE_pas_les_lignes():
+    """⚠️ Appelé deux fois — un redémarrage logique, un banc — il ne doit pas empiler les
+    gestionnaires : chaque ligne apparaîtrait deux fois dans le journal, avec le même
+    horodatage, et on croirait à un bégaiement du service."""
+    pub.installer_journal()
+    pub.installer_journal()
+    import logging
+    assert len(logging.getLogger().handlers) == 1
+
+
+@cas
+def l_explication_du_serveur_VOYAGE_avec_l_echec():
+    """🚨 L'explication d'un refus ne doit pas rester dans un `warning` que la sonde ne voit
+    pas. Première version : seul `log.warning("HTTP %d %s", status, body)` la portait, et la
+    ligne escaladée en `error` au bout de cinq échecs ne disait que « HTTP 400 ».
+
+    ⚠️ Or un 400 ou un 413 ne se résout PAS en réessayant — le lot est malformé ou trop gros,
+    et le boîtier bouclera dessus. Le corps est la seule chose qui dira laquelle des deux.
+
+    ⚖️ Cas STRUCTUREL : on vérifie que le corps entre dans l'exception, parce que c'est elle
+    qui est journalisée au niveau escaladé."""
+    import pathlib as _p
+    import re
+    src = _p.Path(pub.__file__).read_text()
+    m = re.search(r'raise RuntimeError\(f"HTTP \{status\}([^"]*)"\)', src)
+    assert m, "la levée sur HTTP non-2xx a changé de forme — le cas doit être revu"
+    assert "body" in m.group(1), (
+        "le corps de la réponse ne voyage pas avec l'exception : la ligne escaladée en "
+        f"`error` ne dira que le code : {m.group(0)}")
+
+
 # ── Ce que ça donne sur le terrain ───────────────────────────────────────────
 
 @cas

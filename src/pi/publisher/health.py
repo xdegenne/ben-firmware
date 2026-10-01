@@ -73,7 +73,21 @@ DB_PATH = f"{VAR}/measurements.db"
 #    beaucoup — 1 151 ms au premier appel (journal froid), 117 ms ensuite. Sans garde
 #    individuelle, une seule commande lente mangerait le budget de toutes les autres.
 PROBE_TIMEOUT_S = 4.0
-BUDGET_S = 12.0
+
+# 🚨 20 s, ET CE N'EST PAS DE LA GÉNÉROSITÉ : le coût VARIE de 2 à 10 s sur LE MÊME boîtier,
+#    et rien ne permet de prédire lequel. Trois passages consécutifs ont donné 2 029, 1 998 et
+#    2 088 ms, quand le même code venait d'en mettre 9 655 quelques minutes plus tôt — carte SD
+#    occupée, charge à 1,9. Le coût de `journalctl` dépend de l'état du cache du journal, et
+#    l'instantané ne tourne QU'UNE FOIS PAR JOUR : il est donc toujours du mauvais côté.
+#
+# ⚠️ Avec 12 s, la marge était d'une seconde et demie sur le pire cas observé — et c'est
+#    `errors`, la DERNIÈRE sonde, qui aurait été sacrifiée la première. Soit précisément le
+#    champ qui porte les erreurs de service et de noyau.
+#
+# ⓘ Ce que coûte un budget plus large : le hello part AVANT la boucle de publication, donc la
+#   collecte retarde d'autant le premier lot après un redémarrage du publisher. 20 s une fois
+#   par jour, contre une cadence de croisière de 60 s, est dans le bruit.
+BUDGET_S = 20.0
 
 N_ERRORS = 8        # les N dernières lignes de priorité <= 3
 N_FRAMES = 20       # les N dernières trames LoRa : l'état du lien AU MOMENT où il meurt
