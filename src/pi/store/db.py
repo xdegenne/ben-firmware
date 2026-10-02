@@ -186,7 +186,29 @@ CREATE TABLE IF NOT EXISTS pdl (
     pdl_index  INTEGER PRIMARY KEY,
     adco       TEXT NOT NULL UNIQUE,
     first_seen INTEGER NOT NULL,
-    last_seen  INTEGER NOT NULL
+    last_seen  INTEGER NOT NULL,
+    -- ref : la référence OPAQUE que le cloud rend à la déclaration, rangée ICI,
+    -- à côté de l'index local, sans que le boîtier ait à la comprendre.
+    --
+    -- ⭐ C'est le SEUL terme commun entre l'app, le boîtier et le cloud. L'ADS,
+    --    lui, ne monte qu'à la déclaration. Et `pdl_index` ne sort pas d'ici.
+    --
+    -- ⚠️ NULL = ce compteur n'a pas encore été déclaré (ou sa déclaration a été
+    --    refusée, cf. le motif). Un pdl sans ref ne publie PAS : ses points
+    --    restent `sent=0` et repartent dès que la ref arrive. NULL n'est donc
+    --    jamais une perte, c'est une attente.
+    ref        TEXT,
+    -- motif : pourquoi le cloud a REFUSÉ de donner une ref à ce compteur.
+    --
+    -- 🚨 LE RANGER CHANGE TROIS COMPORTEMENTS. Un refus est un ÉTAT STABLE, pas un
+    --    échec transitoire : `ads_non_conforme` ne se résoudra jamais, le schéma
+    --    cloud l'interdit. Sans le mémoriser, ce pdl restait « sans ref » pour
+    --    toujours, donc le boîtier redéclarait sans fin, le journal d'erreurs était
+    --    saturé par le même motif, et l'estimation du retard ne redescendait plus.
+    --
+    -- ⚠️ Mais un motif n'est pas forcément définitif (`deja_rattache` peut se
+    --    résoudre) : on ne cesse donc pas de réessayer, on réessaie RAREMENT.
+    motif      TEXT
 );
 
 -- Quel compteur se trouve actuellement au bout de quel émetteur. Entretenu à la trame
@@ -298,6 +320,18 @@ def connect(path: str = DB_PATH, *, read_only: bool = False) -> sqlite3.Connecti
         # de fournisseur crée de nouvelles lignes sans écraser l'historique). SQLite ne peut pas
         # ajouter une colonne à une PK existante → drop + recreate (labels re-captés en direct
         # depuis LTARF, donnée non critique). No-op si déjà à la bonne def.
+        # Bascule de la clé d'archive (ben-docs#5) : le boîtier range la `ref` que le
+        # cloud lui rend, et c'est elle qui monte avec ses mesures — plus `pdl_index`,
+        # qui est un index LOCAL et ne veut rien dire ailleurs.
+        #
+        # ⚠️ AJOUT SEUL, délibérément : l'ancien code doit pouvoir tourner sur cette
+        #    base. C'est ce qui rend le retour arrière possible sans restaurer quoi
+        #    que ce soit — la règle de toutes les migrations de ce fichier.
+        pdl_cols = [r[1] for r in conn.execute("PRAGMA table_info(pdl)")]
+        if pdl_cols and "ref" not in pdl_cols:
+            conn.execute("ALTER TABLE pdl ADD COLUMN ref TEXT")
+        if pdl_cols and "motif" not in pdl_cols:
+            conn.execute("ALTER TABLE pdl ADD COLUMN motif TEXT")
         tl_cols = [r[1] for r in conn.execute("PRAGMA table_info(tariff_labels)")]
         if tl_cols and "ngtf" not in tl_cols:
             conn.execute("DROP TABLE tariff_labels")
@@ -1729,3 +1763,111 @@ def prune(conn: sqlite3.Connection, retention_days: int = RETENTION_DAYS) -> dic
     except Exception:
         pass
     return {"measurements": m, "lora_link": l, "curve_rollup": r}
+
+
+# ── La référence de compteur rendue par le cloud (ben-docs#5) ─────────────────
+#
+# ⭐ Le boîtier la RANGE et la RENVOIE, sans rien en comprendre. C'est le seul
+#    terme commun entre l'app, le boîtier et le cloud ; `pdl_index` reste local,
+#    et l'ADS ne monte qu'à la déclaration.
+
+def known_refs(conn: sqlite3.Connection) -> dict:
+    """{pdl_index: ref} pour les compteurs déjà déclarés.
+
+    ⚠️ Les pdl sans ref sont ABSENTS du dictionnaire, pas présents à None : un
+       appelant qui ferait `refs[i]` doit échouer franchement plutôt que
+       d'envoyer `null` au cloud et de se faire refuser le lot.
+    """
+    return {r[0]: r[1] for r in conn.execute(
+        "SELECT pdl_index, ref FROM pdl WHERE ref IS NOT NULL AND ref <> ''")}
+
+
+def pdls_without_ref(conn: sqlite3.Connection) -> list:
+    """Les pdl qui n'ont pas encore de référence, du plus petit index au plus grand.
+
+    ⭐ C'est le DÉCLENCHEUR de la déclaration, et c'est une CONDITION, pas un
+       événement : elle se vérifie à chaque tour, sans drapeau et sans rien
+       mémoriser sur ce que le cloud sait. Elle couvre d'un seul énoncé le
+       compteur neuf, le compteur remplacé, et la ref perdue en local (carte
+       reflashée, désappairage).
+
+    ⇒ Réconcilier un état est plus solide que rattraper un événement : un
+      événement raté est définitif, une condition se re-vérifie au tour suivant.
+    """
+    return [r[0] for r in conn.execute(
+        "SELECT pdl_index FROM pdl WHERE ref IS NULL OR ref = '' ORDER BY pdl_index")]
+
+
+def store_motifs(conn: sqlite3.Connection, motifs: dict) -> int:
+    """Range les motifs de refus rendus par la déclaration. Rend le nombre posé.
+
+    🚨 C'est ce qui empêche la redéclaration en boucle. Un pdl refusé garde la trace
+       de SA raison, donc `pdls_without_ref` peut le distinguer d'un pdl simplement
+       pas encore déclaré — deux états que « ref NULL » confondait.
+
+    ⚠️ Un motif n'efface JAMAIS une ref déjà posée : un refus transitoire ne doit
+       pas faire cesser de publier un compteur qui publiait.
+    """
+    n = 0
+    with conn:
+        for pdl_index, motif in motifs.items():
+            cur = conn.execute(
+                "UPDATE pdl SET motif = ? WHERE pdl_index = ? "
+                "AND (ref IS NULL OR ref = '') AND (motif IS NULL OR motif <> ?)",
+                (motif, int(pdl_index), motif))
+            n += cur.rowcount
+    return n
+
+
+def pdls_refuses(conn: sqlite3.Connection) -> list:
+    """Les pdl qui portent un motif de refus et n'ont pas de ref.
+
+    ⭐ Leur existence justifie un plancher de redéclaration LONG : il n'y a rien de
+       neuf à apprendre du cloud tant que la cause n'a pas changé.
+    """
+    return [r[0] for r in conn.execute(
+        "SELECT pdl_index FROM pdl WHERE (ref IS NULL OR ref = '') "
+        "AND motif IS NOT NULL AND motif <> '' ORDER BY pdl_index")]
+
+
+def store_refs(conn: sqlite3.Connection, refs: dict) -> int:
+    """Range les références rendues par la déclaration. Rend le nombre posé.
+
+    ⚠️ IDEMPOTENT et non destructif : une entrée sans ref (le cloud a rendu un
+       MOTIF — ADS non conforme, compteur déjà rattaché) n'efface PAS une ref
+       déjà connue. Sinon un refus transitoire ferait perdre une ref valide, et
+       le boîtier cesserait de publier pour un compteur parfaitement légitime.
+    """
+    n = 0
+    with conn:
+        for pdl_index, ref in refs.items():
+            if not ref:
+                continue
+            # ⭐ Poser une ref EFFACE le motif : la cause du refus a disparu, et
+            #    laisser le motif ferait croire à un refus persistant.
+            cur = conn.execute(
+                "UPDATE pdl SET ref = ?, motif = NULL "
+                "WHERE pdl_index = ? AND (ref IS NULL OR ref <> ?)",
+                (ref, int(pdl_index), ref))
+            n += cur.rowcount
+    return n
+
+
+def invalider_refs(conn: sqlite3.Connection) -> int:
+    """Oublie toutes les refs locales. Rend le nombre effacé.
+
+    🚨 POURQUOI CE GESTE EXISTE. Si le cloud cesse de reconnaître une ref — compteur
+       ré-attaché, rattachement retiré — il refuse le lot, et le boîtier n'avait
+       AUCUN moyen de s'en sortir : `pdls_without_ref` restait vide, donc rien ne
+       redéclarait, donc la ref périmée repartait indéfiniment. Et comme un lot
+       porte plusieurs compteurs, les points des AUTRES compteurs étaient bloqués
+       avec elle.
+
+    ⚠️ On efface TOUT, pas seulement la ref coupable : le refus ne dit pas laquelle
+       l'est. C'est sans danger — la déclaration est idempotente et les rend toutes
+       au tour suivant — et c'est le seul geste qui soit sûr sans deviner.
+    """
+    with conn:
+        cur = conn.execute(
+            "UPDATE pdl SET ref = NULL WHERE ref IS NOT NULL AND ref <> ''")
+    return cur.rowcount

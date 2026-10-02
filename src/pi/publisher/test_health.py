@@ -37,7 +37,7 @@ def cas(fn):
 def base_radio() -> sqlite3.Connection:
     """Un boîtier LoRa qui mesure : un compteur, des mesures, un émetteur, des trames."""
     c = db.connect(":memory:")
-    c.execute("INSERT INTO pdl VALUES(0,'031864467282',1,9)")
+    c.execute("INSERT INTO pdl (pdl_index, adco, first_seen, last_seen) VALUES (0,'031864467282',1,9)")
     c.execute("INSERT INTO emitter VALUES(31,'031864467282',0,1790786260)")
     for i in range(50):
         c.execute("INSERT INTO measurements(ts,pdl_index,papp,sent) VALUES(?,0,?,1)",
@@ -362,7 +362,7 @@ def un_boitier_FILAIRE_n_a_ni_radio_ni_emetteur():
     vrai_var = health.VAR
     health.VAR = tempfile.mkdtemp()      # un répertoire VIDE : aucun fichier d'état radio
     c = db.connect(":memory:")
-    c.execute("INSERT INTO pdl VALUES(0,'021861862663',1,9)")
+    c.execute("INSERT INTO pdl (pdl_index, adco, first_seen, last_seen) VALUES (0,'021861862663',1,9)")
     c.execute("INSERT INTO measurements(ts,pdl_index,papp,sent) VALUES(1790840000,0,300,1)")
     c.commit()
     try:
