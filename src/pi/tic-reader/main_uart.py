@@ -806,6 +806,13 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label,
                 if in_line:            # un groupe commencé, jamais refermé
                     _note_groupe_rejete(etiquettes_ko, current)
                     dropped += 1
+                    # ⚠️ L'IMPUTATION AUSSI, pas seulement le compte. Un groupe qui
+                    #    portait un octet hors alphabet puis finit sans son CR était
+                    #    compté `rejeté` mais PAS imputé à l'alphabet : la cause
+                    #    disparaissait, et c'est exactement le mensonge que ce relevé
+                    #    existe pour tuer. Vaut pour les TROIS sorties hors CR.
+                    if groupe_hors_alphabet:
+                        groupes_alphabet += 1
                 log.debug(f"TIC : ETX corrompu (parité) — trame close ici plutôt "
                           f"que fondue avec la suivante ; {kept} groupe(s) gardé(s)")
                 _derniere_trame.update(gardees=kept, rejetees=dropped, parite=parite_ko,
@@ -866,6 +873,8 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label,
             if in_line:                # CR perdu sur le dernier groupe
                 _note_groupe_rejete(etiquettes_ko, current)
                 dropped += 1
+                if groupe_hors_alphabet:      # cf. l'ETX corrompu : imputer, pas seulement compter
+                    groupes_alphabet += 1
             # ⭐ `parite_ko` est COMPTÉ, pas seulement écarté : c'est ce qui
             #    transforme une protection muette en une mesure. Une liaison
             #    bruyante se verra, au lieu de se déduire de PDL fantômes.
@@ -888,6 +897,8 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label,
             if in_line:
                 _note_groupe_rejete(etiquettes_ko, current)
                 dropped += 1
+                if groupe_hors_alphabet:      # cf. l'ETX corrompu : imputer, pas seulement compter
+                    groupes_alphabet += 1
             current = bytearray()
             in_line = True
             groupe_douteux = False
@@ -939,12 +950,18 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label,
             #
             #        'T' = 0x54 -> 0x14      'S' = 0x53 -> 0x13      'I' = 0x49 -> HT
             #
-            #    Un seul bit retourné, le 6. L'événement de corruption le plus simple qui
-            #    existe, et les deux filtres historiques le laissaient passer — la parité
-            #    parce que le bit de parité, calculé juste par le compteur, reste juste si
-            #    l'erreur naît sur le FIL ; le checksum parce qu'il est aveugle modulo 64.
-            #    En historique, « PTEC TH.. » devenait « PTEC \x14H.. », ACCEPTÉ — et
-            #    PTEC donne l'`index_id`.
+            # 🚨 ET IL FAUT DEUX BITS, PAS UN — ne pas gonfler la menace. Un SEUL bit
+            #    retourné sur le fil casse TOUJOURS la parité, puisque le compteur a
+            #    calculé le bit de parité sur l'octet d'origine : `octet_valide` l'arrête
+            #    déjà, et ce contrôle-ci ne le voit jamais. Ce qui l'atteint, c'est un
+            #    nombre PAIR de bits retournés dans le même octet — par exemple le bit 6
+            #    de la donnée ET le bit de parité : la parité redevient « juste », et
+            #    « PTEC TH.. » arrive en « PTEC \x14H.. » avec un checksum intact.
+            #
+            # ⭐ C'est donc une COÏNCIDENCE RARE qu'on ferme, pas un événement courant —
+            #    le même arbitrage que celui déjà écrit dans `tic_parite.octet_valide`.
+            #    Mais en historique PTEC donne l'`index_id`, et le coût de la fermer est
+            #    de deux comparaisons par octet : on la ferme.
             #
             #    On condamne donc le groupe sans CONSULTER le checksum, qui ne peut pas
             #    trancher. Et on ne se contente pas de sauter l'octet : la ligne serait

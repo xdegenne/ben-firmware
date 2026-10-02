@@ -718,11 +718,17 @@ def signaler_adco_refuse_ne_crie_qu_une_fois_par_valeur():
 #
 #        'T' = 0x54  →  0x14      'S' = 0x53  →  0x13      'I' = 0x49  →  HT
 #
-#    Un seul bit (le 6) suffit, c'est l'événement de corruption le plus simple
-#    qui existe, et les trois filtres historiques le laissaient passer : la
-#    parité ne voit qu'un nombre IMPAIR de bits — or ici le bit de parité est
-#    recalculé juste par le compteur, l'erreur naît sur le FIL ; le checksum est
-#    aveugle modulo 64 ; et rien ne regardait l'alphabet.
+# 🚨 MAIS IL FAUT DEUX BITS, PAS UN, et le dire faux gonflerait la menace. Un
+#    SEUL bit retourné sur le fil casse TOUJOURS la parité : le compteur a
+#    calculé le bit de parité sur l'octet d'origine, donc `octet_valide` l'arrête
+#    et ce contrôle-ci ne le voit jamais. Ce qui l'atteint est un nombre PAIR de
+#    bits retournés dans le même octet — typiquement le bit 6 de la donnée ET le
+#    bit de parité, qui redevient « juste ».
+#
+# ⓘ C'est exactement ce que `sain(0x14)` émet dans les cas ci-dessous : l'octet
+#   `'T'` dont ces deux bits ont basculé. Le banc est donc fidèle à une
+#   corruption réelle — simplement RARE, pas courante. Même arbitrage que celui
+#   déjà écrit dans `tic_parite.octet_valide` à propos des deux bits.
 
 
 def _ligne_substituee(corps: str, i: int, octet: int) -> list[int]:
@@ -795,6 +801,44 @@ def UN_OCTET_HORS_ALPHABET_est_arrete_LA_OU_LE_CHECKSUM_EST_AVEUGLE():
     assert labels.get("PTEC") == "\x14H..", \
         ("sabotage sans effet : sans contrôle d'alphabet la donnée fausse devrait "
          f"passer le checksum, or on obtient {labels!r} — le cas ne prouve plus rien")
+
+
+def _groupe_sans_CR(corps: str, i: int, octet: int) -> list[int]:
+    """Le même groupe que `_ligne_substituee`, mais dont le CR N'ARRIVE JAMAIS."""
+    return _ligne_substituee(corps, i, octet)[:-1]
+
+
+@cas
+def la_CAUSE_survit_a_un_groupe_qui_finit_SANS_son_CR():
+    """🚨 LE SOUS-COMPTAGE QUE CE CAS A ATTRAPÉ.
+
+    `groupes_alphabet` ne montait qu'au CR. Un groupe portant un octet hors
+    alphabet dont le CR est perdu finit sur le LF suivant ou sur l'ETX : il était
+    alors compté `rejeté` mais **plus imputé à l'alphabet**. La cause disparaissait
+    — c'est-à-dire exactement le mensonge que ce relevé existe pour tuer, et ce
+    que fausserait en silence les colonnes prévues par #5.
+
+    ⓘ Trouvé en revue, pas par le banc : le banc ne couvrait que la sortie sur CR.
+    """
+    corps = "PTEC TH.."
+    i = corps.index("TH..")
+    mauvais = ord(corps[i]) - 0x40
+
+    # (a) le groupe abîmé finit sur l'ETX — son CR n'est jamais arrivé
+    flux = [sain(STX)] + _groupe_sans_CR(corps, i, mauvais) + [sain(ETX)]
+    m.read_frame(FauxPort(flux), m.tic_checksum_ok, range_brut)
+    assert m._derniere_trame["rejetees"] == 1, f"groupe non compté : {m._derniere_trame}"
+    assert m._derniere_trame["groupes_alphabet"] == 1, \
+        f"fin sur ETX : le groupe est compté mais la CAUSE est perdue — {m._derniere_trame}"
+
+    # (b) le groupe abîmé finit sur le LF du groupe SUIVANT
+    flux = ([sain(STX)] + _groupe_sans_CR(corps, i, mauvais)
+            + ligne(f"PAPP 00450 {_checksum_histo('PAPP 00450')}") + [sain(ETX)])
+    labels = m.read_frame(FauxPort(flux), m.tic_checksum_ok, range_brut)
+    assert m._derniere_trame["groupes_alphabet"] == 1, \
+        f"fin sur LF : la CAUSE est perdue — {m._derniere_trame}"
+    assert labels.get("PAPP") == "00450", \
+        f"⚖️ témoin : le groupe sain qui suit devait passer — {labels}"
 
 
 @cas
