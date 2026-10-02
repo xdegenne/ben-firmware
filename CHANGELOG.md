@@ -18,6 +18,117 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.9.27] — 2026-10-02
+
+**Le boîtier publie sous la référence que le cloud lui rend.** Ferme
+[#32](https://github.com/xdegenne/ben-firmware/issues/32) (chantier `ben-docs#5`).
+
+`pdl_index` est un entier **LOCAL** au boîtier : il numérote les compteurs dans *sa* base, dans
+l'ordre où il les a vus. Il ne veut rien dire ailleurs, et il cesse de monter. À sa place, le
+boîtier **RANGE et RENVOIE** une référence opaque que le cloud lui rend — sans rien en
+comprendre. C'est désormais le seul terme commun entre l'app, le boîtier et le cloud ; l'ADS, lui,
+ne monte qu'à la déclaration.
+
+#### Le protocole se scinde en trois routes, là où `/hello` faisait tout
+
+```
+POST …/hello          RARE, événementiel
+   ↑ sw · fw · model · pdl: [ {index, adco} ]
+   ↓ 200  refs: [ {pdl, ref} ]        (ou {pdl, motif} si l'ADS n'est pas conforme)
+
+POST …/ping           FRÉQUENT — c'est l'ancien /hello renommé
+   ↑ instantané de santé · contract_epoch · tariff_labels · meter_profile, clavés par ref
+   ↓ 204, rien
+
+POST …/measurements
+   ↑ { lots: [ {ref, points: [...]} ] }     groupé par compteur, SANS pdl
+```
+
+⭐ **Une `ref` par LOT, jamais par point** : un identifiant répété 1000 fois coûte 36 ko, un par
+compteur en coûte 36. Et le multi-compteurs cesse d'être un cas particulier — c'est la forme
+normale du payload.
+
+**Déclencheurs de la déclaration** : ① à l'init du boîtier, ② tant qu'un pdl est **sans ref**,
+③ après une OTA. 🚨 **Jamais au simple démarrage du publisher** — un service qui redémarre n'est
+pas un événement, et `/hello` est redevenu rare.
+
+⭐ Le déclencheur ② est une **CONDITION**, pas un événement : elle se re-vérifie à chaque tour,
+sans drapeau et sans rien mémoriser de ce que le cloud sait. Elle couvre d'un seul énoncé le
+compteur neuf, le compteur remplacé et la ref perdue en local (carte reflashée, désappairage).
+**Réconcilier un état est plus solide que rattraper un événement** : un événement raté est
+définitif, une condition se re-vérifie au tour suivant.
+
+#### 🚨 La jointure sur `pdl` n'est pas un confort, elle est le filtre
+
+Un compteur sans `ref` n'est pas publiable. Ses points doivent rester `sent = 0` — et surtout
+leur `rowid` ne doit **JAMAIS** entrer dans la liste rendue par `fetch_batch` : `mark_sent` les
+passerait à 1 après le 2xx du lot des **autres** compteurs, et la mesure serait perdue **POUR
+TOUJOURS**, sans trace. C'est le seul défaut de ce chantier qu'on ne pourrait pas rattraper, et
+c'est pour ça qu'il est filtré en SQL — où la `LIMIT` porte alors sur les points *publiables*,
+là où filtrer après aurait rendu des lots plus petits que demandés sans que rien ne le dise.
+
+#### 🚨 C'est `update.sh` qui applique la migration, et qui la vérifie
+
+Une colonne `pdl.ref`, **ajout seul** — l'ancien code tourne sur la nouvelle base, donc le retour
+arrière ne demande de restaurer **rien**.
+
+Mais personne sur le boîtier ne peut la créer au bon moment : le publisher ouvre la base en
+écriture **sans rejouer le schéma** (`open_db`, délibéré) et l'API locale en **lecture seule**.
+Sans la colonne, `SELECT_BATCH` lève `no such column: p.ref` à chaque tour et le boîtier cesse de
+publier **en silence** — service « active », journaux presque calmes. Parier sur un redémarrage
+de lecteur aurait laissé muet **pour toujours** le boîtier dont le lecteur ne tourne pas (câble
+TIC débranché, émetteur muet) — exactement celui qu'un pari aurait abandonné.
+
+#### 🚨 La déclaration post-OTA passe par un drapeau, parce que le séquencement l'impose
+
+`check_update.py` bumpe `device.json` à l'étape ⑨, **après** `update.sh` (⑧), puis redémarre le
+publisher (⑩). Une déclaration émise depuis le script aurait donc annoncé l'**ancienne** version.
+
+⇒ `update.sh` pose `/var/lib/ben-firmware/declaration-requise.json`, portant
+`version_attendue: "0.9.27"`. Le publisher ne le consomme **que si** `device.json.softwareVersion`
+lui est égal, et ne l'efface **qu'après un 2xx**. Sans cette garde, il resterait la fenêtre de
+quelques secondes entre la pose (⑧) et le bump (⑨).
+
+⭐ Pour **cette** transition le drapeau est une ceinture : aucun pdl n'a de `ref` (la colonne vient
+de naître), donc le déclencheur ② suffit seul. Il devient le mécanisme unique dès 0.9.28, quand
+les refs seront déjà connues — c'est pour ça qu'il naît ici, éprouvé par un cas où il ne risque
+rien.
+
+#### Ce que l'update ne redémarre pas, et pourquoi
+
+| unité | geste | motif |
+|---|---|---|
+| `ben-local-api` | **restart**, si elle tournait, **après** la migration | dernier consommateur de `db.py` ; coûte ni mesure, ni GPIO, ni radio. Elle ouvre en lecture seule : jamais avant la migration |
+| `ben-publisher` | **non** | l'agent le fait lui-même à l'étape ⑩, après le bump ; le faire ici le relancerait sur un `device.json` encore à 0.9.26 |
+| `ben-tic-reader`, `ben-telemetry` | **non** | changement de `db.py` strictement additif, aucun lecteur n'appelle les nouvelles fonctions, les 4 accès à `pdl` du dépôt nomment tous leurs colonnes (pas de `SELECT *`). Un restart de lecteur **coûte des mesures** (leçons 0.9.17 et 0.9.21) |
+| `ben-radio` | **non**, moins que tout | `capabilities` mappe `lora-tic-receiver` sur **deux** services ; elle est seule maîtresse du RFM95 et le verrou taint de 0.9.12 est né d'un redémarrage de trop. Elle n'importe même pas `db.py` |
+
+#### Le préflight, et ses quatre sabotages vérifiés rouges
+
+L'`ALTER` est éprouvé sur une base fabriquée **à l'ancienne forme** — `db.connect(":memory:")` ne
+prouverait rien, une base neuve naissant déjà avec la colonne. Puis **deux témoins positifs** :
+poser une ref et la relire, et les points retenus qui **repartent** dès que la ref arrive. Sans
+eux, un `refs_connues` toujours vide et un `fetch_batch` sans lot passeraient tous les cas de
+refus (leçon des préflights 0.9.19 et 0.9.26).
+
+Les quatre sabotages ont été passés et attrapés : `ALTER` retiré, `refs_connues` vide,
+`fetch_batch` muet, et filtre `p.ref` retiré.
+
+#### ⚠️ Le parc est muet entre la bascule de l'API et cette OTA
+
+L'API refuse l'ancien format. Donc **avant** cette update, un boîtier qui ne publie pas n'est pas
+une anomalie — c'est l'état attendu ; il en devient une **après**. Rien n'est perdu : rétention
+locale de 180 jours, et `sent = 1` n'est posé, par `rowid`, qu'après un 2xx.
+
+Le script relève le retard de l'outbox **avant** d'agir et l'écrit au journal, comme point de
+comparaison — encadré par les `rowid`, jamais par `count(*) WHERE sent = 0`, qui prend **37 s sur
+un Pi Zero**. Il n'exige **rien** de la publication : elle n'est observable qu'après sa sortie, et
+un contrôle qu'on ne peut pas tenir brûle une version (pi-0.9.12 et son `/info`). Le contrôle
+d'effet porte sur `/health` (`db: true`, et `last_tic_ts` qui avance si le boîtier lisait avant) —
+ce qu'il prouve inoffensif est un `ALTER TABLE` exécuté **sous un lecteur en marche**.
+
+---
+
 ### [0.9.26] — 2026-10-02
 
 **Un octet hors alphabet TIC condamne son groupe.** Ferme [#10](https://github.com/xdegenne/ben-firmware/issues/10).
