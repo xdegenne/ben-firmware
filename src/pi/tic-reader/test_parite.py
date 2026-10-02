@@ -116,6 +116,57 @@ def la_table_et_le_calcul_direct_disent_la_meme_chose():
         assert m.PARITE[i] == (bin(i).count("1") & 1), f"table fausse en {i}"
 
 
+@cas
+def L_ALPHABET_refuse_exactement_ce_que_la_norme_interdit():
+    """NOI-CPT_54E §6.2.1.2 : le champ donnée ne porte que des ASCII imprimables
+    0x20-0x7E. Les cas listés par l'issue, un par un — et le TÉMOIN, sans lequel
+    un prédicat qui refuserait TOUT passerait tous les refus ci-dessous."""
+    for octet, nom in ((0x00, "NUL"), (0x04, "EOT"), (0x1F, "US"),
+                       (0x7F, "DEL"), (0x80, "0x80 après masque")):
+        assert not m.octet_dans_alphabet(octet), f"{nom} accepté en historique"
+        assert not m.octet_dans_alphabet_std(octet), f"{nom} accepté en standard"
+
+    # ⚖️ LE TÉMOIN : tout l'alphabet légal passe, dans les DEUX modes.
+    for octet in range(0x20, 0x7F):
+        assert m.octet_dans_alphabet(octet), f"{octet:#04x} refusé en historique"
+        assert m.octet_dans_alphabet_std(octet), f"{octet:#04x} refusé en standard"
+
+
+@cas
+def HT_est_legal_en_STANDARD_et_refuse_en_HISTORIQUE():
+    """🚨 ET CE N'EST PAS UNE SUBTILITÉ DE PURISTE. En standard `HT` sépare les
+    champs (§5.3.6) : le refuser condamnerait TOUS les groupes et rendrait le
+    lecteur muet. En historique le séparateur est l'espace, et accepter `HT`
+    « pour simplifier » rouvrirait le trou que ce contrôle ferme — `'I'` vaut
+    0x49, `HT` vaut 0x09, soit exactement 64 d'écart, donc MÊME CHECKSUM."""
+    assert m.octet_dans_alphabet_std(m.HT), "HT refusé en standard : lecteur muet"
+    assert not m.octet_dans_alphabet(m.HT), "HT accepté en historique : trou rouvert"
+    assert (ord("I") - m.HT) == 64, \
+        "la démonstration de l'écart de 64 ne tient plus — revoir le commentaire"
+
+
+@cas
+def le_bit_de_parite_ne_trouble_PAS_le_jugement_d_alphabet():
+    """Les deux contrôles sont INDÉPENDANTS : l'alphabet juge les sept bits de
+    donnée, la parité juge le huitième. `'A'` reste `'A'` que son bit de parité
+    soit posé ou non — sinon tout caractère de parité impaire serait refusé deux
+    fois, et le relevé imputerait à l'alphabet ce qui revient à la parité."""
+    for c in "AZ0 9~":
+        assert m.octet_dans_alphabet(trame(c)), f"{c!r} refusé avec son bit de parité"
+
+
+@cas
+def les_TABLES_d_alphabet_disent_la_meme_chose_que_les_PREDICATS():
+    """Les tables sont une optimisation (2,97 µs contre 10,73 sur Pi Zero W, mesuré).
+    Une optimisation qui change le résultat n'en est pas une — et ici elle ferait dire
+    deux choses différentes au même contrôle selon l'appelant."""
+    for i in range(128):
+        assert bool(m.ALPHABET_HISTO[i]) == m.octet_dans_alphabet(i), f"histo diverge en {i}"
+        assert bool(m.ALPHABET_STD[i]) == m.octet_dans_alphabet_std(i), f"std diverge en {i}"
+    assert len(m.ALPHABET_HISTO) == len(m.ALPHABET_STD) == 128, \
+        "128 entrées : read_frame indexe avec l'octet DÉJÀ masqué"
+
+
 if __name__ == "__main__":
     ko = 0
     for fn in CAS:

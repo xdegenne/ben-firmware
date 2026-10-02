@@ -703,6 +703,155 @@ def signaler_adco_refuse_ne_crie_qu_une_fois_par_valeur():
         m._dernier_adco_refuse = None
 
 
+# ─── L'ALPHABET TIC : le troisième filtre, et son angle mort propre ─────────
+#
+# 🚨 CE QUE LE DÉFAUT EST VRAIMENT — et ce qu'il N'EST PAS.
+#
+#    Un octet hors alphabet n'était pas JETÉ, il était AJOUTÉ au groupe. Il n'y
+#    avait donc PAS d'amputation ici, à la différence de la parité : le groupe
+#    gardait sa longueur, un de ses caractères était simplement REMPLACÉ.
+#
+# ⭐ Et c'est précisément là que le checksum est aveugle : il vaut
+#    `(somme & 0x3F) + 0x20`, donc il ne voit la somme que MODULO 64. Remplacer
+#    un caractère par `c - 0x40` retire exactement 64 — **checksum IDENTIQUE** —
+#    et le résultat est un caractère de CONTRÔLE, donc hors alphabet.
+#
+#        'T' = 0x54  →  0x14      'S' = 0x53  →  0x13      'I' = 0x49  →  HT
+#
+#    Un seul bit (le 6) suffit, c'est l'événement de corruption le plus simple
+#    qui existe, et les trois filtres historiques le laissaient passer : la
+#    parité ne voit qu'un nombre IMPAIR de bits — or ici le bit de parité est
+#    recalculé juste par le compteur, l'erreur naît sur le FIL ; le checksum est
+#    aveugle modulo 64 ; et rien ne regardait l'alphabet.
+
+
+def _ligne_substituee(corps: str, i: int, octet: int) -> list[int]:
+    """`corps` + SON checksum d'origine, mais le caractère `i` remplacé par `octet`.
+
+    Émis avec la BONNE parité, pour que seule l'appartenance à l'alphabet soit en
+    cause — sinon le banc prouverait la parité une deuxième fois.
+    """
+    texte = f"{corps} {_checksum_histo(corps)}"
+    return ([sain(LF)]
+            + [sain(octet) if j == i else sain(ord(c)) for j, c in enumerate(texte)]
+            + [sain(CR)])
+
+
+@cas
+def UN_OCTET_HORS_ALPHABET_est_arrete_LA_OU_LE_CHECKSUM_EST_AVEUGLE():
+    """🚨 LE CAS QUI PORTE #10, et le seul qui PROUVE que le contrôle sert.
+
+    « PTEC TH.. » dont le `'T'` de la valeur (0x54) devient 0x14 : un seul bit
+    retourné, le 6.
+
+      1. la PARITÉ ne le voit pas — le bit de parité est juste, l'erreur est née
+         sur le fil après le calcul du compteur ;
+      2. le CHECKSUM ne le voit pas non plus, et le test le VÉRIFIE au lieu de le
+         supposer : −0x40 = −64, donc somme inchangée MODULO 64 ;
+      3. l'ALPHABET le voit, parce que 0x14 n'est pas imprimable.
+
+    ⇒ Sans ce troisième filtre, la période tarifaire enregistrée vaut `'\x14H..'`
+      au lieu de `'TH..'` — une donnée FAUSSE acceptée, pas une donnée perdue. Et
+      en historique c'est PTEC qui donne l'`index_id`.
+    """
+    corps = "PTEC TH.."
+    i = corps.index("TH..")                 # le 'T' de la VALEUR, pas celui de l'étiquette
+    abime = corps[:i] + chr(ord(corps[i]) - 0x40) + corps[i + 1:]
+    assert _checksum_histo(corps) == _checksum_histo(abime), \
+        "l'angle mort du checksum n'est pas reproduit — le cas ne prouve plus rien"
+
+    flux = ([sain(STX)] + _ligne_substituee(corps, i, ord(corps[i]) - 0x40)
+            + ligne(f"PAPP 00450 {_checksum_histo('PAPP 00450')}") + [sain(ETX)])
+    labels = m.read_frame(FauxPort(flux), m.tic_checksum_ok, range_brut)
+
+    assert "PTEC" not in labels, \
+        f"la donnée FAUSSE est passée : PTEC={labels.get('PTEC')!r} au lieu d'un rejet"
+    assert m._derniere_trame["rejetees"] == 1, \
+        f"le groupe condamné ne figure pas au relevé : {m._derniere_trame}"
+    assert m._derniere_trame["alphabet"] == 1, \
+        f"l'octet hors alphabet n'est pas compté : {m._derniere_trame}"
+    assert m._derniere_trame["groupes_alphabet"] == 1, \
+        f"le groupe n'est pas imputé à l'alphabet : {m._derniere_trame}"
+    assert "hors alphabet" in m._cause_rejets("PTEC"), \
+        f"la cause n'est pas nommée : {m._cause_rejets('PTEC')!r}"
+
+    # ⚖️ LE TÉMOIN : la MÊME trame intacte passe, avec sa vraie valeur.
+    flux = ([sain(STX)] + ligne(f"{corps} {_checksum_histo(corps)}")
+            + ligne(f"PAPP 00450 {_checksum_histo('PAPP 00450')}") + [sain(ETX)])
+    labels = m.read_frame(FauxPort(flux), m.tic_checksum_ok, range_brut)
+    assert labels.get("PTEC") == "TH..", \
+        f"un groupe entièrement dans l'alphabet a été refusé : {labels}"
+    assert m._derniere_trame["alphabet"] == 0 and m._derniere_trame["rejetees"] == 0, \
+        f"une trame saine est comptée comme abîmée : {m._derniere_trame}"
+
+    # 🚨 LE SABOTAGE, exigé par l'issue : on retire le contrôle, le banc doit ROUGIR.
+    #    Avec un prédicat qui accepte tout, le checksum valide la ligne abîmée et la
+    #    donnée FAUSSE entre en base. C'est ce qui prouve que c'est bien CE contrôle
+    #    qui l'arrête, et pas un effet de bord d'un autre.
+    flux = ([sain(STX)] + _ligne_substituee(corps, i, ord(corps[i]) - 0x40)
+            + ligne(f"PAPP 00450 {_checksum_histo('PAPP 00450')}") + [sain(ETX)])
+    labels = m.read_frame(FauxPort(flux), m.tic_checksum_ok, range_brut,
+                          alphabet=bytes([1]) * 128)
+    assert labels.get("PTEC") == "\x14H..", \
+        ("sabotage sans effet : sans contrôle d'alphabet la donnée fausse devrait "
+         f"passer le checksum, or on obtient {labels!r} — le cas ne prouve plus rien")
+
+
+@cas
+def le_releve_distingue_PARITE_ALPHABET_et_CHECKSUM():
+    """Trois groupes, trois causes, trois compteurs — exigence de #10.
+
+    ⚠️ Fondre les causes dirait « ça décroche » sans dire OÙ, or le fil, le
+       compteur et le montage ne se diagnostiquent pas pareil.
+    """
+    par_parite = ligne(f"PAPP 00450 {_checksum_histo('PAPP 00450')}")
+    par_parite[7] = corrompu(par_parite[7] & 0x7F)          # dans la VALEUR
+    faux_cks = chr(ord(_checksum_histo("OPTARIF BASE")) ^ 1)
+    flux = ([sain(STX)]
+            + par_parite
+            + _ligne_substituee("IINST 005", 6, 0x04)       # hors alphabet
+            + ligne(f"OPTARIF BASE {faux_cks}")             # checksum FAUX, construit
+            + ligne(f"ADCO 021861000000 {_checksum_histo('ADCO 021861000000')}")
+            + [sain(ETX)])
+    labels = m.read_frame(FauxPort(flux), m.tic_checksum_ok, range_brut)
+    r = m._derniere_trame
+
+    assert r["rejetees"] == 3, f"3 groupes devaient tomber, relevé : {r}"
+    assert r["parite_groupes"] == 1, f"la parité n'est pas comptée seule : {r}"
+    assert r["alphabet"] == 1 and r["groupes_alphabet"] == 1, \
+        f"l'alphabet n'est pas compté seul : {r}"
+    assert r["gardees"] == 1 and labels.get("ADCO") == "021861000000", \
+        f"⚖️ témoin : le groupe sain devait passer — {labels}"
+
+    cause = m._cause_rejets()
+    assert "hors parité" in cause and "hors alphabet" in cause, \
+        f"les deux causes ne sont pas nommées ensemble : {cause!r}"
+
+
+@cas
+def HT_passe_en_STANDARD_et_condamne_en_HISTORIQUE():
+    """⚖️ Le témoin du mode, et il va dans les DEUX sens.
+
+    Refuser `HT` en standard condamnerait tous les groupes : le lecteur
+    deviendrait muet, et aucun cas de REFUS ne le montrerait. L'accepter en
+    historique rouvrirait le trou du modulo 64, puisque `'I'` − `HT` = 64 tout
+    rond. Les deux assertions se tiennent l'une l'autre.
+    """
+    corps = "PTEC TH.."
+    i = corps.index("TH..")
+    flux = [sain(STX)] + _ligne_substituee(corps, i, 0x09) + [sain(ETX)]
+    m.read_frame(FauxPort(flux), m.tic_checksum_ok, range_brut)
+    assert m._derniere_trame["groupes_alphabet"] == 1, \
+        f"HT accepté en historique : {m._derniere_trame}"
+
+    # Le même octet, mode standard : c'est un séparateur légal, il doit PASSER.
+    flux = [sain(STX)] + _ligne_substituee(corps, i, 0x09) + [sain(ETX)]
+    m.read_frame(FauxPort(flux), m.tic_checksum_ok, range_brut,
+                 alphabet=m.ALPHABET_STD)
+    assert m._derniere_trame["groupes_alphabet"] == 0, \
+        f"HT refusé en standard : le lecteur serait muet — {m._derniere_trame}"
+
+
 if __name__ == "__main__":
     # 🚨 ON RATTRAPE TOUTE EXCEPTION, PAS SEULEMENT AssertionError.
     #

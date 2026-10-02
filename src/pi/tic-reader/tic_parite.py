@@ -1,9 +1,16 @@
-"""Le contrôle de parité d'un octet TIC. Isolé exprès, sans aucune dépendance.
+"""Les contrôles d'un octet TIC — parité et alphabet. Isolés exprès, sans dépendance.
 
 ⭐ POURQUOI UN FICHIER À PART. `main_uart.py` importe `RPi.GPIO` au chargement :
-   il ne s'importe donc pas ailleurs que sur un Pi. Tant que cette fonction y
-   vivait, l'argument « le contrôle logiciel se teste sans boîtier » était FAUX.
+   il ne s'importe donc pas ailleurs que sur un Pi. Tant que ces fonctions y
+   vivaient, l'argument « le contrôle logiciel se teste sans boîtier » était FAUX.
    Ici, il est vrai — et le banc tourne sur n'importe quelle machine.
+
+⭐ ET POURQUOI L'ALPHABET ATTERRIT ICI plutôt que dans un `tic_alphabet.py` neuf :
+   un fichier NEUF doit être copié par l'`update.sh` de la version qui le livre, et
+   s'il est oublié le lecteur meurt sur `ImportError` — en boucle, puisque systemd le
+   relance. C'est le mode de défaillance qui a brûlé pi-0.9.0 (paho oublié). Ajouter
+   une fonction à un fichier DÉJÀ déployé n'a pas ce risque. Le nom du module parle
+   donc des contrôles d'un octet, pas de la seule parité.
 """
 from __future__ import annotations
 
@@ -66,3 +73,82 @@ def octet_valide(octet: int) -> bool:
        boîtier — et laisse COMPTER les rejets, ce que le noyau fait en silence.
     """
     return PARITE[octet & 0x7F] == (octet >> 7) & 1
+
+
+# ─── L'alphabet légal d'un groupe TIC ───────────────────────────────────────
+#
+# `Enedis-NOI-CPT_54E` §6.2.1.2 : le champ « donnée » ne contient que des caractères
+# ASCII IMPRIMABLES, soit 0x20 à 0x7E. L'alphabet est donc CONNU D'AVANCE, et tout
+# octet hors de cet ensemble est une erreur par définition de la norme — pas une
+# heuristique.
+#
+# 🚨 CE CONTRÔLE N'EST REDONDANT AVEC AUCUN DES DEUX AUTRES.
+#
+#    Pas avec la PARITÉ : la parité paire détecte un nombre IMPAIR de bits
+#    retournés. DEUX bits retournés dans le même octet la traversent intacts, et
+#    peuvent très bien produire un octet hors alphabet. Ce contrôle attrape donc une
+#    partie de ce que la parité ne peut STRUCTURELLEMENT pas voir.
+#
+#    Pas avec le CHECKSUM : il vaut (somme & 0x3F) + 0x20, donc il ne voit la somme
+#    que MODULO 64 — l'angle mort déjà documenté plus haut.
+#
+# ⭐ Trois filtres indépendants, chacun couvrant l'angle mort des deux autres, pour
+#    trois comparaisons par octet.
+HT = 0x09   # séparateur de champ du mode STANDARD (§5.3.6)
+
+
+def octet_dans_alphabet(octet: int) -> bool:
+    """Mode HISTORIQUE : ASCII imprimables 0x20-0x7E, et rien d'autre.
+
+    🚨 `HT` EST REFUSÉ ICI, ET CE N'EST PAS UN OUBLI. En historique le séparateur
+       est l'espace ; `HT` n'y est pas un caractère légal. Et l'accepter « pour
+       simplifier » rouvrirait exactement le trou que ce contrôle vient fermer :
+       `'I'` vaut 0x49, `HT` vaut 0x09, soit 0x40 d'écart — donc **64**, donc
+       `(somme & 0x3F)` inchangé, donc **checksum IDENTIQUE**. Un seul octet abîmé
+       de cette façon passerait les trois filtres.
+
+    ⓘ Le masque `& 0x7F` est là pour que le prédicat dise la vérité sur l'octet TEL
+      QU'IL ARRIVE d'un port 8N1, bit de parité compris : 0x80 est hors alphabet, et
+      le reste après masque aussi s'il n'est pas imprimable.
+    """
+    o = octet & 0x7F
+    return 0x20 <= o <= 0x7E
+
+
+def octet_dans_alphabet_std(octet: int) -> bool:
+    """Mode STANDARD : les mêmes, PLUS `HT` (0x09) qui y sépare légalement les champs.
+
+    ⚠️ Refuser `HT` en standard condamnerait TOUS les groupes, donc rendrait le
+       lecteur muet. C'est le témoin que le banc doit porter : un contrôle trop
+       strict ne se voit pas dans les cas de refus, seulement dans les cas de
+       PASSAGE.
+    """
+    o = octet & 0x7F
+    return 0x20 <= o <= 0x7E or o == HT
+
+
+# ─── Les mêmes, en TABLE — c'est la forme que `read_frame` consomme ─────────
+#
+# ⭐ MESURÉ SUR PI ZERO W (armv6l, Python 3.9), coût par octet et part de CPU à
+#    9600 bauds, en `nice -19` :
+#
+#        appel de fonction  `not f(b)`     10,73 µs     1,030 %
+#        table              `not T[b]`      2,97 µs     0,285 %
+#        témoin : appel à vide              3,02 µs        —
+#
+#    Un appel de fonction Python coûte À LUI SEUL 3 µs sur cette machine, soit la
+#    quasi-totalité du coût du prédicat : la table est donc ×3,6 moins chère, et
+#    revient au prix d'une instruction vide. L'issue #10 exige que le contrôle ne
+#    coûte « RIEN sur une ligne saine » — avec 0,036 % de CPU à 1200 bauds, c'est
+#    tenu. Même raison et même forme que la table `PARITE` ci-dessus.
+#
+# 🚨 128 ENTRÉES, PAS 256, et ce n'est pas une économie : `read_frame` indexe avec
+#    l'octet DÉJÀ masqué (`b = raw[0] & 0x7F`), après que la parité a jugé le
+#    huitième bit. Une table de 256 laisserait croire qu'on peut l'indexer avec
+#    l'octet brut, et donc qu'on se passe du masque.
+#
+# ⭐ DÉRIVÉES DES PRÉDICATS, jamais réécrites à la main : une table et un prédicat
+#    qui divergent, c'est un contrôle qui dit deux choses selon l'appelant. Le banc
+#    le vérifie quand même sur les 128 valeurs, comme il le fait pour `PARITE`.
+ALPHABET_HISTO = bytes(1 if octet_dans_alphabet(i) else 0 for i in range(128))
+ALPHABET_STD   = bytes(1 if octet_dans_alphabet_std(i) else 0 for i in range(128))

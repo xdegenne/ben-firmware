@@ -58,7 +58,7 @@ from time import sleep
 
 import RPi.GPIO as GPIO
 
-from tic_parite import octet_valide  # noqa: E402
+from tic_parite import octet_valide, ALPHABET_HISTO, ALPHABET_STD  # noqa: E402
 import serial
 
 # Module store partagé (src/pi/store/db.py)
@@ -459,17 +459,25 @@ def _std_horodate_to_epoch(h: str | None) -> int | None:
 #      résumés. Si le taux est ~0, la question ne se pose pas. S'il ne l'est
 #      pas, le chiffre tranche — et il tranchera mieux qu'un raisonnement.
 _PARITE_PERIODE_S = 300
-_parite_cumul = {"car": 0, "trames": 0, "debut": 0.0}
+_parite_cumul = {"car": 0, "alpha": 0, "trames": 0, "debut": 0.0}
 
 
-def _signaler_parite(n: int) -> None:
-    """Accumule les rejets de parité, et n'en parle qu'une fois par période."""
+def _signaler_octets_rejetes(n_parite: int, n_alphabet: int = 0) -> None:
+    """Accumule les octets rejetés et n'en parle qu'une fois par période.
+
+    ⭐ UN SEUL message pour les deux causes, mais qui les NOMME séparément. Deux
+       canaux périodiques indépendants diraient deux fois « la liaison est
+       bruyante » sans jamais dire laquelle des deux détections a mordu ; un
+       message qui fond les causes ne permet pas de distinguer un fil qui prend
+       du bruit d'une corruption à deux bits que la parité ne voit pas.
+    """
     maintenant = time.monotonic()
     if _parite_cumul["debut"] == 0.0:
         _parite_cumul["debut"] = maintenant
 
-    _parite_cumul["car"] += n
-    if n:
+    _parite_cumul["car"] += n_parite
+    _parite_cumul["alpha"] += n_alphabet
+    if n_parite or n_alphabet:
         _parite_cumul["trames"] += 1
 
     ecoule = maintenant - _parite_cumul["debut"]
@@ -477,12 +485,17 @@ def _signaler_parite(n: int) -> None:
         return
 
     # ⓘ Rien à dire quand rien n'est rejeté : le silence EST l'information.
-    if _parite_cumul["car"]:
+    if _parite_cumul["car"] or _parite_cumul["alpha"]:
+        causes = []
+        if _parite_cumul["car"]:
+            causes.append(f"{_parite_cumul['car']} sur parité")
+        if _parite_cumul["alpha"]:
+            causes.append(f"{_parite_cumul['alpha']} hors alphabet TIC")
         log.warning(
-            f"TIC : {_parite_cumul['car']} octet(s) rejeté(s) sur parité "
+            f"TIC : octet(s) rejeté(s) — {', '.join(causes)} — "
             f"dans {_parite_cumul['trames']} trame(s) en {ecoule / 60:.0f} min "
             f"— liaison bruyante ?")
-    _parite_cumul.update(car=0, trames=0, debut=maintenant)
+    _parite_cumul.update(car=0, alpha=0, trames=0, debut=maintenant)
 
 
 # ─── Un pdl_index ne se devine pas ──────────────────────────────────────────
@@ -582,8 +595,24 @@ def _signaler_non_stocke(saute: bool) -> None:
 #    n'a été rejetée — et c'est précisément le mensonge du triphasé : `IINST`
 #    n'est jamais émis, un octet bruité traîne avant le STX, et le message
 #    accuse la parité au lieu de dire que le compteur n'émet pas cette étiquette.
+# 🚨 ET UNE TROISIÈME CAUSE, QUI NE SE FOND PAS DANS LES DEUX AUTRES.
+#
+#    `alphabet` compte les octets tombés parce qu'ils ne sont pas dans
+#    `0x20–0x7E` (+ `HT` en standard). Par construction ils sont TOUS à
+#    l'intérieur d'un groupe : hors groupe, un octet n'est pas accumulé, donc
+#    jamais examiné. Il n'y a donc pas de pendant « tout/groupes » comme pour la
+#    parité, et c'est normal.
+#
+#    `groupes_alphabet` compte les GROUPES que cette cause a condamnés.
+#
+# ⚠️ Fondre les trois dirait « ça décroche » sans dire OÙ — et le fil, le compteur
+#    et le montage ne se diagnostiquent pas pareil. Un octet hors parité accuse le
+#    BRUIT ; un octet hors alphabet accuse une corruption que la parité n'a pas
+#    vue (deux bits dans le même octet) ; un checksum faux sur un groupe
+#    intégralement lu accuse autre chose encore.
 _derniere_trame = {"gardees": 0, "rejetees": 0, "parite": 0,
-                   "parite_groupes": 0, "etiquettes_rejetees": set()}
+                   "parite_groupes": 0, "alphabet": 0, "groupes_alphabet": 0,
+                   "etiquettes_rejetees": set()}
 
 
 def _cause_rejets(etiquette: str = "") -> str:
@@ -594,6 +623,7 @@ def _cause_rejets(etiquette: str = "") -> str:
     """
     r  = _derniere_trame["rejetees"]
     pa = _derniere_trame["parite_groupes"]
+    al = _derniere_trame["alphabet"]
     vues = _derniere_trame["etiquettes_rejetees"]
 
     if not r:
@@ -616,15 +646,29 @@ def _cause_rejets(etiquette: str = "") -> str:
         #    « pas émise » serait alors se tromper dans l'autre sens : elle
         #    était émise, et abîmée. On dit donc ce qu'on sait, et on nomme le
         #    doute au lieu de le taire.
-        if pa:
-            return (f" — {r} groupe(s) rejeté(s), dont {pa} octet(s) hors parité ; "
-                    f"aucun ne portait {etiquette}, mais la parité a pu en abîmer le nom")
+        # Un octet hors ALPHABET fait perdre des caractères exactement comme un
+        # octet hors parité : le nom relevé peut donc être faux pour la même
+        # raison, et le doute se nomme de la même façon.
+        if pa or al:
+            return (f" — {r} groupe(s) rejeté(s), dont {_detail_octets(pa, al)} ; "
+                    f"aucun ne portait {etiquette}, mais la perte de caractères "
+                    f"a pu en abîmer le nom")
         return (f" — {r} groupe(s) rejeté(s) sur checksum, aucun ne portait "
                 f"{etiquette} : cette étiquette n'est probablement pas émise")
 
-    if pa:
-        return f" — {r} groupe(s) rejeté(s), dont {pa} octet(s) hors parité"
+    if pa or al:
+        return f" — {r} groupe(s) rejeté(s), dont {_detail_octets(pa, al)}"
     return f" — {r} groupe(s) rejeté(s) sur checksum"
+
+
+def _detail_octets(pa: int, al: int) -> str:
+    """Nomme les causes présentes, et seulement celles-là."""
+    bouts = []
+    if pa:
+        bouts.append(f"{pa} octet(s) hors parité")
+    if al:
+        bouts.append(f"{al} octet(s) hors alphabet TIC")
+    return " et ".join(bouts)
 
 
 def _note_groupe_rejete(vues: set, brut: bytes | bytearray | str) -> None:
@@ -662,11 +706,26 @@ def _rendre(labels: dict):    # dict | TRAME_CONDAMNEE | None
     return labels
 
 
-def read_frame(ser: serial.Serial, checksum_ok, parse_label):    # dict | TRAME_CONDAMNEE | None
+def read_frame(ser: serial.Serial, checksum_ok, parse_label,
+               alphabet=ALPHABET_HISTO):    # dict | TRAME_CONDAMNEE | None
     """
     Lit une trame TIC complète (STX..ETX), mode-agnostique.
     `checksum_ok(line)` valide la ligne ; `parse_label(line, labels)` la décode.
     Retourne un dict des labels parsés, ou None si timeout / trame vide.
+
+    ⭐ `alphabet` suit le MÊME chemin que les deux autres : l'alphabet légal dépend du
+       mode (`HT` n'est un séparateur qu'en standard), et cette fonction reste
+       mode-agnostique — c'est `MODES` qui injecte la bonne table.
+
+    ⓘ Une TABLE de 128 entrées, pas un prédicat : sur Pi Zero un appel de fonction
+      Python coûte 3 µs à lui seul, soit autant que tout le reste du contrôle. Indexée
+      par l'octet déjà masqué, cf. `tic_parite`.
+
+    🚨 LE DÉFAUT VAUT L'HISTORIQUE, c'est-à-dire le plus STRICT, et c'est délibéré.
+       Oublier d'injecter le prédicat standard rend le lecteur MUET (tous les groupes
+       condamnés sur leurs `HT`) : panne bruyante, que le banc attrape. Le défaut
+       inverse — accepter `HT` partout — rouvrirait le trou du modulo 64 EN SILENCE,
+       puisque `'I'` et `HT` sont à exactement 64 l'un de l'autre.
     """
     deadline = time.time() + TIC_TIMEOUT_S
     # ⚠️ Remis à neuf ICI, pas aux sorties : la sortie sur délai en
@@ -675,6 +734,7 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label):    # dict | TRAME_
     #    n'interroge le relevé que sur une trame lue — mais c'est le genre de
     #    dépendance invisible qui se paie au premier appelant suivant.
     _derniere_trame.update(gardees=0, rejetees=0, parite=0, parite_groupes=0,
+                           alphabet=0, groupes_alphabet=0,
                            etiquettes_rejetees=set())
 
     # Synchronisation sur STX.
@@ -701,17 +761,20 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label):    # dict | TRAME_
         #    chaque tour, et sans cette ligne les rejets ne seraient JAMAIS
         #    comptés : le résumé n'apparaîtrait pas, et le silence se lirait
         #    « tout va bien ».
-        _signaler_parite(parite_ko)
+        _signaler_octets_rejetes(parite_ko)
         log.warning(f"TIC timeout en attente STX ({parite_ko} octet(s) hors parité)")
         return None
 
     labels: dict = {}
     parite_groupes = 0          # sous-ensemble de parite_ko : voir _derniere_trame
+    alpha_ko = 0                # octets hors alphabet TIC — tous dans un groupe
+    groupes_alphabet = 0        # groupes que cette seule cause a condamnés
     etiquettes_ko: set = set()
     current = bytearray()
     in_line = False
     # 🚨 UN SEUL OCTET FAUTIF CONDAMNE TOUTE LA LIGNE. Voir au CR pourquoi.
     groupe_douteux = False
+    groupe_hors_alphabet = False
     kept = dropped = 0
 
     while time.time() < deadline:
@@ -747,8 +810,9 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label):    # dict | TRAME_
                           f"que fondue avec la suivante ; {kept} groupe(s) gardé(s)")
                 _derniere_trame.update(gardees=kept, rejetees=dropped, parite=parite_ko,
                                    parite_groupes=parite_groupes,
+                                   alphabet=alpha_ko, groupes_alphabet=groupes_alphabet,
                                    etiquettes_rejetees=etiquettes_ko)
-                _signaler_parite(parite_ko)
+                _signaler_octets_rejetes(parite_ko, alpha_ko)
                 return _rendre(labels)
 
             # 🚨 LE GROUPE EN COURS EST CONDAMNÉ, et ce n'est pas du zèle.
@@ -807,10 +871,12 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label):    # dict | TRAME_
             #    bruyante se verra, au lieu de se déduire de PDL fantômes.
             _derniere_trame.update(gardees=kept, rejetees=dropped, parite=parite_ko,
                                    parite_groupes=parite_groupes,
+                                   alphabet=alpha_ko, groupes_alphabet=groupes_alphabet,
                                    etiquettes_rejetees=etiquettes_ko)
-            _signaler_parite(parite_ko)
+            _signaler_octets_rejetes(parite_ko, alpha_ko)
             log.debug(f"Trame TIC complète : {kept} groupe(s) gardé(s), "
-                      f"{dropped} rejeté(s), {parite_ko} octet(s) hors parité")
+                      f"{dropped} rejeté(s), {parite_ko} octet(s) hors parité, "
+                      f"{alpha_ko} hors alphabet")
             return _rendre(labels)
         elif b == LF:
             # 🚨 `in_line` encore vrai à l'arrivée d'un LF veut dire une seule
@@ -825,15 +891,28 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label):    # dict | TRAME_
             current = bytearray()
             in_line = True
             groupe_douteux = False
+            groupe_hors_alphabet = False
         elif b == CR:
-            if in_line and groupe_douteux:
+            if in_line and (groupe_douteux or groupe_hors_alphabet):
                 # On ne CONSULTE même pas le checksum : il ne peut pas trancher,
                 # puisqu'il est aveugle à ce qui manque une fois sur soixante-quatre.
-                log.debug("Groupe rejeté : au moins un octet hors parité")
+                #
+                # ⭐ Le journal NOMME la cause, et nomme les DEUX quand les deux ont
+                #    mordu : un groupe peut porter un octet hors parité ET un octet
+                #    hors alphabet, et « rejeté » sans cause renverrait chercher le
+                #    défaut au hasard.
+                causes = []
+                if groupe_douteux:
+                    causes.append("hors parité")
+                if groupe_hors_alphabet:
+                    causes.append("hors alphabet TIC")
+                    groupes_alphabet += 1
+                log.debug("Groupe rejeté : au moins un octet " + " et ".join(causes))
                 _note_groupe_rejete(etiquettes_ko, current)
                 dropped += 1
                 in_line = False
                 groupe_douteux = False
+                groupe_hors_alphabet = False
                 continue
             if in_line and current:
                 line = current.decode("ascii", errors="replace")
@@ -846,16 +925,48 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label):    # dict | TRAME_
                     dropped += 1
             in_line = False
         elif in_line:
+            # 🚨 L'ALPHABET LÉGAL EST CONNU D'AVANCE (NOI-CPT_54E §6.2.1.2 : ASCII
+            #    imprimables 0x20-0x7E, plus `HT` en standard). Un octet hors de cet
+            #    ensemble est une erreur PAR DÉFINITION DE LA NORME — pas une heuristique.
+            #
+            # 🚨 ET LE DÉFAUT N'ÉTAIT PAS CE QU'ON CROIT. L'octet n'était pas jeté, il
+            #    était AJOUTÉ : le groupe gardait sa longueur, un de ses caractères était
+            #    simplement REMPLACÉ. Il n'y avait donc pas d'amputation ici — à la
+            #    différence de la parité — mais une SUBSTITUTION, et c'est exactement là
+            #    que le checksum est aveugle : il vaut (somme & 0x3F) + 0x20, donc modulo
+            #    64. Remplacer un caractère par `c - 0x40` retire exactement 64, donc
+            #    laisse le checksum IDENTIQUE, et donne un caractère de CONTRÔLE :
+            #
+            #        'T' = 0x54 -> 0x14      'S' = 0x53 -> 0x13      'I' = 0x49 -> HT
+            #
+            #    Un seul bit retourné, le 6. L'événement de corruption le plus simple qui
+            #    existe, et les deux filtres historiques le laissaient passer — la parité
+            #    parce que le bit de parité, calculé juste par le compteur, reste juste si
+            #    l'erreur naît sur le FIL ; le checksum parce qu'il est aveugle modulo 64.
+            #    En historique, « PTEC TH.. » devenait « PTEC \x14H.. », ACCEPTÉ — et
+            #    PTEC donne l'`index_id`.
+            #
+            #    On condamne donc le groupe sans CONSULTER le checksum, qui ne peut pas
+            #    trancher. Et on ne se contente pas de sauter l'octet : la ligne serait
+            #    alors AMPUTÉE, ce qui recrée le trou de la parité (des caractères retirés
+            #    dont la somme est un multiple de 64 laissent le checksum intact).
+            #
+            # ⚠️ Compté À PART : fondre les causes dirait « ça décroche » sans dire OÙ.
+            if not alphabet[b]:
+                alpha_ko += 1
+                groupe_hors_alphabet = True
+                continue
             current.append(b)
 
     # ⚠️ Même raison qu'au timeout de synchronisation : c'est précisément quand
     #    tout échoue qu'il faut que le compteur parle.
     _derniere_trame.update(gardees=kept, rejetees=dropped, parite=parite_ko,
                                    parite_groupes=parite_groupes,
+                                   alphabet=alpha_ko, groupes_alphabet=groupes_alphabet,
                                    etiquettes_rejetees=etiquettes_ko)
-    _signaler_parite(parite_ko)
+    _signaler_octets_rejetes(parite_ko, alpha_ko)
     log.warning(f"TIC timeout en lecture trame ({kept} groupe(s) gardé(s), {dropped} "
-                f"rejeté(s), {parite_ko} octet(s) hors parité)")
+                f"rejeté(s), {parite_ko} octet(s) hors parité, {alpha_ko} hors alphabet)")
     return None
 
 # ---------------------------------------------------------------------------
@@ -916,8 +1027,10 @@ def log_uncabled(fields: dict) -> None:
 # ---------------------------------------------------------------------------
 # Un descripteur par mode : débit + fonctions de validation/décodage.
 MODES = {
-    "historique": dict(baud=UART_BAUD_HISTO, checksum=tic_checksum_ok,     parse=_parse_label),
-    "standard":   dict(baud=UART_BAUD_STD,   checksum=tic_checksum_std_ok, parse=_parse_label_std),
+    "historique": dict(baud=UART_BAUD_HISTO, checksum=tic_checksum_ok,     parse=_parse_label,
+                       alphabet=ALPHABET_HISTO),
+    "standard":   dict(baud=UART_BAUD_STD,   checksum=tic_checksum_std_ok, parse=_parse_label_std,
+                       alphabet=ALPHABET_STD),   # + HT, séparateur légal
 }
 
 
@@ -1075,6 +1188,7 @@ if __name__ == "__main__":
 
     mode = MODES[mode_name]
     checksum_ok = mode["checksum"]
+    alphabet = mode["alphabet"]
     parse_label = mode["parse"]
     is_standard = mode_name == "standard"
 
@@ -1174,7 +1288,7 @@ if __name__ == "__main__":
                 # Au fil de l'eau : read_frame se cale sur la cadence du compteur.
                 # PAS de reset_input_buffer (on lit le flux en continu) ni de sleep
                 # (la trame suivante nous attend déjà dans le port).
-                labels = read_frame(ser, checksum_ok, parse_label)
+                labels = read_frame(ser, checksum_ok, parse_label, alphabet)
 
                 _signaler_condamnees(labels is TRAME_CONDAMNEE)
 
