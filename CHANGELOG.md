@@ -18,6 +18,107 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.9.26] — 2026-10-02
+
+**Un octet hors alphabet TIC condamne son groupe.** Ferme [#10](https://github.com/xdegenne/ben-firmware/issues/10).
+
+`Enedis-NOI-CPT_54E` §6.2.1.2 : le champ « donnée » ne contient que des caractères **ASCII
+imprimables, 0x20 à 0x7E** — plus `HT (0x09)`, séparateur de champ du mode standard (§5.3.6).
+L'alphabet légal est donc **connu d'avance**, et tout octet hors de cet ensemble est une erreur
+**par définition de la norme**, pas une heuristique. `read_frame` ne s'en servait pas.
+
+#### 🚨 Le défaut est une SUBSTITUTION, pas une amputation
+
+L'octet n'était pas jeté, il était **ajouté** : le groupe gardait sa longueur, un de ses
+caractères était **remplacé**. Or c'est là que le checksum est aveugle — il vaut
+`(somme & 0x3F) + 0x20`, donc il ne voit la somme que **modulo 64**. Remplacer un caractère par
+`c - 0x40` retire exactement 64 → **checksum identique** — et donne un caractère de contrôle :
+
+```
+'T' = 0x54 → 0x14        'S' = 0x53 → 0x13        'I' = 0x49 → HT
+```
+
+En historique, `PTEC TH..` devenait `PTEC \x14H..`, **accepté**. Et en historique c'est `PTEC`
+qui donne l'`index_id`.
+
+⚠️ **Il faut DEUX bits, pas un.** Un seul bit retourné casse **toujours** la parité : le compteur
+a calculé le bit de parité sur l'octet d'origine, donc `octet_valide` l'arrête et ce contrôle ne
+le voit jamais. Ce qui l'atteint est un nombre **pair** de bits dans le même octet — typiquement
+le bit 6 de la donnée **et** le bit de parité. C'est donc une **coïncidence rare** qu'on ferme, le
+même arbitrage que celui déjà écrit dans `tic_parite.octet_valide`.
+
+⇒ **Trois filtres indépendants**, chacun couvrant l'angle mort des deux autres.
+
+#### Trois défauts trouvés en revue
+
+Chacun avec son banc écrit **avant** le correctif et vérifié rouge.
+
+1. l'explication « un seul bit » ci-dessus — fausse, et elle gonflait la menace ;
+2. `groupes_alphabet` **sous-comptait** : il ne montait qu'à la sortie sur CR, donc un groupe
+   abîmé dont le CR est perdu était compté *rejeté* mais **plus imputé à sa cause**. Les quatre
+   sorties imputent désormais ;
+3. 🚨 **le pire, parce qu'il faisait accuser le compteur** : le test vivait dans `elif in_line:`,
+   donc un octet hors alphabet arrivant **hors** d'un groupe disparaissait avec tout le groupe
+   suivant. Deux bits du LF suffisent — `0x0A` devient `0x09`, soit `HT`, parité préservée et
+   illégal en historique — après quoi `_cause_rejets` concluait « cette étiquette n'est pas
+   émise ? ». Le chemin de la **parité** traitait déjà ce cas ; l'alphabet ouvre désormais le
+   groupe lui-même, condamné d'avance, pour qu'il soit **compté**.
+
+⚖️ Et la frontière tient dans les deux sens : le même octet **avant le STX** ne coûte rien, donc
+le cas du triphasé reste intact.
+
+#### 🚨 Le coût, mesuré sur Pi Zero W
+
+armv6l, `nice -19`, par octet et en part de CPU :
+
+| | µs/octet | % CPU à 1200 bd | % CPU à 9600 bd |
+|---|---|---|---|
+| appel de fonction `not f(b)` | 10,73 | 0,129 % | 1,030 % |
+| **table `not T[b]`** | **2,97** | **0,036 %** | **0,285 %** |
+| témoin : appel à vide | 3,02 | — | — |
+| parité existante `f(b)` | 11,56 | 0,139 % | 1,110 % |
+
+Un appel de fonction Python coûte **à lui seul 3 µs** sur cette machine, soit la quasi-totalité du
+coût du prédicat. D'où une **table de 128 entrées**, ×3,6 moins chère et au prix d'une instruction
+vide — l'issue exigeait que le contrôle « ne coûte RIEN sur une ligne saine ».
+
+🚨 **128 entrées et pas 256** : `read_frame` indexe avec l'octet **déjà masqué**, après que la
+parité a jugé le huitième bit. Les tables sont **dérivées des prédicats**, jamais réécrites, et le
+banc le vérifie sur les 128 valeurs — comme pour `PARITE`.
+
+#### Le relevé gagne sa troisième cause
+
+`alphabet` (octets) et `groupes_alphabet` (groupes) ; `_cause_rejets` **nomme** la cause, et les
+deux quand les deux ont mordu. Fondre les causes dirait « ça décroche » sans dire **où** : un octet
+hors parité accuse le **bruit** du fil, un octet hors alphabet une corruption que la parité **ne
+pouvait pas** voir, un checksum faux sur un groupe intégralement lu autre chose encore.
+
+ⓘ Pour [#5] : les colonnes seraient `groupes_ko_alphabet` à côté de `groupes_ko_parite` et
+`groupes_ko_checksum`.
+
+#### Deux décisions de structure
+
+Le code vit dans **`tic_parite.py`**, pas dans un fichier neuf : un fichier neuf doit être copié
+par l'`update.sh` qui le livre, et s'il est oublié le lecteur meurt sur `ImportError` — en boucle,
+puisque systemd le relance. C'est ce qui a brûlé **pi-0.9.0** (paho oublié).
+
+La table s'injecte par `MODES`, comme `checksum_ok` et `parse_label` : `read_frame` reste
+mode-agnostique. Le défaut du paramètre vaut l'**historique**, donc le plus strict — oublier
+d'injecter la table standard rend le lecteur **muet**, panne bruyante que le banc attrape, là où le
+défaut inverse rouvrirait le trou **en silence**.
+
+#### Éprouvé
+
+29/29 sur `read_frame`, 9/9 sur les contrôles d'octet, **14 bancs du dépôt verts**. Témoin tenu sur
+**ben-0003** (filaire, `pi-0.9.25`) : code posé à la main, lecteur redémarré, `last_tic_ts` qui
+avance — puis dépôt **rétabli**, l'agent OTA faisant un `git checkout` nu.
+
+L'update ne touche que `ben-tic-reader`, et seulement si le boîtier déclare `tic-uart` : la chaîne
+LoRa ne passe pas par `read_frame`, donc ni `ben-telemetry` ni `ben-radio`. Aucune migration,
+aucune table, aucune colonne.
+
+---
+
 ### [0.9.25] — 2026-10-01
 
 **On répare la base corrompue en la recopiant.** Ferme [#23](https://github.com/xdegenne/ben-firmware/issues/23).
