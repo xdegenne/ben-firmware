@@ -151,6 +151,30 @@ HELLO_EVERY = float(os.environ.get("BEN_PUB_HELLO_EVERY", "86400"))
 #    jamais).
 HELLO_SUR_ECHEC_S = float(os.environ.get("BEN_PUB_HELLO_SUR_ECHEC", "3600"))
 
+# ── La DÉCLARATION, et son plancher ───────────────────────────────────────────
+#
+# ⭐ Le déclencheur est une CONDITION, pas un événement : « il existe un pdl sans
+#    ref ». Elle se vérifie à chaque tour, localement, sans drapeau et sans rien
+#    mémoriser sur ce que le cloud sait. Elle couvre d'un seul énoncé le compteur
+#    neuf, le compteur remplacé, et la ref perdue en local (carte reflashée,
+#    désappairage). ⇒ Réconcilier un état est plus solide que rattraper un
+#    événement : un événement raté est définitif, une condition se re-vérifie.
+#
+# 🚨 MAIS IL FAUT UN PLANCHER, et ce n'est pas du zèle. Un pdl dont l'ADS n'est
+#    pas conforme — le PDL fantôme de ben-0001 en est un, deux octets nuls —
+#    n'obtiendra JAMAIS de ref : le CHECK du schéma cloud l'interdit, et c'est
+#    voulu. Sans plancher, ce boîtier redéclarerait toutes les 60 s, pour toujours,
+#    et chaque tentative écrirait une ligne dans le journal du cloud.
+DECLARATION_PLANCHER_S = float(os.environ.get("BEN_PUB_DECLARATION_PLANCHER", "300"))
+
+# 🚨 LE DRAPEAU D'OTA. Une OTA doit faire redéclarer — c'est ainsi que le cloud
+#    apprend la version neuve. Or l'agent d'update est DÉJÀ EN MÉMOIRE quand il
+#    redémarre les services : une déclaration envoyée au démarrage du publisher
+#    partirait AVANT le bump de `device.json`, et le cloud apprendrait l'ANCIENNE
+#    version. ⇒ `update.sh` pose ce drapeau APRÈS le bump, le publisher le consomme
+#    au tour suivant, et la course disparaît.
+DECLARER_FLAG = os.environ.get("BEN_PUB_DECLARER_FLAG", "/var/lib/ben/declarer")
+
 CERT_DIR = os.environ.get("BEN_CERT_DIR", "/etc/ben-firmware/certs")
 DEVICE_JSON = caps.DEVICE_JSON
 
@@ -243,23 +267,57 @@ def open_db() -> sqlite3.Connection:
     return conn
 
 
+# 🚨 LA JOINTURE SUR `pdl` N'EST PAS UN CONFORT : ELLE EST LE FILTRE.
+#
+#    Un compteur sans `ref` n'est pas publiable — le cloud refuserait le lot. Ses
+#    points doivent donc rester `sent = 0` et repartir dès que la `ref` arrive, et
+#    surtout leur `rowid` ne doit JAMAIS entrer dans la liste rendue : `mark_sent`
+#    les passerait à 1 après le 2xx du lot des AUTRES compteurs, et la mesure serait
+#    perdue POUR TOUJOURS, sans trace. C'est l'invariant qui tient tout le plan de
+#    bascule, et c'est le seul défaut de ce fichier qu'on ne pourrait pas rattraper.
+#
+# ⭐ Filtrer en SQL plutôt qu'en Python a un second effet voulu : la LIMITE porte
+#    alors sur les points PUBLIABLES. Filtrer après aurait rendu des lots plus petits
+#    que demandé, donc ralenti le rattrapage sans que rien ne le dise.
+#
+# ⚠️ Le prix, à connaître : si un pdl sans `ref` accumulait beaucoup de points non
+#    envoyés, SQLite devrait les parcourir pour trouver les `limit` lignes qui
+#    passent le filtre. Supportable ici — un pdl sans ref est transitoire, la
+#    déclaration l'équipe au tour suivant — mais ce serait le premier endroit à
+#    regarder si le rattrapage ralentissait sans raison apparente.
 SELECT_BATCH = """
-SELECT rowid, ts, pdl_index, papp, iinst, src_standard,
-       index_id, index_value, inject_total, tariff, meter_ts
-FROM measurements
-WHERE sent = 0
-ORDER BY rowid
+SELECT m.rowid, m.ts, m.papp, m.iinst, m.src_standard,
+       m.index_id, m.index_value, m.inject_total, m.tariff, m.meter_ts, p.ref
+FROM measurements m
+JOIN pdl p ON p.pdl_index = m.pdl_index
+WHERE m.sent = 0 AND p.ref IS NOT NULL AND p.ref <> ''
+ORDER BY m.rowid
 LIMIT ?
 """
 
 
 def fetch_batch(conn: sqlite3.Connection, limit: int) -> tuple[list, list]:
+    """Rend `(rowids, lots)` — les lots GROUPÉS PAR COMPTEUR.
+
+    ⭐ Une `ref` par LOT, jamais par point : un uuid répété 1000 fois coûte 36 ko,
+       un par compteur en coûte 36. Et le multi-compteurs cesse d'être un cas
+       particulier — c'est la forme normale du payload.
+
+    🚨 `pdl_index` NE SORT PAS d'ici. C'est littéralement l'énoncé du chantier : un
+       index local au boîtier ne veut rien dire ailleurs, donc il n'a rien à faire
+       dans le payload le plus volumineux du protocole.
+
+    🚨 Les `rowid` rendus sont EXACTEMENT ceux des points présents dans les lots —
+       ni plus (une mesure marquée sans être partie serait perdue), ni moins (une
+       mesure partie sans être marquée repartirait indéfiniment).
+    """
     rows = conn.execute(SELECT_BATCH, (limit,)).fetchall()
-    rowids, points = [], []
-    for (rid, ts, pdl, papp, iinst, std, idx_id, idx_val,
-         inject, tariff, meter_ts) in rows:
+    rowids = []
+    par_ref: dict = {}
+    for (rid, ts, papp, iinst, std, idx_id, idx_val,
+         inject, tariff, meter_ts, ref) in rows:
         rowids.append(rid)
-        p = {"ts": ts, "pdl": pdl}
+        p = {"ts": ts}
         # On n'envoie que ce qui existe : un champ absent pèse moins qu'un null,
         # et le serveur distingue « absent » de « zéro » (0 W est une vraie valeur).
         if papp is not None:
@@ -278,8 +336,12 @@ def fetch_batch(conn: sqlite3.Connection, limit: int) -> tuple[list, list]:
             p["tariff"] = tariff
         if meter_ts is not None:
             p["meter_ts"] = meter_ts
-        points.append(p)
-    return rowids, points
+        # ⓘ `dict` conserve l'ordre d'insertion (Python 3.7+) : les lots sortent donc
+        #    dans l'ordre d'apparition des compteurs, lui-même l'ordre des `rowid`.
+        #    Rien n'en dépend, mais une sortie stable se diagnostique mieux.
+        par_ref.setdefault(ref, []).append(p)
+    lots = [{"ref": r, "points": pts} for r, pts in par_ref.items()]
+    return rowids, lots
 
 
 def mark_sent(conn: sqlite3.Connection, rowids: list) -> None:
@@ -456,40 +518,110 @@ def _meta(conn: sqlite3.Connection, quoi: str, sql: str, mapper) -> list:
         return []
 
 
-def send_hello(cli: Client, conn: sqlite3.Connection, dev: dict) -> None:
-    """Déclare le boîtier et ses compteurs.
+def declarer(cli: Client, conn: sqlite3.Connection, dev: dict) -> bool:
+    """LA DÉCLARATION — « ce que le boîtier EST ». Rend True sur un 2xx.
 
-    ⚠️ PUREMENT INFORMATIF : s'il échoue, les mesures partent quand même. Coupler
-    les deux ferait qu'une coupure réseau bloquerait la collecte pour une requête
-    de MÉTADONNÉES.
+    ⭐ Rare et ÉVÉNEMENTIELLE : à l'init, tant qu'un pdl est sans `ref`, et après
+       une OTA. 🚨 PAS au démarrage du publisher — un redémarrage n'est ni une OTA
+       ni une redéclaration d'identité.
 
-    On déclare TOUT ce que contient la table `pdl`, y compris un ADCO vide ou
-    aberrant. Le PDL fantôme de ben-0001 (ADCO de deux octets nuls, 13 056 lignes
-    du 18/08) est un FAIT : le boîtier a bien reçu quelque chose. Le filtrer ici
-    détruirait ce fait ; un filtre de format trop strict perdrait en plus de la
-    vraie donnée, en silence. Le serveur assainit les octets nuls (PostgreSQL les
-    refuse dans un `text`) et conserve la ligne.
+    🚨 C'EST LA SEULE REQUÊTE QUI TRANSPORTE L'ADS, et c'est tout l'objet du
+       chantier : l'identifiant du compteur ne voyage qu'ici, jamais avec les
+       mesures. À un envoi par minute, l'alternative aurait été 525 600 fois par an.
+
+    ⚠️ On déclare TOUT ce que contient la table `pdl`, y compris un ADCO vide ou
+       aberrant. Le PDL fantôme de ben-0001 (ADCO de deux octets nuls, 13 056 lignes
+       du 18/08) est un FAIT : le boîtier a bien reçu quelque chose. Le filtrer ici
+       le détruirait, et un filtre de format trop strict perdrait en plus de la
+       vraie donnée, en silence. Le cloud rend un MOTIF pour ce pdl.
     """
     pdls = [{"index": r[0], "adco": r[1] or ""}
             for r in conn.execute("SELECT pdl_index, adco FROM pdl ORDER BY pdl_index")]
+    payload = {"sw": dev.get("softwareVersion", ""),
+               "model": dev.get("model", ""),
+               "pdl": pdls}
+    # ⓘ `fw` est la version de l'ÉMETTEUR, relayée par le boîtier (ben-docs#12).
+    #    Absente aujourd'hui : on ne l'envoie donc PAS plutôt que d'envoyer "" —
+    #    le serveur distingue « absent » de « vide », et `COALESCE(NULLIF(…,''))`
+    #    n'écraserait rien, mais autant ne pas mentir sur le fil.
+    fw = dev.get("firmwareVersion") or ""
+    if fw:
+        payload["fw"] = fw
 
-    # ── Métadonnées : INSTANTANÉ COMPLET, pas un delta ───────────────────────
+    status, body = cli.post("/hello", payload)
+    if not (200 <= status < 300):
+        log.warning("déclaration refusée : HTTP %d %s", status, body[:200])
+        return False
+
+    # ── Ranger les refs rendues ───────────────────────────────────────────────
     #
-    # ⭐ On envoie le contenu ENTIER de ces tables à chaque hello, même inchangé.
-    #    C'est délibéré : le boîtier n'a alors AUCUN état à mémoriser sur ce que
-    #    le cloud sait. Si le cloud perd la métadonnée (restauration, migration,
-    #    reconstruction de la VM), elle revient d'elle-même sous 24 h.
-    #    Un envoi « sur changement seulement » créerait une divergence SILENCIEUSE
-    #    ET DÉFINITIVE — une table absente est indiscernable d'une table vide.
+    # 🚨 C'EST ICI QUE LE BOÎTIER APPREND À PUBLIER. Sans ces refs, `fetch_batch`
+    #    ne rend aucun lot et rien ne part — ce n'est pas une panne, c'est une
+    #    attente, mais elle ne se lève que par cette réponse.
     #
-    # Le coût mesuré sur les vraies données de ben-0001 : **524 o bruts, 276 o
-    # gzippés**, soit 98 ko/an contre 270 Mo/an de mesures — 0,036 % du trafic.
-    # C'est ce chiffre qui a fait renoncer à toute négociation (empreinte, delta,
-    # drapeau serveur) : on protégeait trois cents octets avec un protocole.
+    # ⚠️ Un corps illisible ne doit PAS faire échouer la déclaration : le serveur a
+    #    accepté (2xx), donc l'identité est enregistrée de son côté. On le crie et
+    #    on réessaiera au prochain déclencheur, plutôt que de rejouer en boucle une
+    #    requête qui a réussi.
+    try:
+        refs = {int(e["pdl"]): e.get("ref") or "" for e in json.loads(body).get("refs", [])}
+        motifs = {int(e["pdl"]): e["motif"] for e in json.loads(body).get("refs", [])
+                  if e.get("motif")}
+    except Exception as e:  # noqa: BLE001
+        log.error("déclaration acceptée mais réponse illisible (%s) — aucune ref rangée : %s",
+                  e, body[:200])
+        return True
+
+    n = db.poser_refs(conn, refs)
+    for pdl_index, motif in motifs.items():
+        # 🚨 ON CRIE LE MOTIF. Un pdl sans ref ne publiera JAMAIS. Si la raison
+        #    n'apparaît nulle part, on observera un boîtier qui déclare en boucle
+        #    sans jamais savoir pourquoi — exactement l'angle mort de neuf jours.
+        log.error("pdl %d SANS ref — motif « %s » : ses mesures ne partiront pas",
+                  pdl_index, motif)
+    log.info("déclaration OK — %d compteur(s) déclaré(s), %d ref(s) rangée(s), %d refusé(s)",
+             len(pdls), n, len(motifs))
+    return True
+
+
+def battre(cli: Client, conn: sqlite3.Connection, dev: dict) -> None:
+    """LE BATTEMENT — « ce que le boîtier VIT ». Ne lève jamais.
+
+    ⭐ C'est l'ancien `/hello` reconnu pour ce qu'il était déjà : un signe de vie
+       qui transporte l'instantané de santé. Son code est conservé ; seul le
+       clavage des métadonnées change, de `pdl_index` vers `ref`.
+
+    ⚠️ PUREMENT INFORMATIF : s'il échoue, les mesures partent quand même. Coupler
+       les deux ferait qu'une coupure réseau bloquerait la collecte pour une requête
+       de métadonnées.
+    """
+    # 🚨 LE CLAVAGE PAR `ref` CONTRAINT L'ORDRE TOUT SEUL : un pdl sans ref est
+    #    absent de cette table, donc ses métadonnées ne partent pas — et il n'y a
+    #    aucun drapeau à tenir pour obtenir ce comportement.
+    refs = db.refs_connues(conn)
+
+    def claver(lignes, champ_pdl="pdl"):
+        """Remplace l'index local par la ref, et JETTE ce qui n'en a pas."""
+        out = []
+        for e in lignes:
+            r = refs.get(e[champ_pdl])
+            if not r:
+                continue
+            e = {k: v for k, v in e.items() if k != champ_pdl}
+            e["ref"] = r
+            out.append(e)
+        return out
+
+    # ⭐ On envoie le contenu ENTIER de ces tables à chaque battement, même
+    #    inchangé. C'est délibéré : le boîtier n'a alors AUCUN état à mémoriser sur
+    #    ce que le cloud sait. Un envoi « sur changement seulement » créerait une
+    #    divergence SILENCIEUSE ET DÉFINITIVE — une table absente est indiscernable
+    #    d'une table vide. Coût mesuré sur les vraies données de ben-0001 : 524 o
+    #    bruts, 276 o gzippés, soit 98 ko/an contre 270 Mo/an de mesures.
     #
-    # 🚨 `contract_epoch` n'est pas un confort : sans elle, `index_id` est un
-    #    entier sans signification. Sur ben-0001, `index_id = 1` valait « BASE »
-    #    avant le 12/08 et « HC BLEU » après — même numéro, deux tarifs.
+    # 🚨 `contract_epoch` n'est pas un confort : sans elle, `index_id` est un entier
+    #    sans signification. Sur ben-0001, `index_id = 1` valait « BASE » avant le
+    #    12/08 et « HC BLEU » après — même numéro, deux tarifs.
     epochs = _meta(conn, "contract_epoch",
                    "SELECT pdl_index, ts_start, ngtf FROM contract_epoch "
                    "ORDER BY pdl_index, ts_start",
@@ -513,12 +645,9 @@ def send_hello(cli: Client, conn: sqlite3.Connection, dev: dict) -> None:
                                "std": None if r[4] is None else bool(r[4]),
                                "papp_max": r[5]})
 
-    payload = {"sw": dev.get("softwareVersion", ""),
-               "model": dev.get("model", ""),
-               "pdl": pdls,
-               "contract_epoch": epochs,
-               "tariff_labels": labels,
-               "meter_profile": profile}
+    payload = {"contract_epoch": claver(epochs),
+               "tariff_labels": claver(labels),
+               "meter_profile": claver(profile)}
 
     # ── L'instantané de santé (#16) ───────────────────────────────────────────
     #
@@ -528,25 +657,28 @@ def send_hello(cli: Client, conn: sqlite3.Connection, dev: dict) -> None:
     #    Constaté le 2026-10-01 sur un boîtier du parc — NEUF JOURS de silence,
     #    découverts par hasard, sur une machine injoignable (ni SSH ni VPN).
     #
-    # ⭐ Coût mesuré sur un Pi Zero du parc : ~2,4 s de collecte, 169 o gzippés —
-    #    contre 276 o pour le hello lui-même et 270 Mo/an de mesures.
+    # ⭐ Coût mesuré sur un Pi Zero du parc : ~2,4 s de collecte, 169 o gzippés.
     #
     # ⚠️ `snapshot()` NE LÈVE JAMAIS : chaque sonde y est isolée et se replie sur
     #    l'absence de son champ. Le `try` ci-dessous est une ceinture de plus, pas
     #    une excuse — si un jour il attrape quelque chose, c'est health.py qui a un
-    #    défaut, et le hello doit partir quand même.
+    #    défaut, et le battement doit partir quand même.
     try:
         snap = health.snapshot(conn, dev, db.DB_PATH)
     except Exception as e:  # noqa: BLE001
-        log.warning("santé illisible (%s) — hello envoyé sans", e)
+        log.warning("santé illisible (%s) — battement envoyé sans", e)
         snap = None
     if snap:
         payload["health"] = snap
-    status, body = cli.post("/hello", payload)
+
+    status, body = cli.post("/ping", payload)
     if 200 <= status < 300:
-        log.info("hello OK — %d compteur(s) déclaré(s)", len(pdls))
+        log.info("battement OK — %d époque(s), %d libellé(s), %d profil(s)",
+                 len(payload["contract_epoch"]), len(payload["tariff_labels"]),
+                 len(payload["meter_profile"]))
     else:
-        log.warning("hello refusé : HTTP %d %s", status, body[:200])
+        log.warning("battement refusé : HTTP %d %s", status, body[:200])
+
 
 
 # ── Boucle ────────────────────────────────────────────────────────────────────
@@ -583,16 +715,78 @@ def main() -> int:
     log.info("~%d point(s) en attente", pending_approx(conn))
 
     def hello() -> float:
-        """Envoie le hello et renvoie l'échéance du prochain. Ne lève jamais :
-        un échec de métadonnées ne doit pas empêcher la collecte de partir."""
+        """Envoie le BATTEMENT et renvoie l'échéance du prochain. Ne lève jamais :
+        un échec de métadonnées ne doit pas empêcher la collecte de partir.
+
+        ⓘ Le nom reste `hello` parce que toute la boucle l'appelle et que ce qu'il
+           cadence — le battement quotidien et l'escalade sur échec — n'a pas
+           changé. Ce qui a changé est la ROUTE : `/ping` au lieu de `/hello`.
+        """
         try:
             # On relit device.json à chaque fois : après une OTA, la version a
             # changé sur le disque sans que ce service ait redémarré.
-            send_hello(cli, conn, caps.load_device() or dev)
+            battre(cli, conn, caps.load_device() or dev)
         except Exception as e:
-            log.warning("hello impossible (%s) — on publie quand même", e)
+            log.warning("battement impossible (%s) — on publie quand même", e)
         return time.monotonic() + HELLO_EVERY
 
+    dernier_declare = float("-inf")
+
+    def declarer_si_besoin() -> None:
+        """LA DÉCLARATION, sur ses trois déclencheurs. Ne lève jamais.
+
+        ① à l'init du boîtier    — aucun pdl n'a de ref, donc la condition est vraie
+        ② tant qu'un pdl est SANS ref — compteur neuf, remplacé, ou ref perdue
+        ③ après une OTA          — `update.sh` pose le drapeau APRÈS le bump
+
+        ⭐ ② est une CONDITION, pas un événement à attraper : elle se vérifie à
+           chaque tour, localement, sans drapeau. Réconcilier un état est plus
+           solide que rattraper un événement — un événement raté est définitif,
+           une condition se re-vérifie au tour suivant.
+
+        🚨 Le drapeau d'OTA ne se retire QU'APRÈS un 2xx. Sinon une OTA dont la
+           déclaration échoue sur une coupure réseau perdrait son déclencheur, et
+           le cloud resterait sur l'ANCIENNE version jusqu'au prochain hasard.
+        """
+        nonlocal dernier_declare
+        force = os.path.exists(DECLARER_FLAG)
+        try:
+            manquants = db.pdls_sans_ref(conn)
+        except sqlite3.Error as e:
+            # ⚠️ Une base locale qui bronche n'est pas une raison de déclarer :
+            #    on ne sait pas s'il faut. Même garde que `cadence_sure`.
+            log.warning("pdl sans ref illisible (%s) — déclaration reportée", e)
+            return
+        if not force and not manquants:
+            return
+        # 🚨 LE PLANCHER. Un pdl dont l'ADS n'est pas conforme n'obtiendra JAMAIS de
+        #    ref — le CHECK du schéma cloud l'interdit, et c'est voulu. Sans
+        #    plancher, ce boîtier redéclarerait toutes les 60 s pour toujours, et
+        #    chaque tentative écrirait une ligne au journal du cloud.
+        #    ⓘ Le drapeau d'OTA passe outre : une OTA est un événement rare et daté.
+        if not force and time.monotonic() - dernier_declare < DECLARATION_PLANCHER_S:
+            return
+        dernier_declare = time.monotonic()
+        if force:
+            log.info("déclaration déclenchée par %s (OTA)", DECLARER_FLAG)
+        elif manquants:
+            log.info("déclaration : pdl sans ref %s", manquants)
+        try:
+            ok = declarer(cli, conn, caps.load_device() or dev)
+        except Exception as e:  # noqa: BLE001
+            log.warning("déclaration impossible (%s) — on réessaiera", e)
+            return
+        if ok and force:
+            try:
+                os.unlink(DECLARER_FLAG)
+            except OSError as e:
+                log.warning("drapeau %s non retiré (%s) — on redéclarera",
+                            DECLARER_FLAG, e)
+
+    # ① L'init : aucun pdl n'a de ref au premier démarrage, donc ceci déclare.
+    #    ⚠️ Et sur un boîtier déjà équipé, `pdls_sans_ref` est vide : rien ne part,
+    #       ce qui est la règle — un redémarrage n'est pas une redéclaration.
+    declarer_si_besoin()
     prochain_hello = hello()
     echecs = 0
     # ⚠️ `-inf` et non `0.0` : `time.monotonic()` part de l'uptime, pas de zéro. Avec `0.0`,
@@ -674,6 +868,9 @@ def main() -> int:
                     log.info("rien à envoyer · reste ~%d", pending_approx(conn))
                 except sqlite3.Error as e:
                     log.info("rien à envoyer (retard illisible : %s)", e)
+            # ② La condition, à chaque tour : elle ne coûte qu'une requête sur une
+            #    table de 7 lignes, et le plancher empêche toute rafale.
+            declarer_si_besoin()
             if time.monotonic() >= prochain_hello:
                 prochain_hello = hello()
         except sqlite3.Error as e:
