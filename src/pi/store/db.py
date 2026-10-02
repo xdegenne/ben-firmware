@@ -1758,7 +1758,7 @@ def prune(conn: sqlite3.Connection, retention_days: int = RETENTION_DAYS) -> dic
 #    terme commun entre l'app, le boîtier et le cloud ; `pdl_index` reste local,
 #    et l'ADS ne monte qu'à la déclaration.
 
-def refs_connues(conn: sqlite3.Connection) -> dict:
+def known_refs(conn: sqlite3.Connection) -> dict:
     """{pdl_index: ref} pour les compteurs déjà déclarés.
 
     ⚠️ Les pdl sans ref sont ABSENTS du dictionnaire, pas présents à None : un
@@ -1769,7 +1769,7 @@ def refs_connues(conn: sqlite3.Connection) -> dict:
         "SELECT pdl_index, ref FROM pdl WHERE ref IS NOT NULL AND ref <> ''")}
 
 
-def pdls_sans_ref(conn: sqlite3.Connection) -> list:
+def pdls_without_ref(conn: sqlite3.Connection) -> list:
     """Les pdl qui n'ont pas encore de référence, du plus petit index au plus grand.
 
     ⭐ C'est le DÉCLENCHEUR de la déclaration, et c'est une CONDITION, pas un
@@ -1785,7 +1785,7 @@ def pdls_sans_ref(conn: sqlite3.Connection) -> list:
         "SELECT pdl_index FROM pdl WHERE ref IS NULL OR ref = '' ORDER BY pdl_index")]
 
 
-def poser_refs(conn: sqlite3.Connection, refs: dict) -> int:
+def store_refs(conn: sqlite3.Connection, refs: dict) -> int:
     """Range les références rendues par la déclaration. Rend le nombre posé.
 
     ⚠️ IDEMPOTENT et non destructif : une entrée sans ref (le cloud a rendu un

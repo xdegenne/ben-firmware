@@ -146,7 +146,7 @@ HELLO_EVERY = float(os.environ.get("BEN_PUB_HELLO_EVERY", "86400"))
 #    un hello : l'instantané part donc PENDANT la panne, avec les lignes de son propre journal.
 #
 # ⚠️ Plafonné à un par heure, et JAMAIS plus d'un par panne continue : un boîtier coupé du
-#    monde ne doit pas se mettre à battre. Le coût, c'est `snapshot()` (≤ 20 s) une fois
+#    monde ne doit pas se mettre à heartbeat. Le coût, c'est `snapshot()` (≤ 20 s) une fois
 #    l'heure — et sur un lien mort le hello échoue sans rien coûter de plus (`hello()` ne lève
 #    jamais).
 HELLO_SUR_ECHEC_S = float(os.environ.get("BEN_PUB_HELLO_SUR_ECHEC", "3600"))
@@ -173,7 +173,7 @@ DECLARATION_PLANCHER_S = float(os.environ.get("BEN_PUB_DECLARATION_PLANCHER", "3
 #    partirait AVANT le bump de `device.json`, et le cloud apprendrait l'ANCIENNE
 #    version. ⇒ `update.sh` pose ce drapeau APRÈS le bump, le publisher le consomme
 #    au tour suivant, et la course disparaît.
-DECLARER_FLAG = os.environ.get("BEN_PUB_DECLARER_FLAG", "/var/lib/ben/declarer")
+DECLARER_FLAG = os.environ.get("BEN_PUB_DECLARER_FLAG", "/var/lib/ben/declare")
 
 CERT_DIR = os.environ.get("BEN_CERT_DIR", "/etc/ben-firmware/certs")
 DEVICE_JSON = caps.DEVICE_JSON
@@ -518,7 +518,7 @@ def _meta(conn: sqlite3.Connection, quoi: str, sql: str, mapper) -> list:
         return []
 
 
-def declarer(cli: Client, conn: sqlite3.Connection, dev: dict) -> bool:
+def declare(cli: Client, conn: sqlite3.Connection, dev: dict) -> bool:
     """LA DÉCLARATION — « ce que le boîtier EST ». Rend True sur un 2xx.
 
     ⭐ Rare et ÉVÉNEMENTIELLE : à l'init, tant qu'un pdl est sans `ref`, et après
@@ -572,7 +572,7 @@ def declarer(cli: Client, conn: sqlite3.Connection, dev: dict) -> bool:
                   e, body[:200])
         return True
 
-    n = db.poser_refs(conn, refs)
+    n = db.store_refs(conn, refs)
     for pdl_index, motif in motifs.items():
         # 🚨 ON CRIE LE MOTIF. Un pdl sans ref ne publiera JAMAIS. Si la raison
         #    n'apparaît nulle part, on observera un boîtier qui déclare en boucle
@@ -584,7 +584,7 @@ def declarer(cli: Client, conn: sqlite3.Connection, dev: dict) -> bool:
     return True
 
 
-def battre(cli: Client, conn: sqlite3.Connection, dev: dict) -> None:
+def heartbeat(cli: Client, conn: sqlite3.Connection, dev: dict) -> None:
     """LE BATTEMENT — « ce que le boîtier VIT ». Ne lève jamais.
 
     ⭐ C'est l'ancien `/hello` reconnu pour ce qu'il était déjà : un signe de vie
@@ -598,9 +598,9 @@ def battre(cli: Client, conn: sqlite3.Connection, dev: dict) -> None:
     # 🚨 LE CLAVAGE PAR `ref` CONTRAINT L'ORDRE TOUT SEUL : un pdl sans ref est
     #    absent de cette table, donc ses métadonnées ne partent pas — et il n'y a
     #    aucun drapeau à tenir pour obtenir ce comportement.
-    refs = db.refs_connues(conn)
+    refs = db.known_refs(conn)
 
-    def claver(lignes, champ_pdl="pdl"):
+    def key_by_ref(lignes, champ_pdl="pdl"):
         """Remplace l'index local par la ref, et JETTE ce qui n'en a pas."""
         out = []
         for e in lignes:
@@ -645,9 +645,9 @@ def battre(cli: Client, conn: sqlite3.Connection, dev: dict) -> None:
                                "std": None if r[4] is None else bool(r[4]),
                                "papp_max": r[5]})
 
-    payload = {"contract_epoch": claver(epochs),
-               "tariff_labels": claver(labels),
-               "meter_profile": claver(profile)}
+    payload = {"contract_epoch": key_by_ref(epochs),
+               "tariff_labels": key_by_ref(labels),
+               "meter_profile": key_by_ref(profile)}
 
     # ── L'instantané de santé (#16) ───────────────────────────────────────────
     #
@@ -725,14 +725,14 @@ def main() -> int:
         try:
             # On relit device.json à chaque fois : après une OTA, la version a
             # changé sur le disque sans que ce service ait redémarré.
-            battre(cli, conn, caps.load_device() or dev)
+            heartbeat(cli, conn, caps.load_device() or dev)
         except Exception as e:
             log.warning("battement impossible (%s) — on publie quand même", e)
         return time.monotonic() + HELLO_EVERY
 
     dernier_declare = float("-inf")
 
-    def declarer_si_besoin() -> None:
+    def declare_if_needed() -> None:
         """LA DÉCLARATION, sur ses trois déclencheurs. Ne lève jamais.
 
         ① à l'init du boîtier    — aucun pdl n'a de ref, donc la condition est vraie
@@ -751,7 +751,7 @@ def main() -> int:
         nonlocal dernier_declare
         force = os.path.exists(DECLARER_FLAG)
         try:
-            manquants = db.pdls_sans_ref(conn)
+            manquants = db.pdls_without_ref(conn)
         except sqlite3.Error as e:
             # ⚠️ Une base locale qui bronche n'est pas une raison de déclarer :
             #    on ne sait pas s'il faut. Même garde que `cadence_sure`.
@@ -772,7 +772,7 @@ def main() -> int:
         elif manquants:
             log.info("déclaration : pdl sans ref %s", manquants)
         try:
-            ok = declarer(cli, conn, caps.load_device() or dev)
+            ok = declare(cli, conn, caps.load_device() or dev)
         except Exception as e:  # noqa: BLE001
             log.warning("déclaration impossible (%s) — on réessaiera", e)
             return
@@ -784,9 +784,9 @@ def main() -> int:
                             DECLARER_FLAG, e)
 
     # ① L'init : aucun pdl n'a de ref au premier démarrage, donc ceci déclare.
-    #    ⚠️ Et sur un boîtier déjà équipé, `pdls_sans_ref` est vide : rien ne part,
+    #    ⚠️ Et sur un boîtier déjà équipé, `pdls_without_ref` est vide : rien ne part,
     #       ce qui est la règle — un redémarrage n'est pas une redéclaration.
-    declarer_si_besoin()
+    declare_if_needed()
     prochain_hello = hello()
     echecs = 0
     # ⚠️ `-inf` et non `0.0` : `time.monotonic()` part de l'uptime, pas de zéro. Avec `0.0`,
@@ -870,7 +870,7 @@ def main() -> int:
                     log.info("rien à envoyer (retard illisible : %s)", e)
             # ② La condition, à chaque tour : elle ne coûte qu'une requête sur une
             #    table de 7 lignes, et le plancher empêche toute rafale.
-            declarer_si_besoin()
+            declare_if_needed()
             if time.monotonic() >= prochain_hello:
                 prochain_hello = hello()
         except sqlite3.Error as e:
