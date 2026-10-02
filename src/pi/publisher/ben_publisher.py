@@ -58,6 +58,7 @@ import http.client
 import json
 import logging
 import os
+import pathlib
 import random
 import signal
 import socket
@@ -173,7 +174,13 @@ DECLARATION_PLANCHER_S = float(os.environ.get("BEN_PUB_DECLARATION_PLANCHER", "3
 #    partirait AVANT le bump de `device.json`, et le cloud apprendrait l'ANCIENNE
 #    version. ⇒ `update.sh` pose ce drapeau APRÈS le bump, le publisher le consomme
 #    au tour suivant, et la course disparaît.
-DECLARER_FLAG = os.environ.get("BEN_PUB_DECLARER_FLAG", "/var/lib/ben/declare")
+# ⚠️ CE CHEMIN EST UN CONTRAT AVEC `update.sh`, et il a déjà divergé : le script
+#    écrivait `/var/lib/ben-firmware/declaration-requise.json` pendant que le
+#    publisher lisait `/var/lib/ben/declare`. Trois documents affirmaient un
+#    mécanisme que le code ne pouvait pas déclencher. ⓘ Les 19 autres références
+#    du dépôt disent `/var/lib/ben-firmware` : c'est la forme juste.
+DECLARER_FLAG = os.environ.get("BEN_PUB_DECLARER_FLAG",
+                               "/var/lib/ben-firmware/declaration-requise.json")
 
 CERT_DIR = os.environ.get("BEN_CERT_DIR", "/etc/ben-firmware/certs")
 DEVICE_JSON = caps.DEVICE_JSON
@@ -749,7 +756,29 @@ def main() -> int:
            le cloud resterait sur l'ANCIENNE version jusqu'au prochain hasard.
         """
         nonlocal dernier_declare
-        force = os.path.exists(DECLARER_FLAG)
+        dev_courant = caps.load_device() or dev
+        force = False
+        if os.path.exists(DECLARER_FLAG):
+            # 🚨 LA GARDE CONTRE LA COURSE POSE/BUMP. `update.sh` tourne AVANT que
+            #    l'agent ne bumpe `device.json` : un drapeau consommé trop tôt
+            #    ferait déclarer l'ANCIENNE version. Le script y écrit donc la
+            #    version qu'il installe, et on n'obéit que si elle est en place.
+            try:
+                attendue = json.loads(pathlib.Path(DECLARER_FLAG).read_text()
+                                      ).get("version_attendue")
+            except Exception as e:  # noqa: BLE001
+                # ⚠️ Un drapeau illisible ne doit pas bloquer : on déclare, parce
+                #    qu'une déclaration de trop est sans conséquence alors qu'une
+                #    déclaration manquante laisse le cloud sur l'ancienne version.
+                log.warning("drapeau %s illisible (%s) — on déclare quand même",
+                            DECLARER_FLAG, e)
+                attendue = None
+            installee = dev_courant.get("softwareVersion", "")
+            if attendue and attendue != installee:
+                log.info("drapeau pour %s mais %s est en place — on attend le bump",
+                         attendue, installee)
+            else:
+                force = True
         try:
             manquants = db.pdls_without_ref(conn)
         except sqlite3.Error as e:
@@ -772,7 +801,7 @@ def main() -> int:
         elif manquants:
             log.info("déclaration : pdl sans ref %s", manquants)
         try:
-            ok = declare(cli, conn, caps.load_device() or dev)
+            ok = declare(cli, conn, dev_courant)
         except Exception as e:  # noqa: BLE001
             log.warning("déclaration impossible (%s) — on réessaiera", e)
             return
@@ -800,7 +829,20 @@ def main() -> int:
     echecs_base = 0
     while not _stop:
         try:
-            rowids, points = fetch_batch(conn, BATCH)
+            # 🚨 `lots`, PAS `points` : fetch_batch rend des lots groupés par
+            #    compteur. La première version de ce chantier a converti
+            #    `fetch_batch` sans convertir son appelant — le corps partait en
+            #    `{"points": [ {"ref":…, "points":[…]} ]}`, l'API refusait au
+            #    décodage (`DisallowUnknownFields`), et le boîtier prenait un 400
+            #    à chaque tour POUR TOUJOURS sans rien publier.
+            #
+            # ⚠️ Aucune perte dans ce cas-là, et uniquement grâce à une ligne du
+            #    SERVEUR : sans `DisallowUnknownFields`, `lots` aurait été vide, le
+            #    serveur aurait répondu 200 {"received":0}, et `mark_sent` aurait
+            #    passé les 1000 rowid à sent=1 — le lot perdu pour toujours. Un
+            #    invariant ne doit pas dépendre d'un réglage de l'autre côté du fil :
+            #    d'où le contrôle de `received` plus bas.
+            rowids, lots = fetch_batch(conn, BATCH)
             # 🚨 ICI, PAS DANS LA BRANCHE 2xx — défaut affiné par la revue. `fetch_batch` a
             #    réussi : la base se LIT, et c'est exactement ce que ce compteur mesure. Le
             #    remettre à zéro seulement après un envoi réussi le laissait grimper pendant
@@ -808,9 +850,34 @@ def main() -> int:
             #    locked` isolés — qui sont NORMAUX, le lecteur écrit en continu — finissaient
             #    par déclencher un faux signalement.
             echecs_base = 0
-            if points:
-                status, body = cli.post("/measurements", {"points": points})
+            if lots:
+                n_points = sum(len(l["points"]) for l in lots)
+                status, body = cli.post("/measurements", {"lots": lots})
                 if 200 <= status < 300:
+                    # 🚨 ON VÉRIFIE QUE LE SERVEUR A BIEN REÇU CE QU'ON A ENVOYÉ,
+                    #    AVANT DE MARQUER. `sent=1` ne se défait pas : un 2xx qui
+                    #    annonce moins de points que le lot n'en portait veut dire
+                    #    qu'une partie n'est pas entrée, et les marquer serait une
+                    #    perte DÉFINITIVE.
+                    #
+                    # ⭐ C'est ce qui rend l'invariant AUTOPORTANT. Sans ce contrôle,
+                    #    il repose sur `DisallowUnknownFields` côté serveur : un
+                    #    corps mal formé y décoderait en lot vide, le serveur
+                    #    répondrait 200 {"received": 0}, et les 1000 rowid
+                    #    passeraient à sent=1 sans qu'un seul point soit entré.
+                    #
+                    # ⓘ `inserted` < `received` reste NORMAL (8,2 % des points
+                    #    partagent leur horodatage à la seconde avec un voisin) :
+                    #    on ne compare QUE `received`, jamais `inserted`.
+                    recu = None
+                    try:
+                        recu = json.loads(body).get("received")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    if recu is not None and recu != n_points:
+                        raise RuntimeError(
+                            f"le serveur annonce received={recu} pour {n_points} "
+                            "points envoyés — lot NON marqué")
                     mark_sent(conn, rowids)
                     echecs = 0
                     # ⚠️ `inserted < envoyé` est NORMAL et permanent, ce n'est PAS un
@@ -822,10 +889,14 @@ def main() -> int:
                     # courbe, le NILM ou les index, qui sont monotones.
                     try:
                         r = json.loads(body)
+                        # 🚨 `n_points`, pas `len(lots)` : journaliser le nombre de
+                        #    COMPTEURS donnerait « envoyé 1 · reste ~513056 » pour
+                        #    1000 points partis — la ligne de diagnostic que tout ce
+                        #    fichier existe pour produire, rendue mensongère.
                         log.info("envoyé %d · inséré %s · reste ~%d",
-                                 len(points), r.get("inserted"), pending_approx(conn))
+                                 n_points, r.get("inserted"), pending_approx(conn))
                     except Exception:
-                        log.info("envoyé %d · reste ~%d", len(points), pending_approx(conn))
+                        log.info("envoyé %d · reste ~%d", n_points, pending_approx(conn))
                 elif status == 403:
                     # Révocation : on ne sort PAS. Elle se lève, et le boîtier doit
                     # repartir tout seul sans qu'on aille le redémarrer.

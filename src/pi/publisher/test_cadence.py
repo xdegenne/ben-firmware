@@ -414,8 +414,12 @@ def les_DEUX_compteurs_repartent_de_zero_apres_un_lot_reussi():
     #    grimper pendant toute une panne SERVEUR (ou sur une base vide), si bien que cinq
     #    `database is locked` isolés — qui sont NORMAUX — finissaient par déclencher un faux
     #    signalement.
-    lecture = corps[corps.index("rowids, points = fetch_batch("):]
-    lecture = lecture[:lecture.index("if points:")]
+    # ⚠️ Ancre mise à jour avec la bascule de clé : `fetch_batch` rend désormais
+    #    `(rowids, lots)` — des lots groupés par compteur — et la branche d'envoi
+    #    teste `if lots:`. L'ancre d'origine (`rowids, points`) épinglait l'ancien
+    #    nom et faisait rougir ce banc pour une raison étrangère à ce qu'il éprouve.
+    lecture = corps[corps.index("rowids, lots = fetch_batch("):]
+    lecture = lecture[:lecture.index("if lots:")]
     lecture = "\n".join(l for l in lecture.splitlines() if not l.lstrip().startswith("#"))
     assert "echecs_base = 0" in lecture, (
         "`echecs_base` n'est pas remis à zéro juste après `fetch_batch` : il continuera de "

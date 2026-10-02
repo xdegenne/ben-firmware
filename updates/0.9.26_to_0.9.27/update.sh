@@ -20,8 +20,8 @@
 #       POST …/measurements
 #          ↑ { lots: [ {ref, points: [...]} ] }     groupé par compteur, SANS pdl
 #
-#   Côté boîtier : `pdl.ref` (colonne ajoutée, migration idempotente) + `refs_connues`,
-#   `pdls_sans_ref`, `poser_refs` dans `store/db.py` ; `fetch_batch` rend `(rowids, lots)`
+#   Côté boîtier : `pdl.ref` (colonne ajoutée, migration idempotente) + `known_refs`,
+#   `pdls_without_ref`, `store_refs` dans `store/db.py` ; `fetch_batch` rend `(rowids, lots)`
 #   groupés par `ref` dans `publisher/ben_publisher.py`.
 #
 # ═══ ⚠️ LE PARC EST MUET ENTRE LA BASCULE DE L'API ET CETTE OTA ═══════════════════════════════
@@ -153,7 +153,7 @@ PYEOF
 #      l'`ALTER TABLE` sur une table qui EXISTE DÉJÀ SANS la colonne, qui est exactement l'état
 #      des 7 boîtiers du parc. On fabrique donc une base à l'ANCIENNE FORME, puis on l'ouvre.
 #
-#   ⚖️ ET SURTOUT LE TÉMOIN POSITIF. Sans lui, un `refs_connues` qui rendrait TOUJOURS VIDE et un
+#   ⚖️ ET SURTOUT LE TÉMOIN POSITIF. Sans lui, un `known_refs` qui rendrait TOUJOURS VIDE et un
 #      `fetch_batch` qui ne rendrait JAMAIS de lot passeraient tous les contrôles de refus
 #      ci-dessous — et le boîtier cesserait de publier EN SILENCE, ce qui est précisément le mode
 #      de défaillance que ce chantier introduit. C'est la leçon du préflight de 0.9.19 (un
@@ -200,26 +200,26 @@ try:
         ko.append("la seconde ouverture a perdu des lignes de `pdl`")
 
     # ── ④ L'ÉTAT DE DÉPART, qui est le déclencheur ② : tout le monde est sans ref.
-    if db.pdls_sans_ref(c) != [0, 1]:
-        ko.append(f"pdls_sans_ref ne voit pas les 2 compteurs neufs : {db.pdls_sans_ref(c)}")
-    if db.refs_connues(c) != {}:
-        ko.append("refs_connues rend quelque chose sur une base qui n'a aucune ref")
+    if db.pdls_without_ref(c) != [0, 1]:
+        ko.append(f"pdls_without_ref ne voit pas les 2 compteurs neufs : {db.pdls_without_ref(c)}")
+    if db.known_refs(c) != {}:
+        ko.append("known_refs rend quelque chose sur une base qui n'a aucune ref")
 
     # ── ⑤ ⚖️ LE TÉMOIN POSITIF : poser puis relire doit rendre LA VALEUR POSÉE.
-    if db.poser_refs(c, {0: "cpt-7f3a9e"}) != 1:
-        ko.append("poser_refs ne pose pas la ref d'un compteur sans ref")
-    if db.refs_connues(c) != {0: "cpt-7f3a9e"}:
-        ko.append(f"TÉMOIN : refs_connues ne rend pas la ref posée → {db.refs_connues(c)}")
-    if db.pdls_sans_ref(c) != [1]:
-        ko.append("pdls_sans_ref continue de réclamer un compteur qui a sa ref")
+    if db.store_refs(c, {0: "cpt-7f3a9e"}) != 1:
+        ko.append("store_refs ne pose pas la ref d'un compteur sans ref")
+    if db.known_refs(c) != {0: "cpt-7f3a9e"}:
+        ko.append(f"TÉMOIN : known_refs ne rend pas la ref posée → {db.known_refs(c)}")
+    if db.pdls_without_ref(c) != [1]:
+        ko.append("pdls_without_ref continue de réclamer un compteur qui a sa ref")
 
     # ── ⑥ IDEMPOTENT ET NON DESTRUCTIF. Un refus du cloud (motif au lieu de ref) ne doit PAS
     #    effacer une ref valide : sinon un refus transitoire ferait cesser de publier un
     #    compteur parfaitement légitime, et c'est irrattrapable sans intervention.
-    if db.poser_refs(c, {0: "cpt-7f3a9e"}) != 0:
+    if db.store_refs(c, {0: "cpt-7f3a9e"}) != 0:
         ko.append("re-poser la MÊME ref n'est pas un no-op (UPDATE inutile à chaque tour)")
-    db.poser_refs(c, {0: None, 1: ""})
-    if db.refs_connues(c) != {0: "cpt-7f3a9e"}:
+    db.store_refs(c, {0: None, 1: ""})
+    if db.known_refs(c) != {0: "cpt-7f3a9e"}:
         ko.append("une entrée SANS ref a effacé une ref déjà connue")
 
     # ── ⑦ 🚨 LA JOINTURE EST LE FILTRE, ET C'EST L'INVARIANT QU'ON NE POURRAIT PAS RATTRAPER.
@@ -246,7 +246,7 @@ try:
 
     # ── ⑧ ⚖️ LE SECOND TÉMOIN : la ref arrive, les points retenus REPARTENT. Sans lui, un
     #    `fetch_batch` qui ne rendrait jamais rien passerait ⑦ les doigts dans le nez.
-    db.poser_refs(c, {1: "cpt-b21c04"})
+    db.store_refs(c, {1: "cpt-b21c04"})
     rowids, lots = bp.fetch_batch(c, 100)
     if sorted(rowids) != [1, 2, 3, 4]:
         ko.append(f"TÉMOIN : les points du 2e compteur ne repartent pas après sa ref : {rowids}")
@@ -295,8 +295,8 @@ if "ref" not in [r[1] for r in conn.execute("PRAGMA table_info(pdl)")]:
           "lire p.ref et cesserait de publier en silence", file=sys.stderr)
     sys.exit(1)
 
-refs = db.refs_connues(conn)
-sans = db.pdls_sans_ref(conn)
+refs = db.known_refs(conn)
+sans = db.pdls_without_ref(conn)
 row = conn.execute("SELECT (SELECT max(rowid) FROM measurements), "
                    "       (SELECT min(rowid) FROM measurements WHERE sent = 0)").fetchone()
 retard = 0 if not row or row[0] is None or row[1] is None else max(0, row[0] - row[1] + 1)

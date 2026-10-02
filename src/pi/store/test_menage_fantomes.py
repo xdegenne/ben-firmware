@@ -40,9 +40,9 @@ def cas(fn):
 def malade() -> sqlite3.Connection:
     """La base de ben-0004 telle qu'elle est : un vrai PDL, trois fantômes, quatre époques."""
     c = db.connect(":memory:")
-    c.execute("INSERT INTO pdl VALUES(0,'061961403012',1,9)")
+    c.execute("INSERT INTO pdl (pdl_index, adco, first_seen, last_seen) VALUES (0,'061961403012',1,9)")
     for i, adco in enumerate(("p61961403012", "061961403p12", "0619614030q2"), start=1):
-        c.execute("INSERT INTO pdl VALUES(?,?,1,1)", (i, adco))
+        c.execute("INSERT INTO pdl (pdl_index, adco, first_seen, last_seen) VALUES (?,?,1,1)", (i, adco))
         # ⚠️ `index_id` N'EST PAS DÉCORATIF : sans lui `_rollup_ingest` ignore le point, et
         #    tout le chemin de reconstruction du rollup resterait NON EXERCÉ — c'est
         #    exactement ce qui a laissé passer un retour arrière incomplet.
@@ -118,7 +118,7 @@ def une_VRAIE_bascule_de_contrat_est_INTOUCHABLE():
     toute époque sauf la première passerait tous les cas ci-dessus — et effacerait le
     passage en Tempo d'un boîtier du parc, donc tout calcul de coût antérieur."""
     c = db.connect(":memory:")
-    c.execute("INSERT INTO pdl VALUES(0,'031864467282',1,9)")
+    c.execute("INSERT INTO pdl (pdl_index, adco, first_seen, last_seen) VALUES (0,'031864467282',1,9)")
     for ts, ngtf in ((0, "BASE"), (500, "TEMPO")):
         c.execute("INSERT INTO contract_epoch VALUES(0,?,?)", (ts, ngtf))
     c.commit()
@@ -153,7 +153,7 @@ def un_boitier_SAIN_est_deja_conforme():
     n'y a rien à faire — si l'invariant exigeait un effet, l'update échouerait partout
     ailleurs et rejouerait sans fin."""
     c = db.connect(":memory:")
-    c.execute("INSERT INTO pdl VALUES(0,'031864467282',1,9)")
+    c.execute("INSERT INTO pdl (pdl_index, adco, first_seen, last_seen) VALUES (0,'031864467282',1,9)")
     c.execute("INSERT INTO measurements(ts,pdl_index,papp,sent) VALUES(1,0,10,1)")
     c.commit()
     assert m.conforme(c) == []
@@ -166,7 +166,7 @@ def deux_PDL_sains_font_REFUSER_le_menage():
     """🚨 Ré-attribuer suppose de savoir VERS QUI. Avec deux vrais compteurs la
     destination est indécidable : on ne devine pas, on sort sans rien toucher."""
     c = malade()
-    c.execute("INSERT INTO pdl VALUES(9,'031864467282',1,9)")
+    c.execute("INSERT INTO pdl (pdl_index, adco, first_seen, last_seen) VALUES (9,'031864467282',1,9)")
     c.commit()
     r = m.menage(c, a_blanc=False)
     assert r["refus"] and sorted(x[0] for x in c.execute("SELECT pdl_index FROM pdl")) == [0, 1, 2, 3, 9]
@@ -177,7 +177,7 @@ def un_evenement_sans_PDL_n_est_pas_une_orpheline():
     """⚠️ `event.pdl_index` est NULLABLE. Le compter comme orphelin ferait échouer
     l'invariant sur un boîtier parfaitement sain."""
     c = db.connect(":memory:")
-    c.execute("INSERT INTO pdl VALUES(0,'031864467282',1,9)")
+    c.execute("INSERT INTO pdl (pdl_index, adco, first_seen, last_seen) VALUES (0,'031864467282',1,9)")
     c.execute("INSERT INTO event(id,ts,pdl_index,type,titre) VALUES('x',1,NULL,'t','T')")
     c.commit()
     assert m.conforme(c) == []
@@ -221,7 +221,7 @@ def LIMITE_ASSUMEE_un_retour_au_contrat_d_origine_serait_efface():
     ⇒ Si ce test se met à gêner, c'est qu'un vrai boîtier est concerné : changer la règle,
       pas le test."""
     c = db.connect(":memory:")
-    c.execute("INSERT INTO pdl VALUES(0,'031864467282',1,9)")
+    c.execute("INSERT INTO pdl (pdl_index, adco, first_seen, last_seen) VALUES (0,'031864467282',1,9)")
     for ts, ngtf in ((0, "BASE"), (500, "TEMPO"), (900, "BASE")):
         c.execute("INSERT INTO contract_epoch VALUES(0,?,?)", (ts, ngtf))
     c.commit()
@@ -282,7 +282,7 @@ def un_ORPHELIN_irreparable_ne_declenche_PAS_le_menage():
     nettoyer : des mesures perdues pour rien, la leçon de 0.9.17, et l'inverse exact de ce
     que ce script promet en en-tête."""
     c = db.connect(":memory:")
-    c.execute("INSERT INTO pdl VALUES(0,'061961403012',1,9)")
+    c.execute("INSERT INTO pdl (pdl_index, adco, first_seen, last_seen) VALUES (0,'061961403012',1,9)")
     c.execute("INSERT INTO measurements(ts,pdl_index,papp,sent) VALUES(1,7,10,0)")
     c.commit()
     assert m.a_nettoyer(c) == 0, "on toucherait aux services pour une anomalie irreparable"
@@ -299,8 +299,8 @@ def le_ROLLUP_est_reconstruit_pour_les_mesures_deplacees():
     fantôme resterait un TROU dans `/curve` large, les bandes HC/HP, le coût et l'index par
     tarif — alors que les points bruts sont bien là."""
     c = db.connect(":memory:")
-    c.execute("INSERT INTO pdl VALUES(0,'061961403012',1,9)")
-    c.execute("INSERT INTO pdl VALUES(1,'061961403p12',1,1)")
+    c.execute("INSERT INTO pdl (pdl_index, adco, first_seen, last_seen) VALUES (0,'061961403012',1,9)")
+    c.execute("INSERT INTO pdl (pdl_index, adco, first_seen, last_seen) VALUES (1,'061961403p12',1,1)")
     c.execute("INSERT INTO measurements(ts,pdl_index,papp,index_id,index_value,sent) "
               "VALUES(1000,1,250,1,777,1)")
     c.execute("INSERT INTO rollup_state(id,watermark,done) VALUES(0,0,1)")   # backfill TERMINÉ
@@ -321,7 +321,7 @@ def la_marche_a_blanc_annonce_la_MEME_cible_que_l_execution():
     que ne rien annoncer."""
     def _base():
         c = db.connect(":memory:")
-        c.execute("INSERT INTO pdl VALUES(0,'061961403012',1,9)")
+        c.execute("INSERT INTO pdl (pdl_index, adco, first_seen, last_seen) VALUES (0,'061961403012',1,9)")
         for ts, ngtf in ((0, "HC.."), (10, "HCn.")):
             c.execute("INSERT INTO contract_epoch VALUES(0,?,?)", (ts, ngtf))
         c.execute("INSERT INTO level_profile(pdl_index,computed_ts,ngtf) VALUES(0,0,'HCn.')")
@@ -340,8 +340,8 @@ def la_PORTE_refuse_exactement_comme_le_MENAGE():
     for nb_sains, libelle in ((2, "deux vrais compteurs"), (0, "aucun vrai compteur")):
         c = db.connect(":memory:")
         for i, adco in enumerate(["061961403012", "031864467282"][:nb_sains]):
-            c.execute("INSERT INTO pdl VALUES(?,?,1,9)", (i, adco))
-        c.execute("INSERT INTO pdl VALUES(9,'061961403p12',1,1)")
+            c.execute("INSERT INTO pdl (pdl_index, adco, first_seen, last_seen) VALUES (?,?,1,9)", (i, adco))
+        c.execute("INSERT INTO pdl (pdl_index, adco, first_seen, last_seen) VALUES (9,'061961403p12',1,1)")
         c.execute("INSERT INTO measurements(ts,pdl_index,papp,sent) VALUES(1,9,10,1)")
         c.commit()
         assert m.refus(c), libelle
