@@ -139,10 +139,10 @@
 #define T_PREF    0x03
 #define T_CONTRAT 0x04
 #define T_PAPP    0x05   // PAPP instantané (int24 LE signé) dans le boot → conso affichée dès le 1er boot (unboxing rapide)
-#define T_IINST   0x06
+#define T_IINST   0x06   // IINST instantané (uint16 LE) dans le boot → histo : PAPP=0 en injection, 230×IINST = production estimée
 #define T_FW      0x07   // version du firmware EMETTEUR : 3 octets majeur/mineur/correctif.
                          // Dans le bloc identite/config (0x01-0x06) parce que c en est une : ce
-                         // qui identifie la SONDE, au meme titre que l ADCO identifie le compteur.   // IINST instantané (uint16 LE) dans le boot → histo : PAPP=0 en injection, 230×IINST = production estimée
+                         // qui identifie la SONDE, au meme titre que l ADCO identifie le compteur.
 #define T_EAIT    0x10
 #define T_LTARF   0x11
 #define T_DEMAIN  0x20
