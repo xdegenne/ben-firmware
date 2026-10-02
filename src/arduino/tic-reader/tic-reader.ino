@@ -93,9 +93,40 @@
 // ---------------------------------------------------------------------------
 #define PROTOCOL_VERSION_BOOT  0x01   // trame d'identité (ADCO)
 #define PROTOCOL_VERSION_CURVE 0x05   // trame courbe batchée (v0x05 : dt par point)
-#define FW_VERSION             "0.1.9"   // 0.1.9 : CE QUI SORT DE LA TIC EST CONTROLE A LA SOURCE, sur deux plans qui ne se recouvrent pas. (1) ALPHABET (NOI-CPT_54E 6.2.1.2 : ASCII imprimables 0x20-0x7E, plus HT en standard) : un octet hors alphabet CONDAMNE sa ligne au lieu de la laisser au checksum, qui ne voit la somme que MODULO 64 -- remplacer un caractere par (c-0x40) retire exactement 64, donc le checksum est IDENTIQUE et on ecrivait une donnee FAUSSE la ou on voulait une donnee PERDUE. Condamner = sortir de inLine (la branche CR teste deja inLine && li>0) : ni drapeau ni test de plus dans la boucle chaude. Le 7E1 ecarte deja la parite fausse mais DEUX bits retournes dans le meme octet la traversent. Idem sur depassement du tampon : tronquer fabriquerait la meme donnee fausse. (2) ADCO/ADSC = DOUZE CHIFFRES ASCII, meme predicat que db.adco_valide cote Pi, applique AU DECODAGE : T_ADCO est le SEUL TLV inconditionnel du boot et part TOUJOURS sur 12 octets, donc une valeur courte etait completee de NUL et s en allait chiffree et MAC valide, indiscernable d un ADCO legitime ; 13 chiffres etaient TRONQUES en 12, soit un ADCO d apparence legitime designant un AUTRE compteur. Ne pas recopier suffit (memset de readAndParseTIC). Et le garde adco[0]!=0 MANQUAIT sur le chemin de RETRY en REGISTERING -- le pire des trois, celui qui boucle tant que le boitier n est pas enregistre. Mesure sur banc hote compilant le texte reel du .ino, passe sur les deux versions ; temoins : trame histo saine et trame standard saine decodees a l identique, HT toujours legal en standard, et une trame a l ADCO difforme livre toujours PAPP (on perd l identite, pas la mesure). Flash 30 176 / 30 720 (98 %) contre 30 080 (97 %) en 0.1.8 : +96 o, RAM globale inchangee. PR #25, issues #11 et #9. 0.1.8 : + TLV STGE (registre de statuts standard, 32 bits BRUTS) a chaque trame de courbe -> couleur Tempo du JOUR (bits 24-25) et du LENDEMAIN (bits 26-27), plus surtension / depassement de puissance / organe de coupure / mode producteur, sans un octet de plus. Offset des bits verifie sur trame reelle le 14/08 (capture data/tic-ben0001-20260814-1343.bin, doc docs/tic-stge-capture-2026-08-14.md) : la couleur du jour lue = BLEU, conforme au terrain, et TOUS les autres champs du registre tombent juste avec cette convention. En contrepartie NJOURF/NJOURF+1 passent derriere SEND_NJOURF=0 : ils designent le calendrier FOURNISSEUR, qu EDF ne programme pas pour Tempo, et valent 0 en permanence (verifie 12, 13 et 14/08). Bilan : 30 080 o (97%) contre 30 154 (98%) en 0.1.7 -> on AJOUTE STGE en GAGNANT 74 o. Emission systematique et non sur-changement : pas d etat a synchroniser entre emetteur et recepteur, et une trame perdue est reparee 40 s plus tard (ce boitier a perdu 20-25% de ses trames la semaine du 11/08). 0.1.7 : la trame de BOOT n'est émise que sur une trame TIC ENTIÈRE (`v.complete` = sortie sur ETX et non sur timeout), aux 3 points d'émission. Une trame coupée livrait un ADCO juste (il est en tête) et rien de fiable après : contrat faux (`CONTRAT='00'` sur ben-0001 à chaque ré-enregistrement → époque tarifaire bidon côté serveur) ET ISOUSC/PREF absents (jauge mal calibrée). 0.1.6 : + IINST dans le boot (T_IINST) — histo : PAPP=0 en injection → 230×IINST = production estimée (unboxing producteur). 0.1.5 : PAPP dans le boot (T_PAPP, conso dès le 1er boot → unboxing rapide) + buffer-reuse vérif ACK (-32o pile). (diag pile CONSERVE). 0.1.4 : APP_ACK_MS 800→2000 ms (Pi Zero chargé : crypto Python > 800 ms → l'émetteur ratait l'ACK → boots en boucle + flashs blancs discovery côté central). 0.1.3 : FIX trame boot dans buffer GLOBAL curveBuf (le buffer pile buf[64] débordait pendant le ChaCha et corrompait l ACK -> gate bloquée). 0.1.2 : découplage émetteur↔récepteur (incident ben-0001 09/07). setTimeout 600ms + setRetries 1. MACHINE À ÉTATS REGISTERING/STREAMING : tant que la trame de boot (petit paquet = probe de vivacité) n'est pas ACK, AUCUNE mesure émise ; retry boot à la cadence batch (v frais) ; mesure non-ACK → retour REGISTERING. Base 0.1.0 : garde histo tolérante + IINST 2e courbe + flush 55s + chiffrement ChaCha20 + logging aligné
+// ⭐ LES NOMBRES SONT LA SOURCE DE VERITE, ET LA CHAINE EN DERIVE — jamais l inverse.
+//    La version part desormais dans la trame de boot (TLV T_FW), donc elle existe sous DEUX
+//    formes : trois octets pour la radio, une chaine pour le banner serie. Les ecrire toutes
+//    les deux a la main creerait deux verites qui divergeraient au premier bump, SANS que rien
+//    ne le signale — le banner dirait 0.1.10 pendant que la trame dirait 0.1.9, et c est le
+//    genre d ecart qui ne se decouvre qu en cherchant autre chose.
+// ⇒ On declare les nombres, et le preprocesseur fabrique la chaine. Cout flash : ZERO, la
+//   concatenation est resolue a la compilation.
+#define FW_MAJOR 0
+#define FW_MINOR 1
+#define FW_PATCH 10
+#define FW_STR_(x) #x
+#define FW_STR(x)  FW_STR_(x)
+#define FW_VERSION FW_STR(FW_MAJOR) "." FW_STR(FW_MINOR) "." FW_STR(FW_PATCH)
+// 0.1.10 : L EMETTEUR ANNONCE SA VERSION (TLV T_FW, trois octets) — issue #27. Elle n etait
+//          lisible qu au banner serie, donc QU AVEC UN FTDI SUR PLACE : le bump 0.1.8 -> 0.1.9
+//          de la veille, justifie par « rien ne distingue un boitier corrige d un non corrige
+//          pendant la campagne de reflash », etait donc exact et sans effet a distance. Elle
+//          remplace aussi une valeur qui MENTAIT : capabilities.py declarait fw "0.1.3" alors
+//          que le parc etait en 0.1.8 — une constante GLOBALE livree par OTA ne peut pas dire
+//          l etat de reflash d un boitier, qui est PAR BOITIER. ⚠️ Et il faut DEUX bits pour
+//          qu un octet corrompu traverse la parite, pas un — cf. 0.1.9. Precedent : CE QUI SORT DE LA TIC EST CONTROLE A LA SOURCE, sur deux plans qui ne se recouvrent pas. (1) ALPHABET (NOI-CPT_54E 6.2.1.2 : ASCII imprimables 0x20-0x7E, plus HT en standard) : un octet hors alphabet CONDAMNE sa ligne au lieu de la laisser au checksum, qui ne voit la somme que MODULO 64 -- remplacer un caractere par (c-0x40) retire exactement 64, donc le checksum est IDENTIQUE et on ecrivait une donnee FAUSSE la ou on voulait une donnee PERDUE. Condamner = sortir de inLine (la branche CR teste deja inLine && li>0) : ni drapeau ni test de plus dans la boucle chaude. Le 7E1 ecarte deja la parite fausse mais DEUX bits retournes dans le meme octet la traversent. Idem sur depassement du tampon : tronquer fabriquerait la meme donnee fausse. (2) ADCO/ADSC = DOUZE CHIFFRES ASCII, meme predicat que db.adco_valide cote Pi, applique AU DECODAGE : T_ADCO est le SEUL TLV inconditionnel du boot et part TOUJOURS sur 12 octets, donc une valeur courte etait completee de NUL et s en allait chiffree et MAC valide, indiscernable d un ADCO legitime ; 13 chiffres etaient TRONQUES en 12, soit un ADCO d apparence legitime designant un AUTRE compteur. Ne pas recopier suffit (memset de readAndParseTIC). Et le garde adco[0]!=0 MANQUAIT sur le chemin de RETRY en REGISTERING -- le pire des trois, celui qui boucle tant que le boitier n est pas enregistre. Mesure sur banc hote compilant le texte reel du .ino, passe sur les deux versions ; temoins : trame histo saine et trame standard saine decodees a l identique, HT toujours legal en standard, et une trame a l ADCO difforme livre toujours PAPP (on perd l identite, pas la mesure). Flash 30 176 / 30 720 (98 %) contre 30 080 (97 %) en 0.1.8 : +96 o, RAM globale inchangee. PR #25, issues #11 et #9. 0.1.8 : + TLV STGE (registre de statuts standard, 32 bits BRUTS) a chaque trame de courbe -> couleur Tempo du JOUR (bits 24-25) et du LENDEMAIN (bits 26-27), plus surtension / depassement de puissance / organe de coupure / mode producteur, sans un octet de plus. Offset des bits verifie sur trame reelle le 14/08 (capture data/tic-ben0001-20260814-1343.bin, doc docs/tic-stge-capture-2026-08-14.md) : la couleur du jour lue = BLEU, conforme au terrain, et TOUS les autres champs du registre tombent juste avec cette convention. En contrepartie NJOURF/NJOURF+1 passent derriere SEND_NJOURF=0 : ils designent le calendrier FOURNISSEUR, qu EDF ne programme pas pour Tempo, et valent 0 en permanence (verifie 12, 13 et 14/08). Bilan : 30 080 o (97%) contre 30 154 (98%) en 0.1.7 -> on AJOUTE STGE en GAGNANT 74 o. Emission systematique et non sur-changement : pas d etat a synchroniser entre emetteur et recepteur, et une trame perdue est reparee 40 s plus tard (ce boitier a perdu 20-25% de ses trames la semaine du 11/08). 0.1.7 : la trame de BOOT n'est émise que sur une trame TIC ENTIÈRE (`v.complete` = sortie sur ETX et non sur timeout), aux 3 points d'émission. Une trame coupée livrait un ADCO juste (il est en tête) et rien de fiable après : contrat faux (`CONTRAT='00'` sur ben-0001 à chaque ré-enregistrement → époque tarifaire bidon côté serveur) ET ISOUSC/PREF absents (jauge mal calibrée). 0.1.6 : + IINST dans le boot (T_IINST) — histo : PAPP=0 en injection → 230×IINST = production estimée (unboxing producteur). 0.1.5 : PAPP dans le boot (T_PAPP, conso dès le 1er boot → unboxing rapide) + buffer-reuse vérif ACK (-32o pile). (diag pile CONSERVE). 0.1.4 : APP_ACK_MS 800→2000 ms (Pi Zero chargé : crypto Python > 800 ms → l'émetteur ratait l'ACK → boots en boucle + flashs blancs discovery côté central). 0.1.3 : FIX trame boot dans buffer GLOBAL curveBuf (le buffer pile buf[64] débordait pendant le ChaCha et corrompait l ACK -> gate bloquée). 0.1.2 : découplage émetteur↔récepteur (incident ben-0001 09/07). setTimeout 600ms + setRetries 1. MACHINE À ÉTATS REGISTERING/STREAMING : tant que la trame de boot (petit paquet = probe de vivacité) n'est pas ACK, AUCUNE mesure émise ; retry boot à la cadence batch (v frais) ; mesure non-ACK → retour REGISTERING. Base 0.1.0 : garde histo tolérante + IINST 2e courbe + flush 55s + chiffrement ChaCha20 + logging aligné
 #define BOOT_PAYLOAD_LEN       20     // v0x01 : version + ADCO(12) + ISOUSC + PREF, padding jusqu'à 20 (rétro)
-#define BOOT_MAX_LEN           64     // format cible : header(7) + TLV (ADCO/ISOUSC/PREF/CONTRAT) + MAC(8)
+// ⚠️ RELEVE DE 64 A 72 EN 0.1.10, ET IL FAUT LE DIRE PLUTOT QUE LE SUBIR. Le pire cas etait
+//    deja a 62 octets — mode standard avec un NGTF de 16 caracteres :
+//      header 7 + ADCO 14 + ISOUSC 3 + PREF 3 + CONTRAT 18 + PAPP 5 + IINST 4 + MAC 8 = 62
+//    donc 2 octets de marge, et le TLV T_FW (2 + 3) la portait a 67. 72 laisse 5 octets.
+// ⓘ Cette constante est DOCUMENTAIRE : elle n est referencee nulle part. Le tampon reel est
+//   curveBuf (130 o), et RadioHead accepte 251 — la contrainte n a donc jamais ete la memoire.
+// 🚨 LE VRAI COUT EST L AIRTIME : la trame de boot est emise a CHAQUE tentative d enregistrement,
+//    pas une fois, sur un emetteur alimente par supercap 0,47 F dont le TX a 20 dBm tire ~120 mA.
+//    5 octets de plus a SF9/BW125 ~= un symbole, quelques millisecondes : negligeable devant les
+//    ~600 ms d airtime de la trame, mais ce n est pas zero et ca se dit.
+#define BOOT_MAX_LEN           72     // header(7) + TLV (ADCO/FW/ISOUSC/PREF/CONTRAT/PAPP/IINST) + MAC(8)
 
 // --- Format cible (docs/lora-frame-format.md) : types + flags core + tags TLV ---
 #define TYPE_CURVE       0x05
@@ -109,6 +140,9 @@
 #define T_CONTRAT 0x04
 #define T_PAPP    0x05   // PAPP instantané (int24 LE signé) dans le boot → conso affichée dès le 1er boot (unboxing rapide)
 #define T_IINST   0x06   // IINST instantané (uint16 LE) dans le boot → histo : PAPP=0 en injection, 230×IINST = production estimée
+#define T_FW      0x07   // version du firmware EMETTEUR : 3 octets majeur/mineur/correctif.
+                         // Dans le bloc identite/config (0x01-0x06) parce que c en est une : ce
+                         // qui identifie la SONDE, au meme titre que l ADCO identifie le compteur.
 #define T_EAIT    0x10
 #define T_LTARF   0x11
 #define T_DEMAIN  0x20
@@ -850,6 +884,15 @@ bool sendBootFrame(const char* adco, uint8_t isousc, uint8_t pref, const char* n
   msg_count++;                                       // nonce lo (+1 par trame émise)
   uint16_t pos = writeHeader(buf, TYPE_BOOT);        // [0-6] header clair
   pos = writeTLV(buf, pos, T_ADCO, (const uint8_t*)adco, 12);
+  // INCONDITIONNEL, comme l ADCO : la version est toujours connue, et une trame qui l omettrait
+  // parfois obligerait le recepteur a distinguer « pas emise » de « emetteur ancien ». Son
+  // ABSENCE porte donc une seule information, nette : l emetteur est anterieur a la campagne.
+  // ⚠️ ÉCRIT DIRECTEMENT, SANS TAMPON LOCAL, et ce n'est pas du zèle : un `uint8_t fw[3]`
+  //    consommerait de la PILE dans sendBootFrame — exactement la fonction où le buffer pile
+  //    a débordé pendant le ChaCha en 0.1.3, et dont le témoin de pile mesure 67 octets
+  //    libres au pire. On ne grignote pas ce budget-là pour trois octets constants.
+  buf[pos++] = T_FW;     buf[pos++] = 3;
+  buf[pos++] = FW_MAJOR; buf[pos++] = FW_MINOR; buf[pos++] = FW_PATCH;
   if (isousc) { uint8_t b = isousc; pos = writeTLV(buf, pos, T_ISOUSC, &b, 1); }
   if (pref)   { uint8_t b = pref;   pos = writeTLV(buf, pos, T_PREF,   &b, 1); }
   if (ngtf && ngtf[0]) {
