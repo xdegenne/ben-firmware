@@ -568,6 +568,18 @@ bool verifyTICChecksum(const char *line, size_t len) {
   return cks == (char)((sum & 0x3F) + 0x20);                    // S2
 }
 
+// ADCO/ADSC conforme = EXACTEMENT douze chiffres ASCII, rien d'autre — meme predicat que
+// `db.adco_valide` cote Pi. T_ADCO est le SEUL TLV inconditionnel de la trame de boot, et il
+// part TOUJOURS sur 12 octets quelle que soit la longueur reelle : une valeur courte est donc
+// completee de NUL et s'en va, chiffree et MAC valide, indiscernable d'un ADCO legitime. On
+// refuse donc a la SOURCE. Ne pas recopier SUFFIT : readAndParseTIC a fait son memset, donc
+// v.adco[0] reste a 0 et les trois gardes `adco[0] != 0` bloquent l'emission.
+// (s[i] - '0') > 9 en non signe = une soustraction + une comparaison : le flash est sature.
+static bool adcoValide(const char* s) {
+  for (uint8_t i = 0; i < 12; i++) if ((uint8_t)(s[i] - '0') > 9) return false;
+  return s[12] == 0;
+}
+
 // Parse UNE ligne TIC (déjà validée checksum) directement dans v, EN PLACE,
 // sans String (char* only) → pas de heap, robuste sur AVR.
 static void parseTICLine(char* line, uint8_t len, TICValues& v) {
@@ -578,7 +590,7 @@ static void parseTICLine(char* line, uint8_t len, TICValues& v) {
   line[ls] = 0;                  // termine la valeur (au dernier espace)
   const char* name = line;
   const char* val  = line + fs + 1;
-  if      (!strcmp(name, "ADCO"))    strncpy(v.adco,    val, sizeof(v.adco)    - 1);
+  if      (!strcmp(name, "ADCO"))  { if (adcoValide(val)) strncpy(v.adco, val, sizeof(v.adco) - 1); }
   else if (!strcmp(name, "OPTARIF")) strncpy(v.optarif, val, sizeof(v.optarif) - 1);
   else if (!strcmp(name, "PTEC"))    strncpy(v.ptec,    val, sizeof(v.ptec)    - 1);
   else if (!strcmp(name, "DEMAIN"))  strncpy(v.demain,  val, sizeof(v.demain)  - 1);
@@ -626,7 +638,7 @@ static void parseTICLineStd(char* line, uint8_t len, TICValues& v) {
   line[ht[n - 1]] = 0;                            // termine la donnée
   const char* val = line + dStart;
 
-  if      (!strcmp(name, "ADSC")) strncpy(v.adco, val, sizeof(v.adco) - 1);  // ≈ ADCO
+  if      (!strcmp(name, "ADSC")) { if (adcoValide(val)) strncpy(v.adco, val, sizeof(v.adco) - 1); }  // ≈ ADCO
   else if (!strcmp(name, "SINSTS")) {            // puiss. soutirée (VA) → net positif
     v.papp_net = (int16_t)strtol(val, 0, 10);
     v.fields_seen |= TIC_SEEN_PAPP;
@@ -1268,7 +1280,7 @@ void loop() {
     // `v.complete` garde l'ÉMISSION seule, surtout pas le bloc : le rejet du batch-horloge et
     // la remise à zéro de `curveFlushPending` doivent avoir lieu même sur trame tronquée, sinon
     // le flush différé plus bas enverrait la courbe alors qu'on est encore en REGISTERING.
-    if (v.complete
+    if (v.complete && v.adco[0] != 0        // ← le garde manquait ICI, sur le chemin de retry
         && sendBootFrame(v.adco, v.isousc, v.pref, contractOf(v), pappValue(v), v.iinst)) {
       bootAcked = true;                      // enregistré → STREAMING au prochain point
       lastSentIsousc = v.isousc;
