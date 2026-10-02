@@ -842,6 +842,56 @@ def la_CAUSE_survit_a_un_groupe_qui_finit_SANS_son_CR():
 
 
 @cas
+def un_octet_hors_alphabet_HORS_GROUPE_ouvre_un_groupe_CONDAMNE():
+    """🚨 LE TROU QUE LA REVUE A TROUVÉ, et c'est le pire de tous : il fait accuser
+    le COMPTEUR.
+
+    Le test d'alphabet vivait dans `elif in_line:`. Un octet hors alphabet arrivant
+    HORS d'un groupe ne tombait donc dans AUCUNE branche : il disparaissait.
+
+    Le scénario, en historique : **deux bits du LF basculent** et 0x0A devient 0x09,
+    c'est-à-dire `HT` — parité préservée (deux bits), mais `HT` est interdit en
+    historique. Alors :
+
+      a. aucun groupe n'est ouvert, donc tout « PAPP 01234 X » est jeté octet par octet ;
+      b. au CR, `in_line` est faux, donc RIEN n'est compté ;
+      c. `_cause_rejets('PAPP')` répond « aucun groupe rejeté : cette étiquette n'est
+         pas émise ? » — l'accusation à tort du compteur que cette PR existe pour tuer.
+
+    ⭐ Le chemin PARITÉ traitait déjà ce cas, et pour la raison exacte : entre un CR et
+    le LF suivant, une trame bien formée ne contient RIEN, donc un octet fautif à cet
+    endroit est presque sûrement le LF lui-même. L'alphabet doit donc faire pareil —
+    ouvrir un groupe condamné d'avance, pour qu'il soit COMPTÉ.
+    """
+    corps = "PAPP 01234"
+    cks = _checksum_histo(corps)
+    # le LF de tête remplacé par HT (0x09), émis avec sa BONNE parité
+    groupe_sans_LF = [sain(0x09)] + [sain(ord(c)) for c in f"{corps} {cks}"] + [sain(CR)]
+    flux = ([sain(STX)] + ligne(f"ADCO 021861000000 {_checksum_histo('ADCO 021861000000')}")
+            + groupe_sans_LF + [sain(ETX)])
+    labels = m.read_frame(FauxPort(flux), m.tic_checksum_ok, range_brut)
+
+    assert "PAPP" not in labels, f"⚖️ témoin du cas : PAPP devait être perdu — {labels}"
+    assert m._derniere_trame["alphabet"] == 1, \
+        f"l'octet hors alphabet HORS groupe n'est pas compté — {m._derniere_trame}"
+    assert m._derniere_trame["rejetees"] == 1, \
+        f"le groupe perdu s'évapore du relevé — {m._derniere_trame}"
+    assert m._derniere_trame["groupes_alphabet"] == 1, \
+        f"le groupe perdu n'est pas imputé à l'alphabet — {m._derniere_trame}"
+    cause = m._cause_rejets("PAPP")
+    assert "pas émise" not in cause, \
+        f"🚨 le COMPTEUR est accusé alors que la liaison est en cause — {cause!r}"
+    assert "hors alphabet" in cause, f"la cause n'est pas nommée — {cause!r}"
+
+    # ⚖️ Et la frontière tient : le même octet AVANT le STX ne coûte rien, donc
+    #    « pas émise » reste la bonne réponse — exactement comme pour la parité.
+    flux = [sain(0x09)] + [sain(STX)] + ligne(f"ADCO 021861000000 {_checksum_histo('ADCO 021861000000')}") + [sain(ETX)]
+    m.read_frame(FauxPort(flux), m.tic_checksum_ok, range_brut)
+    assert m._derniere_trame["alphabet"] == 0, \
+        f"un octet hors alphabet AVANT le STX ne doit rien coûter — {m._derniere_trame}"
+
+
+@cas
 def le_releve_distingue_PARITE_ALPHABET_et_CHECKSUM():
     """Trois groupes, trois causes, trois compteurs — exigence de #10.
 

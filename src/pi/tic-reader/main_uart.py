@@ -935,6 +935,36 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label,
                     _note_groupe_rejete(etiquettes_ko, line)
                     dropped += 1
             in_line = False
+        elif not alphabet[b]:
+            # 🚨 UN OCTET HORS ALPHABET HORS GROUPE N'EST PAS ANODIN — et le croire était
+            #    le dernier endroit où ce relevé accusait le COMPTEUR. Le test vivait dans
+            #    `elif in_line:` : un tel octet ne tombait alors dans AUCUNE branche et
+            #    disparaissait.
+            #
+            #    Entre le CR d'un groupe et le LF du suivant, une trame TIC bien formée ne
+            #    contient RIEN. Un octet fautif à cet endroit est donc presque sûrement le
+            #    LF lui-même — et deux bits suffisent : 0x0A devient 0x09, soit `HT`,
+            #    illégal en historique et de parité PRÉSERVÉE. Sans LF, `in_line` reste
+            #    faux, les octets du groupe suivant sont jetés un par un, le CR ne trouve
+            #    rien à évaluer, et le groupe DISPARAÎT SANS TRACE — après quoi
+            #    `_cause_rejets` conclut « cette étiquette n'est pas émise ».
+            #
+            # ⇒ On ouvre donc le groupe nous-mêmes, condamné d'avance, exactement comme le
+            #   fait le chemin de la PARITÉ au-dessus et pour la même raison. Au pire on
+            #   fabrique un groupe fantôme et le relevé dit « un groupe rejeté » là où il
+            #   aurait dit « aucun » : c'est l'erreur la moins chère des deux, puisque
+            #   l'autre envoie chercher un défaut chez le COMPTEUR au lieu de sur le FIL.
+            #
+            # ⚠️ Ne vaut QUE dans la trame : les octets vus pendant l'attente du STX
+            #    n'ouvrent rien — c'est ce qui laisse le cas du triphasé dire « pas émise ».
+            #
+            # ⓘ Placée APRÈS les tests ETX/LF/CR, sans quoi elle les condamnerait : ce sont
+            #   des caractères de contrôle, donc hors alphabet par construction.
+            if not in_line:
+                current = bytearray()
+                in_line = True
+            alpha_ko += 1
+            groupe_hors_alphabet = True
         elif in_line:
             # 🚨 L'ALPHABET LÉGAL EST CONNU D'AVANCE (NOI-CPT_54E §6.2.1.2 : ASCII
             #    imprimables 0x20-0x7E, plus `HT` en standard). Un octet hors de cet
@@ -969,14 +999,17 @@ def read_frame(ser: serial.Serial, checksum_ok, parse_label,
             #    dont la somme est un multiple de 64 laissent le checksum intact).
             #
             # ⚠️ Compté À PART : fondre les causes dirait « ça décroche » sans dire OÙ.
-            if not alphabet[b]:
-                alpha_ko += 1
-                groupe_hors_alphabet = True
-                continue
             current.append(b)
 
     # ⚠️ Même raison qu'au timeout de synchronisation : c'est précisément quand
     #    tout échoue qu'il faut que le compteur parle.
+    #
+    # ⓘ UN GROUPE ENCORE OUVERT ICI N'EST PAS COMPTÉ, ni comme rejeté ni comme imputé —
+    #   et c'est VOLONTAIREMENT identique au traitement de la parité, qui ne le compte pas
+    #   davantage. Inoffensif aujourd'hui : cette sortie rend `None`, donc l'appelant n'a
+    #   pas de trame et n'interroge jamais `_cause_rejets`. Si un appelant futur le faisait,
+    #   les DEUX causes seraient à traiter ensemble, pas l'alphabet seul — une asymétrie
+    #   entre les deux serait pire que l'oubli actuel.
     _derniere_trame.update(gardees=kept, rejetees=dropped, parite=parite_ko,
                                    parite_groupes=parite_groupes,
                                    alphabet=alpha_ko, groupes_alphabet=groupes_alphabet,
