@@ -1300,6 +1300,23 @@ void loop() {
       lastSentIsousc = v.isousc;
       lastSentPref = v.pref;
       lastSentNgtfHash = strhash16(contractOf(v));
+    } else {
+      // 🚨 PAS D'ACK → ON RETOMBE EN REGISTERING, et sans ça le rejet du lot ci-dessus
+      //    fabriquerait une BOUCLE D'ÉMISSION. `lastSent*` ne bouge que sur ACK, donc la
+      //    condition reste vraie à la trame TIC suivante (~1,7 s) : on réémettrait une trame
+      //    de boot à 20 dBm à CHAQUE trame, indéfiniment — brownout sur supercap, et rapport
+      //    cyclique 868 MHz dépassé.
+      //
+      // ⚠️ Avant le rejet du lot, cette boucle était BORNÉE par accident : le lot continuait
+      //    de se remplir, le flush périodique partait au bout de 40-55 s, et c'est LUI qui
+      //    porte `if (!acked) bootAcked = false`. En jetant le lot, `curveN` repart à 1 à
+      //    chaque tour, la condition `curveN > 1` du flush n'est JAMAIS vraie, et la seule
+      //    porte vers REGISTERING se referme. On la rouvre ici, explicitement.
+      //
+      // ⓘ Même sémantique qu'au flush : une trame non acquittée veut dire que le récepteur
+      //   n'est pas là, donc on cesse d'émettre des mesures et on reprend le retry boot à la
+      //   cadence batch au lieu de marteler.
+      bootAcked = false;
     }
   }
 
