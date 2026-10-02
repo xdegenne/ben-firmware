@@ -103,11 +103,26 @@
 //   concatenation est resolue a la compilation.
 #define FW_MAJOR 0
 #define FW_MINOR 1
-#define FW_PATCH 10
+#define FW_PATCH 11
 #define FW_STR_(x) #x
 #define FW_STR(x)  FW_STR_(x)
 #define FW_VERSION FW_STR(FW_MAJOR) "." FW_STR(FW_MINOR) "." FW_STR(FW_PATCH)
-// 0.1.10 : L EMETTEUR ANNONCE SA VERSION (TLV T_FW, trois octets) — issue #27. Elle n etait
+// 0.1.11 : UNE TRAME DE BOOT N ECRASE PLUS LE LOT EN COURS — issue #30. sendBootFrame et
+//          curveStart ecrivent TOUS DEUX dans curveBuf des l offset 0, et font TOUS DEUX
+//          msg_count++. Or l en-tete ecrit a l offset 0 EST LE NONCE ChaCha20 : un boot emis
+//          pendant qu un lot s accumule ecrasait son en-tete, et le flush suivant scellait la
+//          courbe avec l en-tete du BOOT — donc avec un nonce DEJA CONSOMME. Qui capte les deux
+//          obtient le XOR des deux clairs, et la trame de boot est tres previsible (12 chiffres
+//          d ADCO, structure connue) : le clair de la courbe devient partiellement
+//          reconstructible, alors que la courbe est une empreinte comportementale. On JETTE le
+//          lot avant d emettre, on ne le flushe pas : flusher serait plus correct (un changement
+//          de contrat ouvre une nouvelle epoque tarifaire, ce lot appartient a l ancienne) mais
+//          ajouterait un second TX a 20 dBm juste avant celui du boot, sur supercap — le
+//          scenario de brownout du 2026-10-02, non mesure pour deux TX rapproches. L index etant
+//          CUMULATIF, aucun kWh de comptage n est perdu, seulement ~40 s de forme de courbe sur
+//          un evenement rare. Les TROIS chemins d emission de boot traitent desormais le lot
+//          AVANT l appel, et un banc STRUCTUREL refuse qu un quatrieme arrive sans le faire.
+//          0.1.10 : L EMETTEUR ANNONCE SA VERSION (TLV T_FW, trois octets) — issue #27. Elle n etait
 //          lisible qu au banner serie, donc QU AVEC UN FTDI SUR PLACE : le bump 0.1.8 -> 0.1.9
 //          de la veille, justifie par « rien ne distingue un boitier corrige d un non corrige
 //          pendant la campagne de reflash », etait donc exact et sans effet a distance. Elle
@@ -1259,6 +1274,28 @@ void loop() {
       ((v.isousc != 0 && v.isousc != lastSentIsousc) ||
        (v.pref   != 0 && v.pref   != lastSentPref) ||
        (contractOf(v)[0] && strhash16(contractOf(v)) != lastSentNgtfHash))) {
+    // 🚨 LE LOT EN COURS VIT DANS LE MÊME curveBuf QUE LA TRAME DE BOOT (#30), ET LE
+    //    DÉTRUIRE N'EST PAS LE PIRE. `curveStart` écrit l'en-tête — QUI EST LE NONCE — à
+    //    l'offset 0 et fait `msg_count++` ; `sendBootFrame` écrit AUSSI dès l'offset 0 et
+    //    refait `msg_count++`. Un boot émis en cours de lot écrase donc l'en-tête, et le
+    //    flush suivant scellerait la courbe avec l'en-tête du BOOT : même nonce ChaCha20
+    //    qu'une trame déjà partie. Qui capte les deux obtient le XOR des deux clairs — et
+    //    la trame de boot est très prévisible (12 chiffres d'ADCO, structure connue).
+    //    La courbe est une empreinte comportementale : elle dit quand le logement est vide.
+    //
+    // ⚠️ ON JETTE LE LOT, ON NE LE FLUSHE PAS, et c'est un arbitrage assumé. Le flusher
+    //    serait plus CORRECT — un changement de contrat ouvre une nouvelle époque tarifaire,
+    //    donc ce lot appartient à l'ANCIENNE et mériterait d'être rangé de ce côté. Mais
+    //    `curveFlush` ÉMET : ça ajouterait un second TX à 20 dBm (~120 mA de pic) juste avant
+    //    celui du boot, sur une supercap 0,47 F. C'est exactement le scénario de brownout
+    //    mesuré le 2026-10-02, et il n'est PAS mesuré pour deux TX rapprochés. On ne paie pas
+    //    un risque non mesuré pour 29 points, d'autant que l'index d'énergie est CUMULATIF :
+    //    le lot suivant le porte à jour, donc aucun kWh de comptage n'est perdu.
+    //
+    // ⓘ Même idiome que le rejet du batch-horloge plus bas. `batch_seq` n'est pas incrémenté
+    //   volontairement : ce lot n'a jamais été émis, donc le laisser dense évite de faire
+    //   croire au récepteur qu'une courbe a été perdue en l'air.
+    curveActive = false; curveN = 0;         // jeter le lot : son tampon va être écrasé
     if (sendBootFrame(v.adco, v.isousc, v.pref, contractOf(v), pappValue(v), v.iinst)) {
       lastSentIsousc = v.isousc;
       lastSentPref = v.pref;
@@ -1320,6 +1357,13 @@ void loop() {
   // `v` FRAIS → identité/config toujours à jour, jamais un snapshot périmé. Le batch accumulé n'a
   // servi que d'horloge → on le jette (le récepteur n'est pas confirmé, la courbe serait perdue).
   if (!bootAcked && curveFlushPending) {
+    // ⭐ LE LOT EST JETÉ AVANT L'ÉMISSION, PAS APRÈS (#30), et c'est un déplacement d'une
+    //    ligne. `sendBootFrame` écrit dans le MÊME `curveBuf` : l'ordre était inoffensif ICI,
+    //    puisqu'un batch-horloge n'est jamais émis en REGISTERING — mais laisser deux chemins
+    //    traiter le lot dans deux ordres différents est exactement ce qui fait qu'on finit par
+    //    en oublier un. Les trois chemins d'émission de boot le traitent désormais pareil, et
+    //    un banc structurel refuse qu'un quatrième arrive sans le faire.
+    curveActive = false; curveN = 0;         // jeter le batch-horloge
     // `v.complete` garde l'ÉMISSION seule, surtout pas le bloc : le rejet du batch-horloge et
     // la remise à zéro de `curveFlushPending` doivent avoir lieu même sur trame tronquée, sinon
     // le flush différé plus bas enverrait la courbe alors qu'on est encore en REGISTERING.
@@ -1330,7 +1374,6 @@ void loop() {
       lastSentPref = v.pref;
       lastSentNgtfHash = strhash16(contractOf(v));
     }
-    curveActive = false; curveN = 0;         // jeter le batch-horloge
     curveFlushPending = false;               // → pas de flush courbe différé ci-dessous
   }
   }  // --- fin bloc v : TICValues détruit, pile dégagée ---
