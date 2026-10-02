@@ -707,7 +707,24 @@ bool readAndParseTIC(TICValues& v, uint8_t mode) {
           } else dropped++;
         }
         inLine = false;
-      } else if (inLine && li < sizeof(line) - 1) { line[li++] = c; }
+      } else if (inLine) {
+        // ALPHABET TIC — Enedis-NOI-CPT_54E §6.2.1.2 : le champ donnee ne porte que des ASCII
+        // IMPRIMABLES 0x20-0x7E, plus HT (0x09) en standard ou il est separateur legal. Un octet
+        // hors alphabet CONDAMNE sa ligne : on ne la soumet pas au checksum. La sauter ne suffit
+        // PAS — le checksum ne voit la somme que MODULO 64, donc une ligne amputee d un caractere
+        // dont la somme vaut un multiple de 64 passe, et on ecrit une donnee FAUSSE la ou on
+        // voulait une donnee PERDUE. Le 7E1 ecarte deja la parite fausse, mais DEUX bits
+        // retournes dans le meme octet la traversent intacts : ce controle n est pas redondant.
+        // Idem si la ligne depasse le tampon : tronquer fabriquerait la meme donnee fausse.
+        // CONDAMNER = sortir de inLine : la branche CR teste deja `inLine && li > 0`, donc la
+        // ligne ne verra jamais le checksum, les octets suivants sont ignores, et `dropped`
+        // compte UNE fois par ligne (le premier octet fautif ferme la ligne). Pas de drapeau
+        // supplementaire, pas de test de plus dans la branche CR : 24 octets de moins qu un
+        // booleen dedie, et le flash est SATURE (594 o libres apres ce correctif).
+        if (((uint8_t)(c - 0x20) > 0x5E && !(c == 0x09 && mode == MODE_STANDARD))
+            || li >= sizeof(line) - 1) { inLine = false; dropped++; }   // LIGNE CONDAMNEE
+        else line[li++] = c;
+      }
     } else if (millis() - t0 > TIC_TIMEOUT_MS) break;
   }
 
