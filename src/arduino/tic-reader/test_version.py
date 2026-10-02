@@ -63,14 +63,18 @@ def la_CHAINE_est_DERIVEE_des_nombres_et_jamais_ecrite_a_la_main():
 def le_TLV_emet_EXACTEMENT_ces_trois_nombres_la():
     """⚖️ Le témoin du cas précédent : la chaîne peut bien dériver des nombres, si le TLV
     émettait autre chose la version annoncée en radio serait quand même fausse."""
-    m = re.search(r"uint8_t\s+fw\[3\]\s*=\s*\{([^}]*)\}", SRC)
-    assert m, "le tableau de trois octets du TLV T_FW est introuvable"
-    membres = [x.strip() for x in m.group(1).split(",")]
+    # ⓘ Écrit directement dans le tampon de trame, sans tableau local : celui-ci coûterait
+    #   de la PILE dans sendBootFrame, là où le ChaCha a déjà débordé en 0.1.3.
+    m = re.search(r"buf\[pos\+\+\]\s*=\s*T_FW;\s*buf\[pos\+\+\]\s*=\s*(\d+);"
+                  r"\s*(?:\n\s*)?buf\[pos\+\+\]\s*=\s*([A-Z_]+);"
+                  r"\s*buf\[pos\+\+\]\s*=\s*([A-Z_]+);"
+                  r"\s*buf\[pos\+\+\]\s*=\s*([A-Z_]+);", SRC)
+    assert m, "l'écriture du TLV T_FW est introuvable ou a changé de forme"
+    assert m.group(1) == "3", f"le TLV T_FW annonce une longueur de {m.group(1)}, pas 3"
+    membres = [m.group(2), m.group(3), m.group(4)]
     assert membres == ["FW_MAJOR", "FW_MINOR", "FW_PATCH"], (
         f"le TLV émet {membres} au lieu des trois constantes — une valeur recopiée ici "
         f"serait une troisième vérité")
-    assert re.search(r"writeTLV\([^)]*T_FW,\s*fw,\s*3\)", SRC), \
-        "le TLV T_FW n'écrit pas les 3 octets de `fw`"
 
 
 @cas

@@ -887,8 +887,12 @@ bool sendBootFrame(const char* adco, uint8_t isousc, uint8_t pref, const char* n
   // INCONDITIONNEL, comme l ADCO : la version est toujours connue, et une trame qui l omettrait
   // parfois obligerait le recepteur a distinguer « pas emise » de « emetteur ancien ». Son
   // ABSENCE porte donc une seule information, nette : l emetteur est anterieur a la campagne.
-  { uint8_t fw[3] = { FW_MAJOR, FW_MINOR, FW_PATCH };
-    pos = writeTLV(buf, pos, T_FW, fw, 3); }
+  // ⚠️ ÉCRIT DIRECTEMENT, SANS TAMPON LOCAL, et ce n'est pas du zèle : un `uint8_t fw[3]`
+  //    consommerait de la PILE dans sendBootFrame — exactement la fonction où le buffer pile
+  //    a débordé pendant le ChaCha en 0.1.3, et dont le témoin de pile mesure 67 octets
+  //    libres au pire. On ne grignote pas ce budget-là pour trois octets constants.
+  buf[pos++] = T_FW;     buf[pos++] = 3;
+  buf[pos++] = FW_MAJOR; buf[pos++] = FW_MINOR; buf[pos++] = FW_PATCH;
   if (isousc) { uint8_t b = isousc; pos = writeTLV(buf, pos, T_ISOUSC, &b, 1); }
   if (pref)   { uint8_t b = pref;   pos = writeTLV(buf, pos, T_PREF,   &b, 1); }
   if (ngtf && ngtf[0]) {
