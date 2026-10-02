@@ -168,6 +168,14 @@ HELLO_SUR_ECHEC_S = float(os.environ.get("BEN_PUB_HELLO_SUR_ECHEC", "3600"))
 #    et chaque tentative écrirait une ligne dans le journal du cloud.
 DECLARATION_PLANCHER_S = float(os.environ.get("BEN_PUB_DECLARATION_PLANCHER", "300"))
 
+# ⭐ Le plancher LONG : quand tous les pdl sans ref portent déjà un motif, le cloud
+#    a répondu et sa réponse ne changera pas tant que la cause n'aura pas changé.
+#    Six heures laissent la place à un changement côté cloud (un rattachement
+#    retiré, un ADS corrigé) sans saturer les 8 lignes d'erreur que l'instantané de
+#    santé transporte.
+DECLARATION_PLANCHER_REFUS_S = float(
+    os.environ.get("BEN_PUB_DECLARATION_PLANCHER_REFUS", "21600"))
+
 # 🚨 LE DRAPEAU D'OTA. Une OTA doit faire redéclarer — c'est ainsi que le cloud
 #    apprend la version neuve. Or l'agent d'update est DÉJÀ EN MÉMOIRE quand il
 #    redémarre les services : une déclaration envoyée au démarrage du publisher
@@ -482,6 +490,23 @@ def cadence_sure(conn: sqlite3.Connection) -> float:
         return PERIOD
 
 
+def _version(v: str) -> tuple:
+    """`"0.9.27"` → `(0, 9, 27)`, pour comparer un ORDRE et non une égalité.
+
+    ⚠️ Tolérante : un composant non numérique devient 0 plutôt que de lever. Une
+       version mal formée ne doit pas empêcher une déclaration — au pire elle la
+       déclenche trop tôt, ce qui est sans conséquence, alors qu'une exception
+       bloquerait le boîtier.
+    """
+    out = []
+    for p in (v or "").split("."):
+        try:
+            out.append(int(p))
+        except ValueError:
+            out.append(0)
+    return tuple(out)
+
+
 def pending_approx(conn: sqlite3.Connection) -> int:
     """Estimation du retard, en O(1).
 
@@ -497,7 +522,16 @@ def pending_approx(conn: sqlite3.Connection) -> int:
     """
     row = conn.execute(
         "SELECT (SELECT max(rowid) FROM measurements), "
-        "       (SELECT min(rowid) FROM measurements WHERE sent = 0)").fetchone()
+        # 🚨 LE MÊME FILTRE QUE `SELECT_BATCH`, et sans lui ce chiffre MENT.
+        #    Une seule ligne non publiable — compteur refusé par le cloud, ou mesure
+        #    orpheline dont le `pdl_index` n'est plus dans `pdl` — ÉPINGLE le
+        #    minimum : le retard affiché ne redescend plus JAMAIS. Conséquences
+        #    mesurées : la cadence reste verrouillée sur PERIOD_RETARD (10 s au lieu
+        #    de 60, en permanence), et le contrôle « le retard doit DÉCROÎTRE » que
+        #    l'update exige ne peut plus passer.
+        "       (SELECT min(m.rowid) FROM measurements m "
+        "          JOIN pdl p ON p.pdl_index = m.pdl_index "
+        "         WHERE m.sent = 0 AND p.ref IS NOT NULL AND p.ref <> '')").fetchone()
     if not row or row[0] is None or row[1] is None:
         return 0
     return max(0, row[0] - row[1] + 1)
@@ -580,6 +614,9 @@ def declare(cli: Client, conn: sqlite3.Connection, dev: dict) -> bool:
         return True
 
     n = db.store_refs(conn, refs)
+    # 🚨 RANGER LE MOTIF, et c'est ce qui empêche la redéclaration en boucle : un
+    #    refus est un ÉTAT STABLE, pas un échec transitoire.
+    db.store_motifs(conn, motifs)
     for pdl_index, motif in motifs.items():
         # 🚨 ON CRIE LE MOTIF. Un pdl sans ref ne publiera JAMAIS. Si la raison
         #    n'apparaît nulle part, on observera un boîtier qui déclare en boucle
@@ -738,6 +775,7 @@ def main() -> int:
         return time.monotonic() + HELLO_EVERY
 
     dernier_declare = float("-inf")
+    force_deja_tente = False
 
     def declare_if_needed() -> None:
         """LA DÉCLARATION, sur ses trois déclencheurs. Ne lève jamais.
@@ -755,7 +793,7 @@ def main() -> int:
            déclaration échoue sur une coupure réseau perdrait son déclencheur, et
            le cloud resterait sur l'ANCIENNE version jusqu'au prochain hasard.
         """
-        nonlocal dernier_declare
+        nonlocal dernier_declare, force_deja_tente
         dev_courant = caps.load_device() or dev
         force = False
         if os.path.exists(DECLARER_FLAG):
@@ -774,7 +812,12 @@ def main() -> int:
                             DECLARER_FLAG, e)
                 attendue = None
             installee = dev_courant.get("softwareVersion", "")
-            if attendue and attendue != installee:
+            # 🚨 COMPARAISON D'ORDRE, PAS D'ÉGALITÉ. Avec `!=`, un drapeau posé pour
+            #    0.9.27 dont la déclaration échoue, suivi d'une OTA vers 0.9.28, ne
+            #    correspondait PLUS JAMAIS : il n'était jamais retiré, « on attend le
+            #    bump » était journalisé à chaque tour, et le déclenchement d'OTA
+            #    était perdu en silence.
+            if attendue and _version(installee) < _version(attendue):
                 log.info("drapeau pour %s mais %s est en place — on attend le bump",
                          attendue, installee)
             else:
@@ -793,9 +836,31 @@ def main() -> int:
         #    plancher, ce boîtier redéclarerait toutes les 60 s pour toujours, et
         #    chaque tentative écrirait une ligne au journal du cloud.
         #    ⓘ Le drapeau d'OTA passe outre : une OTA est un événement rare et daté.
-        if not force and time.monotonic() - dernier_declare < DECLARATION_PLANCHER_S:
-            return
+        # 🚨 LE PLANCHER S'APPLIQUE AUSSI EN MODE `force`, DÈS LE SECOND ESSAI.
+        #    Le drapeau d'OTA n'est retiré qu'après un 2xx : si le cloud refuse
+        #    (pas encore déployé, 4xx, 5xx), `force` restait vrai et sautait le
+        #    plancher à CHAQUE tour — ~10 s juste après une update, puisque le
+        #    retard est gros. C'était exactement la rafale que le plancher existe
+        #    pour empêcher.
+        plancher = DECLARATION_PLANCHER_S
+        if not force or force_deja_tente:
+            # ⭐ ET UN PLANCHER LONG quand il n'y a plus rien à apprendre : si TOUS
+            #    les pdl sans ref portent déjà un motif, le cloud a déjà répondu, et
+            #    sa réponse ne changera pas tant que la cause n'aura pas changé.
+            #    Sans ça, un ADS définitivement non conforme faisait redéclarer
+            #    toutes les 300 s pour toujours, en saturant les 8 lignes d'erreur
+            #    que l'instantané de santé transporte.
+            try:
+                refuses = set(db.pdls_refuses(conn))
+            except sqlite3.Error:
+                refuses = set()
+            if manquants and set(manquants) <= refuses:
+                plancher = DECLARATION_PLANCHER_REFUS_S
+            if time.monotonic() - dernier_declare < plancher:
+                return
         dernier_declare = time.monotonic()
+        if force:
+            force_deja_tente = True
         if force:
             log.info("déclaration déclenchée par %s (OTA)", DECLARER_FLAG)
         elif manquants:
@@ -828,6 +893,15 @@ def main() -> int:
     #    le serveur pendant neuf jours d'un disque abîmé.
     echecs_base = 0
     while not _stop:
+        # 🚨 HORS DU `try`, ET C'EST TOUT L'INTÉRÊT. Dedans, le `raise` d'un lot
+        #    refusé sautait la déclaration à chaque tour : un boîtier dont le cloud
+        #    ne reconnaît plus une ref ne pouvait JAMAIS la renouveler, puisque
+        #    `pdls_without_ref` restait vide. Il restait bloqué pour toujours, et
+        #    avec lui les points des AUTRES compteurs du même lot.
+        #
+        # ⓘ Elle ne coûte qu'une requête sur une table de 7 lignes, et le plancher
+        #    empêche toute rafale.
+        declare_if_needed()
         try:
             # 🚨 `lots`, PAS `points` : fetch_batch rend des lots groupés par
             #    compteur. La première version de ce chantier a converti
@@ -916,6 +990,19 @@ def main() -> int:
                     # ⚠️ Un 400 ou un 413 ne se résout pas en réessayant : le lot est
                     #    malformé ou trop gros, et le boîtier bouclera dessus. Le corps est
                     #    la seule chose qui dira laquelle des deux.
+                    # 🚨 SI LE CLOUD NE RECONNAÎT PLUS UNE REF, ON L'OUBLIE.
+                    #    Sans ça le boîtier renvoyait indéfiniment une ref périmée :
+                    #    `pdls_without_ref` restait vide, donc rien ne redéclarait.
+                    #    ⚠️ On efface TOUTES les refs, pas seulement la coupable —
+                    #    le refus ne dit pas laquelle l'est, et la déclaration est
+                    #    idempotente : elle les rend toutes au tour suivant.
+                    if "non_rattache" in body or "ref_invalide" in body:
+                        try:
+                            n = db.invalider_refs(conn)
+                            log.warning("le cloud ne reconnaît plus une ref — %d ref(s) "
+                                        "oubliée(s), redéclaration au prochain tour", n)
+                        except sqlite3.Error as e:
+                            log.error("refs non invalidées (%s)", e)
                     raise RuntimeError(f"HTTP {status} {body[:200]}")
             else:
                 # 🚨 `info`, ET PAS `debug` — le niveau racine est INFO, donc `debug` n'écrit
@@ -939,9 +1026,6 @@ def main() -> int:
                     log.info("rien à envoyer · reste ~%d", pending_approx(conn))
                 except sqlite3.Error as e:
                     log.info("rien à envoyer (retard illisible : %s)", e)
-            # ② La condition, à chaque tour : elle ne coûte qu'une requête sur une
-            #    table de 7 lignes, et le plancher empêche toute rafale.
-            declare_if_needed()
             if time.monotonic() >= prochain_hello:
                 prochain_hello = hello()
         except sqlite3.Error as e:
