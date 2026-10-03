@@ -738,7 +738,7 @@ def heartbeat(cli: Client, conn: sqlite3.Connection, dev: dict) -> None:
             #    que le prénom local ne monte JAMAIS au cloud, et le banc la vérifie
             #    nommément. Le cloud reçoit de quoi DÉCIDER — qui, quel rôle, coupé
             #    ou non — et rien de plus.
-            acces = access.pour_le_hello(ac)
+            acces = access.for_cloud(ac)
     except Exception as e:  # noqa: BLE001
         # La LECTURE peut légitimement échouer (base verrouillée) — et ne doit pas
         # empêcher le battement de partir, ni les mesures.

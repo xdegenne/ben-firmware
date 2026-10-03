@@ -421,7 +421,7 @@ def le_hello_ne_transporte_JAMAIS_le_prenom():
     c = neuf()
     access.grant(c, "uid_claire", access.ROLE_MEMBER)
     access.nommer(c, "uid_claire", "Claire")
-    charge = access.pour_le_hello(c)
+    charge = access.for_cloud(c)
     assert charge == [{"uid": "uid_claire", "role": access.ROLE_MEMBER,
                        "revoked": False}], charge
     assert "Claire" not in repr(charge)
