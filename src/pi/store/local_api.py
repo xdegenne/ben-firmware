@@ -770,7 +770,7 @@ class Handler(BaseHTTPRequestHandler):
                 # 🔒 `nom` sort ICI et NULLE PART AILLEURS : cette route est
                 #    réservée au propriétaire, sur son réseau local, pour son
                 #    propre écran. Il ne part pas au hello — cf.
-                #    `access.pour_le_hello`, dont le banc le vérifie.
+                #    `access.for_cloud`, dont le banc le vérifie.
                 {"uid": a["uid"], "role": a["role"],
                  "revoked": a["revoked_ts"] is not None,
                  "updated_ts": a["updated_ts"], "nom": a["nom"]}

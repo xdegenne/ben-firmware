@@ -670,7 +670,7 @@ def tout_effacer(conn: sqlite3.Connection) -> tuple[int, int]:
     return acces, jetons
 
 
-def pour_le_hello(conn: sqlite3.Connection) -> list[dict]:
+def for_cloud(conn: sqlite3.Connection) -> list[dict]:
     """Les droits, tels qu'ils REMONTENT au cloud. Rien de plus.
 
     🔒 SEULE PORTE DE SORTIE des lignes `access`, et c'est tout son intérêt :
