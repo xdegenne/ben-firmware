@@ -372,9 +372,27 @@ def store(conn: sqlite3.Connection, db_path: str = DB_PATH) -> dict:
 
     # `emitter` était au cœur des PDL fantômes : quel compteur au bout de quel émetteur, et
     # depuis quand. Vide sur un boîtier filaire — l'absence est normale.
+    #
+    # ⭐ `fw` = LA VERSION DU FIRMWARE DE L'ÉMETTEUR, et c'est la seule façon de la connaître
+    #    à distance (#28) : le satellite se livre par reflash PHYSIQUE, sa version n'était
+    #    donc lisible qu'au banner série, un FTDI en main, devant le boîtier.
+    #
+    # 🚨 UNE LIGNE PAR ÉMETTEUR, PAS UN CHAMP DE BOÎTIER. La version appartient au satellite,
+    #    donc au compteur qu'il lit — et un boîtier peut en écouter PLUSIEURS. Un champ unique
+    #    à côté de `sw` aurait été faux dès le second émetteur, et faux en silence.
+    #
+    # ⚠️ Trois états, et le troisième n'est pas « inconnu » : une version · la constante
+    #    `anterieur-campagne` (trame de boot reçue SANS le TLV ⇒ émetteur < 0.1.10, il reste à
+    #    reflasher) · `null` (aucune trame de boot vue depuis l'OTA — l'émetteur ne redémarre
+    #    pas quand le Pi redémarre). Cf. le commentaire de la colonne dans `db.py`.
+    #
+    # ⓘ `SELECT` nommé et non `*` : la colonne est arrivée après les quatre autres, et un
+    #   `*` ferait dépendre l'ordre du tuple de l'âge de la base.
     try:
-        emitters = [{"addr": a, "adco": c or "", "pdl": p, "ts": t} for a, c, p, t in
-                    conn.execute("SELECT lora_addr, adco, pdl_index, updated_ts FROM emitter")]
+        emitters = [{"addr": a, "adco": c or "", "pdl": p, "ts": t, "fw": f}
+                    for a, c, p, t, f in conn.execute(
+                        "SELECT lora_addr, adco, pdl_index, updated_ts, fw_version "
+                        "FROM emitter")]
         if emitters:
             out["emitter"] = emitters
     except sqlite3.Error:
@@ -706,22 +724,58 @@ def publisher() -> list | None:
     return garde or None
 
 
+# Les clés de `device.json` qui PRÉTENDENT dire la version du firmware de l'émetteur. Elles
+# ne la disent pas, et ne peuvent pas la dire. Cf. `_sans_fw_emetteur`.
+FW_EMETTEUR_MENTEUR = ("fw",)
+
+
+def _sans_fw_emetteur(caps):
+    """Les capabilities, DÉBARRASSÉES du champ `fw` qui prétendait dire la version du
+    firmware de l'émetteur.
+
+    🚨 POURQUOI ON COUPE À L'ÉMISSION PLUTÔT QU'À LA SOURCE. `caps_for_model` n'écrit plus
+    ce champ (#28), mais ça ne vaut que pour un provisioning NEUF : les `device.json` déjà
+    posés sur le parc portent toujours `"fw": "0.1.3"` — une valeur fausse depuis des mois,
+    les émetteurs étant en 0.1.8 et plus. Tant qu'on la transmet, le cloud lit un chiffre
+    inventé à côté du chiffre mesuré, et c'est le faux qui a l'air officiel.
+
+    ⭐ ET ON NE RÉÉCRIT PAS `device.json` POUR AUTANT. Ce fichier est réécrit par l'agent
+    d'OTA (il y bumpe la version), le toucher depuis un `update.sh` est la manœuvre qui a
+    déjà coûté des tours de boucle, et le champ n'est lu par PERSONNE d'autre que cette
+    fonction : aucun accesseur `fw()` n'existe dans `capabilities.py`. Le supprimer là où il
+    est consommé le supprime donc partout où il avait un effet, sans toucher au disque.
+
+    ⓘ La vraie valeur voyage dans `health.emitter[].fw`, une ligne par émetteur, mesurée.
+    """
+    if isinstance(caps, dict):
+        return {c: ({k: v for k, v in a.items() if k not in FW_EMETTEUR_MENTEUR}
+                    if isinstance(a, dict) else a)
+                for c, a in caps.items()}
+    return caps
+
+
 def versions(dev: dict) -> dict | None:
     """Ce que le boîtier CROIT être. À recouper avec `repo.tag` : les deux divergent si une
-    update a échoué entre le checkout et le bump de `device.json`."""
+    update a échoué entre le checkout et le bump de `device.json`.
+
+    🚨 `arduinoFirmwareVersion` A DISPARU D'ICI, pour la raison exacte qui a fait disparaître
+    `caps[*].fw` : c'était la MÊME affirmation, tenue à la main, sur la version d'un firmware
+    qui se livre par reflash PHYSIQUE. `install.sh` ne l'écrit plus depuis la bascule vers les
+    capabilities (« fini le champ arduinoFirmwareVersion »), mais la sonde le lisait encore —
+    donc un vieux `device.json` continuait de faire monter une version d'émetteur inventée.
+    En garder une seule des deux n'aurait rien réglé : il suffit d'UNE source qui prétend pour
+    que le chiffre mesuré soit noyé.
+    """
     if not dev:
         return None
     out = {k: v for k, v in (("model", dev.get("model")),
-                             ("sw", dev.get("softwareVersion")),
-                             ("arduino", dev.get("arduinoFirmwareVersion"))) if v}
+                             ("sw", dev.get("softwareVersion"))) if v}
     # ⚠️ `capabilities` est un DICT dans `device.json` — `{"lora": {"hw": "rev01"},
-    #    "lora-tic-receiver": {"hw": "rev01", "fw": "0.1.2"}}` — et pas une liste. Ne garder
-    #    que les listes faisait disparaître le champ en silence, alors qu'il porte la version
-    #    de firmware de l'émetteur : précisément celle qu'on avait jugée incohérente sur un
-    #    boîtier du parc. On accepte les deux formes et on transmet tel quel.
+    #    "lora-tic-receiver": {"hw": "rev01"}}` — et pas une liste. Ne garder que les listes
+    #    faisait disparaître le champ en silence. On accepte les deux formes.
     caps = dev.get("capabilities")
     if isinstance(caps, (dict, list)) and caps:
-        out["caps"] = caps
+        out["caps"] = _sans_fw_emetteur(caps)
     return out or None
 
 

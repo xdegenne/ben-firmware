@@ -417,6 +417,39 @@ def on_recv_boot(decoded, rssi, snr, pdl_index, sender_addr) -> None:
     else:
         log.info(f"BOOT pdl_index={pdl_index} ADCO={adco} (PDL connu)")
     if measurements_db is not None:
+        # ── La version du firmware de l'ÉMETTEUR (#28) ────────────────────────────────
+        #
+        # ⭐ Elle n'était lisible qu'au banner série, donc QU'AVEC UN FTDI SUR PLACE.
+        #    L'émetteur se livrant par reflash PHYSIQUE, rien ne permettait de savoir à
+        #    distance ce que porte tel satellite — et `capabilities.py` prétendait le dire
+        #    avec une constante GLOBALE livrée par OTA, qui annonçait 0.1.3 pendant que le
+        #    parc tournait en 0.1.8.
+        #
+        # 🚨 ELLE EST ÉCRITE ICI, DONC APRÈS LE GARDE ADCO, ET C'EST DÉLIBÉRÉ. La version
+        #    ne sort PAS de la TIC — le raisonnement du garde ne la concerne donc pas, et
+        #    on pourrait soutenir qu'elle mériterait de passer même quand l'ADCO est
+        #    refusé. On s'y refuse : l'invariant « une trame de boot qui n'identifie pas
+        #    son compteur n'écrit RIEN » est tenu par deux bancs (`test_boot_contrat`,
+        #    `test_pdl_garde`), et y ouvrir une exception rouvrirait précisément la porte
+        #    qu'on a fermée. Le coût est nul — l'émetteur rejoue sa trame de boot à la
+        #    cadence du batch, et un boîtier qui lit mal sa TIC a un problème plus pressant
+        #    que la version de son satellite.
+        #
+        # ⚠️ `None` = le TLV est ABSENT, et ça ne veut pas dire « inconnu » : `T_FW` est le
+        #    second TLV inconditionnel du boot, écrit avant tout champ TIC. Son absence dit
+        #    donc « émetteur antérieur à la campagne » — cf. `db.EMITTER_FW_ANTERIEUR`.
+        fw_raw = tlvs.get(frame_codec.T_FW)
+        fw = frame_codec.fw_version(fw_raw) if fw_raw is not None else None
+        if fw_raw is not None and fw is None:
+            log.warning(f"T_FW de forme inattendue ({fw_raw!r}) de l'émetteur "
+                        f"0x{sender_addr:02x} — version NON rangée")
+        else:
+            try:
+                if db.record_emitter_fw(measurements_db, sender_addr, fw):
+                    log.info(f"émetteur 0x{sender_addr:02x} : firmware "
+                             f"{fw or db.EMITTER_FW_ANTERIEUR} (pdl_index={pdl_index})")
+            except Exception as e:
+                log.warning(f"store: record_emitter_fw échoué: {e}")
         isousc = tlvs.get(frame_codec.T_ISOUSC)
         if isousc:
             try:

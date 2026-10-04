@@ -73,7 +73,8 @@ def base(n: int = 30000, repertoire: str = None, envoyees: int = 0) -> tuple:
     chemin = os.path.join(d, "measurements.db")
     c = db.connect(chemin)
     c.execute("INSERT INTO pdl (pdl_index, adco, first_seen, last_seen) VALUES (0,'000000000001',1790000000,1790099999)")
-    c.execute("INSERT INTO emitter VALUES(31,'000000000001',0,1790000000)")
+    c.execute("INSERT INTO emitter (lora_addr, adco, pdl_index, updated_ts) "
+              "VALUES (31,'000000000001',0,1790000000)")
     c.executemany("INSERT INTO lora_link(ts,pdl_index,rssi,snr,sent) VALUES(?,0,?,?,1)",
                   [(1790000000 + i * 40, -80.0, 10.0) for i in range(200)])
     if envoyees:

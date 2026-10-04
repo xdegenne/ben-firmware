@@ -217,7 +217,28 @@ CREATE TABLE IF NOT EXISTS emitter (
     lora_addr  INTEGER PRIMARY KEY,
     adco       TEXT NOT NULL DEFAULT '',
     pdl_index  INTEGER,
-    updated_ts INTEGER NOT NULL DEFAULT 0
+    updated_ts INTEGER NOT NULL DEFAULT 0,
+    -- fw_version : la version du firmware de l'ÉMETTEUR, telle qu'il l'annonce lui-même
+    -- (TLV `T_FW` de sa trame de boot). MESURÉE, jamais déduite.
+    --
+    -- ⭐ SA PLACE EST ICI, et pas ailleurs. L'émetteur se livre par reflash PHYSIQUE : sa
+    --    version est donc un attribut de CE satellite-là, pas du boîtier qui l'écoute ni
+    --    d'une de ses mesures. Un boîtier peut écouter PLUSIEURS émetteurs — une ligne par
+    --    `lora_addr`, et le compteur qu'il lit est juste à côté.
+    --
+    -- 🚨 TROIS ÉTATS, ET LE TROISIÈME N'EST PAS « INCONNU » :
+    --      '0.1.11'             l'émetteur l'a annoncée — fait mesuré
+    --      'anterieur-campagne' une trame de boot est arrivée SANS `T_FW` ⇒ cet émetteur
+    --                           est ANTÉRIEUR à la campagne (< 0.1.10). Ce n'est pas une
+    --                           valeur manquante, c'est une information : il reste à
+    --                           reflasher. Tout le parc est dans cet état aujourd'hui.
+    --      NULL                 aucune trame de boot vue depuis cette version du firmware
+    --                           Pi. L'émetteur ne redémarre pas à l'OTA (seul le Pi le
+    --                           fait) : il reste en STREAMING et ne rejoue pas son boot.
+    --                           Celui-là est VRAIMENT inconnu — et le distinguer du
+    --                           précédent est ce qui permet de piloter une campagne sur
+    --                           des faits plutôt que sur un trou.
+    fw_version TEXT
 );
 
 
@@ -332,6 +353,12 @@ def connect(path: str = DB_PATH, *, read_only: bool = False) -> sqlite3.Connecti
             conn.execute("ALTER TABLE pdl ADD COLUMN ref TEXT")
         if pdl_cols and "motif" not in pdl_cols:
             conn.execute("ALTER TABLE pdl ADD COLUMN motif TEXT")
+        # La version du firmware de l'ÉMETTEUR, qu'il annonce dans sa trame de boot (#28).
+        # AJOUT SEUL, comme tout ce qui précède : l'ancien code tourne sur cette base sans
+        # rien savoir de la colonne, donc le retour arrière reste possible sans restaurer.
+        em_cols = [r[1] for r in conn.execute("PRAGMA table_info(emitter)")]
+        if em_cols and "fw_version" not in em_cols:
+            conn.execute("ALTER TABLE emitter ADD COLUMN fw_version TEXT")
         tl_cols = [r[1] for r in conn.execute("PRAGMA table_info(tariff_labels)")]
         if tl_cols and "ngtf" not in tl_cols:
             conn.execute("DROP TABLE tariff_labels")
@@ -1713,6 +1740,53 @@ def bind_emitter(conn: sqlite3.Connection, lora_addr: int, adco: str, *,
         (lora_addr, (adco or "").strip(), pdl, int(time.time())))
     conn.commit()
     return (pdl, change)
+
+
+# 🚨 CE QUE VAUT L'ABSENCE DU TLV, ÉCRIT UNE FOIS POUR TOUTES.
+#
+#    `T_FW` est, dans la trame de boot, le second TLV INCONDITIONNEL après `T_ADCO` : il
+#    est écrit juste après lui, AVANT tout ce qui sort de la TIC (`tic-reader.ino`,
+#    `sendBootFrame`). Son absence ne peut donc pas vouloir dire « la TIC n'était pas
+#    encore lue », contrairement à celle de `CONTRAT`, d'`ISOUSC` ou de `PREF` — c'est
+#    précisément ce qui rend l'inférence sûre, et c'est pour ça que l'émetteur l'écrit
+#    inconditionnellement plutôt que « quand il peut ».
+#
+# ⚠️ ON NE RANGE DONC PAS UN TROU. Un NULL serait indiscernable de « pas encore vu de
+#    trame de boot », qui est un état RÉEL et différent : l'émetteur ne redémarre pas à
+#    l'OTA. Deux états distincts valent deux valeurs distinctes.
+EMITTER_FW_ANTERIEUR = "anterieur-campagne"
+
+
+def record_emitter_fw(conn: sqlite3.Connection, lora_addr: int, fw: str | None) -> bool:
+    """Range la version du firmware d'un émetteur. Retourne True si elle a CHANGÉ.
+
+    `fw=None` ⇒ la trame de boot ne portait pas `T_FW` ⇒ `EMITTER_FW_ANTERIEUR`.
+
+    ⭐ ÉCRITURE SUR CHANGEMENT. Une version ne bouge qu'au reflash, c'est-à-dire
+    quelques fois dans la vie d'un émetteur ; c'est l'appelant qui décide de crier, et il
+    ne criera donc qu'à ce moment-là.
+
+    ⚠️ ET SURTOUT : NE TOUCHE NI `adco`, NI `pdl_index`, NI `updated_ts`. Ces trois-là
+    appartiennent à `bind_emitter`, qui les tient depuis la LECTURE TIC de la même trame.
+    Les écraser ici reviendrait à faire dire à cette fonction deux choses à la fois — et
+    `updated_ts` signifie « depuis quand ce compteur est au bout de cet émetteur », une
+    question à laquelle un numéro de version ne répond pas.
+
+    ⓘ Un émetteur DOWNGRADÉ (reflash vers une version plus ancienne) écrase donc sa
+      version par la plus ancienne, et c'est voulu : on range ce qui TOURNE, pas le
+      maximum jamais vu.
+    """
+    valeur = fw or EMITTER_FW_ANTERIEUR
+    prec = conn.execute("SELECT fw_version FROM emitter WHERE lora_addr=?",
+                        (lora_addr,)).fetchone()
+    if prec is not None and prec[0] == valeur:
+        return False
+    conn.execute(
+        "INSERT INTO emitter(lora_addr, fw_version) VALUES(?,?) "
+        "ON CONFLICT(lora_addr) DO UPDATE SET fw_version=excluded.fw_version",
+        (lora_addr, valeur))
+    conn.commit()
+    return True
 
 
 def emitter_pdl(conn: sqlite3.Connection, lora_addr: int) -> int | None:

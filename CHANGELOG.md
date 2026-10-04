@@ -18,6 +18,126 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.9.28] — 2026-10-04
+
+**Le boîtier apprend la version de son émetteur, et la dit.** Volet ② du chantier
+[`ben-docs#12`](https://github.com/xdegenne/ben-docs/issues/12), sous-tâche
+[#28](https://github.com/xdegenne/ben-firmware/issues/28).
+
+L'émetteur Arduino se livre par **reflash PHYSIQUE** — il n'y a pas d'OTA sur AVR. Sa version
+n'était donc lisible qu'à son banner série, **un FTDI en main, devant le boîtier**. Depuis
+`tic-reader` 0.1.10 il l'annonce dans sa trame de boot (TLV `T_FW`, trois octets) ; cette
+version la décode, la range et la fait monter.
+
+```
+frame_codec     T_FW = 0x07 → "0.1.11", nommé « FW », déclaré STOCKÉ
+emitter         + colonne fw_version (NULLABLE, sans DEFAULT)
+ben-telemetry   décode le TLV à la trame de boot et range la valeur
+health          la fait monter dans la ligne de SON émetteur → health.emitter[].fw
+```
+
+#### 🚨 Une ligne par ÉMETTEUR, pas un champ de boîtier
+
+La version appartient au **satellite**, donc au compteur qu'il lit — et un boîtier peut en
+écouter **plusieurs**. Un champ unique à côté de `sw` aurait été faux dès le second émetteur, et
+faux **en silence** : le dernier boot reçu aurait écrasé l'autre.
+
+⭐ `health.store()` émettait **déjà** une ligne par émetteur (`addr`/`adco`/`pdl`/`ts`). Le
+chantier se réduit donc à un champ dans une structure qui existe.
+
+#### ⭐ Pourquoi le champ voyage DANS `health` et pas au niveau du `/ping`
+
+`ben-api` décode le battement avec `DisallowUnknownFields()`. Une clé **neuve** au niveau du
+`/ping` ferait **400 sur chaque battement du parc** jusqu'au déploiement du volet ③. Seul
+`health` est un `json.RawMessage`, transmis tel quel jusqu'à une colonne `jsonb` : c'est le point
+d'extension prévu, et c'est ce qui permet à ce volet de **partir seul**, sans une ligne de
+`ben-api`.
+
+⚠️ Mesuré sur ben-0001, journal du 02/10 : `HTTP 400 {"error":"bad_body","message":"json
+invalide: json: unknown field \"points\""}`, **59 échecs consécutifs** pendant la bascule de
+0.9.27. Le mécanisme n'est pas théorique.
+
+#### 🚨 Trois états, et le troisième n'est pas « inconnu »
+
+| valeur | sens |
+|---|---|
+| `0.1.11` | annoncée par l'émetteur — fait **mesuré** |
+| `anterieur-campagne` | trame de boot reçue **sans** le TLV ⇒ émetteur < 0.1.10, **à reflasher** |
+| `NULL` | **aucune trame de boot vue** |
+
+L'absence du TLV est une **information**, pas un trou — et l'inférence est sûre pour une raison
+structurelle : `T_FW` est, avec `T_ADCO`, le seul TLV **inconditionnel** de la trame de boot, et
+il est écrit **avant** tout champ issu de la TIC. Son absence ne peut donc pas vouloir dire « la
+TIC n'était pas encore lue », contrairement à celle de `CONTRAT`, d'`ISOUSC` ou de `PREF`.
+
+#### ⚠️ Ce qu'il faut attendre, et qui n'est pas une panne
+
+`fw_version` reste **`NULL` sur tout le parc** jusqu'au prochain **boot** de chaque émetteur :
+il ne redémarre pas quand le Pi redémarre, il reste en `STREAMING` et ne rejoue pas sa trame de
+boot. Pour le remplir, couper l'alim d'un émetteur — ou attendre une coupure du site.
+
+#### ⭐ Deux valeurs qui mentaient, et qui cessent de monter
+
+Relevées sur ben-0001 le 04/10, pour **un** émetteur qui tourne en **0.1.8** :
+
+```
+"arduinoFirmwareVersion": "0.0.6"        ← pas même la lignée de numéros de l'émetteur
+"lora-tic-receiver": { "fw": "0.1.2" }   ← et pas 0.1.3, que le code sème au provisioning
+```
+
+Trois valeurs, trois faussetés différentes. Une constante **globale** livrée par OTA ne pouvait
+pas dire un état de reflash qui est **par émetteur**. `caps_for_model` ne les écrit plus, et
+`health.versions()` les retire **à l'émission** — ce qui vaut pour les `device.json` déjà posés,
+**sans réécrire le fichier** (l'agent d'OTA le réécrit, et le toucher depuis un `update.sh` a
+déjà coûté des tours de boucle).
+
+#### La migration : ajout seul, nullable, et éprouvée sur une base réelle
+
+`ALTER TABLE emitter ADD COLUMN fw_version TEXT` — **métadonnée seule** en SQLite : la ligne de
+schéma est réécrite, aucune page de données ne l'est.
+
+⚠️ Un `NOT NULL DEFAULT 'anterieur-campagne'` aurait été faux **deux fois** : il aurait fabriqué
+un fait d'apparence mesurée pour les émetteurs des 7 boîtiers sans qu'une seule trame de boot
+arrive, et détruit la distinction `NULL` / « antérieur » dont tout dépend. La nullabilité
+**porte le sens**.
+
+⭐ **Éprouvée sur la base réelle de ben-0001 le 04/10** — 535 Mo, lecteur en marche :
+
+```
+db.connect() avec l'ALTER ......  62 ms      db.connect() suivant ....  34 ms  ⇒ ALTER ~28 ms
+user_version ..................  1, INCHANGÉ            ⇒ le backfill one-shot n'a PAS rejoué
+ligne émetteur ................ (31, '031864467282', 0, 1791066099, None) — intacte
+last_tic_ts ................... 1791097096 → 1791097178 ⇒ le lecteur a enregistré PENDANT
+ben-publisher (code 0.9.27) ... a publié 86 points APRÈS l'ajout, « reste ~0 »
+```
+
+🚨 La dernière ligne est **la garantie de retour arrière, mesurée et non plaidée** : l'ancien code
+tourne sur le nouveau schéma. ⓘ Et donc **rien à sauvegarder** — une sauvegarde de 535 Mo
+tiendrait un verrou de lecture pendant toute la copie sur un Pi Zero mono-cœur, donc coûterait
+des trames, pour assurer contre un risque qu'un `ADD COLUMN` nullable ne porte pas.
+
+#### 🚨 Redémarrages
+
+`ben-telemetry` — **obligatoire**, et c'est le seul que cette update paie : le décodeur vit là, et
+**l'agent d'OTA ne redémarre que `ben-publisher`**. L'omettre livrerait un chantier **inerte**
+sans qu'aucun contrôle s'en plaigne. Puis `ben-local-api`, après la migration.
+
+**Jamais `ben-radio`**, ni via `capabilities.py restart lora-tic-receiver` qui mappe la capability
+sur deux services et l'emporterait : elle est seule maîtresse du RFM95, et le verrou taint de
+0.9.12 est né d'un redémarrage de trop. `ben-tic-reader` n'est pas touché — sur un boîtier
+filaire ce chantier est un no-op.
+
+#### Le banc, et ses deux témoins symétriques
+
+`src/pi/ben-telemetry/test_fw_emetteur.py` — **13 cas, aucun matériel**, et le préflight de
+l'`update.sh` l'**exécute sur le Python du boîtier**.
+
+⚖️ Le témoin qui **protège le parc** vient en premier, parce qu'aucun émetteur du parc n'émet
+encore ce TLV : un contrôle trop strict ferait cesser l'enregistrement de **tous** les boîtiers
+radio d'un coup. Une trame **sans** `0x07` doit produire exactement ce qu'elle produisait.
+⚖️ Le témoin **inverse** va jusqu'au hello : rangée mais non remontée, la version n'aurait rien
+résolu.
+
 ### [0.9.27] — 2026-10-02
 
 **Le boîtier publie sous la référence que le cloud lui rend.** Ferme
