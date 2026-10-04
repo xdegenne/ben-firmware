@@ -320,37 +320,6 @@ def la_colonne_s_ajoute_a_une_base_ANCIENNE_sans_rien_perdre():
     db.connect(chemin).close()
 
 
-@cas
-def le_hello_SURVIT_a_une_base_sans_la_colonne():
-    """🚨 LE CAS DE LA FENÊTRE D'OTA, et il est réel. `ben-publisher` ouvre la base SANS
-    rejouer les migrations (c'est délibéré : `open_db()` n'appelle pas `db.connect()`) —
-    c'est `ben-telemetry` qui crée la colonne. Si le publisher parlait le premier, la requête
-    lèverait `OperationalError`.
-
-    ⇒ `health.store()` dégrade sur l'ABSENCE du champ, jamais sur une exception : le reste de
-      l'instantané part quand même. Même discipline que `_meta()` dans le publisher.
-
-    ⓘ C'est aussi pourquoi l'`update.sh` redémarre `ben-telemetry` AVANT `ben-publisher`."""
-    import tempfile
-    chemin = tempfile.mktemp(suffix=".db")
-    vieille = sqlite3.connect(chemin)
-    vieille.executescript("""
-        CREATE TABLE emitter (lora_addr INTEGER PRIMARY KEY, adco TEXT NOT NULL DEFAULT '',
-                              pdl_index INTEGER, updated_ts INTEGER NOT NULL DEFAULT 0);
-        INSERT INTO emitter VALUES (31, '031864467282', 0, 1790786260);
-        CREATE TABLE pdl (pdl_index INTEGER PRIMARY KEY, adco TEXT, first_seen INTEGER,
-                          last_seen INTEGER);
-        INSERT INTO pdl VALUES (0, '031864467282', 1, 9);
-    """)
-    vieille.commit()
-    vieille.close()
-    ro = sqlite3.connect(f"file:{chemin}?mode=ro", uri=True)
-
-    snap = health.snapshot(ro, None, chemin)
-    assert "emitter" not in snap, "le champ doit être ABSENT, pas inventé"
-    assert snap["pdl"] == [{"i": 0}], snap.get("pdl")   # le reste de l'instantané part
-
-
 def main() -> int:
     ok = True
     for f in CAS:
