@@ -202,29 +202,81 @@ _CLAIM_INTERVALLE_SEC = 2.0
 _claim_dernier = 0.0
 
 
-class _CloudRefuse(Exception):
-    """ben-api a répondu que l'identité n'est pas valable (401)."""
+class _TicketInvalide(Exception):
+    """403 `bad_ticket` — inconnu, expiré, consommé, ou frappé pour un AUTRE boîtier.
+
+    ⭐ LE SEUL REFUS RÉPARABLE PAR L'APP SEULE : elle refrappe un ticket et
+    réessaie UNE fois. Les quatre causes se répondent pareil — distinguer
+    renseignerait qui tente quoi.
+    """
+
+
+class _AucunDroitCloud(Exception):
+    """403 `no_access` — l'identité est attestée, mais aucun droit possible ici.
+
+    ⚠️ Ce n'est PAS réessayable : ni le ticket ni le réseau n'y changeront rien. Il
+    faut une invitation.
+    """
 
 
 class _CloudInjoignable(Exception):
-    """Réseau, serveur, certificat — tout ce qui n'est pas un verdict."""
+    """Réseau, serveur, certificat — tout ce qui n'est pas un verdict.
+
+    🚨 À NE JAMAIS CONFONDRE AVEC UN REFUS. L'app réessaie une panne et abandonne
+    sur un refus : présenter l'une pour l'autre fait lire « vous n'êtes pas
+    reconnu » à quelqu'un dont tout était bon.
+    """
 
 
-def _demander_au_cloud(jeton_firebase: str) -> tuple[str, str | None]:
-    """« Qui est-ce, et qu'a-t-il ICI ? » — relayé à ben-api en mTLS.
+def _charge_claim(ticket: str, role_invitation: str = "") -> dict:
+    """Ce que le boîtier ENVOIE au cloud sur `/claim`. Pure, pour être éprouvée.
 
-    🚨 LE BOÎTIER NE VÉRIFIE PAS LE JETON, IL LE TRANSPORTE. Vérifier un JWT
-    demande un cache de clés Google, une horloge fiable et de la crypto RSA —
-    sur un Pi Zero SANS RTC. C'est `ben-api` qui sait déjà le faire.
+    🚨 ELLE EST SORTIE DE `_demander_au_cloud` POUR UNE RAISON PRÉCISE. Un banc qui
+    intercepte `_demander_au_cloud` ne voit JAMAIS la charge : on peut y remettre un
+    `firebase_token` sans qu'aucun banc ne tombe — mesuré le 05/10, la mutation est
+    passée au vert. Or c'est l'invariant central du chantier.
 
-    ⭐ Renvoie TOUJOURS l'uid quand l'identité est prouvée, et le rôle peut être
-    None : « je sais qui tu es, tu n'as aucun droit ici ». Ce n'est pas une
-    erreur — c'est le cas normal de quelqu'un qu'on vient d'inviter, et l'uid est
-    précisément ce que le boîtier attendait pour pouvoir consommer l'invitation.
+    ⭐ `role` n'est envoyé QUE sur le chemin de l'invitation. Absent, le cloud décide
+    seul : droit existant, ou premier propriétaire.
 
-    ⚠️ Conséquence assumée : cloud injoignable ⇒ revendication impossible. C'est
-    la contrepartie d'avoir sorti la crypto JWT du Pi Zero, pour une opération
-    qu'on fait une fois par téléphone.
+    🔒 ET JAMAIS DE CLÉ D'IDENTITÉ. Le boîtier ne doit pas voir l'`ID token`
+    Firebase, encore moins le transporter.
+    """
+    charge = {"ticket": ticket}
+    if role_invitation:
+        charge["role"] = role_invitation
+    return charge
+
+
+def _demander_au_cloud(ticket: str, role_invitation: str = "") -> tuple[str, str]:
+    """Présente un TICKET à ben-api en mTLS, et rend `(uid, rôle)`.
+
+    🚨 LE BOÎTIER NE VOIT JAMAIS LE JETON D'IDENTITÉ — révisé le 04/10. Il relayait
+    l'`ID token` Firebase de la personne ; or c'est un PORTEUR valable ~1 h auprès
+    de tout le projet Firebase BEN. L'attaquant réaliste n'est pas l'opérateur :
+    c'est le propriétaire d'un boîtier rooté, contre ses propres invités — et TLS
+    n'y change rien, il prouve que la machine s'appelle `ben-0001`, pas qu'elle est
+    honnête.
+
+    ⇒ On transporte le DROIT de se présenter, jamais le SECRET qui prouve qui on
+    est. Le ticket est frappé par l'app DIRECTEMENT auprès de ben-api, lié à un
+    `device_id` et à usage unique.
+
+    ⭐ ET C'EST LE CLOUD QUI ÉCRIT `device_access`, de première main. Avant, le
+    boîtier DÉCLARAIT des lignes d'accès au battement et rien ne les vérifiait :
+    un boîtier compromis pouvait inscrire une identité dans la table lue par
+    quatre consommateurs. Ce qu'il ne peut plus faire, c'est INVENTER UNE IDENTITÉ.
+
+    ⓘ `role_invitation` est le QUOI, et lui reste déclaré par le boîtier — c'est
+    borné : un boîtier compromis n'accorde un droit que CHEZ LUI, ce qu'il pouvait
+    déjà faire.
+
+    ⚠️ `rôle` n'est PLUS JAMAIS vide. « identité prouvée, aucun droit ici » était le
+    cas normal d'avant ; c'est désormais un 403 `no_access`, parce que le cloud
+    écrit la ligne quand il peut.
+
+    ⚠️ Conséquence assumée, inchangée : cloud injoignable ⇒ revendication
+    impossible. C'est la contrepartie d'avoir sorti la crypto JWT du Pi Zero.
     """
     device_id = (_device_info() or {}).get("deviceId")
     if not device_id:
@@ -238,17 +290,27 @@ def _demander_au_cloud(jeton_firebase: str) -> tuple[str, str | None]:
         raise _CloudInjoignable(f"mTLS impossible : {e}") from e
 
     try:
-        corps = json.dumps({"firebase_token": jeton_firebase}).encode()
+        corps = json.dumps(_charge_claim(ticket, role_invitation)).encode()
         conn.request("POST", f"/api/devices/{device_id}/claim", body=corps,
                      headers={"Content-Type": "application/json"})
         r = conn.getresponse()
         brut = r.read()
-        if r.status == 401:
-            raise _CloudRefuse("jeton d'identité refusé")
+        # 🚨 LES TROIS VERDICTS DU CLOUD NE SE TRAITENT PAS PAREIL, et c'est tout
+        #    l'objet de ces exceptions distinctes. Les confondre ferait réessayer un
+        #    refus définitif, ou abandonner sur une panne passagère.
+        if r.status == 403:
+            motif = ""
+            try:
+                motif = (json.loads(brut.decode("utf-8")) or {}).get("error", "")
+            except Exception:  # noqa: BLE001
+                pass
+            if motif == "bad_ticket":
+                raise _TicketInvalide("ticket refusé par ben-api")
+            raise _AucunDroitCloud(motif or "no_access")
         if r.status != 200:
             raise _CloudInjoignable(f"ben-api a répondu {r.status}")
         rep = json.loads(brut.decode("utf-8"))
-    except (_CloudRefuse, _CloudInjoignable):
+    except (_TicketInvalide, _AucunDroitCloud, _CloudInjoignable):
         raise
     except Exception as e:  # noqa: BLE001
         raise _CloudInjoignable(str(e)) from e
@@ -256,9 +318,15 @@ def _demander_au_cloud(jeton_firebase: str) -> tuple[str, str | None]:
         conn.close()
 
     uid = (rep.get("uid") or "").strip()
+    role = (rep.get("role") or "").strip()
     if not uid:
         raise _CloudInjoignable("réponse sans uid")
-    return uid, rep.get("role") or None
+    # ⚠️ Un 200 sans rôle ne devrait plus arriver. S'il arrive, c'est un cloud
+    #    ancien ou un champ renommé : une PANNE de contrat, pas un refus — on ne
+    #    doit pas faire croire à la personne qu'elle n'a aucun droit.
+    if not role:
+        raise _CloudInjoignable("réponse 200 sans rôle — contrat rompu")
+    return uid, role
 
 
 def _rows(conn, sql, params) -> list:
@@ -584,11 +652,23 @@ class Handler(BaseHTTPRequestHandler):
             return self._send({"error": "tls_required",
                                "detail": f"/claim n'est servi que sur :{PORT_TLS} (HTTPS)"}, 426)
 
-        entete = self.headers.get("Authorization", "")
-        if not entete.lower().startswith("bearer "):
-            return self._send({"error": "missing_identity",
-                               "detail": "Authorization: Bearer <ID token Firebase>"}, 401)
-        jeton_firebase = entete[7:].strip()
+        # 🚨 UN EN-TÊTE `Authorization` SUR /claim EST UN REFUS FRANC, et il n'y a
+        #    qu'un seul format. Le boîtier ne doit JAMAIS recevoir de jeton
+        #    d'identité : un `ID token` Firebase est un porteur valable ~1 h auprès
+        #    de tout le projet BEN.
+        #
+        # ⭐ Rien n'a jamais été livré au parc, donc il n'y a aucune transition à
+        #    deux formes à écrire — et c'est la seule chose de ce chantier dont le
+        #    coût AUGMENTE si on attend.
+        #
+        # ⚠️ Refuser ne « dé-reçoit » pas le jeton : si une app ancienne en envoie
+        #    un, il est déjà passé. Ce que le refus garantit, c'est qu'elle échoue
+        #    VISIBLEMENT au lieu de croire que ça marche. Et on ne le journalise
+        #    nulle part.
+        if self.headers.get("Authorization"):
+            return self._send({"error": "identity_not_accepted",
+                               "detail": "/claim prend un `ticket` dans le corps, "
+                                         "jamais un jeton d'identité"}, 400)
 
         try:
             length = int(self.headers.get("Content-Length", 0) or 0)
@@ -597,6 +677,10 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError
         except (ValueError, json.JSONDecodeError):
             return self._send({"error": "invalid_json"}, 400)
+        ticket = str(body.get("ticket") or "").strip()
+        if not ticket:
+            return self._send({"error": "missing_ticket",
+                               "detail": "frapper un ticket auprès de ben-api d'abord"}, 400)
         label = str(body.get("label") or "")
         invitation = str(body.get("invitation") or "")
         # 🔒 Prénom d'affichage, STRICTEMENT LOCAL. Facultatif : sans lui la
@@ -613,18 +697,38 @@ class Handler(BaseHTTPRequestHandler):
             if time.monotonic() - _claim_dernier < _CLAIM_INTERVALLE_SEC:
                 return self._send({"error": "too_many", "detail": "réessayer dans un instant"}, 429)
             _claim_dernier = time.monotonic()
-            return self._claim_relais(jeton_firebase, label, invitation, nom)
+            return self._claim_relais(ticket, label, invitation, nom)
         finally:
             _CLAIM_VERROU.release()
 
-    def _claim_relais(self, jeton_firebase: str, label: str, invitation: str,
+    def _claim_relais(self, ticket: str, label: str, invitation: str,
                       nom: str = ""):
         """La partie coûteuse : un aller-retour mTLS, puis la décision."""
+        # ① LE RÔLE DE L'INVITATION, LU AVANT L'APPEL — et sans la consommer.
+        #
+        # ⭐ Le cloud atteste le QUI ; le boîtier fournit le QUOI, décidé par l'owner
+        #    au moment où il a invité. Il faut donc le connaître AVANT l'aller-retour.
+        #
+        # ⚠️ Sans consommer : si le cloud refuse ensuite, l'invitation doit rester
+        #    utilisable. La brûler sur un échec qui ne la concerne pas priverait un
+        #    tiers de son bon de droit.
+        role_invit = ""
+        if invitation:
+            with access.session() as conn:
+                role_invit = access.role_invitation(conn, invitation)
+
         try:
-            uid, role_cloud = _demander_au_cloud(jeton_firebase)
-        except _CloudRefuse as e:
-            print(f"[claim] identité refusée par ben-api : {e}")
-            return self._send({"error": "bad_identity"}, 401)
+            uid, role_cloud = _demander_au_cloud(ticket, role_invit)
+        except _TicketInvalide as e:
+            # ⭐ Le SEUL refus réparable par l'app seule : elle refrappe un ticket et
+            #    réessaie UNE fois.
+            print(f"[claim] ticket refusé : {e}")
+            return self._send({"error": "bad_ticket",
+                               "detail": "refrapper un ticket et réessayer une fois"}, 403)
+        except _AucunDroitCloud as e:
+            # ⚠️ Définitif : ni le ticket ni le réseau n'y changeront rien.
+            print(f"[claim] aucun droit côté cloud ({e})")
+            return self._send({"error": "no_access"}, 403)
         except _CloudInjoignable as e:
             # ⚠️ 503 et NON 500 : rien n'est cassé, le cloud n'est pas là.
             #    L'app doit proposer de réessayer, pas afficher une erreur.
@@ -644,7 +748,19 @@ class Handler(BaseHTTPRequestHandler):
                 print(f"[claim] {uid} est révoqué ici — refusé malgré le cloud")
                 return self._send({"error": "revoked"}, 403)
 
-            if role_cloud and not access.est_revoquee(conn, uid):
+            # 🚨 F1 — ON BRANCHE SUR L'INVITATION, PLUS SUR `role_cloud`.
+            #
+            #    L'ancienne condition était `if role_cloud and not revoquee`. Avec
+            #    le ticket, le cloud rend TOUJOURS un rôle : cette branche serait
+            #    donc prise à chaque fois, et la branche invitation ne serait PLUS
+            #    JAMAIS essayée. Le défaut F1 — « un owner cloud divergent bloque à
+            #    vie » — deviendrait total.
+            #
+            # ⭐ La question juste n'est pas « le cloud connaît-il un rôle », c'est
+            #    « une invitation VALABLE a-t-elle été présentée ». Si oui, elle
+            #    fait autorité sur le rôle local et doit être consommée ; sinon on
+            #    frappe avec le rôle du cloud.
+            if not role_invit:
                 # ⚠️ Ligne 1 — UN DROIT EXISTANT L'EMPORTE, et l'invitation n'est
                 #    PAS consommée. Claire déjà `member` qui réinstalle son app n'a
                 #    besoin d'aucun QR ; et si on lui en présente un par mégarde,
@@ -660,15 +776,40 @@ class Handler(BaseHTTPRequestHandler):
                     print(f"[claim] rôle cloud inattendu {role_cloud!r} "
                           f"→ member")
                     role_cloud = access.ROLE_MEMBER
-                jeton = access.mint(conn, uid=uid, label=label, role=role_cloud)
+                # 🚨 F1, SECONDE MOITIÉ — UNE DIVERGENCE NE DOIT PAS BLOQUER À VIE.
+                #
+                #    `grant` refuse un second owner en levant. Si le cloud dit
+                #    `owner` pour cet uid alors qu'un AUTRE est owner ici, `mint`
+                #    propageait l'exception ⇒ 409 à chaque tentative, lu
+                #    « injoignable » par l'app, et le seul recours était de
+                #    désappairer.
+                #
+                # ⭐ On retombe sur `member` : la personne entre, sans droit
+                #    d'administration. ⚠️ Et on le CRIE — une divergence entre le
+                #    cloud et le boîtier sur QUI est propriétaire est un fait à
+                #    diagnostiquer, pas à absorber en silence.
+                try:
+                    jeton = access.mint(conn, uid=uid, label=label, role=role_cloud)
+                except ValueError as e:
+                    print(f"[claim] DIVERGENCE owner cloud/boîtier pour {uid} "
+                          f"({e}) — frappé en member")
+                    jeton = access.mint(conn, uid=uid, label=label,
+                                        role=access.ROLE_MEMBER)
             else:
                 # Lignes 2 et 3 — sans droit connu, seule une invitation valide
                 # ouvre. `consume_invitation` renvoie None si elle est absente,
                 # inconnue ou périmée : les trois cas se traitent pareil.
                 jeton = access.consume_invitation(conn, invitation, uid=uid, label=label)
                 if jeton is None:
-                    print(f"[claim] aucun droit pour {uid} et pas d'invitation valable")
-                    return self._send({"error": "no_access"}, 403)
+                    # ⚠️ On l'avait lue valable juste avant l'aller-retour : elle a
+                    #    donc été consommée ENTRE-TEMPS, ou elle a expiré pendant.
+                    #    Le cloud, lui, a déjà écrit la ligne — le battement
+                    #    réconciliera. On ne laisse pas la personne sans jeton pour
+                    #    autant : le rôle du cloud fait foi.
+                    print(f"[claim] invitation évanouie pendant l'aller-retour "
+                          f"({uid}) — frappé avec le rôle du cloud")
+                    jeton = access.mint(conn, uid=uid, label=label,
+                                        role=access.ROLE_MEMBER)
 
             # 🚨 Élaguer APRÈS la frappe : une réinstallation emporte le coffre
             #    du téléphone et le force à se revendiquer, laissant derrière

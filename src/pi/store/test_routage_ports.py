@@ -221,10 +221,15 @@ def sur_le_canal_chiffre_tout_exige_un_jeton_sauf_ping_et_claim():
                 continue
             code = _appel(base, route, methode)
             if route in SANS_JETON_EN_CHIFFRE:
-                # ⚠️ NE PAS se contenter du code. `/claim` répond bien 401 sans
-                #    en-tête — mais c'est le jeton FIREBASE qui lui manque, pas
-                #    le jeton BEN. Ce qu'on vérifie, c'est que la GARDE l'a
-                #    laissée passer : `token_required` ne doit pas apparaître.
+                # ⚠️ NE PAS se contenter du code. `/claim` répond 400 sans corps
+                #    utilisable — mais c'est le TICKET qui lui manque, pas le jeton
+                #    BEN. Ce qu'on vérifie ici, c'est que la GARDE l'a laissée
+                #    passer : `token_required` ne doit pas apparaître.
+                #
+                # ⓘ Ce commentaire disait « le jeton FIREBASE qui lui manque ».
+                #    Périmé depuis le 05/10 : le boîtier ne voit plus jamais de
+                #    jeton d'identité. ⇒ Le contrat lui-même est éprouvé par
+                #    `test_claim_ticket.py` — celui-ci ne regarde que le routage.
                 erreur = _erreur(base, route, methode)
                 assert erreur != "token_required", (
                     f"{route} est bloquée par la garde alors qu'elle doit rester "

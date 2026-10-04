@@ -564,6 +564,28 @@ def create_invitation(conn: sqlite3.Connection, *, role: str = ROLE_MEMBER,
     raise RuntimeError("impossible de frapper un code d'invitation libre")
 
 
+def role_invitation(conn: sqlite3.Connection, invitation: str) -> str:
+    """Le rôle que PORTE une invitation, sans la consommer. `""` si elle ne vaut rien.
+
+    🚨 ELLE EXISTE PARCE QUE LE CLOUD ÉCRIT `device_access` DÉSORMAIS. Il atteste
+    le QUI ; c'est le boîtier qui fournit le QUOI — le rôle décidé par l'owner au
+    moment où il a invité. Il faut donc le connaître AVANT l'aller-retour, alors
+    que `consume_invitation` ne le rend qu'en consommant.
+
+    ⚠️ Ne consomme RIEN, délibérément : si le cloud refuse ensuite (ticket
+    invalide, panne), l'invitation doit rester utilisable. La consommer d'abord
+    brûlerait le bon de droit d'un tiers sur un échec qui ne le concerne pas.
+    """
+    code = normaliser_code(invitation)
+    if not code:
+        return ""
+    row = conn.execute(
+        "SELECT role FROM token WHERE invitation_hash = ? AND invitation_expiry_ts > ?",
+        (_digest(code), int(time.time())),
+    ).fetchone()
+    return row["role"] if row else ""
+
+
 def consume_invitation(conn: sqlite3.Connection, invitation: str, *,
                        uid: str, label: str = "") -> str | None:
     """Transforme une invitation valide en vrai jeton. Renvoie le CLAIR, ou None.
