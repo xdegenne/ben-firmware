@@ -69,14 +69,19 @@ Stored at `/etc/ben-firmware/device.json` on each device.
   "deviceId": "ben-0042",
   "model": "pi0-lora",
   "hardwareRevision": "rev01",
-  "arduinoFirmwareVersion": "1.0.0",
   "softwareVersion": "1.1.0"
 }
 ```
 
 - `hardwareRevision` follows `rev01`, `rev02`, ... convention
-- `arduinoFirmwareVersion` is tracked separately — Arduino has its own release cycle
 - `softwareVersion` refers to the Pi agent version
+- 🚨 `arduinoFirmwareVersion` **is gone, and must not come back** (#28). It was a
+  hand-maintained, box-wide claim about a firmware that ships by **physical reflash** — so it
+  could not stay true, and it did not: it still read `0.1.3` while the fleet ran `0.1.8`. The
+  emitter firmware version is now **measured**, reported by the emitter itself in its boot
+  frame (TLV `T_FW`), stored **per emitter** in `emitter.fw_version`, and surfaced to the
+  cloud in `health.emitter[].fw`. A box may listen to **several** emitters, each with its own
+  version — which is the other reason a single box-level field was wrong.
 
 ---
 
@@ -449,7 +454,17 @@ The real security boundary is GPG tag signing — only scripts from a verified s
 
 ## 12. Arduino Firmware
 
-Arduino cannot self-update (no OTA). Its firmware version is tracked in `device.json` (`arduinoFirmwareVersion`) and updated manually after a physical flash.
+Arduino cannot self-update (no OTA): it ships by **physical reflash**.
+
+Its version is therefore **not declared** anywhere on the Pi — it is **measured**. Since
+emitter `0.1.10` each boot frame carries TLV `T_FW` (three bytes: major, minor, patch); the
+receiver stores it per emitter in `emitter.fw_version` and the daily heartbeat carries it in
+`health.emitter[].fw`. That is the only way to know, remotely, what a given satellite runs —
+before this, it took an FTDI in hand, in front of the box.
+
+⚠️ An emitter predating `0.1.10` emits no such TLV. Its absence is recorded as
+`anterieur-campagne` ("predates the campaign") rather than as a missing value, which is what
+makes a reflash campaign steerable from facts. See `docs/lora-frame-format.md` §7.
 
 The `compatibility.yaml` expresses the minimum Arduino firmware version required by a given Pi software version:
 

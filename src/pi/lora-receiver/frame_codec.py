@@ -35,6 +35,7 @@ T_PREF = 0x03
 T_CONTRAT = 0x04
 T_PAPP = 0x05    # PAPP instantané (int24 LE signé) dans le boot → conso dès le 1er boot (unboxing rapide)
 T_IINST = 0x06   # IINST instantané (uint16 LE) dans le boot → histo : PAPP=0 en injection, 230×IINST = production estimée
+T_FW = 0x07      # version du firmware ÉMETTEUR : 3 octets majeur/mineur/correctif, émetteur ≥ 0.1.10
 T_EAIT = 0x10
 T_LTARF = 0x11
 T_DEMAIN = 0x20
@@ -390,14 +391,14 @@ def meter_timestamps(decoded: dict):
 # --------------------------------------------------------------------------- #
 TAG_NAMES = {
     T_ADCO: "ADCO", T_ISOUSC: "ISOUSC", T_PREF: "PREF", T_CONTRAT: "CONTRAT",
-    T_PAPP: "PAPP", T_IINST: "IINST",
+    T_PAPP: "PAPP", T_IINST: "IINST", T_FW: "FW",
     T_EAIT: "EAIT", T_LTARF: "LTARF", T_DEMAIN: "DEMAIN", T_NJOURF: "NJOURF",
     T_NJOURF1: "NJOURF+1", T_ADPS: "ADPS", T_PEJP: "PEJP", T_MSG1: "MSG1", T_MSG2: "MSG2",
     T_STGE: "STGE",
 }
 # Tags déjà CÂBLÉS au stockage. Les autres tags CONNUS sont décodés + LOGUÉS (pas encore
 # stockés) → visibilité avant câblage (DEMAIN/ADPS/PEJP/NJOURF/MSG).
-TAG_STORED = {T_ADCO, T_ISOUSC, T_PREF, T_CONTRAT, T_PAPP, T_IINST, T_EAIT, T_LTARF}
+TAG_STORED = {T_ADCO, T_ISOUSC, T_PREF, T_CONTRAT, T_PAPP, T_IINST, T_FW, T_EAIT, T_LTARF}
 
 _TLV_STR = {T_ADCO, T_CONTRAT, T_LTARF, T_MSG1, T_MSG2}
 _TLV_U8 = {T_ISOUSC, T_PREF, T_DEMAIN, T_NJOURF, T_NJOURF1}
@@ -415,8 +416,31 @@ def stge_couleurs(v: int):
     return STGE_COULEUR.get((v >> 24) & 3), STGE_COULEUR.get((v >> 26) & 3)
 
 
+def fw_version(value: bytes):
+    """« majeur.mineur.correctif » depuis les 3 octets de `T_FW`, ou None si la forme
+    n'est pas celle-là.
+
+    ⭐ TROIS OCTETS, ET PAS LA CHAÎNE. Côté émetteur la source de vérité est
+    `FW_MAJOR`/`FW_MINOR`/`FW_PATCH` et c'est le préprocesseur qui fabrique le banner
+    (`tic-reader.ino`, banc `test_version.py`) : la radio ne transporte donc jamais du
+    texte, et `0.1.10` n'est pas « plus long » que `0.1.9` sur le fil.
+
+    🚨 UNE LONGUEUR AUTRE QUE 3 N'EST PAS UNE VERSION, et on ne la devine pas. Le MAC a
+    déjà prouvé que ces octets sont EXACTEMENT ceux qu'a émis l'émetteur : une longueur
+    inattendue ne dit pas « la radio a abîmé la trame », elle dit « cet émetteur n'écrit
+    pas le tag que nous croyons lire ». La reconstituer à partir de 2 ou 4 octets
+    fabriquerait un numéro de version qui n'existe nulle part — et c'est le seul champ de
+    ce chantier dont TOUTE la valeur est d'être exact.
+    """
+    if len(value) != 3:
+        return None
+    return "%d.%d.%d" % tuple(value)
+
+
 def interpret_tlv(tag: int, value: bytes):
     """Valeur typée d'un TLV connu (str / int / présence) ; octets bruts sinon."""
+    if tag == T_FW:
+        return fw_version(value) or value   # forme inattendue → octets bruts, visibles au journal
     if tag == T_STGE:
         # Rendu LISIBLE et non brut : ce tag n'est pas encore stocké, sa seule sortie est le
         # journal `log_uncabled`. Un entier décimal y serait indéchiffrable.

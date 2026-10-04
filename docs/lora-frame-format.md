@@ -103,11 +103,15 @@ Un champ = `[tag:1][len:1][valeur:len]`. Tag = 1 octet (256 types, ~13 utilisés
 | 0x02 | ISOUSC   | 1    | histo | intensité souscrite (A) |
 | 0x03 | PREF     | 1    | std  | puissance de réf. (kVA) |
 | 0x04 | CONTRAT  | ≤16  | tous | NGTF (std) / OPTARIF (histo) |
+| 0x05 | PAPP     | 3    | tous | PAPP instantané (int24 LE **signé** : <0 = injection) dans le boot |
+| 0x06 | IINST    | 2    | histo | IINST instantané (uint16 LE) dans le boot |
+| 0x07 | FW       | 3    | tous | version du firmware **émetteur** : majeur, mineur, correctif |
 | 0x10 | EAIT     | 4    | std  | énergie active injectée (Wh, producteur) |
 | 0x11 | LTARF    | ≤16  | std  | libellé tarif en cours |
 | 0x20 | DEMAIN   | 1    | histo | couleur du lendemain : 0=BLEU 1=BLANC 2=ROUGE |
 | 0x21 | NJOURF   | 1    | std  | n° profil jour courant (0-9) |
 | 0x22 | NJOURF1  | 1    | std  | n° profil prochain jour (0-9) = NJOURF+1 |
+| 0x23 | STGE     | 4    | std  | registre de statuts BRUT (uint32 LE) → couleur Tempo jour/lendemain |
 | 0x30 | ADPS     | 0/1  | histo | dépassement puissance souscrite (présence ; valeur=I opt.) |
 | 0x31 | PEJP     | 0/1  | histo | préavis EJP (présence) |
 | 0x40 | MSG1     | ≤32  | std  | message court |
@@ -115,6 +119,23 @@ Un champ = `[tag:1][len:1][valeur:len]`. Tag = 1 octet (256 types, ~13 utilisés
 
 Plages réservées : `0x00-0x0F` identité/contrat · `0x10-0x1F` énergie/tarif · `0x20-0x2F`
 calendrier/Tempo · `0x30-0x3F` alertes · `0x40-0x4F` messages · `0x50+` futur.
+
+⭐ **`0x07` tombe dans le bloc identité parce que c'en est une** : la version identifie la
+**SONDE**, au même titre que l'ADCO identifie le compteur. C'est aussi le seul tag de la table
+qui ne sorte **pas** de la TIC.
+
+🚨 **Ce que vaut l'ABSENCE de `0x07`, et pourquoi ce n'est pas un trou.** `T_ADCO` et `T_FW`
+sont les deux seuls TLV **inconditionnels** de la trame de boot, et `T_FW` est écrit juste
+après l'ADCO, **avant** tout champ issu de la TIC. Son absence ne peut donc pas vouloir dire
+« la TIC n'était pas encore lue » — contrairement à celle de `CONTRAT`, d'`ISOUSC` ou de
+`PREF`, et c'est exactement ce qui rend l'inférence sûre. Elle porte **une** information,
+nette : *cet émetteur est antérieur à la campagne* (< 0.1.10), il reste à reflasher.
+
+⇒ Côté récepteur elle est donc **rangée** comme telle (`emitter.fw_version` =
+`anterieur-campagne`), et jamais en `NULL`. Le `NULL` est réservé à un troisième état, bien
+réel : *aucune trame de boot vue* — l'émetteur ne redémarre pas quand le Pi redémarre, donc
+après une OTA il reste en `STREAMING` et ne rejoue pas son boot. Confondre les deux, c'est
+perdre la seule information qui permette de piloter une campagne de reflash.
 
 ## 8. Trame complète (récap)
 

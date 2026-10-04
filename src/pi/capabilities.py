@@ -48,15 +48,28 @@ CAP_SERVICES = {
 
 # ── model → capabilities : source de vérité UNIQUE (provisioning + migration) ─
 # Table historique dérivée de check_network.READERS_BY_MODEL. `hw` seedé depuis le
-# hardwareRevision ; `fw` = firmware du satellite (émetteur) connu à la date.
+# hardwareRevision.
+#
+# 🚨 PLUS DE `fw` ICI, ET IL NE DOIT PAS REVENIR (#28). Ce champ prétendait dire la version
+#    du firmware de l'ÉMETTEUR, et il MENTAIT : il annonçait 0.1.3 pendant que le parc
+#    tournait en 0.1.8. Le commit `517112a` s'intitulait pourtant « suit FW_VERSION du sketch
+#    émetteur » — le suivi a été abandonné en route.
+#
+# ⚠️ Et il ne POUVAIT pas tenir. C'est une constante GLOBALE livrée par OTA, là où l'état de
+#    reflash est PAR ÉMETTEUR : le satellite se livre par reflash PHYSIQUE, et un boîtier peut
+#    en écouter plusieurs. Aucune valeur écrite dans ce fichier ne peut dire ce que porte tel
+#    satellite — seule une valeur qu'il ANNONCE lui-même peut.
+#
+# ⇒ Elle vit désormais dans `emitter.fw_version`, remplie depuis le TLV `T_FW` de la trame de
+#   boot, une ligne par émetteur, et remonte au cloud dans `health.emitter[].fw`.
 def caps_for_model(model: str, hw: str = "rev01") -> dict:
     # rgb-led-indicator : présente sur TOUS les modèles (RGB LED soudée GPIO 12/13/16).
     return {
         "pi0-wired":      {"rgb-led-indicator": {"hw": hw}, "tic-uart": {"hw": hw}},
         "pi0-lora":       {"rgb-led-indicator": {"hw": hw}, "lora": {"hw": hw},
-                           "lora-tic-receiver": {"hw": hw, "fw": "0.1.3"}},
+                           "lora-tic-receiver": {"hw": hw}},
         "pi0-lora-wired": {"rgb-led-indicator": {"hw": hw}, "lora": {"hw": hw},
-                           "lora-tic-receiver": {"hw": hw, "fw": "0.1.3"}, "tic-uart": {"hw": hw}},
+                           "lora-tic-receiver": {"hw": hw}, "tic-uart": {"hw": hw}},
     }.get(model)
 
 

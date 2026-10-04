@@ -38,7 +38,10 @@ def base_radio() -> sqlite3.Connection:
     """Un boîtier LoRa qui mesure : un compteur, des mesures, un émetteur, des trames."""
     c = db.connect(":memory:")
     c.execute("INSERT INTO pdl (pdl_index, adco, first_seen, last_seen) VALUES (0,'031864467282',1,9)")
-    c.execute("INSERT INTO emitter VALUES(31,'031864467282',0,1790786260)")
+    # ⓘ Colonnes NOMMÉES : `VALUES(...)` positionnel se casse à chaque colonne ajoutée
+    #   (`fw_version` est arrivée avec #28), et le banc ne dirait alors rien de son sujet.
+    c.execute("INSERT INTO emitter (lora_addr, adco, pdl_index, updated_ts, fw_version) "
+              "VALUES (31,'031864467282',0,1790786260,'0.1.11')")
     for i in range(50):
         c.execute("INSERT INTO measurements(ts,pdl_index,papp,sent) VALUES(?,0,?,1)",
                   (1790840000 + i, 200 + i))
@@ -167,6 +170,9 @@ def TEMOIN_un_boitier_qui_mesure_rend_son_dernier_horodatage():
     out = health.snapshot(base_radio(), None)
     assert out["pdl"] == [{"i": 0, "last_ts": 1790840049}], out.get("pdl")
     assert out["emitter"][0]["addr"] == 31
+    # ⭐ La version de l'ÉMETTEUR voyage dans SA ligne, pas dans un champ de boîtier (#28) :
+    #   un boîtier peut écouter plusieurs émetteurs, et chacun a sa propre version.
+    assert out["emitter"][0]["fw"] == "0.1.11", out["emitter"]
     f = out["radio"]["recent"][0]["frames"]
     assert len(f) == 20, "les 20 dernières trames, pas toutes"
     assert f[0][0] == 1790841160, "la plus RÉCENTE en tête"
@@ -399,27 +405,60 @@ def le_retard_est_rapporte_et_il_est_en_O_1():
 @cas
 def les_versions_declarees_sont_reprises():
     """À recouper avec `repo.tag` : les deux divergent si une update a échoué entre le
-    `git checkout` et le bump de `device.json` — un état qu'on ne pouvait voir qu'en SSH."""
+    `git checkout` et le bump de `device.json` — un état qu'on ne pouvait voir qu'en SSH.
+
+    🚨 ET `arduinoFirmwareVersion` NE REMONTE PLUS (#28). C'était une affirmation tenue À LA
+    MAIN sur la version d'un firmware qui se livre par reflash PHYSIQUE : `install.sh` ne
+    l'écrit plus depuis la bascule vers les capabilities, mais la sonde la lisait encore, donc
+    un `device.json` ancien continuait de faire monter une version d'émetteur inventée — à
+    côté de la version MESURÉE que porte désormais `emitter[].fw`. Ce cas le verrouille :
+    le `device.json` du test la contient, et elle ne doit PAS ressortir."""
     out = health.snapshot(None, {"model": "Radio", "softwareVersion": "0.9.21",
                                  "arduinoFirmwareVersion": "0.0.6",
                                  "capabilities": ["lora", "lora-tic-receiver"]})
-    assert out["dev"] == {"model": "Radio", "sw": "0.9.21", "arduino": "0.0.6",
-                          "caps": ["lora", "lora-tic-receiver"]}
+    assert out["dev"] == {"model": "Radio", "sw": "0.9.21",
+                          "caps": ["lora", "lora-tic-receiver"]}, out.get("dev")
 
 
 @cas
 def capabilities_est_un_DICT_sur_les_vrais_boitiers():
     """🚨 Défaut trouvé en lançant la collecte sur un vrai boîtier : `device.json` porte
     `capabilities` sous forme de DICT, pas de liste. Ne garder que les listes faisait
-    disparaître le champ EN SILENCE — or il contient la version de firmware de l'émetteur
-    (`lora-tic-receiver.fw`), celle-là même qu'on avait jugée incohérente sur ce boîtier.
+    disparaître le champ EN SILENCE.
 
     ⚖️ Les deux formes doivent passer : le blob n'est pas typé, on transmet tel quel."""
     reel = {"rgb-led-indicator": {"hw": "rev01"}, "lora": {"hw": "rev01"},
-            "lora-tic-receiver": {"hw": "rev01", "fw": "0.1.2"}}
+            "lora-tic-receiver": {"hw": "rev01"}}
     assert health.versions({"capabilities": reel})["caps"] == reel
     assert health.versions({"capabilities": ["lora"]})["caps"] == ["lora"]
     assert "caps" not in (health.versions({"model": "Radio", "capabilities": {}}) or {})
+
+
+@cas
+def le_fw_des_capabilities_NE_REMONTE_PLUS():
+    """🚨 LE CAS QUI FERME LA PORTE À LA VALEUR QUI MENTAIT (#28).
+
+    `capabilities["lora-tic-receiver"]["fw"]` prétendait dire la version du firmware de
+    l'ÉMETTEUR. Elle annonçait 0.1.3 pendant que le parc tournait en 0.1.8 — et elle ne
+    POUVAIT pas tenir : c'est une constante GLOBALE livrée par OTA, là où l'état de reflash
+    est PAR ÉMETTEUR, et où un boîtier peut en écouter plusieurs.
+
+    ⚠️ `caps_for_model` ne l'écrit plus, mais ça ne vaut QUE pour un provisioning neuf : les
+    sept `device.json` du parc la portent toujours. C'est donc à l'ÉMISSION qu'on la coupe,
+    et c'est ce cas qui le vérifie — sinon le cloud lirait le chiffre inventé à côté du
+    chiffre mesuré, et le faux aurait l'air aussi officiel que le vrai.
+
+    ⚖️ Et le témoin INVERSE, dans le même cas : `hw` DOIT survivre. Un filtre qui jetterait
+    l'attribut entier passerait la première assertion en faisant disparaître la révision
+    matérielle, qui n'a rien à voir avec ce chantier."""
+    vieux = {"lora": {"hw": "rev01"},
+             "lora-tic-receiver": {"hw": "rev01", "fw": "0.1.3"}}
+    caps = health.versions({"capabilities": vieux})["caps"]
+    assert "fw" not in caps["lora-tic-receiver"], caps
+    assert caps["lora-tic-receiver"]["hw"] == "rev01", caps
+    assert caps["lora"] == {"hw": "rev01"}, caps
+    # ⓘ Et l'entrée du boîtier n'est pas mutée au passage : `device.json` reste ce qu'il est.
+    assert vieux["lora-tic-receiver"]["fw"] == "0.1.3"
 
 
 @cas
