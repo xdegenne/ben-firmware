@@ -211,6 +211,25 @@ class _TicketInvalide(Exception):
     """
 
 
+class _BoitierRefuse(Exception):
+    """403 `device_mismatch` / `device_revoked` — c'est le BOÎTIER qui est refusé.
+
+    🚨 À NE PAS CONFONDRE AVEC `_AucunDroitCloud`. Les deux sont des 403, mais l'un
+    dit « cette personne n'a pas de droit ici » et l'autre « ce boîtier n'a rien à
+    faire là ». Les mélanger invite la personne à réclamer une invitation alors que
+    le problème est le certificat du boîtier — elle chercherait indéfiniment du
+    mauvais côté.
+    """
+
+
+class _ContratRompu(Exception):
+    """400 — ben-api n'a pas compris notre requête. Réessayer n'y changera RIEN.
+
+    ⚠️ Présenté comme une panne, ça ferait boucler l'app sur un défaut de version :
+    typiquement un cloud plus ancien que le boîtier, qui ne connaît pas le ticket.
+    """
+
+
 class _AucunDroitCloud(Exception):
     """403 `no_access` — l'identité est attestée, mais aucun droit possible ici.
 
@@ -226,6 +245,53 @@ class _CloudInjoignable(Exception):
     sur un refus : présenter l'une pour l'autre fait lire « vous n'êtes pas
     reconnu » à quelqu'un dont tout était bon.
     """
+
+
+def _verdict_cloud(statut: int, brut: bytes) -> Exception | None:
+    """Ce que la réponse de ben-api SIGNIFIE. `None` quand tout va bien.
+
+    🚨 SORTIE POUR ÊTRE ÉPROUVÉE. Un banc qui simule `_demander_au_cloud` n'exécute
+    JAMAIS cette classification : confondre `device_revoked` et `no_access` laissait
+    tous les bancs verts, mesuré le 05/10. C'est la troisième fois de ce chantier
+    qu'une logique enfouie dans une fonction simulée échappe aux bancs — d'où une
+    fonction PURE, systématiquement.
+
+    ⭐ QUATRE VERDICTS, et les confondre coûte cher à chaque fois. ben-api rend 403
+    pour TROIS raisons qui n'appellent pas la même suite :
+
+        bad_ticket                    réparable par l'app seule — refrappe, 1 essai
+        device_mismatch/device_revoked c'est LE BOÎTIER qui est refusé
+        no_access                     la personne n'a aucun droit ici — invitation
+        400                           contrat rompu : réessayer n'y changera RIEN
+    """
+    motif = ""
+    if statut != 200:
+        try:
+            motif = (json.loads(brut.decode("utf-8")) or {}).get("error", "")
+        except Exception:  # noqa: BLE001
+            pass
+    if statut == 200:
+        return None
+    if statut == 403:
+        if motif == "bad_ticket":
+            return _TicketInvalide("ticket refusé par ben-api")
+        if motif == "no_access":
+            return _AucunDroitCloud(motif)
+        # ⭐ TOUT LE RESTE EST UN REFUS DU BOÎTIER, et c'est délibérément UNE seule
+        #    branche : `device_mismatch`, `device_revoked`, un motif inconnu, un
+        #    corps illisible. Les deux premiers avaient leur propre `if` — je l'ai
+        #    RETIRÉ : il rendait exactement la même exception que ce défaut, donc
+        #    aucune mutation ne pouvait détecter sa disparition. Du code qu'aucun
+        #    banc ne peut défendre, et deux endroits où la règle pouvait diverger.
+        #
+        # ⚠️ Le défaut est de ce côté-ci, et c'est le point qui compte : on ne doit
+        #    SURTOUT pas faire croire à la personne que ça vient d'elle. Un
+        #    `no_access` l'envoie réclamer une invitation ; un refus du boîtier
+        #    l'enverrait chercher du mauvais côté pour toujours.
+        return _BoitierRefuse(motif or "403 sans motif")
+    if statut == 400:
+        return _ContratRompu(motif or "400")
+    return _CloudInjoignable(f"ben-api a répondu {statut}")
 
 
 def _charge_claim(ticket: str, role_invitation: str = "") -> dict:
@@ -298,19 +364,12 @@ def _demander_au_cloud(ticket: str, role_invitation: str = "") -> tuple[str, str
         # 🚨 LES TROIS VERDICTS DU CLOUD NE SE TRAITENT PAS PAREIL, et c'est tout
         #    l'objet de ces exceptions distinctes. Les confondre ferait réessayer un
         #    refus définitif, ou abandonner sur une panne passagère.
-        if r.status == 403:
-            motif = ""
-            try:
-                motif = (json.loads(brut.decode("utf-8")) or {}).get("error", "")
-            except Exception:  # noqa: BLE001
-                pass
-            if motif == "bad_ticket":
-                raise _TicketInvalide("ticket refusé par ben-api")
-            raise _AucunDroitCloud(motif or "no_access")
-        if r.status != 200:
-            raise _CloudInjoignable(f"ben-api a répondu {r.status}")
+        verdict = _verdict_cloud(r.status, brut)
+        if verdict is not None:
+            raise verdict
         rep = json.loads(brut.decode("utf-8"))
-    except (_TicketInvalide, _AucunDroitCloud, _CloudInjoignable):
+    except (_TicketInvalide, _AucunDroitCloud, _BoitierRefuse,
+            _ContratRompu, _CloudInjoignable):
         raise
     except Exception as e:  # noqa: BLE001
         raise _CloudInjoignable(str(e)) from e
@@ -713,9 +772,37 @@ class Handler(BaseHTTPRequestHandler):
         #    utilisable. La brûler sur un échec qui ne la concerne pas priverait un
         #    tiers de son bon de droit.
         role_invit = ""
-        if invitation:
-            with access.session() as conn:
+        with access.session() as conn:
+            if invitation:
                 role_invit = access.role_invitation(conn, invitation)
+            # 🚨 VERROU DU PREMIER PROPRIÉTAIRE — « fusionner ne livre rien » est
+            #    vrai de cette PR, PAS du prochain tag tiré de `main`.
+            #
+            #    Un ticket SANS rôle sur un boîtier SANS owner fait un owner. Tant
+            #    que la garde ⑤ n'est pas là, ça se fait depuis le LAN avec un
+            #    compte Google et le `deviceId` — que mDNS DIFFUSE sur le réseau
+            #    local. C'est exactement le TOFU rejeté le 19/09.
+            #
+            # ⚠️ Et ni le ticket ni le cloud ne peuvent le fermer : le ticket vaut
+            #    pour l'uid de celui qui l'a frappé, donc l'attaquant frappe le
+            #    SIEN ; et le cloud ne voit pas par quel canal le ticket est arrivé.
+            #    Seul le boîtier le sait. ⇒ `ben-docs/specs/003`, § rectifié le
+            #    04/10.
+            #
+            # ⭐ Ce verrou ne bloque AUCUN chemin légitime aujourd'hui : la remise du
+            #    ticket en BLE (⑤) n'est pas livrée, donc personne ne peut fonder un
+            #    premier propriétaire de toute façon. Il rend simplement `main`
+            #    TAGGABLE en attendant — et c'est tout son objet.
+            #
+            # ⇒ À ⑤, il devient « seulement pendant la fenêtre de déballage »
+            #    plutôt que « jamais ».
+            if not role_invit and not access.has_owner(conn):
+                print("[claim] REFUS : fonder un premier propriétaire demande la "
+                      "remise du ticket en BLE, pas encore livrée (#35 ⑤)")
+                return self._send(
+                    {"error": "first_owner_locked",
+                     "detail": "le premier propriétaire se fonde au déballage, en BLE"},
+                    403)
 
         try:
             uid, role_cloud = _demander_au_cloud(ticket, role_invit)
@@ -726,9 +813,24 @@ class Handler(BaseHTTPRequestHandler):
             return self._send({"error": "bad_ticket",
                                "detail": "refrapper un ticket et réessayer une fois"}, 403)
         except _AucunDroitCloud as e:
-            # ⚠️ Définitif : ni le ticket ni le réseau n'y changeront rien.
+            # ⚠️ Définitif : ni le ticket ni le réseau n'y changeront rien. Il faut
+            #    une invitation.
             print(f"[claim] aucun droit côté cloud ({e})")
             return self._send({"error": "no_access"}, 403)
+        except _BoitierRefuse as e:
+            # 🚨 C'est LE BOÎTIER qui est refusé, pas la personne. Le dire autrement
+            #    l'enverrait réclamer une invitation pour un problème de certificat.
+            print(f"[claim] ben-api REFUSE CE BOÎTIER ({e}) — "
+                  f"certificat ou enregistrement à vérifier")
+            return self._send({"error": "device_rejected",
+                               "detail": "ce boîtier n'est pas accepté par le cloud"}, 403)
+        except _ContratRompu as e:
+            # ⚠️ 502 et non 503 : réessayer n'y changera rien. Typiquement un cloud
+            #    plus ancien que le boîtier, qui ne connaît pas encore le ticket.
+            print(f"[claim] ben-api n'a pas compris la requête ({e}) — "
+                  f"versions cloud/boîtier incompatibles ?")
+            return self._send({"error": "contract_mismatch",
+                               "detail": "le cloud n'accepte pas ce format"}, 502)
         except _CloudInjoignable as e:
             # ⚠️ 503 et NON 500 : rien n'est cassé, le cloud n'est pas là.
             #    L'app doit proposer de réessayer, pas afficher une erreur.
@@ -737,14 +839,30 @@ class Handler(BaseHTTPRequestHandler):
                                "detail": "réessayer plus tard"}, 503)
 
         with access.session() as conn:
-            # 🚨 LE DRAPEAU LOCAL L'EMPORTE SUR LE CLOUD. Le hello est quotidien :
-            #    pendant 24 h après une révocation, ben-api répond encore l'ancien
-            #    rôle. Faire confiance à sa réponse laisserait revenir quelqu'un
-            #    qu'on vient de couper — sans invitation, et en silence.
+            # 🚨 LE DRAPEAU LOCAL L'EMPORTE SUR LE CLOUD. La révocation remonte
+            #    dans le BATTEMENT (plus dans le hello depuis pi-0.9.27) : entre deux
+            #    battements, ben-api répond encore l'ancien rôle. Faire confiance à
+            #    sa réponse laisserait revenir quelqu'un qu'on vient de couper —
+            #    sans invitation, et en silence.
             #
             # ⭐ Une réinvitation reste possible : l'invitation lève le drapeau
             #    (`grant`). Ce qui devient impossible, c'est le retour FURTIF.
-            if access.est_revoquee(conn, uid) and not invitation:
+            # 🚨 `role_invit` ET NON `invitation` — c'était un CONTOURNEMENT DE
+            #    RÉVOCATION, reproduit le 05/10 :
+            #
+            #      sans invitation      → 403 revoked
+            #      invitation BIDON "x" → 200 {"role": "member"}, et revoked_ts=NULL
+            #
+            #    La garde testait la CHAÎNE BRUTE envoyée par l'app. N'importe quel
+            #    caractère la sautait ; `role_invit` restait vide, donc le code
+            #    partait dans la branche « sans invitation » et `grant` levait le
+            #    drapeau. ⚠️ Et le contournement devenait PERMANENT : la ligne repart
+            #    avec `sent=0`, donc le battement suivant la réinscrit dans le cloud.
+            #
+            # ⭐ Seule une invitation RÉELLEMENT VALABLE lève une révocation. C'est
+            #    tout le sens de « le drapeau local l'emporte » : une réinvitation
+            #    est un geste de l'owner, pas une chaîne de caractères.
+            if access.est_revoquee(conn, uid) and not role_invit:
                 print(f"[claim] {uid} est révoqué ici — refusé malgré le cloud")
                 return self._send({"error": "revoked"}, 403)
 
@@ -760,7 +878,18 @@ class Handler(BaseHTTPRequestHandler):
             #    « une invitation VALABLE a-t-elle été présentée ». Si oui, elle
             #    fait autorité sur le rôle local et doit être consommée ; sinon on
             #    frappe avec le rôle du cloud.
-            if not role_invit:
+            # ⭐ UN DROIT EXISTANT L'EMPORTE, et l'invitation n'est PAS consommée.
+            #    Claire déjà `member` qui réinstalle son app n'a besoin d'aucun code ;
+            #    et si on lui en présente un par mégarde, elle ne doit ni être
+            #    rétrogradée ni BRÛLER le bon de droit d'un tiers. Changer le rôle de
+            #    quelqu'un se fait par révocation puis réinvitation, jamais par effet
+            #    de bord.
+            #
+            # ⚠️ Ce commentaire existait, mais dans l'AUTRE branche — et le code ne
+            #    le tenait pas : une invitation valable était consommée même par
+            #    quelqu'un qui avait déjà un droit.
+            deja = access.role_personne(conn, uid)
+            if not role_invit or deja:
                 # ⚠️ Ligne 1 — UN DROIT EXISTANT L'EMPORTE, et l'invitation n'est
                 #    PAS consommée. Claire déjà `member` qui réinstalle son app n'a
                 #    besoin d'aucun QR ; et si on lui en présente un par mégarde,
@@ -772,10 +901,14 @@ class Handler(BaseHTTPRequestHandler):
                 #    inattendue (champ renommé, réponse tronquée) coûterait une
                 #    revendication en 409 au lieu d'un accès. `member` est le
                 #    repli sûr : il ne donne aucun droit d'administration.
-                if role_cloud not in access.PERSON_ROLES:
-                    print(f"[claim] rôle cloud inattendu {role_cloud!r} "
-                          f"→ member")
-                    role_cloud = access.ROLE_MEMBER
+                # ⭐ LE RÔLE LOCAL FAIT FOI QUAND IL EXISTE. C'est lui qui garde
+                #    les routes de ce boîtier ; le cloud peut diverger (cf. F1), et
+                #    dans ce cas c'est ici qu'on tranche. Sans ligne locale, on prend
+                #    celui du cloud — il vient d'écrire `device_access`.
+                role_a_frapper = deja or role_cloud
+                if role_a_frapper not in access.PERSON_ROLES:
+                    print(f"[claim] rôle inattendu {role_a_frapper!r} → member")
+                    role_a_frapper = access.ROLE_MEMBER
                 # 🚨 F1, SECONDE MOITIÉ — UNE DIVERGENCE NE DOIT PAS BLOQUER À VIE.
                 #
                 #    `grant` refuse un second owner en levant. Si le cloud dit
@@ -789,7 +922,8 @@ class Handler(BaseHTTPRequestHandler):
                 #    cloud et le boîtier sur QUI est propriétaire est un fait à
                 #    diagnostiquer, pas à absorber en silence.
                 try:
-                    jeton = access.mint(conn, uid=uid, label=label, role=role_cloud)
+                    jeton = access.mint(conn, uid=uid, label=label,
+                                        role=role_a_frapper)
                 except ValueError as e:
                     print(f"[claim] DIVERGENCE owner cloud/boîtier pour {uid} "
                           f"({e}) — frappé en member")
@@ -806,10 +940,20 @@ class Handler(BaseHTTPRequestHandler):
                     #    Le cloud, lui, a déjà écrit la ligne — le battement
                     #    réconciliera. On ne laisse pas la personne sans jeton pour
                     #    autant : le rôle du cloud fait foi.
+                    # ⚠️ Le commentaire disait « le rôle du cloud fait foi » et le
+                    #    code frappait `member` — deux choses différentes. C'est le
+                    #    rôle du cloud, et avec le même repli que plus haut : une
+                    #    divergence d'owner ne doit pas bloquer.
                     print(f"[claim] invitation évanouie pendant l'aller-retour "
                           f"({uid}) — frappé avec le rôle du cloud")
-                    jeton = access.mint(conn, uid=uid, label=label,
-                                        role=access.ROLE_MEMBER)
+                    role_secours = (role_cloud if role_cloud in access.PERSON_ROLES
+                                    else access.ROLE_MEMBER)
+                    try:
+                        jeton = access.mint(conn, uid=uid, label=label,
+                                            role=role_secours)
+                    except ValueError:
+                        jeton = access.mint(conn, uid=uid, label=label,
+                                            role=access.ROLE_MEMBER)
 
             # 🚨 Élaguer APRÈS la frappe : une réinstallation emporte le coffre
             #    du téléphone et le force à se revendiquer, laissant derrière
@@ -823,7 +967,7 @@ class Handler(BaseHTTPRequestHandler):
                 #    combler un vide — sinon elle écraserait la correction du
                 #    propriétaire au tour suivant.
                 access.nommer(conn, uid, nom,
-                              seulement_si_vide=not invitation)
+                              seulement_si_vide=not role_invit)
 
             elagues = access.elaguer_doublons(conn, uid, label, garder=jeton)
             if elagues:

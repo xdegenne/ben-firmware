@@ -66,8 +66,13 @@ def _post(base, corps: dict, entetes: dict | None = None) -> tuple[int, dict]:
             return e.code, {}
 
 
-def _base_neuve():
+def _base_neuve(avec_owner: bool = True):
     """Un magasin d'accès vierge, dans un répertoire temporaire.
+
+    ⭐ `avec_owner=True` PAR DÉFAUT, et c'est l'état réaliste : un boîtier en service
+    a un propriétaire. Sans lui, le verrou du premier propriétaire refuse tout
+    `/claim` sans rôle — ce qui est son travail, mais masquerait ce que les autres
+    cas veulent éprouver.
 
     🚨 ON PRÉ-REMPLIT LE SINGLETON, on ne réassigne pas `ACCESS_PATH`. `session()`
     déclare `path: str = ACCESS_PATH` : ce défaut est lié À LA DÉFINITION, donc
@@ -86,6 +91,9 @@ def _base_neuve():
     #    défaut qui n'existait pas. Un banc qui échoue pour la mauvaise raison coûte
     #    autant qu'un banc qui passe pour la mauvaise raison.
     local_api._claim_dernier = 0.0
+    if avec_owner:
+        with access.session() as conn:
+            access.mint(conn, uid="firebase:bob", label="pixel", role=access.ROLE_OWNER)
     return chemin
 
 
@@ -200,7 +208,6 @@ def le_ticket_recu_est_transporte_tel_quel():
 def un_owner_cloud_divergent_ne_bloque_plus_la_revendication():
     _base_neuve()
     with access.session() as conn:
-        access.mint(conn, uid="firebase:bob", label="pixel", role=access.ROLE_OWNER)
         assert access.has_owner(conn), "le banc n'a pas posé d'owner — témoin MORT"
 
     local_api._demander_au_cloud = lambda *a, **k: ("firebase:claire", access.ROLE_OWNER)
@@ -269,6 +276,181 @@ def le_frein_refuse_un_second_claim_immediat():
     assert premier == 200, f"le premier /claim a échoué ({premier})"
     assert second == 429, f"le second a rendu {second}, attendu 429 — le frein ne freine plus"
     assert corps.get("error") in ("too_many", "busy"), f"erreur {corps!r}"
+
+
+# ── ⑦ 🚨 LA FAILLE : une invitation BIDON annulait une révocation ────────────
+#
+# Reproduite le 05/10. La garde testait la CHAÎNE BRUTE envoyée par l'app :
+#
+#     sans invitation      → 403 revoked
+#     invitation BIDON "x" → 200 {"role": "member"}, et revoked_ts remis à NULL
+#
+# ⚠️ N'importe quel caractère sautait la garde. `role_invit` restait vide, donc le
+#    code partait dans la branche « sans invitation » et `grant` levait le drapeau.
+#
+# 🚨 ET LE CONTOURNEMENT ÉTAIT PERMANENT : la ligne repart avec `sent=0`, donc le
+#    battement suivant la RÉINSCRIT dans le cloud. Une révocation effacée pour de bon
+#    par une chaîne de trois octets.
+@cas
+def une_invitation_bidon_n_annule_pas_une_revocation():
+    _base_neuve()
+    with access.session() as conn:
+        access.mint(conn, uid="firebase:claire", label="iPhone", role=access.ROLE_MEMBER)
+        access.revoke_person(conn, "firebase:claire")
+        assert access.est_revoquee(conn, "firebase:claire"), "témoin MORT : pas révoquée"
+
+    local_api._demander_au_cloud = lambda *a, **k: ("firebase:claire", access.ROLE_MEMBER)
+    srv, base = _serveur()
+    try:
+        code, corps = _post(base, {"ticket": "T", "invitation": "x", "label": "iPhone"})
+    finally:
+        srv.shutdown()
+    assert code == 403 and corps.get("error") == "revoked", (
+        f"statut {code} ({corps!r}) — une invitation BIDON a levé la révocation")
+    with access.session() as conn:
+        assert access.est_revoquee(conn, "firebase:claire"), (
+            "la révocation a été effacée — et elle repartirait au cloud au battement "
+            "suivant, donc définitivement")
+
+
+# ── ⑧ Mais une invitation VALABLE, elle, lève bien la révocation ─────────────
+#
+# ⭐ Le témoin symétrique, et il n'est pas décoratif : sans lui, on pourrait
+#    « corriger » la faille en refusant TOUTE réinvitation, ce qui casserait le seul
+#    chemin de retour prévu — une réinvitation est un geste DÉLIBÉRÉ de l'owner.
+@cas
+def une_invitation_valable_leve_la_revocation():
+    _base_neuve()
+    with access.session() as conn:
+        access.mint(conn, uid="firebase:claire", label="iPhone", role=access.ROLE_MEMBER)
+        access.revoke_person(conn, "firebase:claire")
+        code_invit = access.create_invitation(conn, role=access.ROLE_MEMBER)
+
+    local_api._demander_au_cloud = lambda *a, **k: ("firebase:claire", access.ROLE_MEMBER)
+    srv, base = _serveur()
+    try:
+        code, corps = _post(base, {"ticket": "T", "invitation": code_invit})
+    finally:
+        srv.shutdown()
+    assert code == 200, f"statut {code} ({corps!r}) — la réinvitation ne marche plus"
+    with access.session() as conn:
+        assert not access.est_revoquee(conn, "firebase:claire"), \
+            "l'invitation valable n'a pas levé le drapeau"
+
+
+# ── ⑨ 🚨 LE VERROU DU PREMIER PROPRIÉTAIRE ───────────────────────────────────
+#
+# « Fusionner ne livre rien » est vrai de cette PR, PAS du prochain tag tiré de
+# `main`. Un ticket SANS rôle sur un boîtier SANS owner fait un owner — depuis le
+# LAN, avec un compte Google et le `deviceId` que mDNS DIFFUSE. C'est le TOFU rejeté
+# le 19/09.
+#
+# ⚠️ Ni le ticket ni le cloud ne peuvent le fermer : l'attaquant frappe le ticket
+#    pour SON propre uid, et le cloud ne voit pas par quel canal il est arrivé. Seul
+#    le boîtier le sait.
+#
+# ⭐ Ce verrou ne bloque aucun chemin légitime : la remise du ticket en BLE (⑤) n'est
+#    pas livrée. Il rend `main` TAGGABLE en attendant, et c'est tout son objet.
+@cas
+def un_boitier_sans_owner_refuse_de_fonder_un_proprietaire():
+    _base_neuve(avec_owner=False)
+    relaye = []
+    local_api._demander_au_cloud = lambda *a, **k: relaye.append(a) or ("x", "owner")
+    srv, base = _serveur()
+    try:
+        code, corps = _post(base, {"ticket": "T", "label": "iPhone"})
+    finally:
+        srv.shutdown()
+    assert code == 403, f"statut {code} ({corps!r}) — le TOFU est ouvert"
+    assert corps.get("error") == "first_owner_locked", f"erreur {corps!r}"
+    # ⭐ Et le ticket de la personne n'est PAS brûlé : on refuse AVANT l'aller-retour.
+    assert not relaye, "le boîtier a relayé — le ticket a été consommé pour rien"
+
+
+# ── ⑩ Une invitation ne doit pas être brûlée par qui a déjà un droit ─────────
+@cas
+def un_droit_existant_ne_consomme_pas_l_invitation():
+    _base_neuve()
+    with access.session() as conn:
+        access.mint(conn, uid="firebase:claire", label="iPhone", role=access.ROLE_MEMBER)
+        code_invit = access.create_invitation(conn, role=access.ROLE_MEMBER)
+
+    local_api._demander_au_cloud = lambda *a, **k: ("firebase:claire", access.ROLE_MEMBER)
+    srv, base = _serveur()
+    try:
+        code, _ = _post(base, {"ticket": "T", "invitation": code_invit, "label": "iPad"})
+    finally:
+        srv.shutdown()
+    assert code == 200, f"statut {code}"
+    with access.session() as conn:
+        assert access.role_invitation(conn, code_invit) == access.ROLE_MEMBER, (
+            "l'invitation a été consommée par quelqu'un qui avait déjà un droit — "
+            "le bon de droit d'un tiers est perdu")
+
+
+# ── ⑪bis LA CLASSIFICATION DES RÉPONSES, testée pour elle-même ──────────────
+#
+# ⚠️ Le cas ⑪ ci-dessous lève `_BoitierRefuse` depuis un faux cloud : il n'exécute
+#    donc JAMAIS la classification. Confondre `device_revoked` et `no_access`
+#    laissait tous les bancs verts — mesuré. ⇒ On éprouve la fonction PURE.
+@cas
+def chaque_reponse_du_cloud_a_son_verdict():
+    import json as _json
+    v = local_api._verdict_cloud
+    cas_attendus = [
+        (200, {},                            None),
+        (403, {"error": "bad_ticket"},       local_api._TicketInvalide),
+        (403, {"error": "no_access"},        local_api._AucunDroitCloud),
+        (403, {"error": "device_mismatch"},  local_api._BoitierRefuse),
+        (403, {"error": "device_revoked"},   local_api._BoitierRefuse),
+        # ⓘ Motif inconnu : on ne devine pas, et surtout on ne dit pas à la personne
+        #    que ça vient d'elle.
+        (403, {"error": "quelque_chose"},    local_api._BoitierRefuse),
+        (403, {},                            local_api._BoitierRefuse),
+        # ⚠️ 400 n'est PAS réessayable : typiquement un cloud plus ancien que le
+        #    boîtier, qui ne connaît pas le ticket.
+        (400, {"error": "bad_body"},         local_api._ContratRompu),
+        (500, {},                            local_api._CloudInjoignable),
+        (503, {},                            local_api._CloudInjoignable),
+    ]
+    for statut, corps, attendu in cas_attendus:
+        got = v(statut, _json.dumps(corps).encode())
+        if attendu is None:
+            assert got is None, f"{statut} {corps} → {got!r}, attendu aucun verdict"
+        else:
+            assert isinstance(got, attendu), (
+                f"{statut} {corps} → {type(got).__name__}, attendu {attendu.__name__}")
+    # ⚖️ Et un corps illisible ne doit pas faire exploser la classification.
+    assert isinstance(v(403, b"pas du json"), local_api._BoitierRefuse)
+    # 🚨 LE SEUL 403 QUI DOIT DIRE « c'est vous » est `no_access`. Ce banc-ci est le
+    #    seul qui le garantisse : les motifs du boîtier et les inconnus partagent
+    #    désormais UNE branche, donc c'est l'inverse qu'il faut défendre — qu'aucun
+    #    autre motif ne devienne un `no_access`.
+    for motif in ("device_mismatch", "device_revoked", "inconnu", ""):
+        got = v(403, _json.dumps({"error": motif}).encode())
+        assert not isinstance(got, local_api._AucunDroitCloud), (
+            f"403 {motif!r} classé « aucun droit » — la personne irait réclamer une "
+            f"invitation pour un problème qui ne la concerne pas")
+
+
+# ── ⑪ Un refus du BOÎTIER ne se dit pas comme un refus de la PERSONNE ────────
+@cas
+def un_boitier_refuse_par_le_cloud_ne_dit_pas_aucun_droit():
+    _base_neuve()
+
+    def cloud_refuse_le_boitier(*a, **k):
+        raise local_api._BoitierRefuse("device_revoked")
+
+    local_api._demander_au_cloud = cloud_refuse_le_boitier
+    srv, base = _serveur()
+    try:
+        code, corps = _post(base, {"ticket": "T"})
+    finally:
+        srv.shutdown()
+    assert code == 403, f"statut {code}"
+    assert corps.get("error") == "device_rejected", (
+        f"erreur {corps!r} — « aucun droit » enverrait la personne réclamer une "
+        f"invitation pour un problème de certificat du boîtier")
 
 
 if __name__ == "__main__":

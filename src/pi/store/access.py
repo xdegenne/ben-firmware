@@ -472,6 +472,21 @@ def grant(conn: sqlite3.Connection, uid: str, role: str) -> None:
     conn.commit()
 
 
+def role_personne(conn: sqlite3.Connection, uid: str) -> str:
+    """Le rôle d'une personne dans `access`, `""` si elle n'y est pas.
+
+    ⭐ Existe pour une raison précise : savoir, AVANT de consommer une invitation,
+    si la personne a déjà un droit ici. Un membre qui réinstalle son app et à qui on
+    présente un code par mégarde ne doit pas brûler le bon de droit d'un tiers.
+
+    ⚠️ Ne dit RIEN de la révocation — une personne révoquée garde sa ligne et son
+    rôle, c'est `revoked_ts` qui la coupe. Demander les deux séparément est
+    volontaire : les confondre a déjà produit un contournement.
+    """
+    r = conn.execute("SELECT role FROM access WHERE uid = ?", (uid,)).fetchone()
+    return r["role"] if r else ""
+
+
 def est_revoquee(conn: sqlite3.Connection, uid: str) -> bool:
     """Cette personne a-t-elle été coupée ICI ?
 
