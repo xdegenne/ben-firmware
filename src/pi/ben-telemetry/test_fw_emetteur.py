@@ -297,8 +297,14 @@ def la_colonne_s_ajoute_a_une_base_ANCIENNE_sans_rien_perdre():
     ⓘ `CREATE TABLE IF NOT EXISTS` n'ajoute RIEN à une table existante — d'où l'`ALTER`
       conditionnel. Un banc est nécessaire parce que l'oubli ne se verrait qu'au premier
       boîtier du parc : sur une base neuve, le schéma porte déjà la colonne."""
+    # ⚠️ ON EFFACE DERRIÈRE SOI, et ce n'est pas de la coquetterie : l'`update.sh` exécute ce
+    #    banc sur CHAQUE boîtier, et une update qui échoue est REJOUÉE toutes les 10 minutes
+    #    (`device.json` non bumpé). Sans ce nettoyage, un boîtier en boucle accumulerait des
+    #    bases orphelines dans /var/tmp. Constaté en lançant le banc sur ben-0001 le 04/10.
+    import os
     import tempfile
-    chemin = tempfile.mktemp(suffix=".db")
+    fd, chemin = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
     vieille = sqlite3.connect(chemin)
     vieille.executescript("""
         CREATE TABLE emitter (lora_addr INTEGER PRIMARY KEY, adco TEXT NOT NULL DEFAULT '',
@@ -318,6 +324,12 @@ def la_colonne_s_ajoute_a_une_base_ANCIENNE_sans_rien_perdre():
     assert ligne == ("031864467282", 0, 1790786260, None), ligne
     # ⚖️ Et la migration est IDEMPOTENTE : un second `connect()` ne doit pas lever.
     db.connect(chemin).close()
+    conn.close()
+    for suffixe in ("", "-wal", "-shm"):
+        try:
+            os.unlink(chemin + suffixe)
+        except OSError:
+            pass
 
 
 def main() -> int:
