@@ -154,18 +154,50 @@ def sans_ticket_rien_ne_part_vers_le_cloud():
 @cas
 def la_charge_envoyee_au_cloud_ne_porte_QUE_le_ticket():
     charge = local_api._charge_claim("TICKET-ABC")
-    assert charge == {"ticket": "TICKET-ABC"}, (
-        f"charge {charge!r} — hors invitation, le boîtier n'envoie QUE le ticket")
+    assert charge == {"ticket": "TICKET-ABC", "fonder": False}, (
+        f"charge {charge!r} — hors invitation : le ticket, et `fonder` TOUJOURS "
+        f"présent (cf. le banc dédié)")
     # 🔒 Aucune clé qui puisse porter une identité, sous aucun nom.
     for interdit in ("firebase_token", "id_token", "token", "jwt", "authorization"):
         assert interdit not in charge, (
             f"la charge porte {interdit!r} : le boîtier transporterait une identité")
 
 
+# ── ③ter 🚨 `fonder` EST TOUJOURS SÉRIALISÉ, MÊME À FALSE ────────────────────
+#
+# Et ce n'est pas du style : c'est ce qui rend l'ordre de livraison sûr DANS LES DEUX
+# SENS. `ben-api` refuse les champs inconnus — mais cette garde ne se déclenche QUE SI
+# LE CHAMP EST PRÉSENT.
+#
+# ⚠️ L'omettre quand il vaut `False`, comme on le fait pour `role`, laisserait un
+#    firmware récent passer SANS BRUIT devant un cloud ancien : celui-ci accepterait
+#    la charge, fonderait un premier propriétaire sans ordre, et le TOFU resterait
+#    ouvert. C'est précisément le cas dangereux — l'intrus sur le LAN avec un compte
+#    Google et un `deviceId` que mDNS diffuse.
+#
+# ⭐ Toujours présent, le champ fait échouer le cloud ancien en 400, donc
+#    `contract_mismatch` (502) non réessayable : une incompatibilité VISIBLE au lieu
+#    d'un trou de sécurité muet.
+@cas
+def fonder_est_toujours_present_dans_la_charge():
+    for role_invit in ("", access.ROLE_MEMBER):
+        for fonder in (False, True):
+            charge = local_api._charge_claim("T", role_invit, fonder)
+            assert "fonder" in charge, (
+                f"`fonder` ABSENT (role_invit={role_invit!r}, fonder={fonder}) — un "
+                f"cloud ancien accepterait la charge en silence, et le TOFU resterait "
+                f"ouvert")
+            assert charge["fonder"] is fonder, f"fonder={charge['fonder']!r}"
+    # ⓘ L'asymétrie avec `role` est VOULUE : son absence ne crée aucun droit, sa
+    #    présence est ce qui demande quelque chose.
+    assert "role" not in local_api._charge_claim("T", "", False)
+
+
 @cas
 def le_role_part_SEULEMENT_sur_le_chemin_de_l_invitation():
     assert local_api._charge_claim("T", access.ROLE_MEMBER) == {
-        "ticket": "T", "role": access.ROLE_MEMBER}, "le rôle de l'invitation n'est pas transmis"
+        "ticket": "T", "fonder": False, "role": access.ROLE_MEMBER}, \
+        "le rôle de l'invitation n'est pas transmis"
     assert "role" not in local_api._charge_claim("T", ""), (
         "un rôle part hors invitation — le boîtier déclarerait un droit que "
         "personne ne lui a donné")
@@ -386,6 +418,40 @@ def un_droit_existant_ne_consomme_pas_l_invitation():
         assert access.role_invitation(conn, code_invit) == access.ROLE_MEMBER, (
             "l'invitation a été consommée par quelqu'un qui avait déjà un droit — "
             "le bon de droit d'un tiers est perdu")
+
+
+# ── ⑫ 🚨 UNE RÉINVITATION DOIT CONSOMMER L'INVITATION ───────────────────────
+#
+# ⚠️ Régression reproduite le 05/10. `role_personne` rend le rôle de la LIGNE, et une
+#    révocation ne supprime pas la ligne. Une personne révoquée comptait donc comme
+#    « droit existant » :
+#
+#      claim avec invitation valable    : 200 {'role': 'member'}
+#      invitation encore valable après ? 'member'      ← réutilisable par un TIERS
+#
+# 🚨 Et la règle « on ne change un rôle que par révocation puis réinvitation » ne
+#    tenait plus : la réinvitation rendait l'ancien rôle sans consommer le code.
+@cas
+def une_reinvitation_consomme_l_invitation_et_applique_son_role():
+    _base_neuve()
+    with access.session() as conn:
+        access.mint(conn, uid="firebase:claire", label="iPhone", role=access.ROLE_MEMBER)
+        access.revoke_person(conn, "firebase:claire")
+        code_invit = access.create_invitation(conn, role=access.ROLE_MEMBER)
+
+    local_api._demander_au_cloud = lambda *a, **k: ("firebase:claire", access.ROLE_MEMBER)
+    srv, base = _serveur()
+    try:
+        code, corps = _post(base, {"ticket": "T", "invitation": code_invit})
+    finally:
+        srv.shutdown()
+    assert code == 200, f"statut {code} ({corps!r})"
+    with access.session() as conn:
+        assert access.role_invitation(conn, code_invit) == "", (
+            "l'invitation est encore valable après une réinvitation — un TIERS peut "
+            "s'en servir jusqu'à son expiration")
+        assert not access.est_revoquee(conn, "firebase:claire"), \
+            "la réinvitation n'a pas levé le drapeau"
 
 
 # ── ⑪bis LA CLASSIFICATION DES RÉPONSES, testée pour elle-même ──────────────

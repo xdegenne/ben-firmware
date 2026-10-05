@@ -294,7 +294,8 @@ def _verdict_cloud(statut: int, brut: bytes) -> Exception | None:
     return _CloudInjoignable(f"ben-api a répondu {statut}")
 
 
-def _charge_claim(ticket: str, role_invitation: str = "") -> dict:
+def _charge_claim(ticket: str, role_invitation: str = "",
+                 fonder: bool = False) -> dict:
     """Ce que le boîtier ENVOIE au cloud sur `/claim`. Pure, pour être éprouvée.
 
     🚨 ELLE EST SORTIE DE `_demander_au_cloud` POUR UNE RAISON PRÉCISE. Un banc qui
@@ -307,14 +308,33 @@ def _charge_claim(ticket: str, role_invitation: str = "") -> dict:
 
     🔒 ET JAMAIS DE CLÉ D'IDENTITÉ. Le boîtier ne doit pas voir l'`ID token`
     Firebase, encore moins le transporter.
+
+    🚨 `fonder` EST TOUJOURS SÉRIALISÉ, MÊME À `False`, et ce n'est pas du style.
+    C'est ce qui rend l'ordre de livraison SÛR dans les deux sens.
+
+    `ben-api` refuse les champs inconnus (`DisallowUnknownFields`) — mais cette garde
+    ne se déclenche QUE SI LE CHAMP EST PRÉSENT. L'omettre quand il vaut `False`,
+    comme on le fait pour `role`, laisserait un firmware récent passer SANS BRUIT
+    devant un cloud ancien : celui-ci accepterait la charge, fonderait un premier
+    propriétaire sans ordre, et le TOFU resterait ouvert. ⚠️ C'est précisément le cas
+    dangereux — l'intrus sur le LAN avec un compte Google et un `deviceId` que mDNS
+    diffuse.
+
+    ⭐ Toujours présent, le champ fait échouer le cloud ancien en 400 → le boîtier
+    rend `contract_mismatch` (502), non réessayable. Une incompatibilité VISIBLE au
+    lieu d'un trou de sécurité muet.
+
+    ⓘ `role`, lui, reste omis quand il est vide : son absence ne crée aucun droit, et
+    sa présence est ce qui demande quelque chose. L'asymétrie est voulue.
     """
-    charge = {"ticket": ticket}
+    charge = {"ticket": ticket, "fonder": bool(fonder)}
     if role_invitation:
         charge["role"] = role_invitation
     return charge
 
 
-def _demander_au_cloud(ticket: str, role_invitation: str = "") -> tuple[str, str]:
+def _demander_au_cloud(ticket: str, role_invitation: str = "",
+                       fonder: bool = False) -> tuple[str, str]:
     """Présente un TICKET à ben-api en mTLS, et rend `(uid, rôle)`.
 
     🚨 LE BOÎTIER NE VOIT JAMAIS LE JETON D'IDENTITÉ — révisé le 04/10. Il relayait
@@ -356,7 +376,7 @@ def _demander_au_cloud(ticket: str, role_invitation: str = "") -> tuple[str, str
         raise _CloudInjoignable(f"mTLS impossible : {e}") from e
 
     try:
-        corps = json.dumps(_charge_claim(ticket, role_invitation)).encode()
+        corps = json.dumps(_charge_claim(ticket, role_invitation, fonder)).encode()
         conn.request("POST", f"/api/devices/{device_id}/claim", body=corps,
                      headers={"Content-Type": "application/json"})
         r = conn.getresponse()
@@ -794,8 +814,29 @@ class Handler(BaseHTTPRequestHandler):
             #    premier propriétaire de toute façon. Il rend simplement `main`
             #    TAGGABLE en attendant — et c'est tout son objet.
             #
-            # ⇒ À ⑤, il devient « seulement pendant la fenêtre de déballage »
-            #    plutôt que « jamais ».
+            # 🚨 ET IL DOIT DISPARAÎTRE, À UNE CONDITION PRÉCISE : que `ben-api#26`
+            #    soit DÉPLOYÉE. Car ce verrou local BRIQUE LE PARC — reproduit le
+            #    05/10 :
+            #
+            #      boîtier du parc : owner dans le CLOUD, access.db local VIDE
+            #      claim de l'owner légitime → 403 first_owner_locked, 0 appel cloud
+            #
+            #    Les 7 owners du parc n'existent QUE dans le cloud, semés à la main,
+            #    et le seul chemin qui crée un owner LOCAL est ce `/claim`. Aucune
+            #    issue : une invitation exige un jeton owner sur :8088 que personne
+            #    ne peut obtenir, et la fenêtre de déballage ne s'ouvre pas sur un
+            #    boîtier déjà déballé.
+            #
+            # ⭐ La vraie garde est donc CÔTÉ CLOUD : il refuse la CRÉATION d'un
+            #    premier owner sans `fonder`, et laisse passer une ligne EXISTANTE —
+            #    ce qui débloque le parc. Le boîtier ordonne, le cloud exécute.
+            #
+            # ⚠️ Si on retirait ce verrou AVANT le déploiement de #26, le TOFU
+            #    resterait ouvert dans l'intervalle. Il coûte zéro aujourd'hui
+            #    (personne ne frappe de ticket), donc on garde la ceinture.
+            #
+            # ⇒ À RETIRER dès que #26 est en service. À ⑤, `fonder` passera à `true`
+            #    pendant la fenêtre de déballage, et plus rien ne sera nécessaire ici.
             if not role_invit and not access.has_owner(conn):
                 print("[claim] REFUS : fonder un premier propriétaire demande la "
                       "remise du ticket en BLE, pas encore livrée (#35 ⑤)")
@@ -888,7 +929,23 @@ class Handler(BaseHTTPRequestHandler):
             # ⚠️ Ce commentaire existait, mais dans l'AUTRE branche — et le code ne
             #    le tenait pas : une invitation valable était consommée même par
             #    quelqu'un qui avait déjà un droit.
-            deja = access.role_personne(conn, uid)
+            # 🚨 UNE PERSONNE RÉVOQUÉE N'A PAS DE « DROIT EXISTANT ».
+            #
+            #    `role_personne` rend le rôle de la LIGNE, et une révocation ne
+            #    supprime pas la ligne — c'est `revoked_ts` qui coupe. Sa docstring
+            #    prévient exactement contre ça, et je l'ai quand même appelée sans la
+            #    garde. Reproduit le 05/10 :
+            #
+            #      Claire révoquée présente une invitation VALABLE
+            #        → `deja` vaut member, donc branche « droit existant »
+            #        → elle revient avec son ANCIEN rôle, pas celui de l'invitation
+            #        → et L'INVITATION N'EST PAS CONSOMMÉE
+            #
+            # ⚠️ Le code restait donc utilisable par un TIERS jusqu'à son expiration,
+            #    et la règle « on ne change un rôle que par révocation puis
+            #    réinvitation » ne tenait plus — la réinvitation ne changeait rien.
+            deja = ("" if access.est_revoquee(conn, uid)
+                    else access.role_personne(conn, uid))
             if not role_invit or deja:
                 # ⚠️ Ligne 1 — UN DROIT EXISTANT L'EMPORTE, et l'invitation n'est
                 #    PAS consommée. Claire déjà `member` qui réinstalle son app n'a
