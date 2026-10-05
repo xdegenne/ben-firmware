@@ -635,6 +635,46 @@ def un_ticket_absent_ne_dit_rien():
         f"qu'aucun déballage ne soit en cours ; le signaler noierait le vrai défaut")
 
 
+# ── ⑮ Le DÉSAPPAIRAGE emporte aussi le ticket en attente ────────────────────
+#
+# 🚨 Le scénario qui mord : désappairage alors qu'un ticket traîne sur le disque,
+#    puis rallumage et configuration WiFi par une ANCIENNE app — qui n'écrit rien
+#    sur …009, donc n'écrase pas le fichier. Le publisher le lit au démarrage et
+#    le présente avec `fonder: true` : le propriétaire PRÉCÉDENT est fondé sur le
+#    boîtier du SUIVANT. Et une ligne `owner` fausse ne se corrige pas depuis
+#    l'app — c'est exactement ce que `tout_effacer` existe pour éviter.
+@cas
+def le_desappairage_efface_le_ticket_en_attente():
+    import claim_ticket as ct
+    ancien = _chemin_jetable(ct)
+    try:
+        ct.poser("T-du-proprietaire-precedent")
+        assert ct.lire(), "le banc n'a pas réussi à poser un ticket"
+        ct.effacer()
+        assert ct.lire() == "", "effacer() ne retire pas le fichier"
+    finally:
+        ct.effacer()
+        ct.CHEMIN = ancien
+
+    # 🚨 ET SURTOUT : que le DÉSAPPAIRAGE l'appelle. Vérifier `effacer()` seul ne
+    #    prouverait rien — il était déjà couvert, et retirer l'appel de
+    #    `_unprovision` passerait inaperçu.
+    #
+    # ⭐ Commentaires RETIRÉS avant d'inspecter : la prose qui explique la règle
+    #    cite `claim_ticket.effacer()`, donc elle suffirait à satisfaire une
+    #    recherche naïve. C'est le défaut qui a rendu trois bancs verts à tort.
+    src = pathlib.Path(__file__).with_name("local_api.py").read_text()
+    code = "\n".join(l for l in src.split("\n") if not l.lstrip().startswith("#"))
+    debut = code.index("def _unprovision")
+    corps = code[debut:debut + 4000]
+    assert "claim_ticket.effacer()" in corps, (
+        "le désappairage n'efface PAS le ticket en attente — une ancienne app "
+        "qui reconfigure le WiFi ne l'écrasera pas, et le publisher fonderait "
+        "le propriétaire PRÉCÉDENT sur le boîtier du suivant")
+    assert "tout_effacer" in corps, (
+        "le désappairage n'efface plus les droits — garde-fou du cas ⑮")
+
+
 if __name__ == "__main__":
     print("── contrat de /claim : le ticket ──")
     print(f"\n{len(_ECHECS)} échec(s)" if _ECHECS else "\ntout vert")

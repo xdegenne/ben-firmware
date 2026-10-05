@@ -1143,6 +1143,25 @@ class Handler(BaseHTTPRequestHandler):
                 print(f"[unprovision] ⚠️ droits NON effacés ({e}) — "
                       f"le prochain propriétaire sera refusé", flush=True)
 
+            # 🚨 LE TICKET EN ATTENTE PART AUSSI, et pour la même raison que les
+            #    droits : il PORTE une identité, et il est armé de `fonder:true`.
+            #
+            #    Le scénario qui mord : désappairage alors qu'un ticket traîne sur
+            #    le disque, puis rallumage et configuration WiFi par une ANCIENNE
+            #    app — qui n'écrit rien sur …009, donc n'écrase pas le fichier. Au
+            #    démarrage, le publisher le lit et le présente : le propriétaire
+            #    PRÉCÉDENT est fondé sur le boîtier du SUIVANT.
+            #
+            # ⭐ La fenêtre est celle du ticket (900 s), donc étroite — mais elle
+            #    est franchement atteignable en test, ou sur un désappairage suivi
+            #    d'un redéballage immédiat. Et une ligne `owner` fausse ne se
+            #    corrige pas depuis l'app : c'est précisément ce que `tout_effacer`
+            #    existe pour éviter.
+            try:
+                claim_ticket.effacer()
+            except Exception as e:  # noqa: BLE001
+                print(f"[unprovision] ⚠️ ticket NON effacé ({e})", flush=True)
+
             if wipe:
                 for suffix in ("", "-wal", "-shm"):
                     try:
