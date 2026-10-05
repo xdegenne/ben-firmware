@@ -795,55 +795,28 @@ class Handler(BaseHTTPRequestHandler):
         with access.session() as conn:
             if invitation:
                 role_invit = access.role_invitation(conn, invitation)
-            # 🚨 VERROU DU PREMIER PROPRIÉTAIRE — « fusionner ne livre rien » est
-            #    vrai de cette PR, PAS du prochain tag tiré de `main`.
+            # ⓘ IL Y AVAIT ICI UN VERROU LOCAL, retiré le 2026-10-05 : refuser tout
+            #    `/claim` sans invitation quand `access.db` n'a pas d'owner. Il visait
+            #    le TOFU — un ticket sans rôle sur un boîtier sans owner faisait un
+            #    owner, depuis le LAN, avec un compte Google et le `deviceId` que mDNS
+            #    diffuse.
             #
-            #    Un ticket SANS rôle sur un boîtier SANS owner fait un owner. Tant
-            #    que la garde ⑤ n'est pas là, ça se fait depuis le LAN avec un
-            #    compte Google et le `deviceId` — que mDNS DIFFUSE sur le réseau
-            #    local. C'est exactement le TOFU rejeté le 19/09.
+            # 🚨 IL BRIQUAIT TOUT, et pas seulement le parc. Mesuré deux fois :
             #
-            # ⚠️ Et ni le ticket ni le cloud ne peuvent le fermer : le ticket vaut
-            #    pour l'uid de celui qui l'a frappé, donc l'attaquant frappe le
-            #    SIEN ; et le cloud ne voit pas par quel canal le ticket est arrivé.
-            #    Seul le boîtier le sait. ⇒ `ben-docs/specs/003`, § rectifié le
-            #    04/10.
+            #      · les 7 boîtiers du parc, dont l'owner n'existe QUE dans le cloud ;
+            #      · et L'ÉTAPE 7 DU DÉBALLAGE LUI-MÊME — après la fondation en BLE,
+            #        `access.db` est encore VIDE, puisque sa première ligne naît au
+            #        `mint` de ce `/claim`-ci. Le propriétaire tout juste fondé se
+            #        voyait refuser son propre jeton.
             #
-            # ⭐ Ce verrou ne bloque AUCUN chemin légitime aujourd'hui : la remise du
-            #    ticket en BLE (⑤) n'est pas livrée, donc personne ne peut fonder un
-            #    premier propriétaire de toute façon. Il rend simplement `main`
-            #    TAGGABLE en attendant — et c'est tout son objet.
+            # ⭐ La vraie garde est CÔTÉ CLOUD (ben-api#26, déployée le 05/10) : il
+            #    refuse la CRÉATION d'un premier owner sans `fonder`, et laisse passer
+            #    une ligne EXISTANTE. Le boîtier ordonne, le cloud exécute — et c'est
+            #    le seul partage possible, puisque le boîtier ne sait pas si le cloud
+            #    a déjà un owner, mais que lui seul sait par quel CANAL le ticket est
+            #    arrivé.
             #
-            # 🚨 ET IL DOIT DISPARAÎTRE, À UNE CONDITION PRÉCISE : que `ben-api#26`
-            #    soit DÉPLOYÉE. Car ce verrou local BRIQUE LE PARC — reproduit le
-            #    05/10 :
-            #
-            #      boîtier du parc : owner dans le CLOUD, access.db local VIDE
-            #      claim de l'owner légitime → 403 first_owner_locked, 0 appel cloud
-            #
-            #    Les 7 owners du parc n'existent QUE dans le cloud, semés à la main,
-            #    et le seul chemin qui crée un owner LOCAL est ce `/claim`. Aucune
-            #    issue : une invitation exige un jeton owner sur :8088 que personne
-            #    ne peut obtenir, et la fenêtre de déballage ne s'ouvre pas sur un
-            #    boîtier déjà déballé.
-            #
-            # ⭐ La vraie garde est donc CÔTÉ CLOUD : il refuse la CRÉATION d'un
-            #    premier owner sans `fonder`, et laisse passer une ligne EXISTANTE —
-            #    ce qui débloque le parc. Le boîtier ordonne, le cloud exécute.
-            #
-            # ⚠️ Si on retirait ce verrou AVANT le déploiement de #26, le TOFU
-            #    resterait ouvert dans l'intervalle. Il coûte zéro aujourd'hui
-            #    (personne ne frappe de ticket), donc on garde la ceinture.
-            #
-            # ⇒ À RETIRER dès que #26 est en service. À ⑤, `fonder` passera à `true`
-            #    pendant la fenêtre de déballage, et plus rien ne sera nécessaire ici.
-            if not role_invit and not access.has_owner(conn):
-                print("[claim] REFUS : fonder un premier propriétaire demande la "
-                      "remise du ticket en BLE, pas encore livrée (#35 ⑤)")
-                return self._send(
-                    {"error": "first_owner_locked",
-                     "detail": "le premier propriétaire se fonde au déballage, en BLE"},
-                    403)
+            # ⇒ Ce que le boîtier porte désormais, c'est `fonder` — rien de plus.
 
         try:
             uid, role_cloud = _demander_au_cloud(ticket, role_invit)

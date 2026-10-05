@@ -370,33 +370,53 @@ def une_invitation_valable_leve_la_revocation():
             "l'invitation valable n'a pas levé le drapeau"
 
 
-# ── ⑨ 🚨 LE VERROU DU PREMIER PROPRIÉTAIRE ───────────────────────────────────
+# ── ⑨ 🚨 L'ÉTAPE 7 DU DÉBALLAGE — le propriétaire tout juste fondé obtient son jeton
 #
-# « Fusionner ne livre rien » est vrai de cette PR, PAS du prochain tag tiré de
-# `main`. Un ticket SANS rôle sur un boîtier SANS owner fait un owner — depuis le
-# LAN, avec un compte Google et le `deviceId` que mDNS DIFFUSE. C'est le TOFU rejeté
-# le 19/09.
+# C'est le cas que le verrou local CASSAIT, et il était invisible en lecture.
 #
-# ⚠️ Ni le ticket ni le cloud ne peuvent le fermer : l'attaquant frappe le ticket
-#    pour SON propre uid, et le cloud ne voit pas par quel canal il est arrivé. Seul
-#    le boîtier le sait.
+#   ① à ⑥  le ticket part en BLE, le boîtier le présente, le CLOUD écrit device_access
+#   ⑦      le téléphone n'a AUCUN jeton local : la session BLE est finie. Il refrappe
+#          un ticket et rejoue un `/claim` ordinaire sur le LAN.
 #
-# ⭐ Ce verrou ne bloque aucun chemin légitime : la remise du ticket en BLE (⑤) n'est
-#    pas livrée. Il rend `main` TAGGABLE en attendant, et c'est tout son objet.
+# ⚠️ À CET INSTANT, `access.db` EST ENCORE VIDE — sa première ligne naît au `mint` de ce
+#    `/claim`-ci. Un verrou « pas d'owner local ⇒ refus » refusait donc au propriétaire
+#    tout juste fondé son propre jeton. Mesuré : 403 `first_owner_locked`.
+#
+# ⭐ Et le boîtier NE RECONNAÎT PAS la personne : il n'a ni jeton d'identité, ni
+#    moyen de le vérifier. L'uid est frappé DANS LE TICKET par `ben-api`, contre l'ID
+#    token Firebase ; le boîtier relaie, et APPREND qui c'est dans la réponse.
 @cas
-def un_boitier_sans_owner_refuse_de_fonder_un_proprietaire():
-    _base_neuve(avec_owner=False)
-    relaye = []
-    local_api._demander_au_cloud = lambda *a, **k: relaye.append(a) or ("x", "owner")
+def l_etape_7_du_deballage_rend_son_jeton_au_proprietaire():
+    _base_neuve(avec_owner=False)          # ⭐ comme après une fondation en BLE
+    with access.session() as conn:
+        assert not access.has_owner(conn), "témoin MORT : le banc a posé un owner"
+
+    # Le cloud répond ce qu'il répondra : la ligne EXISTE déjà, il la rend.
+    vus = []
+
+    def cloud(ticket, role_invitation="", fonder=False):
+        vus.append((ticket, role_invitation, fonder))
+        return "firebase:xavier", access.ROLE_OWNER
+
+    local_api._demander_au_cloud = cloud
     srv, base = _serveur()
     try:
-        code, corps = _post(base, {"ticket": "T", "label": "iPhone"})
+        code, corps = _post(base, {"ticket": "T2", "label": "iPhone"})
     finally:
         srv.shutdown()
-    assert code == 403, f"statut {code} ({corps!r}) — le TOFU est ouvert"
-    assert corps.get("error") == "first_owner_locked", f"erreur {corps!r}"
-    # ⭐ Et le ticket de la personne n'est PAS brûlé : on refuse AVANT l'aller-retour.
-    assert not relaye, "le boîtier a relayé — le ticket a été consommé pour rien"
+
+    assert code == 200, (
+        f"statut {code} ({corps!r}) — le propriétaire tout juste fondé ne peut pas "
+        f"obtenir son jeton, l'étape 7 du déballage est cassée")
+    assert corps.get("role") == access.ROLE_OWNER, f"role {corps.get('role')!r}"
+    assert corps.get("token"), "aucun jeton rendu"
+    # 🚨 Et le boîtier n'a PAS ordonné de fonder : ce n'est plus la fenêtre de déballage.
+    assert vus and vus[0][2] is False, (
+        f"le boîtier a relayé fonder={vus[0][2]!r} hors fenêtre BLE — il ordonnerait "
+        f"une fondation qu'il n'est pas en position de prouver")
+    # ⭐ Et la ligne locale existe maintenant : les appels suivants n'en dépendent plus.
+    with access.session() as conn:
+        assert access.role_personne(conn, "firebase:xavier") == access.ROLE_OWNER
 
 
 # ── ⑩ Une invitation ne doit pas être brûlée par qui a déjà un droit ─────────
