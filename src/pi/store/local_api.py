@@ -1615,7 +1615,17 @@ def _ecoute_tls() -> ThreadingHTTPServer | None:
               f"désactivée, :{PORT} continue de servir")
         return None
 
-    serveur = _ServeurTLS((HOST, PORT_TLS), Handler)
+    # 🚨 LE `bind` EST DANS LE `try`, ET C'ÉTAIT LE DÉFAUT. Il était dehors : un
+    #    port déjà pris ou un droit manquant levait, `main()` mourait AVANT de
+    #    créer l'écoute en clair, et `Restart=always` + `RestartSec=10` mettait le
+    #    service en boucle de redémarrage. Résultat : plus d'API locale DU TOUT,
+    #    là où la docstring de cette fonction promet l'inverse en toutes lettres.
+    try:
+        serveur = _ServeurTLS((HOST, PORT_TLS), Handler)
+    except OSError as e:
+        print(f"[:{PORT_TLS}] écoute impossible ({e}) — écoute chiffrée "
+              f"désactivée, :{PORT} continue de servir", flush=True)
+        return None
     # ⭐ Le drapeau que lit /claim. Le handler est le MÊME sur les deux écoutes ;
     #    c'est le SERVEUR qui sait s'il est chiffré, pas la requête. Se fier à un
     #    en-tête (`X-Forwarded-Proto` et consorts) serait se fier à l'appelant.

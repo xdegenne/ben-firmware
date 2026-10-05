@@ -277,6 +277,70 @@ def un_jeton_de_membre_n_ouvre_aucune_route_d_owner():
         srv.shutdown()
 
 
+@cas
+def un_bind_rate_sur_8088_ne_tue_pas_8087():
+    """🚨 LE DÉFAUT : le `bind` était HORS du try/except.
+
+    `_ecoute_tls` attrape proprement un certificat absent ou inutilisable et rend
+    `None` — mais `_ServeurTLS((HOST, PORT_TLS), Handler)` était en dehors. Un
+    port déjà pris ou un droit manquant levait, `main()` mourait AVANT de créer
+    l'écoute en clair, et `Restart=always` + `RestartSec=10` mettait le service en
+    boucle de redémarrage. Plus d'API locale DU TOUT — là où la docstring de la
+    fonction promet : « AUCUNE raison de ne pas démarrer ici ne doit empêcher
+    :8087 de servir ».
+
+    ⭐ ASSERTION STRUCTURELLE. Un banc fonctionnel passerait pour la MAUVAISE
+    raison : sur une machine sans certificat, `_ecoute_tls` rend `None` dès sa
+    première garde, bien avant d'atteindre le `bind`. On exige donc que l'appel
+    à `_ServeurTLS` ait un `Try` parmi ses ancêtres — ce qu'aucun commentaire ne
+    peut simuler.
+    """
+    import ast
+    import pathlib as _pl
+
+    src = _pl.Path(__file__).with_name("local_api.py").read_text()
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "_ecoute_tls")
+
+    def contient_bind(noeud):
+        return any(isinstance(n, ast.Call)
+                   and getattr(n.func, "id", "") == "_ServeurTLS"
+                   for n in ast.walk(noeud))
+
+    assert contient_bind(fn), "plus d'appel à `_ServeurTLS` — banc à revoir"
+    protege = any(contient_bind(t) for n in ast.walk(fn)
+                  if isinstance(n, ast.Try) for t in n.body)
+    assert protege, (
+        "le `bind` de :8088 n'est pas protégé : un port pris ferait mourir "
+        "main() AVANT de créer l'écoute en clair, et le service boucle")
+
+
+@cas
+def l_echec_tls_rend_None_au_lieu_de_lever():
+    """⭐ LE CONTRE-TÉMOIN : protéger ne suffit pas, il faut RENDRE None.
+
+    Un `except` qui réémet, ou qui laisse tomber dans le code suivant, ramènerait
+    le même effet. Les deux sorties d'échec doivent rendre `None` — c'est ce que
+    `main()` teste pour continuer sans TLS.
+    """
+    import ast
+    import pathlib as _pl
+
+    src = _pl.Path(__file__).with_name("local_api.py").read_text()
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "_ecoute_tls")
+
+    for t in (n for n in ast.walk(fn) if isinstance(n, ast.Try)):
+        for h in t.handlers:
+            rend_none = any(
+                isinstance(x, ast.Return)
+                and isinstance(x.value, ast.Constant) and x.value.value is None
+                for x in ast.walk(ast.Module(body=h.body, type_ignores=[])))
+            assert rend_none, (
+                "un gestionnaire d'exception de `_ecoute_tls` ne rend pas None — "
+                "l'échec remonterait et emporterait :8087")
+
+
 if __name__ == "__main__":
     # Base d'accès jetable : `session()` mémorise la première connexion ouverte.
     access._shared = access.connect(

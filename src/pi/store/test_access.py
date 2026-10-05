@@ -547,6 +547,48 @@ def elaguer_sans_uid_ne_peut_pas_faucher_les_integrations():
     assert access.role_of(c, a) is not None and access.role_of(c, b) is not None
 
 
+@cas
+def elaguer_avec_un_libelle_VIDE_fonctionne_quand_meme():
+    """🚨 LA CORRECTION ÉTAIT INCOMPLÈTE, et la docstring de `normaliser_libelle`
+    décrit pourtant ce défaut comme réparé : « un libellé VIDE ou de plus de 64
+    caractères ne correspondait jamais ».
+
+    La normalisation avait bien été ajoutée — mais SOUS le
+    `if not uid or not label: return 0`. Le cas « plus de 64 caractères » était
+    donc réparé, le cas « vide » ne l'était pas.
+
+    ⚠️ Et il est atteignable : `mint` range `"appareil"` pour un libellé vide, et
+    `/claim` n'EXIGE pas de libellé. Un client tiers qui revendique sans en
+    laissait un jeton vivant de plus à chaque réinstallation — précisément la
+    fuite que cette fonction répare.
+    """
+    c = neuf()
+    vieux = access.mint(c, uid="uid_xav", label="", role=access.ROLE_MEMBER)
+    frais = access.mint(c, uid="uid_xav", label="", role=access.ROLE_MEMBER)
+    # Les deux sont rangés sous la forme NORMALISÉE.
+    assert access.role_of(c, vieux) is not None and access.role_of(c, frais) is not None
+
+    n = access.elaguer_doublons(c, "uid_xav", "", garder=frais)
+    assert n == 1, (
+        f"{n} jeton(s) élagué(s) au lieu de 1 — un libellé vide laisse une clé "
+        f"vivante de plus à chaque réinstallation")
+    assert access.role_of(c, vieux) is None, "l'ancien jeton est toujours valide"
+    assert access.role_of(c, frais) is not None, "on a fauché le jeton qu'on venait de rendre"
+
+
+@cas
+def elaguer_sans_uid_reste_sans_effet_apres_la_correction():
+    """⭐ LE CONTRE-TÉMOIN. En déplaçant la normalisation AVANT la garde, il ne
+    doit rester qu'UNE condition : `if not uid`. Deux intégrations portant le
+    même nom et aucun uid ne doivent toujours pas pouvoir se faucher.
+    """
+    c = neuf()
+    a = access.mint(c, label="Home Assistant", role=access.ROLE_MEMBER)
+    b = access.mint(c, label="Home Assistant", role=access.ROLE_MEMBER)
+    assert access.elaguer_doublons(c, "", "Home Assistant", garder=a) == 0
+    assert access.role_of(c, a) is not None and access.role_of(c, b) is not None
+
+
 # ── L'écran d'administration ─────────────────────────────────────────────────
 
 @cas

@@ -348,9 +348,18 @@ def elaguer_doublons(conn: sqlite3.Connection, uid: str, label: str,
        [garder] on ne supprime donc RIEN : mieux vaut une ligne en trop qu'un
        accès coupé à la seconde où il est accordé.
     """
-    if not uid or not label:
+    if not uid:
         return 0
-    # ⚠️ Comparer à la forme STOCKÉE, pas à ce qu'on a reçu.
+    # ⚠️ Comparer à la forme STOCKÉE, pas à ce qu'on a reçu — ET LE FAIRE AVANT
+    #    TOUTE GARDE. La normalisation avait bien été ajoutée, mais SOUS un
+    #    `if not label: return 0` : le cas « plus de 64 caractères » était donc
+    #    réparé, et le cas « VIDE » ne l'était pas. Or `mint` range `"appareil"`
+    #    pour un libellé vide, et `/claim` n'exige pas de libellé : un client
+    #    tiers qui revendique sans en laissait un jeton vivant de plus à chaque
+    #    réinstallation — précisément la fuite que cette fonction répare.
+    #
+    # ⓘ Après normalisation, `label` ne peut plus être vide : `normaliser_libelle`
+    #    rend `"appareil"` à défaut. Le tester une seconde fois serait du code mort.
     label = normaliser_libelle(label)
     id_garde = id_of(conn, garder)
     if id_garde is None:

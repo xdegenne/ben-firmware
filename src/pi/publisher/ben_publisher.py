@@ -1164,6 +1164,25 @@ def main() -> int:
     #    le serveur pendant neuf jours d'un disque abîmé.
     echecs_base = 0
     while not _stop:
+        # 🚨 **LE TICKET SE REPRÉSENTE TANT QU'IL EST LÀ.** Il n'était présenté qu'au
+        #    DÉMARRAGE — or quatre sorties de `presenter_le_ticket` journalisent
+        #    « conservé, on réessaiera » et rien ne réessayait : cloud injoignable,
+        #    DNS ou WiFi pas encore montés après le reboot, 5xx de ben-api, réponse
+        #    sans uid, octroi local en échec. Aucun de ces cas ne fait mourir le
+        #    publisher, donc systemd ne le relançait pas : au bout de 900 s le ticket
+        #    expirait et le boîtier restait SANS PROPRIÉTAIRE — exactement ce que le
+        #    ticket existe pour éviter, et il faut alors rouvrir une fenêtre BLE.
+        #
+        # ⭐ AUCUN COMPTEUR D'ESSAIS N'EST NÉCESSAIRE, et c'est ce qui rend la
+        #    reprise simple : passé 900 s le cloud répond `bad_ticket`, `verdict()`
+        #    en fait un refus DÉFINITIF, et le fichier est effacé. La boucle s'éteint
+        #    donc d'elle-même — par le succès, ou par la péremption.
+        #
+        # ⓘ Le recul est celui de la boucle (60 s), soit 15 tentatives au plus. Et
+        #    `lire()` ne coûte qu'un `open()` qui échoue, dans 99,99 % des tours.
+        if claim_ticket.lire():
+            presenter_le_ticket(cli)
+
         # 🚨 HORS DU `try`, ET C'EST TOUT L'INTÉRÊT. Dedans, le `raise` d'un lot
         #    refusé sautait la déclaration à chaque tour : un boîtier dont le cloud
         #    ne reconnaît plus une ref ne pouvait JAMAIS la renouveler, puisque

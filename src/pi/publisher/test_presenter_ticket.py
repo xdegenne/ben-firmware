@@ -182,6 +182,70 @@ def le_fichier_du_ticket_est_en_0600_et_atomique():
     claim_ticket.effacer()  # ⭐ idempotent : appelé sur un refus ET sur un succès
 
 
+@cas
+def le_ticket_est_REPRESENTE_a_chaque_tour_de_boucle():
+    """🚨 LE DÉFAUT : il n'était présenté qu'au DÉMARRAGE.
+
+    Quatre sorties de `presenter_le_ticket` journalisent « conservé, on
+    réessaiera » — cloud injoignable, 5xx, réponse sans uid, octroi local en
+    échec — et RIEN ne réessayait. Aucun de ces cas ne tue le publisher, donc
+    systemd ne le relançait pas : au bout de 900 s le ticket expirait et le
+    boîtier restait SANS PROPRIÉTAIRE. Il fallait rouvrir une fenêtre BLE —
+    exactement ce que le ticket existe pour éviter.
+
+    ⭐ ASSERTION STRUCTURELLE, PAS TEXTUELLE. On parse l'AST et on exige que
+    l'appel soit DANS la boucle `while` de `main`. Un `grep` serait satisfait
+    par l'appel de démarrage, qui existait déjà et ne corrigeait rien — et les
+    commentaires citent abondamment le nom de la fonction.
+    """
+    import ast
+    import pathlib as _pl
+
+    src = _pl.Path(__file__).with_name("ben_publisher.py").read_text()
+    main = next(n for n in ast.walk(ast.parse(src))
+                if isinstance(n, ast.FunctionDef) and n.name == "main")
+    boucles = [n for n in ast.walk(main) if isinstance(n, ast.While)]
+    assert boucles, "plus de boucle `while` dans main() — banc à revoir"
+
+    def appelle(noeud):
+        return any(isinstance(n, ast.Call)
+                   and getattr(n.func, "id", "") == "presenter_le_ticket"
+                   for n in ast.walk(noeud))
+
+    assert any(appelle(b) for b in boucles), (
+        "`presenter_le_ticket` n'est appelé que HORS de la boucle : un ticket "
+        "conservé après un échec ne sera jamais représenté, et il expirera")
+
+
+@cas
+def la_representation_est_gardee_par_la_presence_du_fichier():
+    """⭐ LE CONTRE-TÉMOIN : on ne doit pas appeler le cloud à chaque tour.
+
+    Sans garde, le publisher tenterait une présentation toutes les 60 s sur TOUS
+    les boîtiers du parc, alors que le fichier n'existe qu'entre un déballage BLE
+    et la première connexion réussie — 99,99 % des démarrages.
+    """
+    import ast
+    import pathlib as _pl
+
+    src = _pl.Path(__file__).with_name("ben_publisher.py").read_text()
+    main = next(n for n in ast.walk(ast.parse(src))
+                if isinstance(n, ast.FunctionDef) and n.name == "main")
+    boucle = next(n for n in ast.walk(main) if isinstance(n, ast.While))
+
+    garde_ok = False
+    for n in ast.walk(boucle):
+        if not isinstance(n, ast.If):
+            continue
+        cond = ast.dump(n.test)
+        corps = ast.dump(ast.Module(body=n.body, type_ignores=[]))
+        if "lire" in cond and "presenter_le_ticket" in corps:
+            garde_ok = True
+    assert garde_ok, (
+        "la représentation n'est pas gardée par `claim_ticket.lire()` — le "
+        "publisher appellerait le cloud à chaque tour, sur tout le parc")
+
+
 if __name__ == "__main__":
     print("── présentation du ticket de déballage ──")
     print(f"\n{len(_ECHECS)} échec(s)" if _ECHECS else "\ntout vert")
