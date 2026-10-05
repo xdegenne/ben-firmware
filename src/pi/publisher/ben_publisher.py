@@ -73,6 +73,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # src/pi
 import capabilities as caps  # noqa: E402
 import health  # noqa: E402
 from store import access  # noqa: E402
+from store import claim_ticket  # noqa: E402
 from store import db  # noqa: E402
 
 # ── Réglages ──────────────────────────────────────────────────────────────────
@@ -913,6 +914,101 @@ def _on_signal(signum, _frame):
     log.info("signal %d — arrêt après le lot en cours", signum)
 
 
+def presenter_le_ticket(cli) -> None:
+    """Présente le ticket reçu en BLE, UNE fois, à la première connexion au cloud.
+
+    🚨 C'EST LE CHEMIN QUI REND UN BOÎTIER NEUF REVENDICABLE. Sans lui, `grant()` n'est
+    appelé que depuis `mint()` et `consume_invitation()` : un boîtier envoyé à un
+    client est inrevendicable, et les 7 du parc ne marchent que parce que leurs lignes
+    ont été semées à la main — un rattrapage de migration, pas une procédure.
+
+    ⭐ TOUTE L'ASYMÉTRIE DU DÉBALLAGE TIENT ICI : le téléphone avait Internet, le
+    boîtier non. Le ticket a donc été frappé par l'app, passé en BLE, persisté sur le
+    disque — et c'est maintenant, au premier lien, qu'il se présente.
+
+    🚨 `fonder=True` NE PART QUE D'ICI, et l'existence du fichier en est la PREUVE.
+    Un `/claim` arrivé par le LAN envoie toujours `false` : le boîtier ne sait pas si
+    le cloud a déjà un owner, mais il sait par quel CANAL le ticket est arrivé — et
+    c'est la seule moitié de la garde qu'il soit en position de tenir.
+
+    ⚠️ ON NE FRAPPE AUCUN JETON LOCAL ICI, et ce n'est pas un oubli : la session BLE
+    est finie, il n'y a personne à qui le rendre. ⇒ Voie A (tranchée le 05/10) : l'app
+    refrappe un ticket et rejoue un `/claim` ordinaire sur le LAN. C'est ce qui a rendu
+    `CLAIM_TOKEN` inutile.
+
+    ⓘ Ne lève jamais : un déballage qui échoue ne doit pas empêcher la collecte.
+    """
+    ticket = claim_ticket.lire()
+    if not ticket:
+        return
+
+    try:
+        statut, brut = cli.post("/claim", claim_ticket.charge(ticket, fonder=True))
+    except Exception as e:  # noqa: BLE001
+        # ⭐ ON GARDE LE FICHIER. Le cloud peut être injoignable longtemps au premier
+        #    démarrage — WiFi qui se monte, DNS, ADSL. Effacer ici rendrait le boîtier
+        #    définitivement inrevendicable pour une panne passagère.
+        log.warning("ticket non présenté (%s) — conservé, on réessaiera", e)
+        return
+
+    v = claim_ticket.verdict(statut, brut.encode())
+
+    if isinstance(v, claim_ticket.CloudInjoignable):
+        log.warning("ticket : le cloud a répondu %d — conservé", statut)
+        return
+
+    if v is not None:
+        # 🚨 REFUS DÉFINITIF ⇒ ON EFFACE. Un ticket consommé, expiré ou frappé pour un
+        #    autre boîtier ne redeviendra jamais valable : le garder le ferait
+        #    présenter à CHAQUE démarrage, pour rien, et masquerait le vrai état du
+        #    boîtier dans les journaux.
+        log.error("ticket REFUSÉ (%s: %s) — effacé, un nouveau déballage est "
+                  "nécessaire", type(v).__name__, v)
+        claim_ticket.effacer()
+        return
+
+    try:
+        rep = json.loads(brut)
+        uid = str(rep.get("uid") or "").strip()
+        role = str(rep.get("role") or "").strip()
+    except Exception as e:  # noqa: BLE001
+        log.error("ticket : réponse illisible (%s) — conservé", e)
+        return
+
+    # 🚨 ON NE VALIDE QUE L'uid, PAS LE RÔLE — et la distinction s'est mesurée.
+    #
+    #    `access.grant` refuse DÉJÀ un rôle inconnu (`ValueError`), attrapé plus bas :
+    #    valider ici aussi ne changeait RIEN d'observable, donc aucune mutation ne
+    #    pouvait détecter la disparition de ce contrôle. Deux endroits où la liste des
+    #    rôles pouvait diverger, pour rien.
+    #
+    # ⚠️ L'uid, LUI, N'EST VALIDÉ NULLE PART AILLEURS : `grant` ne le regarde pas, et
+    #    un uid vide s'insérerait tel quel — posant un `owner` qui n'est personne, donc
+    #    un boîtier qui se croit revendiqué et ne l'est pas.
+    #
+    # ⓘ Conservé dans les deux cas : une réponse 200 mal formée est un défaut de
+    #    CONTRAT, pas un refus. L'effacer condamnerait le boîtier pour un bug de notre
+    #    côté.
+    if not uid:
+        log.error("ticket : réponse 200 sans uid (role=%r) — conservé", role)
+        return
+
+    try:
+        with access.session() as ac:
+            access.grant(ac, uid, role)
+    except Exception as e:  # noqa: BLE001
+        # ⚠️ Conservé AUSSI : le cloud a écrit sa ligne, mais pas nous. Réessayer
+        #    rejouera le `/claim`, qui trouvera la ligne EXISTANTE et la rendra — le
+        #    ticket étant consommé, il faudra toutefois un nouveau déballage.
+        log.error("ticket : droit local non écrit (%s) — conservé", e)
+        return
+
+    # 🔒 L'uid est journalisé, jamais le ticket : c'est un secret à usage unique, et
+    #    `journalctl` est lisible.
+    log.info("DÉBALLAGE : %s est désormais %s de ce boîtier", uid, role)
+    claim_ticket.effacer()
+
+
 def main() -> int:
     installer_journal()
     signal.signal(signal.SIGTERM, _on_signal)
@@ -1029,6 +1125,12 @@ def main() -> int:
     #       mémoire existe et vaut la version installée, les deux conditions sont
     #       fausses et rien ne part.
     declare_if_needed()
+    # 🚨 LE TICKET D'ABORD, s'il y en a un. Avant le premier battement : c'est ce qui
+    #    fonde le propriétaire, et tout le reste du parcours en dépend.
+    # ⓘ Ne fait rien dans 99,99 % des démarrages — le fichier n'existe qu'entre le
+    #    déballage en BLE et la première connexion réussie.
+    presenter_le_ticket(cli)
+
     prochain_hello = hello()
     echecs = 0
     # ⚠️ `-inf` et non `0.0` : `time.monotonic()` part de l'uptime, pas de zéro. Avec `0.0`,

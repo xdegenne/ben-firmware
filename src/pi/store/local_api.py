@@ -81,6 +81,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import access
+import claim_ticket
 import db
 import levels
 import settings
@@ -202,135 +203,22 @@ _CLAIM_INTERVALLE_SEC = 2.0
 _claim_dernier = 0.0
 
 
-class _TicketInvalide(Exception):
-    """403 `bad_ticket` — inconnu, expiré, consommé, ou frappé pour un AUTRE boîtier.
-
-    ⭐ LE SEUL REFUS RÉPARABLE PAR L'APP SEULE : elle refrappe un ticket et
-    réessaie UNE fois. Les quatre causes se répondent pareil — distinguer
-    renseignerait qui tente quoi.
-    """
-
-
-class _BoitierRefuse(Exception):
-    """403 `device_mismatch` / `device_revoked` — c'est le BOÎTIER qui est refusé.
-
-    🚨 À NE PAS CONFONDRE AVEC `_AucunDroitCloud`. Les deux sont des 403, mais l'un
-    dit « cette personne n'a pas de droit ici » et l'autre « ce boîtier n'a rien à
-    faire là ». Les mélanger invite la personne à réclamer une invitation alors que
-    le problème est le certificat du boîtier — elle chercherait indéfiniment du
-    mauvais côté.
-    """
-
-
-class _ContratRompu(Exception):
-    """400 — ben-api n'a pas compris notre requête. Réessayer n'y changera RIEN.
-
-    ⚠️ Présenté comme une panne, ça ferait boucler l'app sur un défaut de version :
-    typiquement un cloud plus ancien que le boîtier, qui ne connaît pas le ticket.
-    """
-
-
-class _AucunDroitCloud(Exception):
-    """403 `no_access` — l'identité est attestée, mais aucun droit possible ici.
-
-    ⚠️ Ce n'est PAS réessayable : ni le ticket ni le réseau n'y changeront rien. Il
-    faut une invitation.
-    """
-
-
-class _CloudInjoignable(Exception):
-    """Réseau, serveur, certificat — tout ce qui n'est pas un verdict.
-
-    🚨 À NE JAMAIS CONFONDRE AVEC UN REFUS. L'app réessaie une panne et abandonne
-    sur un refus : présenter l'une pour l'autre fait lire « vous n'êtes pas
-    reconnu » à quelqu'un dont tout était bon.
-    """
-
-
-def _verdict_cloud(statut: int, brut: bytes) -> Exception | None:
-    """Ce que la réponse de ben-api SIGNIFIE. `None` quand tout va bien.
-
-    🚨 SORTIE POUR ÊTRE ÉPROUVÉE. Un banc qui simule `_demander_au_cloud` n'exécute
-    JAMAIS cette classification : confondre `device_revoked` et `no_access` laissait
-    tous les bancs verts, mesuré le 05/10. C'est la troisième fois de ce chantier
-    qu'une logique enfouie dans une fonction simulée échappe aux bancs — d'où une
-    fonction PURE, systématiquement.
-
-    ⭐ QUATRE VERDICTS, et les confondre coûte cher à chaque fois. ben-api rend 403
-    pour TROIS raisons qui n'appellent pas la même suite :
-
-        bad_ticket                    réparable par l'app seule — refrappe, 1 essai
-        device_mismatch/device_revoked c'est LE BOÎTIER qui est refusé
-        no_access                     la personne n'a aucun droit ici — invitation
-        400                           contrat rompu : réessayer n'y changera RIEN
-    """
-    motif = ""
-    if statut != 200:
-        try:
-            motif = (json.loads(brut.decode("utf-8")) or {}).get("error", "")
-        except Exception:  # noqa: BLE001
-            pass
-    if statut == 200:
-        return None
-    if statut == 403:
-        if motif == "bad_ticket":
-            return _TicketInvalide("ticket refusé par ben-api")
-        if motif == "no_access":
-            return _AucunDroitCloud(motif)
-        # ⭐ TOUT LE RESTE EST UN REFUS DU BOÎTIER, et c'est délibérément UNE seule
-        #    branche : `device_mismatch`, `device_revoked`, un motif inconnu, un
-        #    corps illisible. Les deux premiers avaient leur propre `if` — je l'ai
-        #    RETIRÉ : il rendait exactement la même exception que ce défaut, donc
-        #    aucune mutation ne pouvait détecter sa disparition. Du code qu'aucun
-        #    banc ne peut défendre, et deux endroits où la règle pouvait diverger.
-        #
-        # ⚠️ Le défaut est de ce côté-ci, et c'est le point qui compte : on ne doit
-        #    SURTOUT pas faire croire à la personne que ça vient d'elle. Un
-        #    `no_access` l'envoie réclamer une invitation ; un refus du boîtier
-        #    l'enverrait chercher du mauvais côté pour toujours.
-        return _BoitierRefuse(motif or "403 sans motif")
-    if statut == 400:
-        return _ContratRompu(motif or "400")
-    return _CloudInjoignable(f"ben-api a répondu {statut}")
-
-
-def _charge_claim(ticket: str, role_invitation: str = "",
-                 fonder: bool = False) -> dict:
-    """Ce que le boîtier ENVOIE au cloud sur `/claim`. Pure, pour être éprouvée.
-
-    🚨 ELLE EST SORTIE DE `_demander_au_cloud` POUR UNE RAISON PRÉCISE. Un banc qui
-    intercepte `_demander_au_cloud` ne voit JAMAIS la charge : on peut y remettre un
-    `firebase_token` sans qu'aucun banc ne tombe — mesuré le 05/10, la mutation est
-    passée au vert. Or c'est l'invariant central du chantier.
-
-    ⭐ `role` n'est envoyé QUE sur le chemin de l'invitation. Absent, le cloud décide
-    seul : droit existant, ou premier propriétaire.
-
-    🔒 ET JAMAIS DE CLÉ D'IDENTITÉ. Le boîtier ne doit pas voir l'`ID token`
-    Firebase, encore moins le transporter.
-
-    🚨 `fonder` EST TOUJOURS SÉRIALISÉ, MÊME À `False`, et ce n'est pas du style.
-    C'est ce qui rend l'ordre de livraison SÛR dans les deux sens.
-
-    `ben-api` refuse les champs inconnus (`DisallowUnknownFields`) — mais cette garde
-    ne se déclenche QUE SI LE CHAMP EST PRÉSENT. L'omettre quand il vaut `False`,
-    comme on le fait pour `role`, laisserait un firmware récent passer SANS BRUIT
-    devant un cloud ancien : celui-ci accepterait la charge, fonderait un premier
-    propriétaire sans ordre, et le TOFU resterait ouvert. ⚠️ C'est précisément le cas
-    dangereux — l'intrus sur le LAN avec un compte Google et un `deviceId` que mDNS
-    diffuse.
-
-    ⭐ Toujours présent, le champ fait échouer le cloud ancien en 400 → le boîtier
-    rend `contract_mismatch` (502), non réessayable. Une incompatibilité VISIBLE au
-    lieu d'un trou de sécurité muet.
-
-    ⓘ `role`, lui, reste omis quand il est vide : son absence ne crée aucun droit, et
-    sa présence est ce qui demande quelque chose. L'asymétrie est voulue.
-    """
-    charge = {"ticket": ticket, "fonder": bool(fonder)}
-    if role_invitation:
-        charge["role"] = role_invitation
-    return charge
+# ── Les verdicts du cloud, et le ticket : UN SEUL endroit ────────────────────
+#
+# 🚨 Ils vivaient ICI, et le publisher a besoin des mêmes pour présenter le ticket reçu
+#    en BLE. Les recopier aurait fait DEUX définitions du contrat — trois avec le
+#    provisioner — et la divergence ne se verrait pas : chacun marcherait seul.
+#
+# ⇒ `store/claim_ticket.py` porte le fichier ET le contrat. Les alias ci-dessous
+#    gardent les noms locaux pour ne pas réécrire tout ce fichier, mais il n'y a plus
+#    qu'une source.
+_TicketInvalide = claim_ticket.TicketInvalide
+_AucunDroitCloud = claim_ticket.AucunDroit
+_BoitierRefuse = claim_ticket.BoitierRefuse
+_ContratRompu = claim_ticket.ContratRompu
+_CloudInjoignable = claim_ticket.CloudInjoignable
+_charge_claim = claim_ticket.charge
+_verdict_cloud = claim_ticket.verdict
 
 
 def _demander_au_cloud(ticket: str, role_invitation: str = "",
