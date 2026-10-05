@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import os as _os
 import sys
 import tempfile
 import threading
@@ -537,6 +538,101 @@ def un_boitier_refuse_par_le_cloud_ne_dit_pas_aucun_droit():
     assert corps.get("error") == "device_rejected", (
         f"erreur {corps!r} — « aucun droit » enverrait la personne réclamer une "
         f"invitation pour un problème de certificat du boîtier")
+
+
+def _chemin_jetable(ct):
+    """Détourne `claim_ticket.CHEMIN` vers un répertoire temporaire.
+
+    ⚠️ `CHEMIN` est figé à l'import du module ; poser la variable
+    d'environnement ici serait trop tard. On substitue donc le global, qui est
+    relu à chaque appel.
+    """
+    import tempfile
+    d = tempfile.mkdtemp(prefix="banc-ticket-")
+    ancien = ct.CHEMIN
+    ct.CHEMIN = pathlib.Path(d) / "claim_ticket"
+    return ancien
+
+
+# ── ⑫ Le ticket déposé doit être LISIBLE par celui qui le présentera ────────
+#
+# 🚨 CE BANC EXISTE PARCE QUE LE DÉFAUT A COÛTÉ UN DÉBALLAGE ENTIER. Mesuré sur
+#    ben-0005 le 05/10 : `ben-ble-provisioner` tourne en `User=root`, le
+#    publisher en `User=ben`. Un fichier 0600 root:root est illisible par celui
+#    qui doit s'en servir. Le boîtier journalisait pourtant `claim_ticket:stored`
+#    et le cloud ne voyait jamais le ticket présenté — `used_at` restait nul.
+#
+# ⭐ On observe l'APPEL à `chown`, pas le propriétaire final : sur la machine de
+#    banc, l'écrivain EST déjà le propriétaire du répertoire, donc comparer les
+#    uid passerait même sans le correctif. Une assertion qui ne peut pas échouer
+#    n'est pas une assertion.
+@cas
+def le_ticket_est_donne_au_compte_du_repertoire():
+    import claim_ticket as ct
+
+    ancien = _chemin_jetable(ct)
+    appels = []
+    vrai_chown = _os.chown
+    _os.chown = lambda chemin, uid, gid: appels.append((uid, gid))
+    try:
+        ct.poser("T-abcdef")
+        st = ct.CHEMIN.parent.stat()
+    finally:
+        _os.chown = vrai_chown
+        ct.effacer()
+        ct.CHEMIN = ancien
+    assert appels, (
+        "aucun chown — un ticket écrit par root reste illisible pour le publisher, "
+        "et le déballage se termine sans propriétaire SANS RIEN DIRE")
+    assert appels[-1] == (st.st_uid, st.st_gid), (
+        f"chown vers {appels[-1]} au lieu du propriétaire du répertoire "
+        f"({st.st_uid}, {st.st_gid})")
+
+
+# ── ⑬ Un ticket ILLISIBLE ne se confond pas avec un ticket ABSENT ───────────
+@cas
+def un_ticket_illisible_se_voit_dans_le_journal():
+    import claim_ticket as ct
+    import io as _io
+    import contextlib as _ctx
+
+    # ⭐ Un RÉPERTOIRE à la place du fichier, et non un `chmod 000` : sous root —
+    #    c'est-à-dire sur le boîtier — les permissions sont ignorées et le banc
+    #    passerait sans rien prouver. `IsADirectoryError` ne dépend d'aucun uid.
+    ancien = _chemin_jetable(ct)
+    ct.CHEMIN.mkdir(parents=True, exist_ok=True)
+    sortie = _io.StringIO()
+    try:
+        with _ctx.redirect_stdout(sortie):
+            got = ct.lire()
+    finally:
+        ct.CHEMIN.rmdir()
+        ct.CHEMIN = ancien
+
+    assert got == "", f"lire() a rendu {got!r} au lieu de la chaîne vide"
+    assert "ILLISIBLE" in sortie.getvalue(), (
+        f"rien dans le journal ({sortie.getvalue()!r}) — « pas de ticket » et "
+        f"« ticket que je ne peux pas lire » resteraient indiscernables")
+
+
+# ── ⑭ …et un ticket ABSENT reste SILENCIEUX (contre-témoin du ⑬) ────────────
+@cas
+def un_ticket_absent_ne_dit_rien():
+    import claim_ticket as ct
+    import io as _io
+    import contextlib as _ctx
+
+    ancien = _chemin_jetable(ct)
+    sortie = _io.StringIO()
+    try:
+        with _ctx.redirect_stdout(sortie):
+            got = ct.lire()
+    finally:
+        ct.CHEMIN = ancien
+    assert got == "", f"lire() a rendu {got!r}"
+    assert sortie.getvalue() == "", (
+        f"bruit dans le journal ({sortie.getvalue()!r}) — le cas NORMAL est "
+        f"qu'aucun déballage ne soit en cours ; le signaler noierait le vrai défaut")
 
 
 if __name__ == "__main__":

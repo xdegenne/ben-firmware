@@ -545,18 +545,39 @@ def pending_approx(conn: sqlite3.Connection) -> int:
     (les lignes purgées laissent des trous) — c'est une ligne de journal, pas une
     comptabilité.
     """
-    row = conn.execute(
-        "SELECT (SELECT max(rowid) FROM measurements), "
-        # 🚨 LE MÊME FILTRE QUE `SELECT_BATCH`, et sans lui ce chiffre MENT.
-        #    Une seule ligne non publiable — compteur refusé par le cloud, ou mesure
-        #    orpheline dont le `pdl_index` n'est plus dans `pdl` — ÉPINGLE le
-        #    minimum : le retard affiché ne redescend plus JAMAIS. Conséquences
-        #    mesurées : la cadence reste verrouillée sur PERIOD_RETARD (10 s au lieu
-        #    de 60, en permanence), et le contrôle « le retard doit DÉCROÎTRE » que
-        #    l'update exige ne peut plus passer.
-        "       (SELECT min(m.rowid) FROM measurements m "
-        "          JOIN pdl p ON p.pdl_index = m.pdl_index "
-        "         WHERE m.sent = 0 AND p.ref IS NOT NULL AND p.ref <> '')").fetchone()
+    # 🚨 UN BOÎTIER VIERGE N'A PAS ENCORE CETTE TABLE, et le publisher y mourait.
+    #    Mesuré sur ben-0005 le 05/10, au premier démarrage après un déballage :
+    #    `sqlite3.OperationalError: no such table: measurements`. Or cet appel est
+    #    la DEUXIÈME ligne de `main()`, donc bien avant `presenter_le_ticket()` —
+    #    dont le commentaire dit pourtant « LE TICKET D'ABORD ». Le ticket n'était
+    #    présenté qu'au redémarrage de systemd, 30 s plus tard, et un plantage
+    #    durable aurait fait expirer sa fenêtre de 900 s.
+    #
+    # ⭐ La table naît à la première ouverture en ÉCRITURE par un LECTEUR
+    #    (`db.connect()` rejoue le schéma) ; le publisher, lui, ouvre en lecture.
+    #    Sur un boîtier neuf il peut donc démarrer AVANT que le premier lecteur
+    #    n'ait écrit — et « zéro point en attente » est alors la réponse VRAIE.
+    #
+    # ⚠️ On ne ravale que ce défaut-là : toute autre `OperationalError` (base
+    #    verrouillée, fichier corrompu) doit continuer de remonter.
+    try:
+        row = conn.execute(
+            "SELECT (SELECT max(rowid) FROM measurements), "
+            # 🚨 LE MÊME FILTRE QUE `SELECT_BATCH`, et sans lui ce chiffre MENT.
+            #    Une seule ligne non publiable — compteur refusé par le cloud, ou mesure
+            #    orpheline dont le `pdl_index` n'est plus dans `pdl` — ÉPINGLE le
+            #    minimum : le retard affiché ne redescend plus JAMAIS. Conséquences
+            #    mesurées : la cadence reste verrouillée sur PERIOD_RETARD (10 s au lieu
+            #    de 60, en permanence), et le contrôle « le retard doit DÉCROÎTRE » que
+            #    l'update exige ne peut plus passer.
+            "       (SELECT min(m.rowid) FROM measurements m "
+            "          JOIN pdl p ON p.pdl_index = m.pdl_index "
+            "         WHERE m.sent = 0 AND p.ref IS NOT NULL AND p.ref <> '')").fetchone()
+    except sqlite3.OperationalError as e:
+        if "no such table" not in str(e):
+            raise
+        log.info("base encore vide (%s) — 0 point en attente", e)
+        return 0
     if not row or row[0] is None or row[1] is None:
         return 0
     return max(0, row[0] - row[1] + 1)

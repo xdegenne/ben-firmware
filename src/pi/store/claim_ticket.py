@@ -56,7 +56,34 @@ def poser(ticket: str) -> None:
     tmp = CHEMIN.with_suffix(".tmp")
     tmp.write_text(ticket, encoding="utf-8")
     os.chmod(tmp, 0o600)
+    _donner_au_lecteur(tmp)
     tmp.replace(CHEMIN)
+
+
+def _donner_au_lecteur(chemin: pathlib.Path) -> None:
+    """Donne le fichier au compte qui devra le LIRE puis l'EFFACER.
+
+    🚨 SANS CECI, LE TICKET EST DÉPOSÉ ET JAMAIS PRÉSENTÉ. Mesuré sur ben-0005 le
+    05/10 : le provisioner BLE tourne en `User=root`, le publisher en `User=ben`.
+    Un fichier 0600 root:root est donc ILLISIBLE par celui qui doit s'en servir —
+    `lire()` rendait `""`, `presenter_le_ticket` concluait « pas de ticket », et le
+    déballage se terminait sans propriétaire. Le journal du boîtier annonçait
+    pourtant `claim_ticket:stored` : tout avait l'air d'avoir marché.
+
+    ⭐ On s'aligne sur le PROPRIÉTAIRE DU RÉPERTOIRE plutôt que sur un nom codé en
+    dur : c'est lui qui désigne le compte des agents (`/var/lib/ben-firmware` est à
+    `ben`), et ça reste juste si ce compte change un jour. Effacer demande en plus
+    le droit d'écrire dans le répertoire — que ce même compte a, puisqu'il le
+    possède.
+
+    ⚠️ Sans droit de `chown` (donc hors root), on ne fait RIEN : c'est le cas où
+    l'écrivain est déjà le bon compte, et il n'y a rien à corriger.
+    """
+    try:
+        st = CHEMIN.parent.stat()
+        os.chown(chemin, st.st_uid, st.st_gid)
+    except (PermissionError, OSError):
+        pass
 
 
 def lire() -> str:
@@ -64,7 +91,17 @@ def lire() -> str:
     démarrage ne doit pas empêcher le publisher de publier des mesures."""
     try:
         return CHEMIN.read_text(encoding="utf-8").strip()
-    except Exception:  # noqa: BLE001
+    except FileNotFoundError:
+        # Le cas NORMAL, et de loin le plus fréquent : aucun déballage en cours.
+        return ""
+    except Exception as e:  # noqa: BLE001
+        # 🚨 TOUT LE RESTE EST UN DÉFAUT, ET IL DOIT SE VOIR. Avaler l'erreur ici
+        #    confondait « pas de ticket » avec « un ticket que je n'ai pas le droit
+        #    de lire » — deux situations dont l'une est normale et l'autre fait
+        #    échouer le déballage en silence. C'est exactement ce qui est arrivé le
+        #    05/10 sur ben-0005 (0600 root:root, lu par `ben`).
+        print(f"[ticket] ILLISIBLE ({type(e).__name__}: {e}) — un ticket est "
+              f"peut-être en attente et ne sera pas présenté", flush=True)
         return ""
 
 
