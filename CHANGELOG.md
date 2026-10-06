@@ -18,6 +18,68 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.11.1] — 2026-10-06
+
+**Une release qui ne change rien, exprès.** Chantier
+[`ben-docs#16`](https://github.com/xdegenne/ben-docs/issues/16), sous-tâche
+[#44](https://github.com/xdegenne/ben-firmware/issues/44).
+
+Le mécanisme de la ref par boîtier est livré des deux côtés — `pi-0.11.0` sur le parc,
+`GET /api/devices/{id}/update` déployé — mais il n'avait **jamais fait passer une vraie release à un
+seul boîtier**. C'est ce que celle-ci éprouve, et sans rien risquer : si quelque chose casse, ça
+casse sur un `update.sh` qui n'a rien à casser.
+
+Le chemin complet est exercé — ref demandée au cloud, plan lu sur `canary`, signature GPG du tag,
+SHA256 du script, exécution, bump, redémarrage du publisher, déclaration au cloud — et le script
+lui-même est **inerte**.
+
+#### Ce qu'elle ne fait pas, et c'est exhaustif
+
+Aucun fichier livré. Aucune migration, aucune table, aucune colonne. Aucun service redémarré par le
+script. **Aucune écriture, nulle part** — ni dans la base, ni dans `/var/lib`, ni dans `/etc`.
+
+⇒ Le retour arrière vers 0.11.0 ne demande de restaurer **rien** : il n'y a rien à restaurer. Le
+seul effet observable est `device.json.softwareVersion = 0.11.1`, écrit par l'**agent** à l'étape ⑨
+— pas par le script.
+
+#### ⭐ Le flux éprouvé, et c'est lui le livrable
+
+```
+① travail     <type>/<issue#>-<slug>   update.sh · son sha256 · le CHANGELOG
+② tag d'essai pi-0.11.1-rc1 signé      sur la tête de CETTE branche
+③ canary      UNE ligne                l'entrée updates_caps pointant ce tag
+④ on regarde  ben-0001 seulement       ota_ref='canary' côté cloud
+⑤ si bon      squash dans main + pi-0.11.1   → tout le parc
+⑥ canary      on retire la ligne
+```
+
+⭐ **Le tag n'a pas besoin d'être « dans » `canary` ** : le boîtier lit `compatibility.yaml` depuis
+`origin/<ref>` et `update.sh` depuis **le tag**. Donc `canary` reste un **plan de contrôle pur** —
+une ligne, jamais de code — et le code ne vit qu'à un seul endroit. ⓘ Un tag survit à la suppression
+de sa branche.
+
+🚨 **Le `to` est le même des deux côtés, seul le tag diffère.** Cette entrée porte `pi-0.11.1`, pas
+le `-rc1` : la branche de travail est exactement ce que `main` recevra, et c'est `canary` qui porte
+la variante d'essai. C'est aussi ce qui fait qu'un boîtier d'essai déjà en `0.11.1` ne **rejoue
+rien** quand `main` le rattrape — aucune transition ne part de `0.11.1`. Si les `to` divergeaient, il
+se retrouverait sur une version que `main` n'a jamais entendue, et `hors_du_plan` crierait pour
+toujours.
+
+#### Ce qui se passe quand même, et qu'il faut regarder
+
+L'agent redémarre `ben-publisher` à l'étape ⑩, systématiquement. Le publisher constate alors que la
+version installée n'est pas celle qu'il a déclarée, et **déclare** — c'est la condition de
+`pi-0.10.0`, et elle fait que `devices.sw_version` suit sans qu'on y pense :
+
+```
+déclaration : version installée 0.11.1, déclarée 0.11.0
+déclaration OK — N compteur(s) déclaré(s)
+```
+
+⚠️ **Et le témoin de tout ce chantier est ailleurs** : les boîtiers dont `ota_ref` est `NULL` ne
+doivent voir **aucune** transition. Si le parc entier passe en 0.11.1, le mécanisme n'a pas
+fonctionné — il a seulement eu l'air de fonctionner.
+
 ### [0.11.0] — 2026-10-06
 
 **Chaque boîtier demande au cloud où chercher ses mises à jour.** Chantier
