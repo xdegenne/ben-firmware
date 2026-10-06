@@ -74,10 +74,10 @@ log "préflight ① OK (3 fichiers présents et compilables)"
 
 # ═══ PRÉFLIGHT ② — LE BANC LIVRÉ PAR LE TAG, SUR LE PYTHON ET LE GIT DU BOÎTIER ══════════════
 #
-#   18 cas, et ce banc-là a besoin du `git` de la cible : six de ses cas montent un VRAI dépôt
+#   21 cas, et ce banc-là a besoin du `git` de la cible : HUIT de ses cas montent un VRAI dépôt
 #   jetable pour vérifier d'où le plan a été lu. C'est le seul moyen de prouver « lu depuis
 #   origin/canary », qu'une branche REBASÉE est relue à jour (refspec forcée), et qu'une branche
-#   DÉJÀ FUSIONNÉE rend la main à `main`.
+#   FUSIONNÉE EN SQUASH reste suivie — le boîtier obéit au cloud, il ne devine pas.
 #
 # 🚨 ET IL NE LIT PLUS UN MESSAGE DE GIT TRADUISIBLE — c'est le défaut le plus grave trouvé en
 #    revue, et il brûlait cette version. Deux cas lisent le texte d'une erreur de git ; `git.mo`
@@ -89,14 +89,14 @@ log "préflight ① OK (3 fichiers présents et compilables)"
 #    correction, vert après.
 #
 # ⚖️ Les témoins vont dans les deux sens : une implémentation qui rendrait toujours `main`
-#    passerait tous les cas de repli. 12 mutations vérifiées ROUGES avant livraison — et DEUX sont
-#    restées VERTES, ce qui a fait corriger les commentaires plutôt que garder des gardes
-#    invérifiables (le `--` avant la refspec, et le fetch de `main` avant la comparaison).
+#    passerait tous les cas de repli. 16 mutations vérifiées ROUGES avant livraison — et UNE est
+#    restée VERTE, ce qui a fait corriger le commentaire plutôt que garder une garde invérifiable
+#    (le `--` avant la refspec : c'est le `+` qui fait barrière).
 # ⚠️ `TMPDIR=/var/tmp` et pas /tmp : /tmp peut être un tmpfs étroit sur un Pi Zero, et ce banc y
 #    crée des dépôts git.
 TMPDIR=/var/tmp python3 "$UPD/test_ref_ota.py" \
     || fail "le banc de la ref OTA échoue — NE PAS déployer en l'état"
-log "préflight ② OK (banc livré : 18 cas, dont 6 sur un vrai dépôt git, et 2 sous LANGUAGE=fr)"
+log "préflight ② OK (banc livré : 21 cas, dont 8 sur un vrai dépôt git, et 2 sous LANGUAGE=fr)"
 
 # ═══ PRÉFLIGHT ③ — 🚨 LE CORRECTIF EST BRANCHÉ, PROUVÉ SUR L'ARBRE ════════════════════════════
 #
@@ -123,7 +123,7 @@ def appels(arbre):
 dl, da = defs(lib), defs(agent)
 al, aa = appels(lib), appels(agent)
 ko = []
-for f in ("ref_valide", "ref_demandee", "plan_de_mise_a_jour"):
+for f in ("ref_valide", "ref_demandee", "plan_de_mise_a_jour", "hors_du_plan"):
     if f not in dl:
         ko.append(f"{f}() ABSENTE de update_lib")
 # ⚖️ Chacune doit être appelée, et PAS par n'importe qui : la décision vit dans l'agent.
@@ -131,6 +131,10 @@ if "ref_demandee" not in aa:
     ko.append("l'agent n'appelle pas ref_demandee() — il ne demanderait jamais la ref")
 if "plan_de_mise_a_jour" not in aa:
     ko.append("l'agent n'appelle pas plan_de_mise_a_jour() — pas de repli dans le tick")
+# 🚨 Sans cet appel, un boîtier sorti du parc OTA journaliserait « Already up to date » pour
+#    toujours — c'est l'état de ben-0005, invisible depuis des semaines.
+if "hors_du_plan" not in aa:
+    ko.append("l'agent n'appelle pas hors_du_plan() — un boîtier figé resterait silencieux")
 if "ref_valide" not in al:
     ko.append("ref_valide() n'est jamais appelée — le nom du réseau irait tel quel dans git")
 # 🚨 Les deux lectures de git doivent accepter une ref ; sans le paramètre, `main` serait encore

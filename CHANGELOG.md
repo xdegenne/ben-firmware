@@ -108,31 +108,58 @@ avant, verts après.
 poussant `main` alors que le git du boîtier nomme sa branche par défaut `master`. Le banc du Mac
 ne pouvait pas le voir. Un banc de préflight **doit** être exécuté sur la cible avant le tag.
 
-#### Deux trous du repli, fermés
+#### 🚨 Le boîtier n'essaie pas de devenir plus malin que le cloud
 
-- une branche **déjà fusionnée qui survit** (merge sans `--delete-branch`, ou `ota_ref` qu'on
-  oublie de remettre à `NULL`) : le boîtier suivait un plan qui ne bougerait plus et **ratait
-  toutes les releases suivantes**, en silence. ⭐ La parade ne demande aucun état : si
-  `origin/<ref>` est un **ancêtre** d'`origin/main`, alors `main` contient déjà tout, plus la
-  suite — on rend la main. Promouvoir demande deux gestes ; ceci rattrape l'oubli du second ;
-- un `compatibility.yaml` **illisible sur la branche** : `yaml.safe_load` lève une `YAMLError`,
-  pas une `CalledProcessError`, donc l'erreur traversait et le tick échouait **toutes les 10
-  minutes**. Le repli attrape maintenant tout ce qui cloche **sur le chemin de la branche** — et
-  seulement là : un `main` cassé doit lever, c'est une panne réelle qui doit se voir.
+Une première version de ce volet détectait une branche **promue** par un test d'ascendance
+(`merge-base --is-ancestor`), pour rendre la main à `main` si on avait oublié de détacher le
+boîtier. **La garde a été retirée**, et pour deux raisons qui disent la même chose :
+
+- **les dépôts BEN ne fusionnent qu'en squash** — vérifié sur l'API GitHub, `allow_merge_commit`
+  et `allow_rebase_merge` sont faux. Un squash crée un commit **neuf** : les commits de la branche
+  ne sont donc **jamais** ancêtres de `main`, et le test répondait toujours « non ». La garde ne
+  pouvait pas se déclencher. ⚠️ Et son banc la croyait bonne parce qu'il fusionnait en `--ff-only`,
+  une forme qui **n'arrive jamais** sur ces dépôts : vert à tort ;
+- elle **passait outre un ordre légitime** : épingler un boîtier sur une branche tirée d'un vieux
+  commit pour le **retenir** avant une release risquée. Cette branche étant ancêtre de `main`, la
+  garde ramenait le boîtier sur `main` et lui appliquait la release.
+
+⭐ Le boîtier ne peut pas distinguer « branche morte, je suis coincé » de « on me retient exprès ».
+Il ne doit donc pas **décider** — c'est le cloud qui choisit la ref, et une seconde décision locale
+recréerait deux vérités. **Il obéit, et il crie.**
+
+#### 🚨 « Rien à faire » et « je ne peux plus rien faire » ne se disent pas pareil
+
+`hors_du_plan` remplace la garde : si la version installée n'est **ni** le `from` d'une transition
+**ni** le `to` d'une, le plan ne l'a jamais entendue et ce boîtier **n'avancera plus jamais**.
+L'agent le dit en `warning` au lieu du paisible « Already up to date ».
+
+ⓘ Ce n'est pas une hypothèse : **ben-0005** annonce `0.9.29`, une version absente de toute
+transition, et il est hors du parc OTA depuis des semaines sans qu'une seule ligne le dise.
+
+#### Le trou du repli, fermé
+
+Un `compatibility.yaml` **illisible sur la branche** : `yaml.safe_load` lève une `YAMLError`, pas
+une `CalledProcessError`, donc l'erreur traversait et le tick échouait **toutes les 10 minutes**. Le
+repli attrape maintenant tout ce qui cloche **sur le chemin de la branche** — et seulement là : un
+`main` cassé doit lever, c'est une panne réelle qui doit se voir.
 
 #### Le banc, et ce qui a été vu tomber
 
-**18 cas.** Six montent un **vrai dépôt git** jetable : seul moyen de prouver « lu depuis
-`origin/canary` », « une branche **rebasée** est relue à jour » et « une branche **fusionnée** rend
-la main ». Les autres couvrent la validation du nom et tout ce qui vaut `main` — dont un **5xx au
-corps valide**, seul cas qui vise la garde sur le statut HTTP. Et les dépôts jetables se
-**nettoient** désormais (`atexit`) : une update qui échoue est rejouée toutes les 10 minutes, donc
-ils s'empilaient sur la carte SD.
+**21 cas.** **Huit** montent un **vrai dépôt git** jetable : seul moyen de prouver « lu depuis
+`origin/canary` », « une branche **rebasée** est relue à jour » et « une branche fusionnée **en
+squash** reste suivie ». Les autres couvrent la validation du nom, le signalement d'une version hors
+plan, et tout ce qui vaut `main` — dont un **5xx au corps valide**, seul cas qui vise la garde sur le
+statut HTTP. Les dépôts jetables se **nettoient** (`atexit`) : une update qui échoue est rejouée
+toutes les 10 minutes, donc ils s'empilaient sur la carte SD.
 
-⚖️ **12 mutations** vérifiées rouges, **6 sabotages** du préflight ③ aussi. ⚠️ Et **deux mutations
-sont restées vertes** : le `--` avant la refspec, et le fetch de `main` avant la comparaison. Les
-commentaires ont été **corrigés** plutôt que de garder des gardes invérifiables — les deux sont
-conservées, aucune n'est créditée d'une protection qu'on n'a pas vue tomber.
+⚠️ **Et le banc avait cessé de pouvoir tomber sur la locale.** `_ENV_GIT` était une constante de
+module, donc figée à l'**import** : le `LANGUAGE=fr` que les deux cas posent ensuite n'atteignait
+plus `git`, et ils restaient verts même en retirant `LC_ALL=C`. L'environnement est maintenant
+construit **à chaque appel**, et la mutation a été vérifiée **rouge sur ben-0001**.
+
+⚖️ **16 mutations** vérifiées rouges, **7 sabotages** du préflight ③ aussi. ⚠️ **Une** est restée
+verte — le `--` avant la refspec, puisque c'est le `+` qui fait barrière : le commentaire a été
+corrigé plutôt que de garder une garde invérifiable.
 
 **Aucun redémarrage** (l'agent est un `oneshot` par timer), **aucune migration**, **aucun état
 nouveau sur le disque** — la ref n'est pas mémorisée, elle est redemandée à chaque tick. Le

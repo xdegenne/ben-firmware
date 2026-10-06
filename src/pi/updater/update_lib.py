@@ -32,7 +32,13 @@ log = logging.getLogger(__name__)
 #    (`LANGUAGE=fr LC_ALL=C` rend bien « couldn't find remote ref »). Inutile de vider LANGUAGE.
 # ⓘ On n'épingle QUE les appels de ce chantier. `verify_tag` journalise la sortie de GPG, qui
 #    est un autre sujet et que rien ne lit.
-_ENV_GIT = {**os.environ, "LC_ALL": "C"}
+# 🚨 CONSTRUIT À CHAQUE APPEL, et ce n'est pas un détail de style. En constante de module,
+#    l'environnement était figé à l'IMPORT : un banc qui pose `LANGUAGE=fr` ensuite ne changeait
+#    plus rien à ce que git recevait, donc ses deux cas restaient VERTS même en retirant
+#    `LC_ALL=C`. La protection était bonne et le banc ne la prouvait plus — c'est-à-dire qu'on
+#    ne pouvait plus le voir tomber.
+def _env_git() -> dict:
+    return {**os.environ, "LC_ALL": "C"}
 
 
 # ---------------------------------------------------------------------------
@@ -153,29 +159,44 @@ def load_compatibility_from_remote(repo_path: str = "/opt/ben/repo",
         check=True,
         capture_output=True,
         text=True,
-        env=_ENV_GIT,
+        env=_env_git(),
     )
     return yaml.safe_load(result.stdout)
 
 
-def deja_fusionnee(repo_path: str, ref: str) -> bool:
-    """`origin/<ref>` est-elle entièrement contenue dans `origin/main` ?
+def hors_du_plan(compat: dict, version: str) -> bool:
+    """Le plan retenu ignore-t-il complètement la version installée ?
 
-    ⭐ C'est la parade au PIÈGE DE LA PROMOTION, et elle ne demande AUCUN état : si la
-       branche est un ancêtre de `main`, alors `main` contient déjà tout ce qu'elle
-       contient, PLUS la suite. La suivre encore ne peut que faire rater des releases.
+    🚨 CE QUI REMPLACE LA GARDE « BRANCHE DÉJÀ FUSIONNÉE », ET POURQUOI ELLE A ÉTÉ RETIRÉE.
+       Cette garde comparait l'historique (`merge-base --is-ancestor`) pour détecter une
+       branche promue dont le boîtier n'aurait pas été détaché. Elle était fausse deux fois :
 
-    ⚠️ Un code de retour autre que 0 ou 1 (donc une vraie erreur de git) vaut « pas
-       fusionnée » : on garde le comportement nominal plutôt que de dévier sur un
-       doute. On n'arrive ici qu'après deux `fetch` réussis, donc les deux refs
-       existent.
+       · **les dépôts BEN ne fusionnent QU'EN SQUASH** (vérifié : `allow_merge_commit` et
+         `allow_rebase_merge` sont faux). Un squash crée un commit NEUF : les commits de la
+         branche ne sont donc JAMAIS des ancêtres de `main`, et le test répondait toujours
+         « non ». La garde ne pouvait pas se déclencher. ⚠️ Et son banc la croyait bonne parce
+         qu'il fusionnait en `--ff-only` — une forme qui n'arrive jamais ici ;
+       · elle PASSAIT OUTRE un ordre légitime : épingler un boîtier sur une branche tirée d'un
+         vieux commit pour le RETENIR avant une release risquée. Cette branche étant ancêtre de
+         `main`, la garde ramenait le boîtier sur `main` et lui appliquait la release.
+
+    ⭐ LES DEUX DISENT LA MÊME CHOSE : le boîtier ne peut pas distinguer « branche morte, je
+       suis coincé » de « on me retient exprès ». Il ne doit donc pas DÉCIDER — c'est le cloud
+       qui choisit la ref, et une seconde décision locale recréerait deux vérités. Il obéit, et
+       il CRIE : un boîtier bruyant se répare, un boîtier silencieusement figé ne se voit pas.
+
+    ⇒ Vrai quand la version installée n'est NI le `from` d'une transition, NI le `to` d'une :
+      le plan n'a jamais entendu parler d'elle, donc ce boîtier n'avancera plus jamais.
+      ⓘ Le `to` compte : un boîtier à la dernière version est à jour, ce n'est pas une anomalie.
+      ⓘ Ça ne vaut pas que pour une branche : ben-0005 annonce `0.9.29`, une version qui n'est
+        dans aucune transition de `main`, et il est hors du parc OTA depuis des semaines sans
+        qu'aucune ligne ne le dise. Ceci l'aurait dit.
     """
-    r = subprocess.run(
-        ["git", "-C", repo_path, "merge-base", "--is-ancestor",
-         f"origin/{ref}", f"origin/{REF_DEFAUT}"],
-        capture_output=True, text=True, env=_ENV_GIT,
-    )
-    return r.returncode == 0
+    caps = compat.get("updates_caps") or []
+    if not caps:
+        return True
+    return (version not in {t.get("from") for t in caps}
+            and version not in {t.get("to") for t in caps})
 
 
 def plan_de_mise_a_jour(repo_path: str = "/opt/ben/repo",
@@ -188,14 +209,14 @@ def plan_de_mise_a_jour(repo_path: str = "/opt/ben/repo",
 
        ① la ref est introuvable. La règle du dépôt est « branche supprimée au merge »,
           donc le geste NORMAL de promotion détruit la ref interrogée ;
-       ② la branche est DÉJÀ FUSIONNÉE mais survit (merge sans `--delete-branch`, ou
-          `ota_ref` qu'on a oublié de remettre à NULL). Sans cette garde, le boîtier
-          suivrait un plan qui ne bougera plus et RATERAIT toutes les releases
-          suivantes — en silence. Promouvoir demande deux gestes ; celui-ci rattrape
-          l'oubli du second ;
-       ③ le `compatibility.yaml` de la branche est ILLISIBLE. `yaml.safe_load` lève une
+       ② le `compatibility.yaml` de la branche est ILLISIBLE. `yaml.safe_load` lève une
           `YAMLError`, pas une `CalledProcessError` : avec un `except` étroit l'erreur
           traversait et le tick échouait, puis re-échouait toutes les 10 minutes.
+
+    🚨 CE QU'IL NE FAIT PAS, ET C'EST UNE DÉCISION : il ne cherche PAS à deviner qu'une branche
+       a été promue. Le boîtier OBÉIT à la ref que le cloud lui donne ; s'il s'y trouve figé,
+       `hors_du_plan` le fait CRIER. Voir le commentaire de cette fonction pour les deux raisons
+       qui ont fait retirer la garde d'ancêtre.
 
     ⇒ D'où un `except Exception` ASSUMÉ sur le chemin de la branche : tout ce qui
       cloche sur une ref d'essai doit rendre la main à `main`, jamais arrêter les mises
@@ -207,25 +228,7 @@ def plan_de_mise_a_jour(repo_path: str = "/opt/ben/repo",
         return load_compatibility_from_remote(repo_path, REF_DEFAUT), REF_DEFAUT
     try:
         fetch_origin(repo_path, ref)
-        # `main` AUSSI, parce qu'un boîtier sur une branche ne fetcherait QUE sa ref : sa
-        # vue d'`origin/main` daterait d'avant son basculement, et la comparaison
-        # « fusionnée ? » porterait sur un `main` d'hier — donc ne verrait jamais la fusion.
-        # ⚠️ GARDE NON DÉMONTRÉE, et je préfère l'écrire : la retirer laisse le banc VERT.
-        #    Sur un dépôt de banc, fetcher la seule branche d'essai a parfois rafraîchi
-        #    `origin/main` au passage — et parfois non, selon la forme du dépôt. Je n'ai pas
-        #    isolé la cause. ⇒ On garde le fetch explicite précisément pour que la comparaison
-        #    ne dépende PAS d'un comportement de git qu'on ne sait pas énoncer ; mais il ne
-        #    faut pas lui créditer une protection qu'on n'a pas vue tomber.
-        #    ⓘ Mesuré par ailleurs : `origin/main` absent fait sortir `merge-base` en 128, donc
-        #      `deja_fusionnee` rend False — le défaut serait « on suit la branche pour
-        #      toujours », silencieux, exactement ce que cette garde existe pour éviter.
-        fetch_origin(repo_path, REF_DEFAUT)
-        if deja_fusionnee(repo_path, ref):
-            log.info("branche %s déjà fusionnée dans %s — on suit %s : elle ne peut plus "
-                     "rien apporter, et %s a pu avancer depuis",
-                     ref, REF_DEFAUT, REF_DEFAUT, REF_DEFAUT)
-        else:
-            return load_compatibility_from_remote(repo_path, ref), ref
+        return load_compatibility_from_remote(repo_path, ref), ref
     except Exception as e:  # noqa: BLE001
         motif = (getattr(e, "stderr", None) or str(e)).strip()[:200]
         log.warning("ref %s inutilisable (%s) — repli sur %s DANS CE TICK",
@@ -312,7 +315,7 @@ def fetch_origin(repo_path: str = "/opt/ben/repo", ref: str = REF_DEFAUT) -> Non
         check=True,
         capture_output=True,
         text=True,
-        env=_ENV_GIT,
+        env=_env_git(),
     )
 
 

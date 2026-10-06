@@ -96,7 +96,18 @@ def main() -> None:
         transition = update_lib.find_next_transition(compat, device)
 
         if transition is None:
-            log.info("Already up to date (%s)", device["softwareVersion"])
+            # 🚨 « RIEN À FAIRE » ET « JE NE PEUX PLUS RIEN FAIRE » NE SE DISENT PAS PAREIL.
+            #    Une version que le plan ignore complètement sort le boîtier du parc OTA : il
+            #    journalisera « Already up to date » à chaque tick, pour toujours, et personne
+            #    ne le verra. C'est l'état de ben-0005 depuis des semaines.
+            if update_lib.hors_du_plan(compat, device["softwareVersion"]):
+                log.warning(
+                    "AUCUNE transition ne part de %s dans le plan de origin/%s, et aucune n'y "
+                    "mène : ce boîtier N'AVANCERA PLUS tant qu'il suit cette ref. Vérifier "
+                    "`ota_ref` côté cloud, ou la version de device.json.",
+                    device["softwareVersion"], ref)
+            else:
+                log.info("Already up to date (%s)", device["softwareVersion"])
             sys.exit(0)
 
         tag = transition["tag"]

@@ -272,50 +272,83 @@ def une_branche_REBASEE_est_relue_a_jour():
 
 
 @cas
-def une_branche_DEJA_FUSIONNEE_rend_la_main_a_main():
-    """🚨 LE PIÈGE DE LA PROMOTION, et il est SILENCIEUX. Promouvoir demande deux gestes :
-    fusionner la branche, ET remettre le boîtier sur `main` côté cloud. Si le second est
-    oublié — ou si la branche survit au merge — le boîtier continue de suivre un plan qui ne
-    bougera plus, et RATE toutes les releases suivantes sans que rien ne le dise.
+def une_branche_FUSIONNEE_EN_SQUASH_reste_SUIVIE_le_boitier_obeit():
+    """🚨 LE CAS QUI A FAIT RETIRER UNE GARDE. On avait ajouté un test d'ancêtre pour détecter
+    une branche promue dont le boîtier n'aurait pas été détaché. Deux raisons l'ont tué :
 
-    ⭐ La parade ne demande aucun état : si `origin/<ref>` est un ANCÊTRE d'`origin/main`, alors
-       `main` contient déjà tout ce que la branche contient, plus la suite. Lire `main` est
-       donc strictement meilleur, jamais moins bon."""
+    · **les dépôts BEN ne fusionnent QU'EN SQUASH** — vérifié sur l'API GitHub. Un squash crée
+      un commit NEUF, donc les commits de la branche ne sont JAMAIS ancêtres de `main` et le
+      test répondait toujours « non » : la garde ne pouvait pas se déclencher. Le banc la
+      croyait bonne parce qu'il fusionnait en `--ff-only`, forme qui n'arrive jamais ici ;
+    · elle PASSAIT OUTRE un ordre légitime — retenir un boîtier sur une vieille branche avant
+      une release risquée.
+
+    ⭐ Le boîtier ne peut pas distinguer les deux situations : il OBÉIT, et c'est
+       `hors_du_plan` qui le fait crier. Ce cas fixe donc le comportement VOULU, et il tombe si
+       quelqu'un remet une garde d'ancêtre."""
     d = pathlib.Path(tempfile.mkdtemp()); _A_NETTOYER.append(d)
     git("init", "-q", "--bare", str(d / "origin.git"), cwd=d)
     w = d / "w"
     git("clone", "-q", str(d / "origin.git"), str(w), cwd=d)
     git("config", "user.email", "banc@ben", cwd=w)
     git("config", "user.name", "banc", cwd=w)
-    # ⚠️ `-B main` EXPLICITE : le git du boîtier nomme sa branche par défaut `master`
-    #    (constaté sur ben-0001), celui du Mac `main`. Un banc qui suppose l'un des deux
-    #    échoue sur l'autre — et il est exécuté en préflight, donc il brûlerait la version.
+    # ⚠️ `-B main` explicite : le git du boîtier nomme sa branche par défaut `master`.
     git("checkout", "-q", "-B", "main", cwd=w)
     (w / "compatibility.yaml").write_text("plan: main-v1\n")
     git("add", "-A", cwd=w); git("commit", "-qm", "v1", cwd=w)
     git("push", "-q", "origin", "main", cwd=w)
-    # la branche d'essai, poussée…
     git("checkout", "-q", "-B", "canary", cwd=w)
     (w / "compatibility.yaml").write_text("plan: canary\n")
     git("commit", "-qam", "essai", cwd=w); git("push", "-q", "origin", "canary", cwd=w)
-    # …puis FUSIONNÉE dans main, qui continue d'avancer. La branche SURVIT.
+    # LE SQUASH, tel que GitHub le fait : un commit NEUF sur main, sans parent dans canary.
     git("checkout", "-q", "main", cwd=w)
-    git("merge", "-q", "--ff-only", "canary", cwd=w)
-    (w / "compatibility.yaml").write_text("plan: main-v2\n")
-    git("commit", "-qam", "v2", cwd=w); git("push", "-q", "origin", "main", cwd=w)
-
-    # 🚨 ET `origin/main` EST RENDU PÉRIMÉ, parce que c'est l'état RÉEL d'un boîtier sur une
-    #    branche : il ne fetchait que SA ref, donc sa vue de `main` daterait d'avant son
-    #    basculement — et la comparaison « fusionnée ? » porterait sur un `main` d'hier, donc
-    #    ne verrait jamais la fusion. C'est ce qui rend le fetch de `main` OBLIGATOIRE avant
-    #    de comparer, et non un simple confort.
-    subprocess.run(["git", "update-ref", "-d", "refs/remotes/origin/main"],
-                   cwd=w, capture_output=True)
+    git("merge", "-q", "--squash", "canary", cwd=w)
+    git("commit", "-qm", "squash de canary", cwd=w)
+    git("push", "-q", "origin", "main", cwd=w)
 
     compat, ref = ul.plan_de_mise_a_jour(str(w), "canary")
-    assert ref == ul.REF_DEFAUT, f"la branche est fusionnée, il faut rendre la main : {ref}"
-    assert compat == {"plan": "main-v2"}, (
-        f"plan périmé suivi alors que main a avancé : {compat}")
+    assert ref == "canary", (
+        f"le boîtier doit OBÉIR au cloud, pas deviner la promotion : {ref}")
+    assert compat == {"plan": "canary"}, compat
+    # ⚖️ Et la preuve que le test d'ancêtre ne POUVAIT pas marcher ici :
+    r = subprocess.run(["git", "merge-base", "--is-ancestor", "origin/canary", "origin/main"],
+                       cwd=w, capture_output=True)
+    assert r.returncode != 0, (
+        "après un squash, la branche ne doit PAS être ancêtre de main — si elle l'est, ce banc "
+        "ne reproduit pas la fusion du dépôt et toute garde d'ancêtre y serait verte à tort")
+
+
+# ── Le signalement qui remplace la garde ─────────────────────────────────────
+
+@cas
+def un_boitier_dont_la_version_est_INCONNUE_DU_PLAN_est_signale():
+    """🚨 « Rien à faire » et « je ne peux plus rien faire » ne se disent pas pareil. Une version
+    que le plan ignore sort le boîtier du parc OTA : il journaliserait « Already up to date » à
+    chaque tick, pour toujours, et personne ne le verrait.
+
+    ⓘ Ce n'est pas une hypothèse : ben-0005 annonce `0.9.29`, version absente de toute
+       transition, et il est hors du parc depuis des semaines sans qu'une ligne le dise."""
+    plan = {"updates_caps": [{"from": "0.10.0", "to": "0.11.0", "tag": "pi-0.11.0"}]}
+    assert ul.hors_du_plan(plan, "0.9.29"), "une version inconnue du plan doit être signalée"
+    assert ul.hors_du_plan(plan, "0.12.0"), "une version EN AVANCE sur le plan aussi"
+
+
+@cas
+def une_version_CONNUE_du_plan_ne_declenche_aucun_signalement():
+    """⚖️ LE TÉMOIN, et sans lui un `hors_du_plan` qui rendrait toujours True ferait crier les
+    8 boîtiers à chaque tick — et un avertissement permanent ne se lit plus."""
+    plan = {"updates_caps": [{"from": "0.10.0", "to": "0.11.0", "tag": "pi-0.11.0"},
+                             {"from": "0.11.0", "to": "0.12.0", "tag": "pi-0.12.0"}]}
+    for connue in ("0.10.0", "0.11.0", "0.12.0"):
+        assert not ul.hors_du_plan(plan, connue), (
+            f"{connue} est dans le plan — en `from` ou en `to` — rien à signaler")
+
+
+@cas
+def un_plan_VIDE_est_signale_aussi():
+    """Un `compatibility.yaml` sans aucune transition ne peut faire avancer personne."""
+    assert ul.hors_du_plan({}, "0.11.0")
+    assert ul.hors_du_plan({"updates_caps": []}, "0.11.0")
 
 
 @cas
