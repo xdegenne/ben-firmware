@@ -18,6 +18,98 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.11.0] — 2026-10-06
+
+**Chaque boîtier demande au cloud où chercher ses mises à jour.** Chantier
+[`ben-docs#16`](https://github.com/xdegenne/ben-docs/issues/16), sous-tâche
+[#42](https://github.com/xdegenne/ben-firmware/issues/42).
+
+Le but : valider une OTA sur une branche, sur **un ou deux boîtiers seulement**, puis fusionner
+la branche sur `main` et tout le monde reçoit. Jusqu'ici `main` était écrit **en dur** dans
+l'agent, deux fois — donc un tag publié partait sur les 8 boîtiers au tick suivant, dans les dix
+minutes. Une release touchant plusieurs surfaces à la fois (`#35` en touche trois : le service
+qui publie, l'API locale, le provisioning BLE) ne pouvait pas s'essayer sur un boîtier d'abord.
+
+```
+① avant chaque tentative   GET /api/devices/<id>/update, en mTLS
+② le cloud répond          { "ref": "canary" }
+③ rien d'exploitable       ⇒ main
+④ l'agent fetch cette ref  et y lit compatibility.yaml
+⑤ le reste est intact      GPG du tag · SHA256 du script · UNE transition par tick
+```
+
+#### 🚨 C'est l'agent qui demande, pas le publisher qui relaie
+
+Si une mauvaise version tue le publisher, on doit **encore pouvoir piloter ce boîtier** — c'est
+précisément le moment où on en a besoin. Le prix est une trentaine de lignes de client mTLS dans
+l'agent, **entièrement sous `try/except`** : il répare tous les autres services, il ne doit pas
+gagner une dépendance capable de le tuer. Même doctrine que l'import défensif de
+`label_for_model`.
+
+#### ⭐ Débrayable, et sans contrainte d'ordre de déploiement
+
+La route n'existe pas encore (`ben-api#29`) : tout le parc prend donc `main` et se comporte
+exactement comme avant. Ce volet part **seul**, et le jour où la route serait coupée, rien ne
+s'arrête. C'est l'inverse du champ `access` de `ben-docs#3`, qui exigeait l'API **avant** le tag.
+
+#### 🚨 Le nom de branche vient du réseau et finit dans une ligne de commande `git`
+
+`ref_valide` impose un alphabet **fermé** : `[a-z0-9][a-z0-9._/-]{0,99}`. Le premier caractère
+alphanumérique règle d'un coup `-x` et `--upload-pack=…`, qui serait une **exécution de
+commande**. Sont refusés en plus `..` (intervalle de révisions), `refs/` (un autre espace de
+noms), un `/` ou un `.lock` final. La signature GPG du tag reste le verrou qui décide quel
+**code** s'exécute, mais elle intervient **après** : elle ne couvre pas ça.
+
+#### 🚨 Refspec explicite et forcée, et les deux moitiés comptent
+
+`+<ref>:refs/remotes/origin/<ref>`.
+
+- **explicite** : sans elle, la mise à jour de la ref distante dépend du `remote.origin.fetch` du
+  dépôt — vérifié `+refs/heads/*` sur ben-0001, posé par `install.sh`. Un boîtier provisionné
+  autrement lirait un plan **périmé**, sans que rien ne le dise ;
+- **forcée** : une branche d'essai **se rebase depuis `main`**, c'est l'usage prévu, donc son
+  historique est réécrit. Sans le `+`, le fetch refuserait la mise à jour non fast-forward et le
+  boîtier continuerait de lire l'**ancien** plan.
+
+⚠️ **Et une garde qu'on croyait utile ne l'est pas.** Le `--` avant la refspec a été éprouvé par
+mutation : le banc reste **vert** sans lui, parce que c'est le `+` qui empêche la lecture comme
+option. Le commentaire a été corrigé plutôt que de garder une garde invérifiable — `--` est
+conservé parce qu'il ne coûte rien, pas parce qu'il protège.
+
+#### 🚨 Repli sur `main` dans le même tick
+
+Le cas n'est pas théorique : la règle du dépôt est « branche supprimée au merge », donc le geste
+**normal** de promotion détruit la ref que le boîtier interroge. Sans ce repli, promouvoir une
+version arrêterait les mises à jour des boîtiers d'essai — en silence, jusqu'à ce que quelqu'un
+relise un journal.
+
+#### ⚠️ Attendu, et ce n'est pas une panne : rien ne change au tick qui applique cette update
+
+L'agent est un **processus neuf à chaque tick**, et celui qui exécute `update.sh` a chargé son
+code **avant** le `checkout` de l'étape ⑥. Le premier appel au cloud a donc lieu au réveil
+suivant du timer, dans ~10 min.
+
+ⓘ C'est l'asymétrie exacte qui a fait fermer `#37` sans la faire : un correctif dans l'agent
+n'est **jamais** immédiat ; un correctif dans le publisher, si — l'agent le redémarre à ⑩.
+
+#### Le banc, et ce qui a été vu tomber
+
+**15 cas.** Quatre montent un **vrai dépôt git** jetable à deux branches : c'est le seul moyen de
+prouver « lu depuis `origin/canary` » et « une branche **rebasée** est relue à jour ». Les onze
+autres couvrent la validation du nom et tout ce qui vaut `main` — y compris un **5xx au corps
+valide**, le seul cas qui vise la garde sur le statut HTTP (les autres passent sans elle, leur
+corps étant illisible).
+
+⚖️ Les témoins vont dans les deux sens : une implémentation qui rendrait **toujours** `main`
+passerait tous les cas de repli. **9 mutations** vérifiées rouges, **6 sabotages** du préflight ③
+aussi — dont « les commentaires seuls », puisque les deux fichiers nomment `ref_demandee`,
+`plan_de_mise_a_jour` et `REF_DEFAUT` dans leur prose. Le préflight vérifie aussi le **témoin
+inverse** : que l'agent ne lise **plus** le plan en direct, sinon le repli est contourné.
+
+**Aucun redémarrage** (l'agent est un `oneshot` par timer), **aucune migration**, **aucun état
+nouveau sur le disque** — la ref n'est pas mémorisée, elle est redemandée à chaque tick. Le
+retour arrière vers 0.10.0 ne demande de restaurer **rien**.
+
 ### [0.10.0] — 2026-10-06
 
 **La version installée atteint enfin le cloud — par une condition, plus par un événement.**

@@ -81,12 +81,18 @@ def main() -> None:
             device["model"] = label
             update_lib.save_device_json(device, DEVICE_JSON)
 
-        # 3. Fetch origin (tags + main branch)
-        log.info("Fetching origin...")
-        update_lib.fetch_origin(REPO_PATH)
+        # 3. La REF où chercher le plan — demandée au CLOUD, boîtier par boîtier
+        #    (ben-docs#16). Ne lève jamais : tout ce qui ne donne pas une ref valide
+        #    vaut `main`, donc ce boîtier se comporte comme avant tant que la route
+        #    n'existe pas, ou le jour où elle serait coupée.
+        ref = update_lib.ref_demandee(device["deviceId"])
 
-        # 4. Load compatibility.yaml from origin/main and find next transition
-        compat = update_lib.load_compatibility_from_remote(REPO_PATH)
+        # 4. Fetch + plan de mise à jour, avec repli sur `main` DANS CE TICK si la
+        #    ref est inutilisable (branche supprimée au merge, typiquement).
+        log.info("Fetching origin (%s)...", ref)
+        compat, ref = update_lib.plan_de_mise_a_jour(REPO_PATH, ref)
+        if ref != update_lib.REF_DEFAUT:
+            log.info("plan lu depuis origin/%s", ref)
         transition = update_lib.find_next_transition(compat, device)
 
         if transition is None:
