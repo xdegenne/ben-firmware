@@ -130,11 +130,13 @@ def ref_demandee(device_id: str) -> str:
         totalité du parc, donc ce sera la réponse NORMALE de 8 boîtiers toutes les 10 minutes.
         Un avertissement permanent ne se lit plus, et il noierait celui de `hors_du_plan` — qui
         signale, lui, un boîtier réellement bloqué ;
-      · **2xx avec une ref refusée** par la validation — là c'est un `WARNING` : quelqu'un a
-        écrit une valeur que le boîtier ne peut pas employer, donc une intention qui ne
-        s'applique pas et qu'on mettrait une heure à comprendre sans cette ligne. On prend
-        `main` plutôt que de figer : la valeur est une erreur humaine, et le boîtier n'avance
-        plus tant qu'elle est là.
+    🚨 UNE REF FOURNIE MAIS REFUSÉE NE DONNE PAS `main` — elle fait SAUTER LE TICK, avec un
+       `WARNING`. Le cloud a donné une instruction ; elle est inapplicable, mais elle existe, et
+       prendre `main` reviendrait à livrer la release à un boîtier qu'on retenait — pour un `H`
+       majuscule dans « Hold », ou une espace en fin de valeur. Irréversible, pour une faute de
+       frappe. Figer est au contraire SÛR (rien n'est appliqué) et BRUYANT (un avertissement par
+       tick), donc ça se corrige. ⇒ Le `WARNING` reste : une intention qui ne s'applique pas doit
+       se voir, et sans cette ligne on y passerait une heure.
 
     🚨 TOUT LE RESTE LÈVE : 5xx, 403, délai dépassé, DNS, TLS, connexion refusée, corps
        illisible. Voir le commentaire de `REF_DEFAUT` : un 503 d'un seul tick ne doit pas livrer
@@ -146,13 +148,21 @@ def ref_demandee(device_id: str) -> str:
         ctx.load_cert_chain(f"{CERT_DIR}/device.crt", f"{CERT_DIR}/device.key")
         # 🚨 On ne touche NI `check_hostname` NI `verify_mode` : les désactiver annulerait la
         #    moitié de l'authentification. Si le serveur est rejeté, on corrige le certificat.
-    except OSError as e:
-        # ⓘ Pas de certificat = boîtier non provisionné ou désappairé : il ne peut PAS parler au
+    except FileNotFoundError as e:
+        # ⓘ AUCUN certificat = boîtier non provisionné ou désappairé : il ne peut PAS parler au
         #   cloud, donc il ne peut pas être retenu sur une branche. `main` est sans risque, et
         #   sauter le tick figerait l'OTA d'un boîtier qui ne pourra jamais demander.
         log.info("pas de certificat (%s) — ce boîtier ne peut être retenu sur aucune branche, "
                  "on prend %s", e, REF_DEFAUT)
         return REF_DEFAUT
+    except OSError as e:
+        # 🚨 `FileNotFoundError` SEULEMENT, et pas `OSError` : celui-ci englobe `ssl.SSLError` ET
+        #    `PermissionError` (vérifié : les deux en héritent). Un certificat PRÉSENT mais
+        #    momentanément illisible — c'est la fenêtre de `ben_certd.basculer` pendant une
+        #    rotation — n'est pas « ce boîtier n'a pas de certificat » : on ne sait pas, donc on
+        #    ne fait rien. L'alternative livrerait la release de `main` à un boîtier RETENU, par
+        #    le hasard d'une rotation de clé.
+        raise TickASauter(f"certificat présent mais inutilisable ({e})") from e
     try:
         conn = http.client.HTTPSConnection(
             API_HOST, API_PORT, context=ctx, timeout=REF_TIMEOUT_S)
@@ -180,8 +190,9 @@ def ref_demandee(device_id: str) -> str:
         log.info("aucune branche pour ce boîtier — on suit %s", REF_DEFAUT)
         return REF_DEFAUT
     if not ref_valide(ref):
-        log.warning("ref OTA refusée (%r) — on prend %s", ref, REF_DEFAUT)
-        return REF_DEFAUT
+        log.warning("ref OTA refusée (%r) — tick sauté, ce boîtier n'avancera pas tant que "
+                    "`ota_ref` porte cette valeur", ref)
+        raise TickASauter(f"ref refusée par la validation ({ref!r})")
     if ref != REF_DEFAUT:
         log.info("ref OTA : %s (dite par le cloud)", ref)
     return ref
@@ -190,22 +201,31 @@ def ref_demandee(device_id: str) -> str:
 def ref_existe_sur_origin(repo_path: str, ref: str):
     """`True` existe · `False` n'existe pas · `None` on ne sait pas.
 
-    🚨 ON LIT UN CODE DE SORTIE, JAMAIS UN MESSAGE. `ls-remote --exit-code` rend 0 si la ref
-       existe, **2** si aucune ne correspond, et 128 sur une panne — trois codes distincts,
-       mesurés. Lire « couldn't find remote ref » aurait rouvert le défaut de la locale, qui a
-       déjà failli brûler cette version.
+    🚨 ON LIT UN CODE DE SORTIE, JAMAIS UN MESSAGE — `ls-remote` sort en 128 sur une panne, et
+       lire « couldn't find remote ref » aurait rouvert le défaut de la locale qui a déjà failli
+       brûler cette version.
+
+    🚨 ET ON COMPARE LE NOM COMPLET, parce que le MOTIF de `ls-remote` est apparié SUR LA QUEUE
+       du nom de ref. Vérifié sur git 2.54.0 : avec `canary` SUPPRIMÉE mais `foo/canary` encore
+       présente, `ls-remote --heads origin -- canary` rend le code 0 et affiche
+       `refs/heads/foo/canary`. Le boîtier aurait conclu « la branche existe encore », donc
+       sauté CHAQUE tick, sans fin, et ne serait JAMAIS revenu sur `main` — un boîtier perdu pour
+       une homonymie en sous-dossier.
     """
+    cible = f"refs/heads/{ref}"
     r = subprocess.run(
-        ["git", "-C", repo_path, "ls-remote", "--exit-code", "--heads", "origin", "--", ref],
+        ["git", "-C", repo_path, "ls-remote", "--heads", "origin", "--", cible],
         capture_output=True, text=True, env=_env_git(),
     )
-    if r.returncode == 0:
-        return True
-    if r.returncode == 2:
-        return False
-    log.warning("impossible de savoir si %s existe sur origin (code %d) : %s",
-                ref, r.returncode, (r.stderr or "").strip()[:200])
-    return None
+    # ⓘ Sans `--exit-code`, le code 0 vaut « la commande a abouti » et non « trouvé » : une
+    #   sortie VIDE avec un code 0 est donc la preuve de l'absence. C'est ce qu'on veut, le code
+    #   servant à distinguer la panne (128) de la réponse.
+    if r.returncode != 0:
+        log.warning("impossible de savoir si %s existe sur origin (code %d) : %s",
+                    ref, r.returncode, (r.stderr or "").strip()[:200])
+        return None
+    return any(ligne.split("\t")[-1].strip() == cible
+               for ligne in r.stdout.splitlines() if ligne.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +337,18 @@ def plan_de_mise_a_jour(repo_path: str = "/opt/ben/repo",
     except Exception as e:  # noqa: BLE001
         raise TickASauter(f"plan de {ref} illisible ({e}) — on n'applique RIEN de {REF_DEFAUT} "
                           f"à sa place") from e
+
+
+def _rev_num(rev: str) -> int:
+    """`"rev03"` → 3.
+
+    ⓘ RENDUE À SON APPELANT après l'avoir supprimée par accident dans un remplacement de bloc :
+      `find_next_transition` l'appelle encore dans son repli PAR MODÈLE, et un `NameError` y
+      serait levé à chaque tick. Rien ne le déclenche aujourd'hui — `compatibility.yaml` n'a
+      plus de section `updates:` depuis le ménage du 2026-07-22 — mais un défaut latent dans
+      l'agent d'OTA est précisément celui qu'on ne veut pas laisser dormir.
+    """
+    return int(rev.lstrip("rev"))
 
 
 def find_next_transition(compat: dict, device: dict) -> Optional[dict]:

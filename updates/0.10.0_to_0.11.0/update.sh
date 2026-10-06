@@ -12,7 +12,9 @@
 #     ① avant chaque tentative d'OTA : GET /api/devices/<id>/update, en mTLS
 #     ② le cloud répond { "ref": "canary" }
 #     ③ `main` sur un signal AFFIRMATIF SEULEMENT : 404 (route absente), « aucune branche »,
-#       nom refusé, ou branche dont l'absence est PROUVÉE. Tout le reste SAUTE LE TICK
+#       ou branche dont l'absence est PROUVÉE. Tout le reste SAUTE LE TICK — y compris une ref
+#       FOURNIE mais refusée par la validation : « Hold » avec une majuscule ne doit pas livrer
+#       la release à un boîtier qu'on retenait
 #     ④ l'agent fetch cette ref et y lit compatibility.yaml
 #     ⑤ le reste ne change pas : GPG du tag, SHA256 du script, UNE transition par tick
 #
@@ -48,8 +50,11 @@
 #   démarrage, donc AVANT le `git checkout` de l'étape ⑥. Le code neuf est sur le disque, il ne
 #   s'exécutera qu'au prochain réveil du `ben-update.timer` (~10 min).
 #
-#   ⇒ Attendu : « Fetching origin (main) » dès le tick suivant, et « ref OTA indisponible (…) — on
-#     prend main » tant que `ben-api#29` n'est pas déployée. Les deux sont l'état NORMAL.
+#   ⇒ Attendu : « route de ref absente (404) — mécanisme non déployé, on prend main » puis
+#     « Fetching origin (main) », dès le tick suivant et tant que `ben-api#29` n'est pas
+#     déployée. Les deux sont l'état NORMAL. ⚠️ Ces libellés sont ceux que l'agent écrit VRAIMENT,
+#     relevés sur ben-0001 : un script figé par son SHA256 qui annonce une ligne inexistante
+#     envoie l'opérateur chercher ce qui n'est pas là.
 #   ⓘ C'est exactement cette asymétrie qui a fait fermer `ben-firmware#37` sans la faire : un
 #     correctif dans l'agent n'est jamais immédiat. Un correctif dans le publisher, si — l'agent le
 #     redémarre à l'étape ⑩.
@@ -89,7 +94,7 @@ log "préflight ① OK (3 fichiers présents et compilables)"
 
 # ═══ PRÉFLIGHT ② — LE BANC LIVRÉ PAR LE TAG, SUR LE PYTHON ET LE GIT DU BOÎTIER ══════════════
 #
-#   24 cas, et ce banc-là a besoin du `git` de la cible : NEUF de ses cas montent un VRAI dépôt
+#   27 cas, et ce banc-là a besoin du `git` de la cible : DIX de ses cas montent un VRAI dépôt
 #   jetable pour vérifier d'où le plan a été lu. C'est le seul moyen de prouver « lu depuis
 #   origin/canary », qu'une branche REBASÉE est relue à jour (refspec forcée), et qu'une branche
 #   FUSIONNÉE EN SQUASH reste suivie — le boîtier obéit au cloud, il ne devine pas. Et deux cas
@@ -106,14 +111,14 @@ log "préflight ① OK (3 fichiers présents et compilables)"
 #    correction, vert après.
 #
 # ⚖️ Les témoins vont dans les deux sens : une implémentation qui rendrait toujours `main`
-#    passerait tous les cas de repli. 25 mutations vérifiées ROUGES avant livraison — et UNE est
+#    passerait tous les cas de repli. 30 mutations vérifiées ROUGES avant livraison — et UNE est
 #    restée VERTE, ce qui a fait corriger le commentaire plutôt que garder une garde invérifiable
 #    (le `--` avant la refspec : c'est le `+` qui fait barrière).
 # ⚠️ `TMPDIR=/var/tmp` et pas /tmp : /tmp peut être un tmpfs étroit sur un Pi Zero, et ce banc y
 #    crée des dépôts git.
 TMPDIR=/var/tmp python3 "$UPD/test_ref_ota.py" \
     || fail "le banc de la ref OTA échoue — NE PAS déployer en l'état"
-log "préflight ② OK (banc livré : 24 cas, dont 9 sur un vrai dépôt git, et 2 sous LANGUAGE=fr)"
+log "préflight ② OK (banc livré : 27 cas, dont 10 sur un vrai dépôt git, et 2 sous LANGUAGE=fr)"
 
 # ═══ PRÉFLIGHT ③ — 🚨 LE CORRECTIF EST BRANCHÉ, PROUVÉ SUR L'ARBRE ════════════════════════════
 #
@@ -220,7 +225,8 @@ log "── à vérifier APRÈS cette update (hors de portée de ce script) ─�
 log "   🚨 RIEN NE CHANGE AU TICK COURANT : l'agent en mémoire est l'ANCIEN. Le premier appel"
 log "      au cloud a lieu au réveil suivant du ben-update.timer, dans ~10 min."
 log "   journalctl -u ben-update -n 30 --no-pager  → attendu, au tick SUIVANT :"
-log "     « ref OTA indisponible (…) — on prend main »   (ben-api#29 pas encore déployée)"
+log "     « route de ref absente (404) — mécanisme non déployé, on prend main »"
+log "       (ben-api#29 pas encore déployée — c'est l'état NORMAL)"
 log "     « Fetching origin (main) »"
 log "   ⇒ les deux sont l'état NORMAL, pas une panne. Le mécanisme est installé et inerte."
 log "   Quand ben-api#29 sera là : poser ota_ref='canary' sur UN boîtier, et attendre"

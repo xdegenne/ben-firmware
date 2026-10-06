@@ -232,18 +232,27 @@ def aucune_branche_pour_ce_boitier_donne_main_EN_INFO_PAS_EN_WARNING():
 
 
 @cas
-def une_ref_PRESENTE_mais_refusee_donne_main_ET_un_WARNING():
-    """⚖️ LE CONTRE-TÉMOIN du cas précédent, et il est indispensable : sans lui, un code qui
-    ravalerait TOUT en `info` passerait — et une valeur qu'un opérateur a écrite mais que le
-    boîtier refuse resterait invisible, alors qu'elle veut dire qu'une intention ne s'applique
-    pas."""
-    h = journal()
-    try:
-        assert _avec_cloud(200, '{"ref": "--upload-pack=id"}') == ul.REF_DEFAUT
-        assert any(n >= logging.WARNING for n, _ in h.lignes), (
-            f"une ref refusée doit s'annoncer en WARNING : {h.lignes}")
-    finally:
-        ul.log.removeHandler(h)
+def une_ref_PRESENTE_mais_refusee_SAUTE_LE_TICK_avec_un_WARNING():
+    """🚨 ELLE NE DONNE PAS `main`, et c'est la règle de cette PR appliquée à elle-même : le
+    cloud a donné une instruction, elle est inapplicable, mais elle EXISTE. Prendre `main`
+    livrerait la release à un boîtier qu'on retenait — pour un `H` majuscule dans « Hold », ou
+    une espace en fin de valeur. Irréversible, pour une faute de frappe. Figer est SÛR (rien
+    n'est appliqué) et BRUYANT (un avertissement par tick), donc ça se corrige.
+
+    ⚖️ Le WARNING reste le contre-témoin du cas précédent : sans lui, un code qui ravalerait tout
+       en `info` passerait, et une intention qui ne s'applique pas resterait invisible."""
+    for mauvaise in ('{"ref": "--upload-pack=id"}', '{"ref": "Hold"}', '{"ref": "hold "}',
+                     '{"ref": "a..b"}'):
+        h = journal()
+        try:
+            _avec_cloud(200, mauvaise)
+        except ul.TickASauter:
+            assert any(n >= logging.WARNING for n, _ in h.lignes), (
+                f"une ref refusée doit s'annoncer en WARNING : {h.lignes}")
+            continue
+        finally:
+            ul.log.removeHandler(h)
+        raise AssertionError(f"{mauvaise} doit faire SAUTER le tick, pas prendre main")
 
 
 # ── TOUT LE RESTE FAIT SAUTER LE TICK ───────────────────────────────────────
@@ -290,7 +299,27 @@ def un_corps_ILLISIBLE_fait_SAUTER_LE_TICK():
 
 
 @cas
-def un_certificat_absent_donne_main_et_ne_saute_PAS_le_tick():
+def un_certificat_PRESENT_MAIS_ILLISIBLE_fait_SAUTER_LE_TICK():
+    """🚨 `FileNotFoundError` SEULEMENT doit donner `main`, pas `OSError` : celui-ci englobe
+    `ssl.SSLError` ET `PermissionError` (les deux en héritent, vérifié). Un certificat PRÉSENT
+    mais momentanément illisible — la fenêtre de `ben_certd.basculer` pendant une rotation — n'est
+    pas « ce boîtier n'a pas de certificat ». Sinon le hasard d'une rotation de clé livrerait la
+    release de `main` à un boîtier RETENU."""
+    import ssl
+    vrai = ssl.create_default_context
+    for panne in (PermissionError("device.key"), ssl.SSLError("bad key")):
+        ssl.create_default_context = lambda *a, **k: (_ for _ in ()).throw(panne)
+        try:
+            ul.ref_demandee("ben-0001")
+        except ul.TickASauter:
+            continue
+        finally:
+            ssl.create_default_context = vrai
+        raise AssertionError(f"{panne!r} doit faire sauter le tick, pas prendre main")
+
+
+@cas
+def un_certificat_ABSENT_donne_main_et_ne_saute_PAS_le_tick():
     """ⓘ Un boîtier sans certificat ne peut PAS parler au cloud, donc il ne peut pas être
     retenu sur une branche : `main` est sans risque. Sauter le tick figerait l'OTA d'un boîtier
     qui ne pourra jamais demander — exactement le contraire du but."""
@@ -452,6 +481,22 @@ def un_fetch_qui_echoue_SANS_PROUVER_l_absence_fait_SAUTER_LE_TICK():
 
 
 @cas
+def une_HOMONYME_EN_SOUS_DOSSIER_ne_fait_PAS_passer_la_branche_pour_presente():
+    """🚨 LE MOTIF DE `ls-remote` EST APPARIÉ SUR LA QUEUE DU NOM DE REF. Vérifié sur git 2.54.0 :
+    avec `canary` supprimée mais `foo/canary` encore là, `ls-remote --heads origin -- canary`
+    rend le code 0 et affiche `refs/heads/foo/canary`. Le boîtier aurait conclu « la branche
+    existe encore », donc sauté CHAQUE tick, sans fin, et ne serait JAMAIS revenu sur `main` —
+    perdu pour une homonymie en sous-dossier."""
+    d, w = depot({"main": "plan: main\n", "foo/canary": "plan: homonyme\n"})
+    assert ul.ref_existe_sur_origin(str(w), "canary") is False, (
+        "`canary` n'existe pas : seule `foo/canary` existe, et le motif ne doit pas la confondre")
+    assert ul.ref_existe_sur_origin(str(w), "foo/canary") is True
+    # ⇒ et le repli doit donc bien avoir lieu
+    compat, ref = ul.plan_de_mise_a_jour(str(w), "canary")
+    assert ref == ul.REF_DEFAUT and compat == {"plan": "main"}, (compat, ref)
+
+
+@cas
 def une_branche_dont_l_ABSENCE_EST_PROUVEE_retombe_sur_main():
     """⚖️ LE CONTRE-TÉMOIN du cas précédent : sans lui, un code qui sauterait TOUJOURS le tick
     passerait — et le geste normal de promotion (« branche supprimée au merge ») figerait les
@@ -524,6 +569,31 @@ def le_message_de_git_est_en_C_meme_si_le_boitier_parle_francais():
         else:
             os.environ["LANGUAGE"] = avant
     raise AssertionError("une ref absente doit faire échouer le fetch")
+
+
+@cas
+def le_repli_PAR_MODELE_de_find_next_transition_ne_leve_pas():
+    """🚨 DÉFAUT LATENT, trouvé en revue : `_rev_num` avait été supprimée par accident dans un
+    remplacement de bloc, alors que `find_next_transition` l'appelle encore dans son repli PAR
+    MODÈLE. Un `NameError` y serait levé à CHAQUE tick. Rien ne le déclenche aujourd'hui —
+    `compatibility.yaml` n'a plus de section `updates:` depuis le ménage du 2026-07-22 — mais un
+    défaut qui dort dans l'agent d'OTA est précisément celui qu'on ne veut pas laisser dormir, et
+    rien ne l'aurait rattrapé avant qu'il morde.
+
+    ⚖️ Ce cas emprunte donc le CHEMIN MORT exprès, avec son gating matériel, pour que la
+       suppression de `_rev_num` se voie."""
+    plan = {"updates": {"pi0-wired": [
+        {"from": "0.1.0", "to": "0.2.0", "tag": "pi-0.2.0",
+         "script": "x", "requires": {"hardwareRevision": {"minimum": "rev03"}}}]}}
+    # matériel TROP ANCIEN ⇒ transition écartée, et c'est `_rev_num` qui le décide
+    assert ul.find_next_transition(
+        plan, {"softwareVersion": "0.1.0", "model": "pi0-wired",
+               "hardwareRevision": "rev01"}) is None
+    # matériel suffisant ⇒ transition rendue
+    t = ul.find_next_transition(
+        plan, {"softwareVersion": "0.1.0", "model": "pi0-wired",
+               "hardwareRevision": "rev03"})
+    assert t and t["tag"] == "pi-0.2.0", t
 
 
 if __name__ == "__main__":

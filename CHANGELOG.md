@@ -93,7 +93,31 @@ Les deux seuls signaux affirmatifs :
 | branche dont `ls-remote` prouve l'absence | promotion : « branche supprimée au merge » ⇒ `main` |
 
 Tout le reste — 5xx, délai dépassé, DNS, TLS, corps illisible, fetch qui échoue sans prouver
-l'absence — **saute le tick**. Une **absence de réponse n'est pas une réponse** : sans
+l'absence, **certificat présent mais illisible**, et **ref fournie mais refusée** — **saute le
+tick**.
+
+⚠️ **Une ref fournie mais refusée ne donne pas `main`**, et c'est la règle appliquée à elle-même :
+le cloud a donné une instruction, elle est inapplicable, mais elle **existe**. Un `H` majuscule
+dans « Hold », ou une espace en fin de valeur, livrerait sinon la release à un boîtier qu'on
+retenait — irréversible, pour une faute de frappe. Figer est **sûr** (rien n'est appliqué) et
+**bruyant** (un `WARNING` par tick), donc ça se corrige.
+
+⚠️ **Et seul `FileNotFoundError` vaut « pas de certificat »**, pas `OSError` : celui-ci englobe
+`ssl.SSLError` **et** `PermissionError`. Un certificat **présent mais momentanément illisible** —
+la fenêtre de `ben_certd.basculer` pendant une rotation — ne doit pas faire prendre `main`, sinon
+le hasard d'une rotation de clé livre la release à un boîtier retenu.
+
+🚨 **Et le nom de branche se compare en entier.** Le motif de `ls-remote` est apparié **sur la
+queue** du nom de ref : vérifié sur git 2.54.0, avec `canary` supprimée mais `foo/canary` encore
+présente, `ls-remote --heads origin -- canary` rend le code 0 et affiche `refs/heads/foo/canary`.
+Le boîtier aurait conclu « elle existe encore », sauté **chaque** tick sans fin, et ne serait
+jamais revenu sur `main` — perdu pour une homonymie en sous-dossier.
+
+ⓘ Au passage, un **défaut latent** : `_rev_num()` avait été supprimée par accident alors que
+`find_next_transition` l'appelle encore dans son repli **par modèle** — un `NameError` à chaque
+tick. Rien ne le déclenche aujourd'hui (`compatibility.yaml` n'a plus de section `updates:`), mais
+un défaut qui dort dans l'agent d'OTA est celui qu'on ne veut pas laisser dormir. Rendue, et le
+banc emprunte désormais ce chemin mort exprès. Une **absence de réponse n'est pas une réponse** : sans
 instruction, on ne fait rien, et le timer repasse dans dix minutes. Une OTA n'est jamais urgente ;
 une release appliquée par erreur ne se retire pas.
 
@@ -182,7 +206,7 @@ repli attrape maintenant tout ce qui cloche **sur le chemin de la branche** — 
 
 #### Le banc, et ce qui a été vu tomber
 
-**24 cas.** **Neuf** montent un **vrai dépôt git** jetable : seul moyen de prouver « lu depuis
+**27 cas.** **Dix** montent un **vrai dépôt git** jetable : seul moyen de prouver « lu depuis
 `origin/canary` », « une branche **rebasée** est relue à jour » et « une branche fusionnée **en
 squash** reste suivie ». Les autres couvrent la validation du nom, le signalement d'une version hors
 plan, et tout ce qui vaut `main` — dont un **5xx au corps valide**, seul cas qui vise la garde sur le
@@ -194,7 +218,7 @@ module, donc figée à l'**import** : le `LANGUAGE=fr` que les deux cas posent e
 plus `git`, et ils restaient verts même en retirant `LC_ALL=C`. L'environnement est maintenant
 construit **à chaque appel**, et la mutation a été vérifiée **rouge sur ben-0001**.
 
-⚖️ **25 mutations** vérifiées rouges, **7 sabotages** du préflight ③ aussi. ⚠️ **Une** est restée
+⚖️ **30 mutations** vérifiées rouges, **7 sabotages** du préflight ③ aussi. ⚠️ **Une** est restée
 verte — le `--` avant la refspec, puisque c'est le `+` qui fait barrière : le commentaire a été
 corrigé plutôt que de garder une garde invérifiable.
 
