@@ -57,6 +57,26 @@ def _env_git() -> dict:
 #    réponse, DNS, TLS, 404, 5xx, JSON illisible, champ absent, nom refusé — et le
 #    jour où la route est coupée, les boîtiers continuent de se mettre à jour comme
 #    avant. Aucune contrainte d'ordre de déploiement : ce code part SEUL.
+# 🚨 LA RÈGLE, ET ELLE TIENT EN UNE PHRASE : on ne suit `main` que sur un signal AFFIRMATIF —
+#    le cloud a dit « aucune branche », ou la branche demandée N'EXISTE DÉMONTRABLEMENT PLUS.
+#    Tout le reste — 5xx, délai dépassé, DNS, TLS, corps illisible, fetch qui échoue sans qu'on
+#    sache pourquoi — fait SAUTER LE TICK.
+#
+# ⚠️ C'EST UN RENVERSEMENT, et il faut savoir pourquoi. La première version repliait sur `main`
+#    « à la moindre erreur », au nom du débrayage. Mais `main` n'est le choix prudent QUE si le
+#    boîtier est sur une branche pour recevoir quelque chose EN AVANCE. Si on l'y a mis pour le
+#    RETENIR avant une release risquée, alors `main` est précisément le danger : un 503 d'un seul
+#    tick suffisait à lui livrer la release qu'on voulait éviter — et `device.json` étant bumpé,
+#    ce n'est PAS rattrapable.
+#    ⇒ Le boîtier ne peut pas distinguer les deux intentions. Mais il n'a pas à les distinguer :
+#      une ABSENCE DE RÉPONSE N'EST PAS UNE RÉPONSE. Sans instruction, on ne fait RIEN. Une OTA
+#      n'est jamais urgente — le timer repasse dans dix minutes — alors qu'une release appliquée
+#      par erreur ne se retire pas.
+#
+# ⚠️ CE QUE ÇA COÛTE, ET IL FAUT L'ASSUMER : couper le SERVEUR fige l'OTA du parc le temps de la
+#    panne (le boîtier saute ses ticks). Débrayer le mécanisme ne se fait donc pas en éteignant
+#    l'API, mais par un signal affirmatif : RETIRER LA ROUTE (404 ⇒ `main`), ou mettre `ota_ref`
+#    à NULL. Les deux sont immédiats et explicites.
 REF_DEFAUT = "main"
 API_HOST = os.environ.get("BEN_API_HOST", "api.benpilote.fr")
 API_PORT = int(os.environ.get("BEN_API_PORT", "8443"))
@@ -76,6 +96,15 @@ REF_TIMEOUT_S = float(os.environ.get("BEN_OTA_REF_TIMEOUT", "10"))
 _REF_ALPHABET = re.compile(r"^[a-z0-9][a-z0-9._/-]{0,99}$")
 
 
+class TickASauter(Exception):
+    """On ne sait pas quel plan suivre ⇒ on ne fait RIEN, et on réessaie au tick suivant.
+
+    🚨 CE N'EST PAS UN ÉCHEC, et l'agent sort en 0 : rien n'a été tenté, `device.json` n'est pas
+       touché, et le timer repasse dans dix minutes. Un échec (code 1) voudrait dire qu'une
+       update a été tentée et a raté ; ici on s'est abstenu, ce qui est le résultat voulu.
+    """
+
+
 def ref_valide(ref) -> bool:
     """La ref est-elle employable dans un `git fetch` et un `git show` ?
 
@@ -90,46 +119,93 @@ def ref_valide(ref) -> bool:
 
 
 def ref_demandee(device_id: str) -> str:
-    """Demande au cloud où chercher le plan. Rend TOUJOURS une ref employable.
+    """Demande au cloud où chercher le plan. Rend une ref, ou LÈVE `TickASauter`.
 
-    🚨 NE LÈVE JAMAIS. C'est l'agent qui répare tous les autres services : il ne
-       doit pas gagner une dépendance capable de le tuer. Même doctrine que l'import
-       défensif de `label_for_model`, et que le `hello()` du publisher — un échec de
-       métadonnée n'empêche pas le travail de se faire.
+    On ne rend `main` que sur un signal AFFIRMATIF :
+
+      · **404** — la route n'existe pas, donc le mécanisme n'est pas déployé ou a été retiré.
+        C'est l'état d'aujourd'hui, et c'est aussi le geste de débrayage ;
+      · **2xx sans `ref`** (absente ou `null`) — le cloud dit « ce boîtier n'est retenu sur
+        aucune branche ». ⚠️ EN `INFO`, PAS EN `WARNING` : `ota_ref` vaut `NULL` pour la quasi-
+        totalité du parc, donc ce sera la réponse NORMALE de 8 boîtiers toutes les 10 minutes.
+        Un avertissement permanent ne se lit plus, et il noierait celui de `hors_du_plan` — qui
+        signale, lui, un boîtier réellement bloqué ;
+      · **2xx avec une ref refusée** par la validation — là c'est un `WARNING` : quelqu'un a
+        écrit une valeur que le boîtier ne peut pas employer, donc une intention qui ne
+        s'applique pas et qu'on mettrait une heure à comprendre sans cette ligne. On prend
+        `main` plutôt que de figer : la valeur est une erreur humaine, et le boîtier n'avance
+        plus tant qu'elle est là.
+
+    🚨 TOUT LE RESTE LÈVE : 5xx, 403, délai dépassé, DNS, TLS, connexion refusée, corps
+       illisible. Voir le commentaire de `REF_DEFAUT` : un 503 d'un seul tick ne doit pas livrer
+       à un boîtier RETENU la release qu'on lui épargnait.
     """
     try:
         ctx = ssl.create_default_context(
             ssl.Purpose.SERVER_AUTH, cafile=f"{CERT_DIR}/root-ca.crt")
         ctx.load_cert_chain(f"{CERT_DIR}/device.crt", f"{CERT_DIR}/device.key")
-        # 🚨 On ne touche NI `check_hostname` NI `verify_mode` : les désactiver
-        #    annulerait la moitié de l'authentification. Si le serveur est rejeté,
-        #    on corrige le certificat.
+        # 🚨 On ne touche NI `check_hostname` NI `verify_mode` : les désactiver annulerait la
+        #    moitié de l'authentification. Si le serveur est rejeté, on corrige le certificat.
+    except OSError as e:
+        # ⓘ Pas de certificat = boîtier non provisionné ou désappairé : il ne peut PAS parler au
+        #   cloud, donc il ne peut pas être retenu sur une branche. `main` est sans risque, et
+        #   sauter le tick figerait l'OTA d'un boîtier qui ne pourra jamais demander.
+        log.info("pas de certificat (%s) — ce boîtier ne peut être retenu sur aucune branche, "
+                 "on prend %s", e, REF_DEFAUT)
+        return REF_DEFAUT
+    try:
         conn = http.client.HTTPSConnection(
             API_HOST, API_PORT, context=ctx, timeout=REF_TIMEOUT_S)
         try:
             conn.request("GET", f"/api/devices/{device_id}/update")
             rep = conn.getresponse()
             # ⓘ Borné : on lit un objet d'une ligne, pas un corps de taille inconnue.
-            corps = rep.read(4096)
-            if not (200 <= rep.status < 300):
-                log.info("ref OTA : HTTP %d — on prend %s", rep.status, REF_DEFAUT)
-                return REF_DEFAUT
+            statut, corps = rep.status, rep.read(4096)
         finally:
             conn.close()
+    except Exception as e:  # noqa: BLE001
+        raise TickASauter(f"cloud injoignable pour la ref ({e})") from e
+
+    if statut == 404:
+        log.info("route de ref absente (404) — mécanisme non déployé, on prend %s", REF_DEFAUT)
+        return REF_DEFAUT
+    if not (200 <= statut < 300):
+        raise TickASauter(f"HTTP {statut} sur la ref — on ne sait pas quel plan suivre")
+    try:
         ref = json.loads(corps).get("ref")
     except Exception as e:  # noqa: BLE001
-        log.info("ref OTA indisponible (%s) — on prend %s", e, REF_DEFAUT)
+        raise TickASauter(f"réponse de ref illisible ({e})") from e
+
+    if ref is None:
+        log.info("aucune branche pour ce boîtier — on suit %s", REF_DEFAUT)
         return REF_DEFAUT
     if not ref_valide(ref):
-        # ⚠️ `warning` et non `info` : contrairement à « pas de réponse », celui-ci
-        #    veut dire que quelqu'un a écrit une valeur que le boîtier refuse — donc
-        #    une intention qui ne s'applique pas, et qu'on mettrait une heure à
-        #    comprendre sans cette ligne.
         log.warning("ref OTA refusée (%r) — on prend %s", ref, REF_DEFAUT)
         return REF_DEFAUT
     if ref != REF_DEFAUT:
         log.info("ref OTA : %s (dite par le cloud)", ref)
     return ref
+
+
+def ref_existe_sur_origin(repo_path: str, ref: str):
+    """`True` existe · `False` n'existe pas · `None` on ne sait pas.
+
+    🚨 ON LIT UN CODE DE SORTIE, JAMAIS UN MESSAGE. `ls-remote --exit-code` rend 0 si la ref
+       existe, **2** si aucune ne correspond, et 128 sur une panne — trois codes distincts,
+       mesurés. Lire « couldn't find remote ref » aurait rouvert le défaut de la locale, qui a
+       déjà failli brûler cette version.
+    """
+    r = subprocess.run(
+        ["git", "-C", repo_path, "ls-remote", "--exit-code", "--heads", "origin", "--", ref],
+        capture_output=True, text=True, env=_env_git(),
+    )
+    if r.returncode == 0:
+        return True
+    if r.returncode == 2:
+        return False
+    log.warning("impossible de savoir si %s existe sur origin (code %d) : %s",
+                ref, r.returncode, (r.stderr or "").strip()[:200])
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -201,49 +277,46 @@ def hors_du_plan(compat: dict, version: str) -> bool:
 
 def plan_de_mise_a_jour(repo_path: str = "/opt/ben/repo",
                         ref: str = REF_DEFAUT) -> tuple:
-    """Rend `(compatibility, ref_employée)`. Retombe sur `main` DANS CE TICK.
+    """Rend `(compatibility, ref_employée)`, ou LÈVE `TickASauter`.
 
-    🚨 LE REPLI DANS LE MÊME TICK EST LE CŒUR DE CE MÉCANISME, et il couvre TROIS cas
-       qui mènent tous au même endroit — `main` — parce qu'une branche d'essai est, par
-       nature, l'endroit où les choses cassent :
+    🚨 MÊME RÈGLE QUE `ref_demandee` : on ne rend la main à `main` que si la branche
+       **n'existe démontrablement plus** sur `origin` — le cas normal après une promotion,
+       puisque la règle du dépôt est « branche supprimée au merge ». Tout autre échec fait
+       sauter le tick : un réseau qui tombe pendant qu'on suit une branche de RETENUE ne doit
+       pas livrer la release de `main`.
 
-       ① la ref est introuvable. La règle du dépôt est « branche supprimée au merge »,
-          donc le geste NORMAL de promotion détruit la ref interrogée ;
-       ② le `compatibility.yaml` de la branche est ILLISIBLE. `yaml.safe_load` lève une
-          `YAMLError`, pas une `CalledProcessError` : avec un `except` étroit l'erreur
-          traversait et le tick échouait, puis re-échouait toutes les 10 minutes.
+    🚨 UN `compatibility.yaml` ILLISIBLE SUR LA BRANCHE FAIT SAUTER LE TICK, et c'est la raison
+       la plus forte de tout ce raisonnement : **un plan mal formé est précisément ce que la
+       branche d'essai existe pour attraper.** Replier sur `main` ferait disparaître de l'écran
+       le défaut qu'on cherchait à voir — le boîtier se mettrait à jour normalement, et le plan
+       cassé ne se manifesterait qu'au moment où il atteindrait tout le parc. Sauter le tick le
+       laisse visible, sans rien appliquer : l'erreur se corrige en poussant sur la branche, et
+       le boîtier repart au tick suivant.
 
-    🚨 CE QU'IL NE FAIT PAS, ET C'EST UNE DÉCISION : il ne cherche PAS à deviner qu'une branche
-       a été promue. Le boîtier OBÉIT à la ref que le cloud lui donne ; s'il s'y trouve figé,
-       `hors_du_plan` le fait CRIER. Voir le commentaire de cette fonction pour les deux raisons
-       qui ont fait retirer la garde d'ancêtre.
-
-    ⇒ D'où un `except Exception` ASSUMÉ sur le chemin de la branche : tout ce qui
-      cloche sur une ref d'essai doit rendre la main à `main`, jamais arrêter les mises
-      à jour. ⚠️ Et il ne vaut QUE pour ce chemin — un `main` cassé, lui, doit lever :
-      c'est une panne réelle, qui doit se voir.
+    🚨 Il ne cherche PAS à deviner qu'une branche a été promue : le boîtier obéit à la ref que
+       le cloud lui donne, et `hors_du_plan` le fait crier s'il s'y trouve figé. Voir le
+       commentaire de `hors_du_plan` pour les deux raisons qui ont fait retirer la garde
+       d'ascendance.
     """
     if ref == REF_DEFAUT:
         fetch_origin(repo_path, REF_DEFAUT)
         return load_compatibility_from_remote(repo_path, REF_DEFAUT), REF_DEFAUT
     try:
         fetch_origin(repo_path, ref)
-        return load_compatibility_from_remote(repo_path, ref), ref
     except Exception as e:  # noqa: BLE001
         motif = (getattr(e, "stderr", None) or str(e)).strip()[:200]
-        log.warning("ref %s inutilisable (%s) — repli sur %s DANS CE TICK",
-                    ref, motif, REF_DEFAUT)
-    fetch_origin(repo_path, REF_DEFAUT)
-    return load_compatibility_from_remote(repo_path, REF_DEFAUT), REF_DEFAUT
-
-
-# ---------------------------------------------------------------------------
-# Transition resolution
-# ---------------------------------------------------------------------------
-
-def _rev_num(rev: str) -> int:
-    """'rev03' → 3"""
-    return int(rev.lstrip("rev"))
+        if ref_existe_sur_origin(repo_path, ref) is False:
+            log.warning("la branche %s n'existe plus sur origin (%s) — repli sur %s DANS CE "
+                        "TICK ; vérifier `ota_ref` côté cloud", ref, motif, REF_DEFAUT)
+            fetch_origin(repo_path, REF_DEFAUT)
+            return load_compatibility_from_remote(repo_path, REF_DEFAUT), REF_DEFAUT
+        raise TickASauter(f"fetch de {ref} impossible et la branche existe peut-être "
+                          f"encore ({motif})") from e
+    try:
+        return load_compatibility_from_remote(repo_path, ref), ref
+    except Exception as e:  # noqa: BLE001
+        raise TickASauter(f"plan de {ref} illisible ({e}) — on n'applique RIEN de {REF_DEFAUT} "
+                          f"à sa place") from e
 
 
 def find_next_transition(compat: dict, device: dict) -> Optional[dict]:

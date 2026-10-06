@@ -76,12 +76,49 @@ mutation : le banc reste **vert** sans lui, parce que c'est le `+` qui empêche 
 option. Le commentaire a été corrigé plutôt que de garder une garde invérifiable — `--` est
 conservé parce qu'il ne coûte rien, pas parce qu'il protège.
 
-#### 🚨 Repli sur `main` dans le même tick
+#### 🚨 On ne suit `main` que sur un signal **affirmatif** — tout le reste saute le tick
 
-Le cas n'est pas théorique : la règle du dépôt est « branche supprimée au merge », donc le geste
-**normal** de promotion détruit la ref que le boîtier interroge. Sans ce repli, promouvoir une
-version arrêterait les mises à jour des boîtiers d'essai — en silence, jusqu'à ce que quelqu'un
-relise un journal.
+C'est le renversement de la dernière revue, et la raison est sèche : **`main` n'est le choix
+prudent que si le boîtier est sur une branche pour recevoir quelque chose en avance.** Si on l'y a
+mis pour le **retenir** avant une release risquée, `main` est précisément le danger — et un `503`
+d'un **seul** tick suffisait à lui livrer la release qu'on lui épargnait. `device.json` étant
+bumpé, ce n'est **pas** rattrapable.
+
+Les deux seuls signaux affirmatifs :
+
+| signal | effet |
+|---|---|
+| **404** sur la route | le mécanisme n'est pas déployé, ou a été retiré ⇒ `main` |
+| `{"ref": null}` ou pas de `ref` | le cloud dit « aucune branche » ⇒ `main` |
+| branche dont `ls-remote` prouve l'absence | promotion : « branche supprimée au merge » ⇒ `main` |
+
+Tout le reste — 5xx, délai dépassé, DNS, TLS, corps illisible, fetch qui échoue sans prouver
+l'absence — **saute le tick**. Une **absence de réponse n'est pas une réponse** : sans
+instruction, on ne fait rien, et le timer repasse dans dix minutes. Une OTA n'est jamais urgente ;
+une release appliquée par erreur ne se retire pas.
+
+⚠️ **Corollaire assumé** : couper le **serveur** fige l'OTA le temps de la panne. Débrayer le
+mécanisme se fait par un signal affirmatif — **retirer la route** (404), ou `ota_ref` à `NULL` —
+pas en éteignant l'API.
+
+🚨 **Et un `compatibility.yaml` mal formé sur la branche saute le tick aussi**, pour la raison la
+plus forte du chantier : **c'est typiquement ce qu'une branche d'essai existe pour attraper**.
+Replier sur `main` ferait disparaître de l'écran le défaut qu'on cherchait à voir — le boîtier se
+mettrait à jour normalement, et le plan cassé ne se manifesterait qu'en atteignant tout le parc.
+
+ⓘ **Même logique, déjà acquise, pour un tag absent** : tout ce qui échoue *après* la lecture du
+plan — signature GPG d'un tag qui n'existe pas, SHA256 qui ne concorde pas, `update.sh` qui sort
+non nul — échoue **hors de toute portée de repli**, puisque `plan_de_mise_a_jour` s'arrête à la
+lecture du plan. L'échec nomme désormais la ref : sans ça, un défaut de branche se lit comme un
+échec ordinaire et on cherche la cause au mauvais endroit.
+
+#### `{"ref": null}` se dit en `INFO`, pas en `WARNING`
+
+`ota_ref` vaut `NULL` pour la quasi-totalité du parc : ce sera donc la réponse **normale** de 8
+boîtiers toutes les 10 minutes, soit **1 150 avertissements par jour** pour dire que tout va bien.
+Ça noierait celui de `hors_du_plan`, qui signale un boîtier réellement bloqué. Le `WARNING` reste
+pour une valeur **présente mais refusée** — là, une intention ne s'applique pas, et il faut le
+voir. Deux cas du banc éprouvent les **niveaux**, pas les valeurs.
 
 #### ⚠️ Attendu, et ce n'est pas une panne : rien ne change au tick qui applique cette update
 
@@ -145,7 +182,7 @@ repli attrape maintenant tout ce qui cloche **sur le chemin de la branche** — 
 
 #### Le banc, et ce qui a été vu tomber
 
-**21 cas.** **Huit** montent un **vrai dépôt git** jetable : seul moyen de prouver « lu depuis
+**24 cas.** **Neuf** montent un **vrai dépôt git** jetable : seul moyen de prouver « lu depuis
 `origin/canary` », « une branche **rebasée** est relue à jour » et « une branche fusionnée **en
 squash** reste suivie ». Les autres couvrent la validation du nom, le signalement d'une version hors
 plan, et tout ce qui vaut `main` — dont un **5xx au corps valide**, seul cas qui vise la garde sur le
@@ -157,7 +194,7 @@ module, donc figée à l'**import** : le `LANGUAGE=fr` que les deux cas posent e
 plus `git`, et ils restaient verts même en retirant `LC_ALL=C`. L'environnement est maintenant
 construit **à chaque appel**, et la mutation a été vérifiée **rouge sur ben-0001**.
 
-⚖️ **16 mutations** vérifiées rouges, **7 sabotages** du préflight ③ aussi. ⚠️ **Une** est restée
+⚖️ **25 mutations** vérifiées rouges, **7 sabotages** du préflight ③ aussi. ⚠️ **Une** est restée
 verte — le `--` avant la refspec, puisque c'est le `+` qui fait barrière : le commentaire a été
 corrigé plutôt que de garder une garde invérifiable.
 

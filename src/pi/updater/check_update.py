@@ -51,6 +51,9 @@ def setup_logging() -> None:
 def main() -> None:
     setup_logging()
     log = logging.getLogger(__name__)
+    # ⓘ Posée AVANT le try : l'échec final la nomme, et elle doit exister même si on tombe
+    #   avant l'étape 3.
+    ref = update_lib.REF_DEFAUT
 
     # 1. Acquire lockfile — exit immediately if another instance is running
     try:
@@ -82,15 +85,25 @@ def main() -> None:
             update_lib.save_device_json(device, DEVICE_JSON)
 
         # 3. La REF où chercher le plan — demandée au CLOUD, boîtier par boîtier
-        #    (ben-docs#16). Ne lève jamais : tout ce qui ne donne pas une ref valide
-        #    vaut `main`, donc ce boîtier se comporte comme avant tant que la route
-        #    n'existe pas, ou le jour où elle serait coupée.
-        ref = update_lib.ref_demandee(device["deviceId"])
+        #    (ben-docs#16). Tant que la route n'existe pas, le cloud rend 404 et ce
+        #    boîtier prend `main` : il se comporte exactement comme avant.
+        #    🚨 Et elle peut lever `TickASauter` : sans réponse claire du cloud, on ne fait
+        #       RIEN. Voir `update_lib.REF_DEFAUT` — un 503 d'un seul tick ne doit pas livrer
+        #       à un boîtier RETENU la release qu'on lui épargnait.
+        try:
+            ref = update_lib.ref_demandee(device["deviceId"])
 
-        # 4. Fetch + plan de mise à jour, avec repli sur `main` DANS CE TICK si la
-        #    ref est inutilisable (branche supprimée au merge, typiquement).
-        log.info("Fetching origin (%s)...", ref)
-        compat, ref = update_lib.plan_de_mise_a_jour(REPO_PATH, ref)
+            # 4. Fetch + plan de mise à jour. Repli sur `main` DANS CE TICK si la branche
+            #    n'existe DÉMONTRABLEMENT plus (cas normal après une promotion) ; sinon on
+            #    saute le tick.
+            log.info("Fetching origin (%s)...", ref)
+            compat, ref = update_lib.plan_de_mise_a_jour(REPO_PATH, ref)
+        except update_lib.TickASauter as e:
+            # ⓘ Sortie 0, et c'est délibéré : rien n'a été tenté, `device.json` n'est pas
+            #   touché, et le timer repasse dans dix minutes. Un code 1 dirait qu'une update a
+            #   échoué.
+            log.info("tick sauté — %s", e)
+            sys.exit(0)
         if ref != update_lib.REF_DEFAUT:
             log.info("plan lu depuis origin/%s", ref)
         transition = update_lib.find_next_transition(compat, device)
@@ -175,7 +188,16 @@ def main() -> None:
                         "sur l'update, mais il tourne sur l'ancien code", e)
 
     except Exception:
-        log.exception("Update failed — device.json not modified, will retry next tick")
+        # 🚨 ON NOMME LA REF, et ce n'est pas cosmétique. Tout ce qui échoue APRÈS la lecture du
+        #    plan — signature GPG d'un tag qui n'existe pas, SHA256 qui ne concorde pas,
+        #    `update.sh` qui sort non nul — échoue ICI, donc HORS de toute portée de repli :
+        #    `plan_de_mise_a_jour` s'arrête à la lecture du plan. C'est le comportement voulu, et
+        #    c'est même l'intérêt du canary : un plan qui nomme un tag absent doit se VOIR sur le
+        #    boîtier d'essai, pas se faire remplacer en silence par celui de `main`.
+        #    ⇒ Mais sans la ref dans la ligne, un échec de branche se lit comme un échec
+        #      ordinaire, et on cherche la cause au mauvais endroit.
+        log.exception("Update failed (plan lu depuis origin/%s) — device.json not modified, "
+                      "will retry next tick", ref)
         sys.exit(1)
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)

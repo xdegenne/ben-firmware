@@ -11,7 +11,8 @@
 #
 #     ① avant chaque tentative d'OTA : GET /api/devices/<id>/update, en mTLS
 #     ② le cloud répond { "ref": "canary" }
-#     ③ pas de réponse, réponse illisible, nom refusé, branche absente ⇒ `main`
+#     ③ `main` sur un signal AFFIRMATIF SEULEMENT : 404 (route absente), « aucune branche »,
+#       nom refusé, ou branche dont l'absence est PROUVÉE. Tout le reste SAUTE LE TICK
 #     ④ l'agent fetch cette ref et y lit compatibility.yaml
 #     ⑤ le reste ne change pas : GPG du tag, SHA256 du script, UNE transition par tick
 #
@@ -22,8 +23,22 @@
 #      capable de le tuer.
 #
 #   ⭐ DÉBRAYABLE, ET SANS CONTRAINTE D'ORDRE DE DÉPLOIEMENT. La route n'existe pas encore
-#      (`ben-api#29`) : tout boîtier prendra donc `main` et se comportera exactement comme avant.
-#      C'est voulu — ce volet part SEUL, et le jour où la route serait coupée, rien ne s'arrête.
+#      (`ben-api#29`) : le cloud rend 404, tout boîtier prend donc `main` et se comporte
+#      exactement comme avant. Ce volet part SEUL.
+#
+#   🚨 MAIS « ÇA NE RÉPOND PAS ⇒ main » A ÉTÉ RENVERSÉ EN REVUE, et il faut savoir pourquoi.
+#      `main` n'est le choix prudent QUE si le boîtier est sur une branche pour recevoir quelque
+#      chose EN AVANCE. Si on l'y a mis pour le RETENIR avant une release risquée, `main` est
+#      précisément le danger : un 503 d'un SEUL tick suffisait à lui livrer la release qu'on lui
+#      épargnait, et `device.json` étant bumpé, ce n'est PAS rattrapable.
+#      ⇒ Une ABSENCE DE RÉPONSE N'EST PAS UNE RÉPONSE. Sans instruction claire, on ne fait RIEN
+#        et on réessaie dans dix minutes. Une OTA n'est jamais urgente.
+#      ⇒ Corollaire assumé : couper le SERVEUR fige l'OTA le temps de la panne. Débrayer le
+#        mécanisme se fait par un signal affirmatif — RETIRER LA ROUTE (404), ou `ota_ref` à
+#        NULL — pas en éteignant l'API.
+#      ⇒ Et un `compatibility.yaml` MAL FORMÉ sur la branche saute le tick lui aussi : c'est
+#        typiquement ce qu'une branche d'essai existe pour ATTRAPER. Replier sur `main` ferait
+#        disparaître de l'écran le défaut qu'on cherchait à voir.
 #
 # ═══ 🚨 CE QU'IL FAUT ATTENDRE, ET QUI N'EST PAS UNE PANNE ════════════════════════════════════
 #
@@ -74,10 +89,12 @@ log "préflight ① OK (3 fichiers présents et compilables)"
 
 # ═══ PRÉFLIGHT ② — LE BANC LIVRÉ PAR LE TAG, SUR LE PYTHON ET LE GIT DU BOÎTIER ══════════════
 #
-#   21 cas, et ce banc-là a besoin du `git` de la cible : HUIT de ses cas montent un VRAI dépôt
+#   24 cas, et ce banc-là a besoin du `git` de la cible : NEUF de ses cas montent un VRAI dépôt
 #   jetable pour vérifier d'où le plan a été lu. C'est le seul moyen de prouver « lu depuis
 #   origin/canary », qu'une branche REBASÉE est relue à jour (refspec forcée), et qu'une branche
-#   FUSIONNÉE EN SQUASH reste suivie — le boîtier obéit au cloud, il ne devine pas.
+#   FUSIONNÉE EN SQUASH reste suivie — le boîtier obéit au cloud, il ne devine pas. Et deux cas
+#   éprouvent des NIVEAUX de journal, pas des valeurs : « aucune branche » doit se dire en INFO
+#   (ce sera la réponse de 8 boîtiers toutes les 10 min) et une ref refusée en WARNING.
 #
 # 🚨 ET IL NE LIT PLUS UN MESSAGE DE GIT TRADUISIBLE — c'est le défaut le plus grave trouvé en
 #    revue, et il brûlait cette version. Deux cas lisent le texte d'une erreur de git ; `git.mo`
@@ -89,14 +106,14 @@ log "préflight ① OK (3 fichiers présents et compilables)"
 #    correction, vert après.
 #
 # ⚖️ Les témoins vont dans les deux sens : une implémentation qui rendrait toujours `main`
-#    passerait tous les cas de repli. 16 mutations vérifiées ROUGES avant livraison — et UNE est
+#    passerait tous les cas de repli. 25 mutations vérifiées ROUGES avant livraison — et UNE est
 #    restée VERTE, ce qui a fait corriger le commentaire plutôt que garder une garde invérifiable
 #    (le `--` avant la refspec : c'est le `+` qui fait barrière).
 # ⚠️ `TMPDIR=/var/tmp` et pas /tmp : /tmp peut être un tmpfs étroit sur un Pi Zero, et ce banc y
 #    crée des dépôts git.
 TMPDIR=/var/tmp python3 "$UPD/test_ref_ota.py" \
     || fail "le banc de la ref OTA échoue — NE PAS déployer en l'état"
-log "préflight ② OK (banc livré : 21 cas, dont 8 sur un vrai dépôt git, et 2 sous LANGUAGE=fr)"
+log "préflight ② OK (banc livré : 24 cas, dont 9 sur un vrai dépôt git, et 2 sous LANGUAGE=fr)"
 
 # ═══ PRÉFLIGHT ③ — 🚨 LE CORRECTIF EST BRANCHÉ, PROUVÉ SUR L'ARBRE ════════════════════════════
 #
@@ -123,7 +140,8 @@ def appels(arbre):
 dl, da = defs(lib), defs(agent)
 al, aa = appels(lib), appels(agent)
 ko = []
-for f in ("ref_valide", "ref_demandee", "plan_de_mise_a_jour", "hors_du_plan"):
+for f in ("ref_valide", "ref_demandee", "plan_de_mise_a_jour", "hors_du_plan",
+          "ref_existe_sur_origin"):
     if f not in dl:
         ko.append(f"{f}() ABSENTE de update_lib")
 # ⚖️ Chacune doit être appelée, et PAS par n'importe qui : la décision vit dans l'agent.
@@ -135,6 +153,21 @@ if "plan_de_mise_a_jour" not in aa:
 #    toujours — c'est l'état de ben-0005, invisible depuis des semaines.
 if "hors_du_plan" not in aa:
     ko.append("l'agent n'appelle pas hors_du_plan() — un boîtier figé resterait silencieux")
+# 🚨 LA RÈGLE DU SIGNAL AFFIRMATIF : sans `TickASauter` défini ET levé ET rattrapé par l'agent,
+#    on retombe sur « toute erreur ⇒ main » — qui livre à un boîtier RETENU la release qu'on lui
+#    épargnait, de façon irréversible.
+if not any(isinstance(n, ast.ClassDef) and n.name == "TickASauter" for n in ast.walk(lib)):
+    ko.append("TickASauter absente — plus de « on ne fait rien sans instruction »")
+if not any(isinstance(n, ast.Raise) and "TickASauter" in ast.dump(n) for n in ast.walk(lib)):
+    ko.append("TickASauter n'est JAMAIS levée — la règle du signal affirmatif est décorative")
+if "TickASauter" not in {h.type.attr for n in ast.walk(agent)
+                         if isinstance(n, ast.Try) for h in n.handlers
+                         if isinstance(h.type, ast.Attribute)}:
+    ko.append("l'agent ne rattrape pas TickASauter — un tick sauté deviendrait un ÉCHEC")
+# ⚖️ Et le témoin inverse : `ls-remote` doit être interrogé, sinon « la branche n'existe plus »
+#    serait deviné — ou pire, lu dans un message traduit.
+if "ref_existe_sur_origin" not in al:
+    ko.append("ref_existe_sur_origin() n'est pas appelée — l'absence serait devinée")
 if "ref_valide" not in al:
     ko.append("ref_valide() n'est jamais appelée — le nom du réseau irait tel quel dans git")
 # 🚨 Les deux lectures de git doivent accepter une ref ; sans le paramètre, `main` serait encore

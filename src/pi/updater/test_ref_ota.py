@@ -18,6 +18,7 @@ par le cloud ; le boîtier doit pouvoir s'en passer entièrement.
 """
 import atexit
 import json
+import logging
 import os
 import pathlib
 import shutil
@@ -158,6 +159,25 @@ class _Conn:
         pass
 
 
+class _Journal(logging.Handler):
+    """Capte les lignes de `update_lib` : certains défauts de ce chantier sont des NIVEAUX,
+    pas des valeurs. Un `WARNING` émis 8 fois × toutes les 10 min noie celui qui compte."""
+
+    def __init__(self):
+        super().__init__()
+        self.lignes = []
+
+    def emit(self, r):
+        self.lignes.append((r.levelno, r.getMessage()))
+
+
+def journal():
+    h = _Journal()
+    ul.log.addHandler(h)
+    ul.log.setLevel(logging.INFO)
+    return h
+
+
 def _avec_cloud(status, corps, monkey=None):
     import http.client
     import ssl
@@ -183,42 +203,97 @@ def une_ref_dite_par_le_cloud_est_employee():
     assert _avec_cloud(200, '{"ref": "canary"}') == "canary"
 
 
-@cas
-def une_ref_refusee_par_la_validation_vaut_main():
-    assert _avec_cloud(200, '{"ref": "--upload-pack=id"}') == ul.REF_DEFAUT
-
+# ── Les DEUX signaux affirmatifs, et EUX SEULS, donnent `main` ───────────────
 
 @cas
-def tout_ce_qui_ne_donne_pas_une_ref_vaut_main():
-    for status, corps in ((404, ""), (500, "boom"), (200, "pas du json"),
-                          (200, "{}"), (200, '{"ref": null}'), (200, '{"branche": "canary"}')):
-        assert _avec_cloud(status, corps) == ul.REF_DEFAUT, (status, corps)
+def une_route_ABSENTE_404_donne_main_c_est_le_debrayage():
+    """C'est l'état d'aujourd'hui — `ben-api#29` n'est pas déployée — et c'est aussi le geste
+    de débrayage : retirer la route rend 404, donc rend `main` à tout le parc."""
+    assert _avec_cloud(404, "") == ul.REF_DEFAUT
 
 
 @cas
-def un_5xx_AU_CORPS_VALIDE_vaut_main_aussi():
-    """🚨 Le cas qui exige de regarder le CODE et pas seulement le corps. Un proxy ou une page
-    d'erreur peut rendre un JSON parfaitement formé ; sans la garde sur le statut, le boîtier
-    suivrait une branche dite par une réponse d'ERREUR. Les autres cas de refus passent tous
-    sans cette garde, parce que leur corps est illisible — celui-ci est le seul qui la vise."""
-    for status in (403, 404, 500, 502, 503):
-        assert _avec_cloud(status, '{"ref": "canary"}') == ul.REF_DEFAUT, status
+def aucune_branche_pour_ce_boitier_donne_main_EN_INFO_PAS_EN_WARNING():
+    """🚨 `ota_ref` vaut `NULL` pour la quasi-totalité du parc, donc `{"ref": null}` sera la
+    réponse NORMALE de 8 boîtiers toutes les 10 minutes. En `WARNING`, ça ferait 1 150 lignes
+    d'avertissement par jour pour dire que tout va bien — et ça noierait celui de
+    `hors_du_plan`, qui signale un boîtier réellement bloqué. Un avertissement permanent ne se
+    lit plus."""
+    for corps in ('{"ref": null}', "{}", '{"branche": "canary"}'):
+        h = journal()
+        try:
+            assert _avec_cloud(200, corps) == ul.REF_DEFAUT, corps
+            niveaux = [n for n, _ in h.lignes]
+            assert niveaux and max(niveaux) <= logging.INFO, (
+                f"{corps} doit se dire en INFO, pas en {logging.getLevelName(max(niveaux))} : "
+                f"{h.lignes}")
+        finally:
+            ul.log.removeHandler(h)
 
 
 @cas
-def une_PANNE_RESEAU_ne_leve_jamais_et_vaut_main():
-    """🚨 L'agent répare tous les autres services : il ne doit pas gagner une dépendance
-    capable de le tuer. Un `raise` ici, et plus aucune OTA sur ce boîtier."""
+def une_ref_PRESENTE_mais_refusee_donne_main_ET_un_WARNING():
+    """⚖️ LE CONTRE-TÉMOIN du cas précédent, et il est indispensable : sans lui, un code qui
+    ravalerait TOUT en `info` passerait — et une valeur qu'un opérateur a écrite mais que le
+    boîtier refuse resterait invisible, alors qu'elle veut dire qu'une intention ne s'applique
+    pas."""
+    h = journal()
+    try:
+        assert _avec_cloud(200, '{"ref": "--upload-pack=id"}') == ul.REF_DEFAUT
+        assert any(n >= logging.WARNING for n, _ in h.lignes), (
+            f"une ref refusée doit s'annoncer en WARNING : {h.lignes}")
+    finally:
+        ul.log.removeHandler(h)
+
+
+# ── TOUT LE RESTE FAIT SAUTER LE TICK ───────────────────────────────────────
+
+@cas
+def un_boitier_RETENU_ne_recoit_PAS_la_release_sur_un_503():
+    """🚨 LE CAS QUI A FAIT RENVERSER LA RÈGLE, et il n'est pas rattrapable. Un boîtier retenu
+    sur `hold` pendant que `main` publie 0.11.0 → 0.12.0 : un SEUL tick où `/update` répond 503
+    suffisait à lui faire lire le plan de `main` et appliquer la release qu'on lui épargnait.
+    `device.json` bumpé, donc irréversible.
+
+    ⭐ Une ABSENCE DE RÉPONSE N'EST PAS UNE RÉPONSE : sans instruction, on ne fait RIEN. Une OTA
+       n'est jamais urgente — le timer repasse dans dix minutes."""
+    for statut in (500, 502, 503, 403, 429):
+        try:
+            r = _avec_cloud(statut, '{"ref": "hold"}')
+        except ul.TickASauter:
+            continue
+        raise AssertionError(f"HTTP {statut} a rendu {r!r} au lieu de sauter le tick")
+
+
+@cas
+def une_PANNE_RESEAU_fait_SAUTER_LE_TICK():
     class _Casse(_Conn):
         def request(self, *a, **k):
             raise OSError("réseau injoignable")
 
-    assert _avec_cloud(200, '{"ref": "canary"}', monkey=_Casse) == ul.REF_DEFAUT
+    try:
+        _avec_cloud(200, '{"ref": "canary"}', monkey=_Casse)
+    except ul.TickASauter:
+        return
+    raise AssertionError("une panne réseau doit faire sauter le tick, pas choisir un plan")
 
 
 @cas
-def un_certificat_absent_vaut_main_aussi():
-    """Le cas du boîtier désappairé, ou d'un certificat pas encore posé."""
+def un_corps_ILLISIBLE_fait_SAUTER_LE_TICK():
+    """⚠️ Un 200 au corps cassé veut dire que quelque chose s'est mis entre le boîtier et le
+    cloud — un portail, un proxy. On ne devine pas ce que le cloud voulait dire."""
+    try:
+        _avec_cloud(200, "pas du json")
+    except ul.TickASauter:
+        return
+    raise AssertionError("un corps illisible doit faire sauter le tick")
+
+
+@cas
+def un_certificat_absent_donne_main_et_ne_saute_PAS_le_tick():
+    """ⓘ Un boîtier sans certificat ne peut PAS parler au cloud, donc il ne peut pas être
+    retenu sur une branche : `main` est sans risque. Sauter le tick figerait l'OTA d'un boîtier
+    qui ne pourra jamais demander — exactement le contraire du but."""
     import ssl
     vrai = ssl.create_default_context
     ssl.create_default_context = lambda *a, **k: (_ for _ in ()).throw(
@@ -239,16 +314,6 @@ def le_plan_est_lu_depuis_la_ref_demandee():
     compat, ref = ul.plan_de_mise_a_jour(str(w), "canary")
     assert ref == "canary", ref
     assert compat == {"plan": "canary"}, compat
-
-
-@cas
-def une_branche_ABSENTE_retombe_sur_main_DANS_LE_MEME_TICK():
-    """🚨 Le cas normal après une promotion : « branche supprimée au merge ». Sans ce repli,
-    le geste de promotion arrête les mises à jour des boîtiers d'essai, en silence."""
-    d, w = depot({"main": "plan: main\n"})
-    compat, ref = ul.plan_de_mise_a_jour(str(w), "jamais-existe")
-    assert ref == ul.REF_DEFAUT, ref
-    assert compat == {"plan": "main"}, compat
 
 
 @cas
@@ -352,13 +417,47 @@ def un_plan_VIDE_est_signale_aussi():
 
 
 @cas
-def un_compatibility_yaml_ILLISIBLE_sur_la_branche_retombe_sur_main():
-    """🚨 Le repli ne couvrait QUE l'échec de git. Un YAML mal formé sur la branche d'essai
-    lève une `yaml.YAMLError`, pas une `CalledProcessError` : l'erreur traversait, le tick
-    échouait, et il échouait de nouveau toutes les 10 minutes. Or une branche d'essai est
-    précisément l'endroit où un YAML se casse."""
+def un_compatibility_yaml_ILLISIBLE_sur_la_branche_fait_SAUTER_LE_TICK():
+    """Un YAML mal formé sur la branche lève une `yaml.YAMLError`, pas une
+    `CalledProcessError` : avec l'`except` d'origine l'erreur traversait et le tick échouait
+    toutes les 10 minutes.
+
+    🚨 MAIS LE REPLI N'EST PAS LA BONNE RÉPONSE NON PLUS, et c'est la raison la plus forte du
+    chantier : **un plan mal formé est exactement ce que la branche d'essai existe pour
+    attraper.** Replier sur `main` ferait disparaître de l'écran le défaut qu'on cherchait à
+    voir — le boîtier se mettrait à jour normalement et le plan cassé ne se manifesterait qu'en
+    atteignant tout le parc. Sauter le tick le laisse visible, sans rien appliquer."""
     d, w = depot({"main": "plan: main\n", "canary": "plan: [ceci n'est pas\n  du yaml: :\n"})
-    compat, ref = ul.plan_de_mise_a_jour(str(w), "canary")
+    try:
+        ul.plan_de_mise_a_jour(str(w), "canary")
+    except ul.TickASauter:
+        return
+    raise AssertionError("un plan illisible doit faire sauter le tick, pas replier sur main")
+
+
+@cas
+def un_fetch_qui_echoue_SANS_PROUVER_l_absence_fait_SAUTER_LE_TICK():
+    """🚨 La frontière de ce chantier. « Je n'ai pas pu fetcher » ne veut PAS dire « la branche
+    n'existe plus » : ça peut être le réseau. On ne le devine pas, on le DEMANDE —
+    `ls-remote --exit-code` rend 2 pour une ref absente et 128 pour une panne, deux CODES
+    distincts. Ici `origin` est injoignable : on ne sait pas, donc on ne fait rien."""
+    d, w = depot({"main": "plan: main\n", "canary": "plan: canary\n"})
+    subprocess.run(["git", "remote", "set-url", "origin", str(d / "disparu.git")],
+                   cwd=w, check=True, capture_output=True)
+    try:
+        ul.plan_de_mise_a_jour(str(w), "canary")
+    except ul.TickASauter:
+        return
+    raise AssertionError("un origin injoignable doit faire sauter le tick")
+
+
+@cas
+def une_branche_dont_l_ABSENCE_EST_PROUVEE_retombe_sur_main():
+    """⚖️ LE CONTRE-TÉMOIN du cas précédent : sans lui, un code qui sauterait TOUJOURS le tick
+    passerait — et le geste normal de promotion (« branche supprimée au merge ») figerait les
+    boîtiers d'essai pour toujours. `ls-remote` répond ici 2 : l'absence est DÉMONTRÉE."""
+    d, w = depot({"main": "plan: main\n"})
+    compat, ref = ul.plan_de_mise_a_jour(str(w), "promue-puis-supprimee")
     assert ref == ul.REF_DEFAUT, ref
     assert compat == {"plan": "main"}, compat
 
