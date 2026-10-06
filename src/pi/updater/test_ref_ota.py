@@ -16,8 +16,11 @@ par le cloud ; le boîtier doit pouvoir s'en passer entièrement.
 
     python3 src/pi/updater/test_ref_ota.py
 """
+import atexit
 import json
+import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -40,6 +43,19 @@ def git(*a, cwd):
                           capture_output=True, text=True).stdout
 
 
+# 🚨 LES DÉPÔTS JETABLES SE NETTOIENT. Ce banc est exécuté en PRÉFLIGHT par `update.sh` : une
+#    update qui échoue est rejouée TOUTES LES 10 MINUTES, donc chaque passage laisserait ses
+#    dépôts derrière lui et ils s'empileraient sur la carte SD d'un Pi Zero. `atexit` et non un
+#    `finally` par cas : il nettoie aussi quand un cas lève.
+_A_NETTOYER: list = []
+
+
+@atexit.register
+def _nettoyer():
+    for d in _A_NETTOYER:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def depot(branches: dict):
     """Un `origin` nu + un clone, avec un `compatibility.yaml` par branche.
 
@@ -48,6 +64,7 @@ def depot(branches: dict):
        demandée — question à laquelle seul git répond.
     """
     d = pathlib.Path(tempfile.mkdtemp())
+    _A_NETTOYER.append(d)
     git("init", "-q", "--bare", str(d / "origin.git"), cwd=d)
     w = d / "w"
     git("clone", "-q", str(d / "origin.git"), str(w), cwd=d)
@@ -255,6 +272,65 @@ def une_branche_REBASEE_est_relue_a_jour():
 
 
 @cas
+def une_branche_DEJA_FUSIONNEE_rend_la_main_a_main():
+    """🚨 LE PIÈGE DE LA PROMOTION, et il est SILENCIEUX. Promouvoir demande deux gestes :
+    fusionner la branche, ET remettre le boîtier sur `main` côté cloud. Si le second est
+    oublié — ou si la branche survit au merge — le boîtier continue de suivre un plan qui ne
+    bougera plus, et RATE toutes les releases suivantes sans que rien ne le dise.
+
+    ⭐ La parade ne demande aucun état : si `origin/<ref>` est un ANCÊTRE d'`origin/main`, alors
+       `main` contient déjà tout ce que la branche contient, plus la suite. Lire `main` est
+       donc strictement meilleur, jamais moins bon."""
+    d = pathlib.Path(tempfile.mkdtemp()); _A_NETTOYER.append(d)
+    git("init", "-q", "--bare", str(d / "origin.git"), cwd=d)
+    w = d / "w"
+    git("clone", "-q", str(d / "origin.git"), str(w), cwd=d)
+    git("config", "user.email", "banc@ben", cwd=w)
+    git("config", "user.name", "banc", cwd=w)
+    # ⚠️ `-B main` EXPLICITE : le git du boîtier nomme sa branche par défaut `master`
+    #    (constaté sur ben-0001), celui du Mac `main`. Un banc qui suppose l'un des deux
+    #    échoue sur l'autre — et il est exécuté en préflight, donc il brûlerait la version.
+    git("checkout", "-q", "-B", "main", cwd=w)
+    (w / "compatibility.yaml").write_text("plan: main-v1\n")
+    git("add", "-A", cwd=w); git("commit", "-qm", "v1", cwd=w)
+    git("push", "-q", "origin", "main", cwd=w)
+    # la branche d'essai, poussée…
+    git("checkout", "-q", "-B", "canary", cwd=w)
+    (w / "compatibility.yaml").write_text("plan: canary\n")
+    git("commit", "-qam", "essai", cwd=w); git("push", "-q", "origin", "canary", cwd=w)
+    # …puis FUSIONNÉE dans main, qui continue d'avancer. La branche SURVIT.
+    git("checkout", "-q", "main", cwd=w)
+    git("merge", "-q", "--ff-only", "canary", cwd=w)
+    (w / "compatibility.yaml").write_text("plan: main-v2\n")
+    git("commit", "-qam", "v2", cwd=w); git("push", "-q", "origin", "main", cwd=w)
+
+    # 🚨 ET `origin/main` EST RENDU PÉRIMÉ, parce que c'est l'état RÉEL d'un boîtier sur une
+    #    branche : il ne fetchait que SA ref, donc sa vue de `main` daterait d'avant son
+    #    basculement — et la comparaison « fusionnée ? » porterait sur un `main` d'hier, donc
+    #    ne verrait jamais la fusion. C'est ce qui rend le fetch de `main` OBLIGATOIRE avant
+    #    de comparer, et non un simple confort.
+    subprocess.run(["git", "update-ref", "-d", "refs/remotes/origin/main"],
+                   cwd=w, capture_output=True)
+
+    compat, ref = ul.plan_de_mise_a_jour(str(w), "canary")
+    assert ref == ul.REF_DEFAUT, f"la branche est fusionnée, il faut rendre la main : {ref}"
+    assert compat == {"plan": "main-v2"}, (
+        f"plan périmé suivi alors que main a avancé : {compat}")
+
+
+@cas
+def un_compatibility_yaml_ILLISIBLE_sur_la_branche_retombe_sur_main():
+    """🚨 Le repli ne couvrait QUE l'échec de git. Un YAML mal formé sur la branche d'essai
+    lève une `yaml.YAMLError`, pas une `CalledProcessError` : l'erreur traversait, le tick
+    échouait, et il échouait de nouveau toutes les 10 minutes. Or une branche d'essai est
+    précisément l'endroit où un YAML se casse."""
+    d, w = depot({"main": "plan: main\n", "canary": "plan: [ceci n'est pas\n  du yaml: :\n"})
+    compat, ref = ul.plan_de_mise_a_jour(str(w), "canary")
+    assert ref == ul.REF_DEFAUT, ref
+    assert compat == {"plan": "main"}, compat
+
+
+@cas
 def main_sans_ref_particuliere_marche_comme_avant():
     """⚖️ LE CONTRE-TÉMOIN DU CHANTIER : on AJOUTE un étage, on n'en casse pas un."""
     d, w = depot({"main": "plan: main\n"})
@@ -270,14 +346,52 @@ def une_option_passee_en_ref_echoue_comme_une_REF_introuvable():
 
     ⚠️ ET CE CAS NE PROUVE PAS CE QU'ON CROYAIT : il tient grâce au `+` de la refspec, qui la
        rend non-interprétable comme une option — vérifié par mutation, retirer le `--` laisse
-       ce cas VERT. Ne pas le relire comme un banc du `--`."""
+       ce cas VERT. Ne pas le relire comme un banc du `--`.
+
+    🚨 ET IL TOURNE SOUS `LANGUAGE=fr`, DÉLIBÉRÉMENT. Ce banc est exécuté en PRÉFLIGHT par
+       `update.sh` : s'il échoue, l'update avorte, est rejouée toutes les 10 min, et la version
+       est BRÛLÉE. Or il lit un message de git — qui est TRADUIT. `git.mo` français est présent
+       sur l'image du parc (vérifié sur ben-0001), donc un boîtier dont la locale est française
+       dirait « impossible de trouver la référence distante » et ce cas tomberait, sur un
+       boîtier parfaitement sain. ⇒ `fetch_origin` épingle `LC_ALL=C`, et c'est CE cas qui le
+       prouve : sans l'épinglage il est rouge sur une cible traduite."""
     d, w = depot({"main": "plan: main\n"})
+    avant = os.environ.get("LANGUAGE")
+    os.environ["LANGUAGE"] = "fr"
     try:
         ul.fetch_origin(str(w), "--upload-pack=/bin/false")
     except subprocess.CalledProcessError as e:
-        assert "remote ref" in (e.stderr or "") or "refspec" in (e.stderr or ""), e.stderr
+        assert "remote ref" in (e.stderr or "") or "refspec" in (e.stderr or ""), (
+            f"message de git non épinglé en C — il parle la langue du boîtier : {e.stderr!r}")
         return
+    finally:
+        if avant is None:
+            os.environ.pop("LANGUAGE", None)
+        else:
+            os.environ["LANGUAGE"] = avant
     raise AssertionError("une option passée en ref doit faire ÉCHOUER le fetch")
+
+
+@cas
+def le_message_de_git_est_en_C_meme_si_le_boitier_parle_francais():
+    """⚖️ LE TÉMOIN DIRECT de l'épinglage, sur le chemin NORMAL d'erreur — celui que
+    `plan_de_mise_a_jour` journalise. Un journal qui change de langue d'un boîtier à l'autre
+    ne se grep pas, et surtout : tout contrôle qui lirait ce texte deviendrait faux ailleurs."""
+    d, w = depot({"main": "plan: main\n"})
+    avant = os.environ.get("LANGUAGE")
+    os.environ["LANGUAGE"] = "fr"
+    try:
+        ul.fetch_origin(str(w), "nexistepas")
+    except subprocess.CalledProcessError as e:
+        assert "couldn't find remote ref" in (e.stderr or ""), (
+            f"git n'est pas épinglé en C : {e.stderr!r}")
+        return
+    finally:
+        if avant is None:
+            os.environ.pop("LANGUAGE", None)
+        else:
+            os.environ["LANGUAGE"] = avant
+    raise AssertionError("une ref absente doit faire échouer le fetch")
 
 
 if __name__ == "__main__":

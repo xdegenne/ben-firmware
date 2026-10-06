@@ -92,19 +92,47 @@ suivant du timer, dans ~10 min.
 ⓘ C'est l'asymétrie exacte qui a fait fermer `#37` sans la faire : un correctif dans l'agent
 n'est **jamais** immédiat ; un correctif dans le publisher, si — l'agent le redémarre à ⑩.
 
+#### 🚨 Un banc de préflight ne doit pas lire un message traduit — il brûlait cette version
+
+Trouvé en revue, et **reproduit sur ben-0001**. Deux cas du banc lisaient le texte d'une erreur de
+git (`"remote ref"`). Or `git.mo` **français est présent sur l'image du parc** et `install.sh` ne
+fixe aucune locale : sur un boîtier en français, git dit *« impossible de trouver la référence
+distante »*. Le banc tombait ⇒ le préflight ② échouait ⇒ l'update avortait ⇒ **rejouée toutes les
+10 minutes, sur un boîtier parfaitement sain**, et `pi-0.11.0` était **brûlée**.
+
+`fetch_origin` épingle désormais `LC_ALL=C` — mesuré sur la cible : gettext ignore `LANGUAGE`
+quand la locale est `C` — et les deux cas tournent **sous `LANGUAGE=fr`** pour le prouver. Rouges
+avant, verts après.
+
+ⓘ Le même piège a mordu une deuxième fois, au même endroit : un cas montait son dépôt en
+poussant `main` alors que le git du boîtier nomme sa branche par défaut `master`. Le banc du Mac
+ne pouvait pas le voir. Un banc de préflight **doit** être exécuté sur la cible avant le tag.
+
+#### Deux trous du repli, fermés
+
+- une branche **déjà fusionnée qui survit** (merge sans `--delete-branch`, ou `ota_ref` qu'on
+  oublie de remettre à `NULL`) : le boîtier suivait un plan qui ne bougerait plus et **ratait
+  toutes les releases suivantes**, en silence. ⭐ La parade ne demande aucun état : si
+  `origin/<ref>` est un **ancêtre** d'`origin/main`, alors `main` contient déjà tout, plus la
+  suite — on rend la main. Promouvoir demande deux gestes ; ceci rattrape l'oubli du second ;
+- un `compatibility.yaml` **illisible sur la branche** : `yaml.safe_load` lève une `YAMLError`,
+  pas une `CalledProcessError`, donc l'erreur traversait et le tick échouait **toutes les 10
+  minutes**. Le repli attrape maintenant tout ce qui cloche **sur le chemin de la branche** — et
+  seulement là : un `main` cassé doit lever, c'est une panne réelle qui doit se voir.
+
 #### Le banc, et ce qui a été vu tomber
 
-**15 cas.** Quatre montent un **vrai dépôt git** jetable à deux branches : c'est le seul moyen de
-prouver « lu depuis `origin/canary` » et « une branche **rebasée** est relue à jour ». Les onze
-autres couvrent la validation du nom et tout ce qui vaut `main` — y compris un **5xx au corps
-valide**, le seul cas qui vise la garde sur le statut HTTP (les autres passent sans elle, leur
-corps étant illisible).
+**18 cas.** Six montent un **vrai dépôt git** jetable : seul moyen de prouver « lu depuis
+`origin/canary` », « une branche **rebasée** est relue à jour » et « une branche **fusionnée** rend
+la main ». Les autres couvrent la validation du nom et tout ce qui vaut `main` — dont un **5xx au
+corps valide**, seul cas qui vise la garde sur le statut HTTP. Et les dépôts jetables se
+**nettoient** désormais (`atexit`) : une update qui échoue est rejouée toutes les 10 minutes, donc
+ils s'empilaient sur la carte SD.
 
-⚖️ Les témoins vont dans les deux sens : une implémentation qui rendrait **toujours** `main`
-passerait tous les cas de repli. **9 mutations** vérifiées rouges, **6 sabotages** du préflight ③
-aussi — dont « les commentaires seuls », puisque les deux fichiers nomment `ref_demandee`,
-`plan_de_mise_a_jour` et `REF_DEFAUT` dans leur prose. Le préflight vérifie aussi le **témoin
-inverse** : que l'agent ne lise **plus** le plan en direct, sinon le repli est contourné.
+⚖️ **12 mutations** vérifiées rouges, **6 sabotages** du préflight ③ aussi. ⚠️ Et **deux mutations
+sont restées vertes** : le `--` avant la refspec, et le fetch de `main` avant la comparaison. Les
+commentaires ont été **corrigés** plutôt que de garder des gardes invérifiables — les deux sont
+conservées, aucune n'est créditée d'une protection qu'on n'a pas vue tomber.
 
 **Aucun redémarrage** (l'agent est un `oneshot` par timer), **aucune migration**, **aucun état
 nouveau sur le disque** — la ref n'est pas mémorisée, elle est redemandée à chaque tick. Le

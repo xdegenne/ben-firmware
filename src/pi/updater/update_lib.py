@@ -20,6 +20,21 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 
+# 🚨 LA LANGUE DE GIT EST ÉPINGLÉE, et ce n'est pas du confort. `git.mo` FRANÇAIS est présent
+#    sur l'image du parc — vérifié sur ben-0001 — et `install.sh` ne fixe aucune locale : la
+#    langue des messages dépend donc de la façon dont chaque carte SD a été écrite. Un message
+#    traduit a deux effets, et le second brûle une version :
+#      · les journaux du parc ne se grep plus de la même manière d'un boîtier à l'autre ;
+#      · tout contrôle qui LIT ce texte devient faux ailleurs — et le banc livré par le tag est
+#        exécuté en PRÉFLIGHT par `update.sh`, donc un contrôle faux fait AVORTER l'update, qui
+#        est rejouée toutes les 10 minutes, indéfiniment.
+# ⓘ `LC_ALL=C` SUFFIT, mesuré sur la cible : gettext ignore `LANGUAGE` quand la locale est `C`
+#    (`LANGUAGE=fr LC_ALL=C` rend bien « couldn't find remote ref »). Inutile de vider LANGUAGE.
+# ⓘ On n'épingle QUE les appels de ce chantier. `verify_tag` journalise la sortie de GPG, qui
+#    est un autre sujet et que rien ne lit.
+_ENV_GIT = {**os.environ, "LC_ALL": "C"}
+
+
 # ---------------------------------------------------------------------------
 # La REF où chercher le plan de mise à jour  (ben-docs#16)
 # ---------------------------------------------------------------------------
@@ -138,27 +153,83 @@ def load_compatibility_from_remote(repo_path: str = "/opt/ben/repo",
         check=True,
         capture_output=True,
         text=True,
+        env=_ENV_GIT,
     )
     return yaml.safe_load(result.stdout)
+
+
+def deja_fusionnee(repo_path: str, ref: str) -> bool:
+    """`origin/<ref>` est-elle entièrement contenue dans `origin/main` ?
+
+    ⭐ C'est la parade au PIÈGE DE LA PROMOTION, et elle ne demande AUCUN état : si la
+       branche est un ancêtre de `main`, alors `main` contient déjà tout ce qu'elle
+       contient, PLUS la suite. La suivre encore ne peut que faire rater des releases.
+
+    ⚠️ Un code de retour autre que 0 ou 1 (donc une vraie erreur de git) vaut « pas
+       fusionnée » : on garde le comportement nominal plutôt que de dévier sur un
+       doute. On n'arrive ici qu'après deux `fetch` réussis, donc les deux refs
+       existent.
+    """
+    r = subprocess.run(
+        ["git", "-C", repo_path, "merge-base", "--is-ancestor",
+         f"origin/{ref}", f"origin/{REF_DEFAUT}"],
+        capture_output=True, text=True, env=_ENV_GIT,
+    )
+    return r.returncode == 0
 
 
 def plan_de_mise_a_jour(repo_path: str = "/opt/ben/repo",
                         ref: str = REF_DEFAUT) -> tuple:
     """Rend `(compatibility, ref_employée)`. Retombe sur `main` DANS CE TICK.
 
-    🚨 LE REPLI DANS LE MÊME TICK EST LE CŒUR DE CE MÉCANISME, et le cas n'est pas
-       théorique : la règle du dépôt est « branche supprimée au merge », donc le
-       geste NORMAL de promotion détruit la ref que le boîtier interroge. Sans ce
-       repli, promouvoir une version arrêterait les mises à jour des boîtiers
-       d'essai — en silence, et jusqu'à ce que quelqu'un relise un journal.
+    🚨 LE REPLI DANS LE MÊME TICK EST LE CŒUR DE CE MÉCANISME, et il couvre TROIS cas
+       qui mènent tous au même endroit — `main` — parce qu'une branche d'essai est, par
+       nature, l'endroit où les choses cassent :
+
+       ① la ref est introuvable. La règle du dépôt est « branche supprimée au merge »,
+          donc le geste NORMAL de promotion détruit la ref interrogée ;
+       ② la branche est DÉJÀ FUSIONNÉE mais survit (merge sans `--delete-branch`, ou
+          `ota_ref` qu'on a oublié de remettre à NULL). Sans cette garde, le boîtier
+          suivrait un plan qui ne bougera plus et RATERAIT toutes les releases
+          suivantes — en silence. Promouvoir demande deux gestes ; celui-ci rattrape
+          l'oubli du second ;
+       ③ le `compatibility.yaml` de la branche est ILLISIBLE. `yaml.safe_load` lève une
+          `YAMLError`, pas une `CalledProcessError` : avec un `except` étroit l'erreur
+          traversait et le tick échouait, puis re-échouait toutes les 10 minutes.
+
+    ⇒ D'où un `except Exception` ASSUMÉ sur le chemin de la branche : tout ce qui
+      cloche sur une ref d'essai doit rendre la main à `main`, jamais arrêter les mises
+      à jour. ⚠️ Et il ne vaut QUE pour ce chemin — un `main` cassé, lui, doit lever :
+      c'est une panne réelle, qui doit se voir.
     """
-    if ref != REF_DEFAUT:
-        try:
-            fetch_origin(repo_path, ref)
+    if ref == REF_DEFAUT:
+        fetch_origin(repo_path, REF_DEFAUT)
+        return load_compatibility_from_remote(repo_path, REF_DEFAUT), REF_DEFAUT
+    try:
+        fetch_origin(repo_path, ref)
+        # `main` AUSSI, parce qu'un boîtier sur une branche ne fetcherait QUE sa ref : sa
+        # vue d'`origin/main` daterait d'avant son basculement, et la comparaison
+        # « fusionnée ? » porterait sur un `main` d'hier — donc ne verrait jamais la fusion.
+        # ⚠️ GARDE NON DÉMONTRÉE, et je préfère l'écrire : la retirer laisse le banc VERT.
+        #    Sur un dépôt de banc, fetcher la seule branche d'essai a parfois rafraîchi
+        #    `origin/main` au passage — et parfois non, selon la forme du dépôt. Je n'ai pas
+        #    isolé la cause. ⇒ On garde le fetch explicite précisément pour que la comparaison
+        #    ne dépende PAS d'un comportement de git qu'on ne sait pas énoncer ; mais il ne
+        #    faut pas lui créditer une protection qu'on n'a pas vue tomber.
+        #    ⓘ Mesuré par ailleurs : `origin/main` absent fait sortir `merge-base` en 128, donc
+        #      `deja_fusionnee` rend False — le défaut serait « on suit la branche pour
+        #      toujours », silencieux, exactement ce que cette garde existe pour éviter.
+        fetch_origin(repo_path, REF_DEFAUT)
+        if deja_fusionnee(repo_path, ref):
+            log.info("branche %s déjà fusionnée dans %s — on suit %s : elle ne peut plus "
+                     "rien apporter, et %s a pu avancer depuis",
+                     ref, REF_DEFAUT, REF_DEFAUT, REF_DEFAUT)
+        else:
             return load_compatibility_from_remote(repo_path, ref), ref
-        except subprocess.CalledProcessError as e:
-            log.warning("ref %s inutilisable (%s) — repli sur %s DANS CE TICK",
-                        ref, (e.stderr or "").strip()[:200], REF_DEFAUT)
+    except Exception as e:  # noqa: BLE001
+        motif = (getattr(e, "stderr", None) or str(e)).strip()[:200]
+        log.warning("ref %s inutilisable (%s) — repli sur %s DANS CE TICK",
+                    ref, motif, REF_DEFAUT)
     fetch_origin(repo_path, REF_DEFAUT)
     return load_compatibility_from_remote(repo_path, REF_DEFAUT), REF_DEFAUT
 
@@ -241,6 +312,7 @@ def fetch_origin(repo_path: str = "/opt/ben/repo", ref: str = REF_DEFAUT) -> Non
         check=True,
         capture_output=True,
         text=True,
+        env=_ENV_GIT,
     )
 
 

@@ -74,20 +74,29 @@ log "préflight ① OK (3 fichiers présents et compilables)"
 
 # ═══ PRÉFLIGHT ② — LE BANC LIVRÉ PAR LE TAG, SUR LE PYTHON ET LE GIT DU BOÎTIER ══════════════
 #
-#   15 cas, et ce banc-là a besoin du `git` de la cible : quatre de ses cas montent un VRAI dépôt
-#   jetable à deux branches pour vérifier d'où le plan a été lu. C'est le seul moyen de prouver
-#   « lu depuis origin/canary » — et de prouver qu'une branche REBASÉE est relue à jour, ce qui
-#   dépend d'une refspec forcée.
+#   18 cas, et ce banc-là a besoin du `git` de la cible : six de ses cas montent un VRAI dépôt
+#   jetable pour vérifier d'où le plan a été lu. C'est le seul moyen de prouver « lu depuis
+#   origin/canary », qu'une branche REBASÉE est relue à jour (refspec forcée), et qu'une branche
+#   DÉJÀ FUSIONNÉE rend la main à `main`.
+#
+# 🚨 ET IL NE LIT PLUS UN MESSAGE DE GIT TRADUISIBLE — c'est le défaut le plus grave trouvé en
+#    revue, et il brûlait cette version. Deux cas lisent le texte d'une erreur de git ; `git.mo`
+#    FRANÇAIS est présent sur l'image du parc (vérifié sur ben-0001) et `install.sh` ne fixe
+#    aucune locale. Sur un boîtier en français, git dit « impossible de trouver la référence
+#    distante » : le banc tombait, CE préflight échouait, l'update avortait et se rejouait toutes
+#    les 10 minutes sur un boîtier parfaitement SAIN. `fetch_origin` épingle désormais `LC_ALL=C`
+#    et les deux cas tournent SOUS `LANGUAGE=fr` pour le prouver. Reproduit sur ben-0001 avant
+#    correction, vert après.
 #
 # ⚖️ Les témoins vont dans les deux sens : une implémentation qui rendrait toujours `main`
-#    passerait tous les cas de repli. 9 mutations vérifiées ROUGES avant livraison — dont une qui
-#    est restée VERTE et a fait corriger un commentaire faux plutôt que garder une garde
-#    invérifiable.
+#    passerait tous les cas de repli. 12 mutations vérifiées ROUGES avant livraison — et DEUX sont
+#    restées VERTES, ce qui a fait corriger les commentaires plutôt que garder des gardes
+#    invérifiables (le `--` avant la refspec, et le fetch de `main` avant la comparaison).
 # ⚠️ `TMPDIR=/var/tmp` et pas /tmp : /tmp peut être un tmpfs étroit sur un Pi Zero, et ce banc y
 #    crée des dépôts git.
 TMPDIR=/var/tmp python3 "$UPD/test_ref_ota.py" \
     || fail "le banc de la ref OTA échoue — NE PAS déployer en l'état"
-log "préflight ② OK (banc livré : 15 cas, dont 4 sur un vrai dépôt git)"
+log "préflight ② OK (banc livré : 18 cas, dont 6 sur un vrai dépôt git, et 2 sous LANGUAGE=fr)"
 
 # ═══ PRÉFLIGHT ③ — 🚨 LE CORRECTIF EST BRANCHÉ, PROUVÉ SUR L'ARBRE ════════════════════════════
 #
