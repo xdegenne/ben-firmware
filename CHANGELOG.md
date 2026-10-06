@@ -18,6 +18,214 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.11.0] — 2026-10-06
+
+**Chaque boîtier demande au cloud où chercher ses mises à jour.** Chantier
+[`ben-docs#16`](https://github.com/xdegenne/ben-docs/issues/16), sous-tâche
+[#42](https://github.com/xdegenne/ben-firmware/issues/42).
+
+Le but : valider une OTA sur une branche, sur **un ou deux boîtiers seulement**, puis fusionner
+la branche sur `main` et tout le monde reçoit. Jusqu'ici `main` était écrit **en dur** dans
+l'agent, deux fois — donc un tag publié partait sur les 8 boîtiers au tick suivant, dans les dix
+minutes. Une release touchant plusieurs surfaces à la fois (`#35` en touche trois : le service
+qui publie, l'API locale, le provisioning BLE) ne pouvait pas s'essayer sur un boîtier d'abord.
+
+```
+① avant chaque tentative   GET /api/devices/<id>/update, en mTLS
+② le cloud répond          { "ref": "canary" }
+③ rien d'exploitable       ⇒ main
+④ l'agent fetch cette ref  et y lit compatibility.yaml
+⑤ le reste est intact      GPG du tag · SHA256 du script · UNE transition par tick
+```
+
+#### 🚨 C'est l'agent qui demande, pas le publisher qui relaie
+
+Si une mauvaise version tue le publisher, on doit **encore pouvoir piloter ce boîtier** — c'est
+précisément le moment où on en a besoin. Le prix est une trentaine de lignes de client mTLS dans
+l'agent, **entièrement sous `try/except`** : il répare tous les autres services, il ne doit pas
+gagner une dépendance capable de le tuer. Même doctrine que l'import défensif de
+`label_for_model`.
+
+#### ⭐ Débrayable, et sans contrainte d'ordre de déploiement
+
+La route n'existe pas encore (`ben-api#29`) : tout le parc prend donc `main` et se comporte
+exactement comme avant. Ce volet part **seul**, et le jour où la route serait coupée, rien ne
+s'arrête. C'est l'inverse du champ `access` de `ben-docs#3`, qui exigeait l'API **avant** le tag.
+
+#### 🚨 Et la ref ne peut désigner qu'une BRANCHE
+
+Côté source de la refspec, `refs/heads/<ref>` — et c'est une **barrière**, pas une précision. Avec un
+simple `<ref>`, git résout le nom à sa façon et ne cherche pas que dans les branches : vérifié sur
+git 2.54.0, `+pi-0.11.0:…` rapatrie le **tag**, et `+pull/43/head:…` la **tête d'une pull request**.
+
+Or `ben-firmware` est **public** : n'importe qui peut ouvrir une PR depuis un fork, donc un
+`ota_ref = "pull/N/head"` ferait lire un plan **écrit par un inconnu**. La signature GPG protège
+toujours le **code** — `update.sh` vient du tag — mais un plan étranger pourrait faire rejouer un
+vieux `update.sh` signé sur une version qui n'est pas la sienne.
+
+ⓘ C'était aussi incohérent avec `ref_existe_sur_origin`, qui ne regarde que `refs/heads/` : le fetch
+pouvait réussir là où la vérification d'existence aurait dit non.
+
+#### 🚨 Le nom de branche vient du réseau et finit dans une ligne de commande `git`
+
+`ref_valide` impose un alphabet **fermé** : `[a-z0-9][a-z0-9._/-]{0,99}`. Le premier caractère
+alphanumérique règle d'un coup `-x` et `--upload-pack=…`, qui serait une **exécution de
+commande**. Sont refusés en plus `..` (intervalle de révisions), `refs/` (un autre espace de
+noms), un `/` ou un `.lock` final. La signature GPG du tag reste le verrou qui décide quel
+**code** s'exécute, mais elle intervient **après** : elle ne couvre pas ça.
+
+#### 🚨 Refspec explicite et forcée, et les deux moitiés comptent
+
+`+<ref>:refs/remotes/origin/<ref>`.
+
+- **explicite** : sans elle, la mise à jour de la ref distante dépend du `remote.origin.fetch` du
+  dépôt — vérifié `+refs/heads/*` sur ben-0001, posé par `install.sh`. Un boîtier provisionné
+  autrement lirait un plan **périmé**, sans que rien ne le dise ;
+- **forcée** : une branche d'essai **se rebase depuis `main`**, c'est l'usage prévu, donc son
+  historique est réécrit. Sans le `+`, le fetch refuserait la mise à jour non fast-forward et le
+  boîtier continuerait de lire l'**ancien** plan.
+
+⚠️ **Et une garde qu'on croyait utile ne l'est pas.** Le `--` avant la refspec a été éprouvé par
+mutation : le banc reste **vert** sans lui, parce que c'est le `+` qui empêche la lecture comme
+option. Le commentaire a été corrigé plutôt que de garder une garde invérifiable — `--` est
+conservé parce qu'il ne coûte rien, pas parce qu'il protège.
+
+#### 🚨 Au moindre doute, `main` — parce que l'OTA est le seul canal de réparation
+
+Décision prise avec Xavier, **notée dans la PR #43** après avoir été renversée deux fois en revue.
+Ce qui tranche :
+
+- **`ota_ref` sert à recevoir une version en avance, et à rien d'autre.** L'usage « retenir un
+  boîtier en arrière » n'existe pas — ni dans `ben-docs#16`, ni dans `ben-api#29`. Il avait été
+  introduit en revue, et toute une règle avait été bâtie dessus ;
+- donc **`main` est toujours le choix prudent** : c'est ce que le reste du parc reçoit de toute
+  façon, et une version d'avance manquée se rattrape au tick suivant ;
+- 🚨 **surtout, l'OTA est le seul canal de réparation.** Un certificat expiré, une CA renouvelée,
+  et le boîtier ne joint plus le cloud. S'il en concluait « je ne sais pas, donc je ne fais rien »,
+  il sortirait de l'OTA **pour toujours**, et la seule issue serait d'y aller en SSH. La prudence
+  apparente fermait le seul canal qui pouvait le réparer.
+
+```
+panne de l'API · 5xx · 403 · DNS · TLS · certificat illisible
+corps illisible · nom de branche refusé · branche disparue       →  main, en WARNING
+404 sur la route · {"ref": null}                                 →  main, en INFO
+```
+
+⚖️ Et chaque cas vérifie **deux** choses dans le banc : la ref rendue **et** le niveau du journal.
+Un `main` silencieux serait aussi faux qu'un gel — ces situations ne sont pas normales.
+
+#### ⓘ Une seule exception : le plan de la branche est inutilisable
+
+Si la branche **existe** mais que son `compatibility.yaml` est **illisible ou absent**, on saute le
+tick, **en `error`**. Et c'est l'argument de Xavier : **un plan mal formé est typiquement ce qu'une
+branche d'essai existe pour attraper**. Replier sur `main` ferait disparaître de l'écran le défaut
+qu'on cherchait à voir, et il ne se manifesterait qu'en atteignant tout le parc.
+
+C'est le **seul** endroit qui lève `TickASauter`, et le préflight ③ de l'`update.sh` le vérifie :
+une seule levée, et **jamais** dans `ref_demandee`. La règle est encodée dans le contrôle parce
+qu'elle a déjà été renversée deux fois.
+
+#### ⭐ La branche sans suite : on crie, puis on bascule
+
+Une branche fusionnée **en squash** qui survit avec son `ota_ref` encore posé : le boîtier atteint
+la dernière version qu'elle prévoyait, puis affiche paisiblement « Already up to date » **pour
+toujours**, en ratant toutes les releases suivantes de `main`.
+
+La détection ne demande aucun état : la branche n'offre plus rien pour sa version, `main` offre une
+transition. Le boîtier le **crie**, puis **bascule** sur `main`. ⓘ C'est possible précisément parce
+qu'il n'existe pas de retenue délibérée à protéger — les deux décisions se tiennent.
+
+#### `{"ref": null}` se dit en `INFO`, pas en `WARNING`
+
+`ota_ref` vaut `NULL` pour la quasi-totalité du parc : ce sera donc la réponse **normale** de 8
+boîtiers toutes les 10 minutes, soit **1 150 avertissements par jour** pour dire que tout va bien.
+Ça noierait celui de `hors_du_plan`, qui signale un boîtier réellement bloqué. Le `WARNING` reste
+pour une valeur **présente mais refusée** — là, une intention ne s'applique pas, et il faut le
+voir. Deux cas du banc éprouvent les **niveaux**, pas les valeurs.
+
+#### ⚠️ Attendu, et ce n'est pas une panne : rien ne change au tick qui applique cette update
+
+L'agent est un **processus neuf à chaque tick**, et celui qui exécute `update.sh` a chargé son
+code **avant** le `checkout` de l'étape ⑥. Le premier appel au cloud a donc lieu au réveil
+suivant du timer, dans ~10 min.
+
+ⓘ C'est l'asymétrie exacte qui a fait fermer `#37` sans la faire : un correctif dans l'agent
+n'est **jamais** immédiat ; un correctif dans le publisher, si — l'agent le redémarre à ⑩.
+
+#### 🚨 Un banc de préflight ne doit pas lire un message traduit — il brûlait cette version
+
+Trouvé en revue, et **reproduit sur ben-0001**. Deux cas du banc lisaient le texte d'une erreur de
+git (`"remote ref"`). Or `git.mo` **français est présent sur l'image du parc** et `install.sh` ne
+fixe aucune locale : sur un boîtier en français, git dit *« impossible de trouver la référence
+distante »*. Le banc tombait ⇒ le préflight ② échouait ⇒ l'update avortait ⇒ **rejouée toutes les
+10 minutes, sur un boîtier parfaitement sain**, et `pi-0.11.0` était **brûlée**.
+
+`fetch_origin` épingle désormais `LC_ALL=C` — mesuré sur la cible : gettext ignore `LANGUAGE`
+quand la locale est `C` — et les deux cas tournent **sous `LANGUAGE=fr`** pour le prouver. Rouges
+avant, verts après.
+
+ⓘ Le même piège a mordu une deuxième fois, au même endroit : un cas montait son dépôt en
+poussant `main` alors que le git du boîtier nomme sa branche par défaut `master`. Le banc du Mac
+ne pouvait pas le voir. Un banc de préflight **doit** être exécuté sur la cible avant le tag.
+
+#### 🚨 Le boîtier n'essaie pas de devenir plus malin que le cloud
+
+Une première version de ce volet détectait une branche **promue** par un test d'ascendance
+(`merge-base --is-ancestor`), pour rendre la main à `main` si on avait oublié de détacher le
+boîtier. **La garde a été retirée**, et pour deux raisons qui disent la même chose :
+
+- **les dépôts BEN ne fusionnent qu'en squash** — vérifié sur l'API GitHub, `allow_merge_commit`
+  et `allow_rebase_merge` sont faux. Un squash crée un commit **neuf** : les commits de la branche
+  ne sont donc **jamais** ancêtres de `main`, et le test répondait toujours « non ». La garde ne
+  pouvait pas se déclencher. ⚠️ Et son banc la croyait bonne parce qu'il fusionnait en `--ff-only`,
+  une forme qui **n'arrive jamais** sur ces dépôts : vert à tort ;
+- un second argument avait été avancé — « elle passerait outre un ordre légitime de retenue » — et
+  il est **tombé depuis** : la retenue délibérée n'existe pas. Il ne reste que la première raison,
+  mais elle suffit : **une garde qui ne peut jamais se déclencher est pire qu'absente**, puisqu'on
+  la croit active.
+
+⭐ Ce qui la remplace compare le **contenu** des deux plans — ce que la branche offre pour la
+version du boîtier, face à ce que `main` offre — donc résiste au squash. Voir « la branche sans
+suite » plus haut.
+
+#### 🚨 « Rien à faire » et « je ne peux plus rien faire » ne se disent pas pareil
+
+`hors_du_plan` remplace la garde : si la version installée n'est **ni** le `from` d'une transition
+**ni** le `to` d'une, le plan ne l'a jamais entendue et ce boîtier **n'avancera plus jamais**.
+L'agent le dit en `warning` au lieu du paisible « Already up to date ».
+
+ⓘ Ce n'est pas une hypothèse : **ben-0005** annonce `0.9.29`, une version absente de toute
+transition, et il est hors du parc OTA depuis des semaines sans qu'une seule ligne le dise.
+
+#### Le trou du repli, fermé
+
+Un `compatibility.yaml` **illisible sur la branche** : `yaml.safe_load` lève une `YAMLError`, pas
+une `CalledProcessError`, donc l'erreur traversait et le tick échouait **toutes les 10 minutes**. Le
+repli attrape maintenant tout ce qui cloche **sur le chemin de la branche** — et seulement là : un
+`main` cassé doit lever, c'est une panne réelle qui doit se voir.
+
+#### Le banc, et ce qui a été vu tomber
+
+**33 cas.** **Quinze** montent un **vrai dépôt git** jetable : seul moyen de prouver « lu depuis
+`origin/canary` », « une branche **rebasée** est relue à jour » et « une branche fusionnée **en
+squash** reste suivie ». Les autres couvrent la validation du nom, le signalement d'une version hors
+plan, et tout ce qui vaut `main` — dont un **5xx au corps valide**, seul cas qui vise la garde sur le
+statut HTTP. Les dépôts jetables se **nettoient** (`atexit`) : une update qui échoue est rejouée
+toutes les 10 minutes, donc ils s'empilaient sur la carte SD.
+
+⚠️ **Et le banc avait cessé de pouvoir tomber sur la locale.** `_ENV_GIT` était une constante de
+module, donc figée à l'**import** : le `LANGUAGE=fr` que les deux cas posent ensuite n'atteignait
+plus `git`, et ils restaient verts même en retirant `LC_ALL=C`. L'environnement est maintenant
+construit **à chaque appel**, et la mutation a été vérifiée **rouge sur ben-0001**.
+
+⚖️ **42 mutations** vérifiées rouges, **9 sabotages** du préflight ③ aussi. ⚠️ **Une** est restée
+verte — le `--` avant la refspec, puisque c'est le `+` qui fait barrière : le commentaire a été
+corrigé plutôt que de garder une garde invérifiable.
+
+**Aucun redémarrage** (l'agent est un `oneshot` par timer), **aucune migration**, **aucun état
+nouveau sur le disque** — la ref n'est pas mémorisée, elle est redemandée à chaque tick. Le
+retour arrière vers 0.10.0 ne demande de restaurer **rien**.
+
 ### [0.10.0] — 2026-10-06
 
 **La version installée atteint enfin le cloud — par une condition, plus par un événement.**

@@ -51,6 +51,9 @@ def setup_logging() -> None:
 def main() -> None:
     setup_logging()
     log = logging.getLogger(__name__)
+    # ⓘ Posée AVANT le try : l'échec final la nomme, et elle doit exister même si on tombe
+    #   avant l'étape 3.
+    ref = update_lib.REF_DEFAUT
 
     # 1. Acquire lockfile — exit immediately if another instance is running
     try:
@@ -81,16 +84,45 @@ def main() -> None:
             device["model"] = label
             update_lib.save_device_json(device, DEVICE_JSON)
 
-        # 3. Fetch origin (tags + main branch)
-        log.info("Fetching origin...")
-        update_lib.fetch_origin(REPO_PATH)
+        # 3. La REF où chercher le plan — demandée au CLOUD, boîtier par boîtier
+        #    (ben-docs#16). Tant que la route n'existe pas, le cloud rend 404 et ce
+        #    boîtier prend `main` : il se comporte exactement comme avant.
+        #    ⓘ Elle NE LÈVE JAMAIS : au moindre doute elle rend `main`, en `warning`. L'OTA est
+        #      le seul canal de réparation d'un boîtier, on ne le ferme pas parce que le cloud
+        #      n'a pas répondu (décision notée dans PR #43).
+        try:
+            ref = update_lib.ref_demandee(device["deviceId"])
 
-        # 4. Load compatibility.yaml from origin/main and find next transition
-        compat = update_lib.load_compatibility_from_remote(REPO_PATH)
+            # 4. Fetch + plan de mise à jour. Tout échec donne `main` avec un `warning` ; la
+            #    seule exception est un plan de branche inutilisable, qui saute le tick.
+            log.info("Fetching origin (%s)...", ref)
+            compat, ref = update_lib.plan_de_mise_a_jour(
+                REPO_PATH, ref, device["softwareVersion"])
+        except update_lib.TickASauter as e:
+            # 🚨 `error`, PAS `info` : un seul cas lève ceci — le plan de la branche d'essai est
+            #    inutilisable — et un gel silencieux est exactement le défaut qu'on ferme.
+            #    `update_lib` a déjà crié la cause ; cette ligne dit la conséquence.
+            # ⓘ Sortie 0 quand même : rien n'a été tenté, `device.json` n'est pas touché, et le
+            #   timer repasse dans dix minutes. Un code 1 dirait qu'une update a échoué.
+            log.error("tick sauté, AUCUNE mise à jour tentée — %s", e)
+            sys.exit(0)
+        if ref != update_lib.REF_DEFAUT:
+            log.info("plan lu depuis origin/%s", ref)
         transition = update_lib.find_next_transition(compat, device)
 
         if transition is None:
-            log.info("Already up to date (%s)", device["softwareVersion"])
+            # 🚨 « RIEN À FAIRE » ET « JE NE PEUX PLUS RIEN FAIRE » NE SE DISENT PAS PAREIL.
+            #    Une version que le plan ignore complètement sort le boîtier du parc OTA : il
+            #    journalisera « Already up to date » à chaque tick, pour toujours, et personne
+            #    ne le verra. C'est l'état de ben-0005 depuis des semaines.
+            if update_lib.hors_du_plan(compat, device["softwareVersion"]):
+                log.warning(
+                    "AUCUNE transition ne part de %s dans le plan de origin/%s, et aucune n'y "
+                    "mène : ce boîtier N'AVANCERA PLUS tant qu'il suit cette ref. Vérifier "
+                    "`ota_ref` côté cloud, ou la version de device.json.",
+                    device["softwareVersion"], ref)
+            else:
+                log.info("Already up to date (%s)", device["softwareVersion"])
             sys.exit(0)
 
         tag = transition["tag"]
@@ -158,7 +190,19 @@ def main() -> None:
                         "sur l'update, mais il tourne sur l'ancien code", e)
 
     except Exception:
-        log.exception("Update failed — device.json not modified, will retry next tick")
+        # 🚨 ON NOMME LA REF, et ce n'est pas cosmétique. Tout ce qui échoue APRÈS la lecture du
+        #    plan — signature GPG d'un tag qui n'existe pas, SHA256 qui ne concorde pas,
+        #    `update.sh` qui sort non nul — échoue ICI, donc HORS de toute portée de repli :
+        #    `plan_de_mise_a_jour` s'arrête à la lecture du plan. C'est le comportement voulu, et
+        #    c'est même l'intérêt du canary : un plan qui nomme un tag absent doit se VOIR sur le
+        #    boîtier d'essai, pas se faire remplacer en silence par celui de `main`.
+        #    ⇒ Mais sans la ref dans la ligne, un échec de branche se lit comme un échec
+        #      ordinaire, et on cherche la cause au mauvais endroit.
+        # ⚠️ « DEMANDÉE », pas « lue » : si c'est la lecture de `main` qui a échoué après un repli,
+        #    `ref` porte encore le nom de la branche, et dire « plan lu depuis origin/canary »
+        #    enverrait chercher la cause au mauvais endroit. « Demandée » est vrai dans tous les cas.
+        log.exception("Update failed (ref demandée : origin/%s) — device.json not modified, "
+                      "will retry next tick", ref)
         sys.exit(1)
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
