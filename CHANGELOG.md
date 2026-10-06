@@ -18,6 +18,141 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.10.0] — 2026-10-06
+
+**La version installée atteint enfin le cloud — par une condition, plus par un événement.**
+Chantier [`ben-docs#15`](https://github.com/xdegenne/ben-docs/issues/15), sous-tâche
+[#38](https://github.com/xdegenne/ben-firmware/issues/38).
+
+Mesuré le 04/10, après la publication de `pi-0.9.28` : `devices.sw_version` annonçait
+**`0.9.27` pour les 8 boîtiers** alors que ben-0001 et ben-0003 tournaient bel et bien en
+`0.9.28` — `device.json` bumpé, dépôt sur le tag, « ✓ update OK » au journal, battement à
+l'heure. Or cette colonne est la **seule** source de la vue parc : le panneau « Versions
+firmware » du tableau `ben-parc` et la colonne « version » de son détail. Un tableau de bord
+qui annonce une version périmée rend le parc **impossible à piloter** — on ne sait plus qui a
+pris quoi, ce qui est exactement ce que l'ingestion cloud existe pour dire.
+
+```
+ben_publisher   la version déclarée est MÉMORISÉE après le 2xx, et comparée à chaque tour
+                /var/lib/ben-firmware/version-declaree.json   { "version", "ts" }
+                le drapeau d'OTA est RETIRÉ : pose, lecture, et sa garde d'ordre
+```
+
+#### La cause, en une ligne
+
+`devices.sw_version` n'est écrite que par la route `/hello` — la **déclaration** — et par rien
+d'autre. Le battement, lui, va sur `/ping`, qui écrit `last_seen` et la santé et ne touche
+jamais la version. Et la déclaration post-OTA reposait sur un **drapeau que chaque `update.sh`
+devait penser à poser** : **un seul des 37 scripts** du dépôt l'a fait — `0.9.26_to_0.9.27`,
+celui qui a introduit le mécanisme — et il a été **oublié dès la transition suivante**.
+
+#### ⭐ Le dépôt portait déjà l'argument, deux fois
+
+C'est ce qui rend le correctif évident après coup. `ben_publisher.py`, sur son déclencheur ② :
+
+> ⭐ ② est une CONDITION, pas un événement à attraper […] Réconcilier un état est plus solide
+> que rattraper un événement — un événement raté est définitif, une condition se re-vérifie au
+> tour suivant.
+
+Et `check_update.py`, sur le redémarrage du publisher : « *Le laisser à la charge de chaque
+`update.sh` reviendrait à l'oublier un jour.* » La déclaration n'avait pas eu droit au même
+traitement.
+
+#### ⭐ Mémoire absente = jamais déclarée, et c'est ce qui recale tout le parc
+
+Aucun boîtier ne porte ce fichier aujourd'hui, donc **chacun déclare une fois** au premier
+battement après son OTA. Le trou du 04/10 se ferme sans qu'on touche à un boîtier, et sans
+rien de manuel.
+
+Ce que la condition couvre, et que le drapeau ne couvrait pas :
+
+- une OTA ;
+- un **retour arrière** de version — c'est une **égalité** qu'on teste, pas un ordre ;
+- un `device.json` édité à la main ;
+- une déclaration **refusée** (4xx/5xx, réseau) : re-tentée au tour suivant, sans mémoire
+  d'événement à conserver ;
+- un publisher redémarré au mauvais moment.
+
+ⓘ Ce qu'elle ne couvre **pas** : une **restauration de la base cloud** à un état antérieur — le
+boîtier croirait avoir déjà déclaré. Seule une variante où le cloud rendrait sa version dans la
+réponse du `/ping` fermerait ce cas ; hors périmètre, noté dans `ben-docs#15`.
+
+#### ⓘ Un fichier, pas une table — c'est le mode de défaillance qui tranche
+
+Une table aurait demandé un **DDL dans `update.sh`** : `open_db()` du publisher ouvre en
+écriture **sans rejouer le schéma** (délibéré) et l'API locale est en lecture seule, donc aucun
+des deux ne peut la créer. Oubliée, elle aurait fait lever `no such table` à chaque tour et le
+boîtier aurait cessé de publier **en silence** — la classe de panne que 0.9.27 a failli livrer.
+Un fichier absent ou illisible, lui, vaut « jamais déclarée » : une déclaration de trop, bornée
+par le plancher.
+
+Hors de `measurements.db` **aussi** parce qu'elle se **reconstruit** (0.9.25) ; et si la mémoire
+ne survit pas, on redéclare. Elle vit là où vivait le drapeau — `/var/lib/ben-firmware`,
+propriété de `ben` — donc **aucun état nouveau à provisionner**.
+
+⇒ **Aucune migration, aucune table, aucune colonne**, et le retour arrière vers 0.9.28 ne
+demande de restaurer **rien**.
+
+#### 🚨 Le plancher s'applique aussi à la version — mais pas le plancher long
+
+Un cloud qui refuse laisse la condition **vraie** : c'est sa force, et c'est aussi pourquoi le
+plancher reste. Sans lui, le boîtier redéclarerait toutes les 10 s quand le retard est gros —
+la rafale déjà constatée avec le drapeau.
+
+En revanche le plancher **long** (6 h, « plus rien à apprendre » quand tous les pdl sans ref
+portent déjà un motif) ne vaut **que si la version est à jour** : six heures de vue parc fausse
+à cause d'un ADS non conforme serait un défaut pour un autre.
+
+#### Le drapeau est retiré, pose et consommation
+
+`_version()` disparaît avec son unique appelant — la garde d'ordre pose/bump, qui n'a plus
+d'objet puisqu'on compare désormais à `device.json` lui-même. Le publisher **supprime sans
+jamais le lire** un drapeau qu'un boîtier porterait encore : l'interpréter reviendrait à garder
+les deux mécanismes, donc à garder celui qu'on retire.
+
+#### 🚨 Aucun redémarrage dans le script
+
+Le seul service concerné est `ben-publisher`, et c'est l'**agent** qui le redémarre à l'étape ⑩,
+**après** le bump ⑨. Le faire dans `update.sh` le relancerait sur un `device.json` encore en
+0.9.28, qui déclarerait 0.9.28.
+
+ⓘ Ce serait sans dommage **durable**, et c'est une propriété de la condition, pas une chance :
+au redémarrage de ⑩ la mémoire (0.9.28) différerait de l'installée (0.10.0), donc le boîtier
+redéclarerait. Là où le drapeau exigeait une garde d'ordre explicite pour survivre à cette
+course, la condition s'en passe.
+
+#### Le banc, et les sabotages qu'on a vérifiés rouges
+
+**15 cas**, aucun matériel, aucune base : les quatre états de la mémoire (absente ⇒ **une**
+déclaration · égale ⇒ **aucune** · différente ⇒ **une** · refus du cloud ⇒ re-tentée au tour
+suivant **sans rafale**), le retour arrière, la version installée vide, les deux planchers, et
+la mémoire sur disque (aller-retour, atomicité, fichier illisible, répertoire non inscriptible).
+
+⚖️ Les témoins **négatifs** sont la moitié du banc : une condition toujours vraie fermerait le
+défaut d'origine *et* ferait redéclarer sept boîtiers toutes les 60 s pour toujours. **10
+mutations** du correctif vérifiées rouges, chacune par le cas qui la vise.
+
+🚨 Et le préflight ③ prouve que le correctif est **branché**, **sur l'arbre syntaxique, jamais
+par un `grep`** : `ben_publisher.py` nomme `memoriser_version_declaree`, `DECLARER_FLAG` et le
+chemin du drapeau dans ses **commentaires**, donc un `grep` serait **vert** sur un fichier qui
+ne les appelle jamais, et **rouge** sur la suppression qu'on vient de faire. **8 sabotages**
+vérifiés rouges, dont « les commentaires seuls » et « affectation retirée mais nom encore
+employé » — ce dernier lèverait un `NameError` au premier tour, et le publisher ne démarrerait
+plus du tout.
+
+Contrôle d'effet sur `/health` (`db: true`), jamais `/info`. Il ne prouve **que** l'innocuité du
+script : la déclaration part après ⑩, quand le script n'existe plus. On ne l'**exige** donc pas
+— un garde-fou impossible à tenir brûle une version (pi-0.9.12) — et ce qu'il faut regarder
+ensuite est écrit nommément en fin de journal.
+
+#### ⚠️ Pourquoi 0.10.0, et le piège de l'ordre lexicographique
+
+Le mécanisme de la déclaration change de nature et un état local apparaît : ce n'est pas un
+correctif de détail. ⚠️ Mais `« 0.10.0 » < « 0.9.28 »` **comme chaînes**. Sans conséquence sur
+l'OTA — `find_next_transition` compare `from` par **égalité**, jamais par ordre — mais le
+panneau « Versions firmware » de `ben-parc` trie en texte (`ORDER BY 1 DESC`), donc 0.10.0
+s'affichera **sous** 0.9.28.
+
 ### [0.9.28] — 2026-10-04
 
 **Le boîtier apprend la version de son émetteur, et la dit.** Volet ② du chantier

@@ -6,7 +6,8 @@ ben_publisher — pousse les mesures du boîtier vers `ben-api`.
 Ce fichier décrit le comportement du boîtier ; le contrat de l'API et la
 politique serveur n'y figurent pas.
 
-    hello  au démarrage, puis une fois par JOUR (versions + compteurs).
+    hello  au démarrage, puis une fois par JOUR (santé + compteurs ; la VERSION,
+           elle, part par la DÉCLARATION, sur sa condition — voir VERSION_DECLAREE).
            S'il échoue, ON CONTINUE — et c'est le rejeu quotidien qui rattrape,
            il n'y a pas de reprise immédiate.
     boucle toutes les 60 s : jusqu'à BATCH points non envoyés, du plus ancien.
@@ -113,8 +114,10 @@ ECHECS_ERREUR = int(os.environ.get("BEN_PUB_ECHECS_ERREUR", "5"))
 #     pdl_index dès qu'un ADCO inconnu se présente : changement de compteur, nouvel
 #     émetteur LoRa) — sans nouveau hello, le cloud reçoit des mesures pour un
 #     pdl_index qu'il ne sait pas nommer ;
-#   - après une OTA, `softwareVersion` change, mais nos updates redémarrent les
-#     LECTEURS, pas forcément ce service : `devices.sw_version` resterait périmé.
+#   ⓘ La VERSION, elle, ne voyage plus ici : depuis 0.9.27 elle est portée par la
+#     DÉCLARATION (`/hello`), que sa propre condition déclenche — pas par ce
+#     battement périodique, qui ne transporte aucun `sw`. Croire le contraire est
+#     exactement ce qui a laissé `devices.sw_version` périmé (ben-docs#15).
 #
 # ⏱️ QUOTIDIEN, et non horaire (décidé le 2026-09-21). Le hello va porter en plus
 # l'INSTANTANÉ COMPLET de `contract_epoch`, `tariff_labels` et `meter_profile` —
@@ -154,12 +157,16 @@ HELLO_SUR_ECHEC_S = float(os.environ.get("BEN_PUB_HELLO_SUR_ECHEC", "3600"))
 
 # ── La DÉCLARATION, et son plancher ───────────────────────────────────────────
 #
-# ⭐ Le déclencheur est une CONDITION, pas un événement : « il existe un pdl sans
-#    ref ». Elle se vérifie à chaque tour, localement, sans drapeau et sans rien
-#    mémoriser sur ce que le cloud sait. Elle couvre d'un seul énoncé le compteur
-#    neuf, le compteur remplacé, et la ref perdue en local (carte reflashée,
-#    désappairage). ⇒ Réconcilier un état est plus solide que rattraper un
+# ⭐ LES DEUX DÉCLENCHEURS SONT DES CONDITIONS, pas des événements : « il existe un
+#    pdl sans ref » et « la version installée n'est pas celle que le cloud a
+#    acceptée ». Toutes deux se vérifient à chaque tour, localement. La première
+#    couvre d'un seul énoncé le compteur neuf, le compteur remplacé et la ref perdue
+#    en local (carte reflashée, désappairage) ; la seconde, l'OTA, le retour arrière
+#    et le refus du cloud. ⇒ Réconcilier un état est plus solide que rattraper un
 #    événement : un événement raté est définitif, une condition se re-vérifie.
+#    ⓘ Il y avait un TROISIÈME déclencheur, événementiel — un drapeau d'OTA posé par
+#      `update.sh`. Il a été oublié par 36 scripts sur 37 et la vue parc en est
+#      restée fausse deux releases durant : cf. `VERSION_DECLAREE`, ben-docs#15.
 #
 # 🚨 MAIS IL FAUT UN PLANCHER, et ce n'est pas du zèle. Un pdl dont l'ADS n'est
 #    pas conforme — le PDL fantôme de ben-0001 en est un, deux octets nuls —
@@ -176,18 +183,51 @@ DECLARATION_PLANCHER_S = float(os.environ.get("BEN_PUB_DECLARATION_PLANCHER", "3
 DECLARATION_PLANCHER_REFUS_S = float(
     os.environ.get("BEN_PUB_DECLARATION_PLANCHER_REFUS", "21600"))
 
-# 🚨 LE DRAPEAU D'OTA. Une OTA doit faire redéclarer — c'est ainsi que le cloud
-#    apprend la version neuve. Or l'agent d'update est DÉJÀ EN MÉMOIRE quand il
-#    redémarre les services : une déclaration envoyée au démarrage du publisher
-#    partirait AVANT le bump de `device.json`, et le cloud apprendrait l'ANCIENNE
-#    version. ⇒ `update.sh` pose ce drapeau APRÈS le bump, le publisher le consomme
-#    au tour suivant, et la course disparaît.
-# ⚠️ CE CHEMIN EST UN CONTRAT AVEC `update.sh`, et il a déjà divergé : le script
-#    écrivait `/var/lib/ben-firmware/declaration-requise.json` pendant que le
-#    publisher lisait `/var/lib/ben/declare`. Trois documents affirmaient un
-#    mécanisme que le code ne pouvait pas déclencher. ⓘ Les 19 autres références
-#    du dépôt disent `/var/lib/ben-firmware` : c'est la forme juste.
-DECLARER_FLAG = os.environ.get("BEN_PUB_DECLARER_FLAG",
+# ── LA VERSION DÉCLARÉE, mémorisée LOCALEMENT ─────────────────────────────────
+#
+# 🚨 CE QUI REMPLACE LE DRAPEAU D'OTA (ben-docs#15, #38). Une OTA doit faire
+#    redéclarer : c'est ainsi, et SEULEMENT ainsi, que le cloud apprend la version
+#    neuve — `devices.sw_version` n'est écrite que par la route `/hello`, jamais par
+#    le battement. Le mécanisme était un ÉVÉNEMENT : chaque `update.sh` devait poser
+#    `/var/lib/ben-firmware/declaration-requise.json`, que ce service consommait au
+#    tour suivant. UN SEUL des 37 scripts du dépôt l'a fait — celui qui a introduit
+#    le mécanisme — et il a été OUBLIÉ dès la transition suivante. Mesuré le 04/10 :
+#    `devices.sw_version` annonçait 0.9.27 pour les 8 boîtiers, dont deux tournaient
+#    en 0.9.28, et la vue parc serait restée fausse INDÉFINIMENT.
+#
+# ⭐ UNE CONDITION, PAS UN ÉVÉNEMENT — la doctrine est déjà écrite vingt lignes plus
+#    haut pour « il existe un pdl sans ref », elle n'avait simplement pas été
+#    appliquée ici : on mémorise la version que le cloud a ACCEPTÉE, et on la compare
+#    à chaque tour à celle de `device.json`. Un événement raté est définitif ; une
+#    condition se re-vérifie au tour suivant. ⇒ Un seul énoncé couvre l'OTA, le
+#    RETOUR ARRIÈRE, un `device.json` édité à la main, une déclaration REFUSÉE
+#    (4xx/5xx, réseau), et un publisher redémarré au mauvais moment.
+#
+# ⭐ MÉMOIRE ABSENTE = JAMAIS DÉCLARÉE, et c'est ce qui recale TOUT LE PARC sans
+#    qu'on touche à un boîtier : au premier battement après l'OTA qui livre ce code,
+#    aucun boîtier n'a ce fichier, donc chacun déclare une fois.
+#
+# ⓘ UN FICHIER, PAS UNE TABLE, et c'est le MODE DE DÉFAILLANCE qui tranche. Une
+#    table demanderait un DDL dans `update.sh` — `open_db()` ouvre en écriture SANS
+#    rejouer le schéma (délibéré) et l'API locale est en lecture seule, donc aucun
+#    des deux ne peut la créer : oubliée, elle ferait lever `no such table` à chaque
+#    tour et le boîtier cesserait de publier EN SILENCE (la classe de panne que
+#    0.9.27 a failli livrer). Un fichier absent ou illisible, lui, vaut « jamais
+#    déclarée » : une déclaration de trop, bornée par le plancher.
+# ⓘ Hors de `measurements.db` AUSSI parce qu'elle se RECONSTRUIT (0.9.25) — et si la
+#    mémoire ne survit pas, on redéclare, ce qui est sans conséquence. Il vit là où
+#    vivait le drapeau, `/var/lib/ben-firmware`, propriété de `ben` : aucun état
+#    nouveau à provisionner.
+VERSION_DECLAREE = os.environ.get("BEN_PUB_VERSION_DECLAREE",
+                                  "/var/lib/ben-firmware/version-declaree.json")
+
+# ⓘ L'ANCIEN DRAPEAU, gardé pour être RETIRÉ — sans jamais être lu. Un boîtier peut
+#    en porter un, posé par un vieux script ou laissé par une déclaration jamais
+#    acceptée. L'INTERPRÉTER reviendrait à garder les deux mécanismes, donc à garder
+#    celui qu'on retire ; le LAISSER laisserait sur le disque un fichier qui ne veut
+#    plus rien dire, et que quelqu'un relira un jour comme s'il voulait dire quelque
+#    chose.
+DRAPEAU_LEGUE = os.environ.get("BEN_PUB_DRAPEAU_LEGUE",
                                "/var/lib/ben-firmware/declaration-requise.json")
 
 CERT_DIR = os.environ.get("BEN_CERT_DIR", "/etc/ben-firmware/certs")
@@ -490,23 +530,6 @@ def cadence_sure(conn: sqlite3.Connection) -> float:
         return PERIOD
 
 
-def _version(v: str) -> tuple:
-    """`"0.9.27"` → `(0, 9, 27)`, pour comparer un ORDRE et non une égalité.
-
-    ⚠️ Tolérante : un composant non numérique devient 0 plutôt que de lever. Une
-       version mal formée ne doit pas empêcher une déclaration — au pire elle la
-       déclenche trop tôt, ce qui est sans conséquence, alors qu'une exception
-       bloquerait le boîtier.
-    """
-    out = []
-    for p in (v or "").split("."):
-        try:
-            out.append(int(p))
-        except ValueError:
-            out.append(0)
-    return tuple(out)
-
-
 def pending_approx(conn: sqlite3.Connection) -> int:
     """Estimation du retard, en O(1).
 
@@ -559,12 +582,110 @@ def _meta(conn: sqlite3.Connection, quoi: str, sql: str, mapper) -> list:
         return []
 
 
+def version_declaree(chemin: str = "") -> str:
+    """La version que le cloud a ACCEPTÉE, ou `""` si on n'en sait rien.
+
+    ⚠️ NE LÈVE JAMAIS, et tout ce qui cloche vaut `""` : fichier absent, illisible,
+       tronqué par une coupure, JSON invalide. « On ne sait pas » et « jamais
+       déclarée » doivent donner le MÊME comportement — une déclaration de plus,
+       bornée par le plancher. L'arbitrage inverse (supposer que le cloud sait)
+       laisserait la vue parc fausse pour toujours, et EN SILENCE : c'est très
+       exactement le défaut qu'on ferme.
+    """
+    try:
+        brut = pathlib.Path(chemin or VERSION_DECLAREE).read_text()
+    except FileNotFoundError:
+        return ""
+    except OSError as e:
+        log.warning("mémoire de version illisible (%s) — on redéclare", e)
+        return ""
+    try:
+        return str(json.loads(brut).get("version") or "")
+    except Exception as e:  # noqa: BLE001
+        log.warning("mémoire de version incompréhensible (%s) — on redéclare", e)
+        return ""
+
+
+def memoriser_version_declaree(version: str, chemin: str = "") -> None:
+    """Range la version que le cloud VIENT d'accepter. Ne lève jamais.
+
+    🚨 APRÈS LE 2xx, JAMAIS AVANT. Écrite trop tôt, la condition deviendrait fausse
+       alors que le cloud ignore encore la version : on retomberait sur le défaut
+       d'origine, et sans drapeau pour le rattraper.
+
+    ⭐ ÉCRITURE ATOMIQUE, et ce n'est pas du zèle : un fichier tronqué par une
+       coupure se relirait comme une AUTRE version, donc ferait taire la déclaration
+       au lieu de la provoquer — le seul mode de défaillance de ce fichier qui soit
+       SILENCIEUX. Avec `os.replace`, on a l'ancienne valeur ou la neuve.
+
+    ⚠️ Un échec d'écriture ne fait rien échouer : on redéclarera au tour suivant.
+       Bruyant et sans perte plutôt que silencieux.
+    """
+    p = pathlib.Path(chemin or VERSION_DECLAREE)
+    tmp = p.with_name(p.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps({"version": version, "ts": int(time.time())}) + "\n")
+        os.replace(tmp, p)
+    except OSError as e:
+        log.warning("version déclarée non mémorisée (%s) — on redéclarera", e)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def motif_declaration(installee: str, declaree: str, manquants: list, refuses: set,
+                      dernier: float, maintenant: float) -> str:
+    """Le MOTIF de la déclaration à faire à ce tour, ou `""` s'il n'y en a pas.
+
+    ⭐ Pure, et c'est délibéré : la DÉCISION et la ligne de journal qui l'explique
+       sortent du même calcul. Deux calculs séparés finiraient par dire deux choses,
+       et on relirait un journal qui n'explique plus ce que le code a fait.
+
+    ① LA VERSION — la version installée n'est pas celle que le cloud a acceptée.
+    ② LE PDL SANS REF — compteur neuf, remplacé, ou ref perdue en local.
+
+    Les deux sont des CONDITIONS : ni l'une ni l'autre ne se perd si le tour qui
+    l'observe échoue.
+    """
+    # ⚠️ UNE VERSION INSTALLÉE VIDE NE SE DÉCLARE PAS. `device.json` illisible ou
+    #    amputé apprendrait au cloud un `sw` VIDE — pire que périmé, puisque plus
+    #    rien ne dirait que la valeur est à retrouver.
+    version_a_dire = bool(installee) and declaree != installee
+    motifs = []
+    if version_a_dire:
+        motifs.append(f"version installée {installee}, "
+                      f"déclarée {declaree or 'jamais'}")
+    if manquants:
+        motifs.append(f"pdl sans ref {sorted(manquants)}")
+    if not motifs:
+        return ""
+
+    # 🚨 LE PLANCHER S'APPLIQUE AUSSI À LA VERSION. Un cloud qui refuse (pas encore
+    #    déployé, 4xx, 5xx) laisse la condition VRAIE — c'est sa force — donc sans
+    #    plancher le boîtier redéclarerait à chaque tour, soit toutes les 10 s quand
+    #    le retard est gros. C'est la rafale que le plancher existe pour empêcher, et
+    #    elle s'est déjà produite avec le drapeau.
+    plancher = DECLARATION_PLANCHER_S
+    # ⭐ LE PLANCHER LONG ne vaut QUE si la version est à jour : « plus rien à
+    #    apprendre » est faux tant qu'une version attend d'être dite, et six heures
+    #    de vue parc fausse à cause d'un ADS non conforme serait un défaut pour un
+    #    autre.
+    if not version_a_dire and set(manquants) <= set(refuses):
+        plancher = DECLARATION_PLANCHER_REFUS_S
+    if maintenant - dernier < plancher:
+        return ""
+    return " · ".join(motifs)
+
+
 def declare(cli: Client, conn: sqlite3.Connection, dev: dict) -> bool:
     """LA DÉCLARATION — « ce que le boîtier EST ». Rend True sur un 2xx.
 
-    ⭐ Rare et ÉVÉNEMENTIELLE : à l'init, tant qu'un pdl est sans `ref`, et après
-       une OTA. 🚨 PAS au démarrage du publisher — un redémarrage n'est ni une OTA
-       ni une redéclaration d'identité.
+    ⭐ Rare, et sur DEUX CONDITIONS réconciliées à chaque tour : tant qu'un pdl est
+       sans `ref`, et tant que la version installée n'est pas celle que le cloud a
+       acceptée (`motif_declaration`). 🚨 PAS au démarrage du publisher — un
+       redémarrage n'est ni une OTA ni une redéclaration d'identité ; c'est la
+       MÉMOIRE de la version, pas le démarrage, qui décide.
 
     🚨 C'EST LA SEULE REQUÊTE QUI TRANSPORTE L'ADS, et c'est tout l'objet du
        chantier : l'identifiant du compteur ne voyage qu'ici, jamais avec les
@@ -775,111 +896,82 @@ def main() -> int:
         return time.monotonic() + HELLO_EVERY
 
     dernier_declare = float("-inf")
-    force_deja_tente = False
 
     def declare_if_needed() -> None:
-        """LA DÉCLARATION, sur ses trois déclencheurs. Ne lève jamais.
+        """LA DÉCLARATION, sur ses DEUX conditions. Ne lève jamais.
 
-        ① à l'init du boîtier    — aucun pdl n'a de ref, donc la condition est vraie
-        ② tant qu'un pdl est SANS ref — compteur neuf, remplacé, ou ref perdue
-        ③ après une OTA          — `update.sh` pose le drapeau APRÈS le bump
+        ① la version installée n'est pas celle que le cloud a ACCEPTÉE
+        ② un pdl est SANS ref — compteur neuf, remplacé, ou ref perdue
 
-        ⭐ ② est une CONDITION, pas un événement à attraper : elle se vérifie à
-           chaque tour, localement, sans drapeau. Réconcilier un état est plus
-           solide que rattraper un événement — un événement raté est définitif,
-           une condition se re-vérifie au tour suivant.
-
-        🚨 Le drapeau d'OTA ne se retire QU'APRÈS un 2xx. Sinon une OTA dont la
-           déclaration échoue sur une coupure réseau perdrait son déclencheur, et
-           le cloud resterait sur l'ANCIENNE version jusqu'au prochain hasard.
+        ⭐ DEUX CONDITIONS ET AUCUN ÉVÉNEMENT : les deux se re-vérifient à chaque
+           tour, localement. Plus de drapeau à poser, donc plus rien à oublier dans
+           un `update.sh` — c'est tout l'objet de #38, et le troisième déclencheur
+           (« après une OTA ») a disparu en tant que tel : il est devenu un CAS
+           PARTICULIER de ①.
         """
-        nonlocal dernier_declare, force_deja_tente
+        nonlocal dernier_declare
+        # ⓘ L'ANCIEN DRAPEAU SE RETIRE SANS SE LIRE. Cf. `DRAPEAU_LEGUE` : ne rien en
+        #    déduire est le seul moyen de n'avoir qu'un mécanisme. Ça ne coûte qu'un
+        #    `unlink` qui échoue, dans 100 % des tours une fois le parc passé.
+        try:
+            os.unlink(DRAPEAU_LEGUE)
+            log.info("ancien drapeau %s retiré — la version est désormais réconciliée "
+                     "à chaque tour, il ne sert plus", DRAPEAU_LEGUE)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log.warning("ancien drapeau %s non retiré (%s) — sans conséquence, "
+                        "il n'est plus lu", DRAPEAU_LEGUE, e)
+
+        # 🚨 ON RELIT `device.json` À CHAQUE TOUR, et c'est ce qui rend la condition
+        #    possible : après une OTA la version a changé SUR LE DISQUE sans que ce
+        #    service ait redémarré — et quand il redémarre (l'agent le fait à l'étape
+        #    ⑩, après le bump ⑨), il relit de toute façon.
         dev_courant = caps.load_device() or dev
-        force = False
-        if os.path.exists(DECLARER_FLAG):
-            # 🚨 LA GARDE CONTRE LA COURSE POSE/BUMP. `update.sh` tourne AVANT que
-            #    l'agent ne bumpe `device.json` : un drapeau consommé trop tôt
-            #    ferait déclarer l'ANCIENNE version. Le script y écrit donc la
-            #    version qu'il installe, et on n'obéit que si elle est en place.
-            try:
-                attendue = json.loads(pathlib.Path(DECLARER_FLAG).read_text()
-                                      ).get("version_attendue")
-            except Exception as e:  # noqa: BLE001
-                # ⚠️ Un drapeau illisible ne doit pas bloquer : on déclare, parce
-                #    qu'une déclaration de trop est sans conséquence alors qu'une
-                #    déclaration manquante laisse le cloud sur l'ancienne version.
-                log.warning("drapeau %s illisible (%s) — on déclare quand même",
-                            DECLARER_FLAG, e)
-                attendue = None
-            installee = dev_courant.get("softwareVersion", "")
-            # 🚨 COMPARAISON D'ORDRE, PAS D'ÉGALITÉ. Avec `!=`, un drapeau posé pour
-            #    0.9.27 dont la déclaration échoue, suivi d'une OTA vers 0.9.28, ne
-            #    correspondait PLUS JAMAIS : il n'était jamais retiré, « on attend le
-            #    bump » était journalisé à chaque tour, et le déclenchement d'OTA
-            #    était perdu en silence.
-            if attendue and _version(installee) < _version(attendue):
-                log.info("drapeau pour %s mais %s est en place — on attend le bump",
-                         attendue, installee)
-            else:
-                force = True
+        installee = dev_courant.get("softwareVersion", "")
         try:
             manquants = db.pdls_without_ref(conn)
         except sqlite3.Error as e:
-            # ⚠️ Une base locale qui bronche n'est pas une raison de déclarer :
-            #    on ne sait pas s'il faut. Même garde que `cadence_sure`.
+            # ⚠️ Une base locale qui bronche n'est pas une raison de déclarer : on ne
+            #    sait pas s'il faut. Même garde que `cadence_sure`. ⓘ Et ça ne perd
+            #    rien de la version : `declare()` lit la table `pdl` lui aussi, donc
+            #    il échouerait de toute façon — mais au tour suivant la condition est
+            #    toujours là, ce que le drapeau ne garantissait pas.
             log.warning("pdl sans ref illisible (%s) — déclaration reportée", e)
             return
-        if not force and not manquants:
-            return
-        # 🚨 LE PLANCHER. Un pdl dont l'ADS n'est pas conforme n'obtiendra JAMAIS de
-        #    ref — le CHECK du schéma cloud l'interdit, et c'est voulu. Sans
-        #    plancher, ce boîtier redéclarerait toutes les 60 s pour toujours, et
-        #    chaque tentative écrirait une ligne au journal du cloud.
-        #    ⓘ Le drapeau d'OTA passe outre : une OTA est un événement rare et daté.
-        # 🚨 LE PLANCHER S'APPLIQUE AUSSI EN MODE `force`, DÈS LE SECOND ESSAI.
-        #    Le drapeau d'OTA n'est retiré qu'après un 2xx : si le cloud refuse
-        #    (pas encore déployé, 4xx, 5xx), `force` restait vrai et sautait le
-        #    plancher à CHAQUE tour — ~10 s juste après une update, puisque le
-        #    retard est gros. C'était exactement la rafale que le plancher existe
-        #    pour empêcher.
-        plancher = DECLARATION_PLANCHER_S
-        if not force or force_deja_tente:
-            # ⭐ ET UN PLANCHER LONG quand il n'y a plus rien à apprendre : si TOUS
-            #    les pdl sans ref portent déjà un motif, le cloud a déjà répondu, et
-            #    sa réponse ne changera pas tant que la cause n'aura pas changé.
-            #    Sans ça, un ADS définitivement non conforme faisait redéclarer
-            #    toutes les 300 s pour toujours, en saturant les 8 lignes d'erreur
-            #    que l'instantané de santé transporte.
+        refuses: set = set()
+        if manquants:
+            # ⓘ Lue seulement quand il y a des manquants : c'est le seul cas où elle
+            #    peut changer le plancher.
             try:
                 refuses = set(db.pdls_refuses(conn))
             except sqlite3.Error:
                 refuses = set()
-            if manquants and set(manquants) <= refuses:
-                plancher = DECLARATION_PLANCHER_REFUS_S
-            if time.monotonic() - dernier_declare < plancher:
-                return
+        motif = motif_declaration(installee, version_declaree(), manquants, refuses,
+                                  dernier_declare, time.monotonic())
+        if not motif:
+            return
         dernier_declare = time.monotonic()
-        if force:
-            force_deja_tente = True
-        if force:
-            log.info("déclaration déclenchée par %s (OTA)", DECLARER_FLAG)
-        elif manquants:
-            log.info("déclaration : pdl sans ref %s", manquants)
+        log.info("déclaration : %s", motif)
         try:
             ok = declare(cli, conn, dev_courant)
         except Exception as e:  # noqa: BLE001
             log.warning("déclaration impossible (%s) — on réessaiera", e)
             return
-        if ok and force:
-            try:
-                os.unlink(DECLARER_FLAG)
-            except OSError as e:
-                log.warning("drapeau %s non retiré (%s) — on redéclarera",
-                            DECLARER_FLAG, e)
-
-    # ① L'init : aucun pdl n'a de ref au premier démarrage, donc ceci déclare.
-    #    ⚠️ Et sur un boîtier déjà équipé, `pdls_without_ref` est vide : rien ne part,
-    #       ce qui est la règle — un redémarrage n'est pas une redéclaration.
+        # 🚨 ON MÉMORISE CE QUI A ÉTÉ ENVOYÉ, pas ce qui est sur le disque MAINTENANT :
+        #    `declare()` a construit son corps avec `dev_courant`, donc avec
+        #    `installee`. Relire `device.json` ici pourrait mémoriser une version
+        #    qu'on n'a pas dite, si une OTA s'est terminée pendant la requête.
+        if ok and installee:
+            memoriser_version_declaree(installee)
+    # ① L'init. Au PREMIER démarrage, aucun pdl n'a de ref ET aucune version n'a été
+    #    déclarée : ceci déclare, deux fois motivé.
+    #    ⭐ Et c'est ici que le parc se recale : au premier démarrage APRÈS l'OTA qui
+    #       livre ce code, la mémoire de version n'existe sur aucun boîtier, donc
+    #       chacun déclare une fois — sans qu'on touche à un boîtier.
+    #    ⚠️ Mais un redémarrage n'est toujours PAS une redéclaration : dès que la
+    #       mémoire existe et vaut la version installée, les deux conditions sont
+    #       fausses et rien ne part.
     declare_if_needed()
     prochain_hello = hello()
     echecs = 0
