@@ -76,65 +76,50 @@ mutation : le banc reste **vert** sans lui, parce que c'est le `+` qui empêche 
 option. Le commentaire a été corrigé plutôt que de garder une garde invérifiable — `--` est
 conservé parce qu'il ne coûte rien, pas parce qu'il protège.
 
-#### 🚨 On ne suit `main` que sur un signal **affirmatif** — tout le reste saute le tick
+#### 🚨 Au moindre doute, `main` — parce que l'OTA est le seul canal de réparation
 
-C'est le renversement de la dernière revue, et la raison est sèche : **`main` n'est le choix
-prudent que si le boîtier est sur une branche pour recevoir quelque chose en avance.** Si on l'y a
-mis pour le **retenir** avant une release risquée, `main` est précisément le danger — et un `503`
-d'un **seul** tick suffisait à lui livrer la release qu'on lui épargnait. `device.json` étant
-bumpé, ce n'est **pas** rattrapable.
+Décision prise avec Xavier, **notée dans la PR #43** après avoir été renversée deux fois en revue.
+Ce qui tranche :
 
-Les deux seuls signaux affirmatifs :
+- **`ota_ref` sert à recevoir une version en avance, et à rien d'autre.** L'usage « retenir un
+  boîtier en arrière » n'existe pas — ni dans `ben-docs#16`, ni dans `ben-api#29`. Il avait été
+  introduit en revue, et toute une règle avait été bâtie dessus ;
+- donc **`main` est toujours le choix prudent** : c'est ce que le reste du parc reçoit de toute
+  façon, et une version d'avance manquée se rattrape au tick suivant ;
+- 🚨 **surtout, l'OTA est le seul canal de réparation.** Un certificat expiré, une CA renouvelée,
+  et le boîtier ne joint plus le cloud. S'il en concluait « je ne sais pas, donc je ne fais rien »,
+  il sortirait de l'OTA **pour toujours**, et la seule issue serait d'y aller en SSH. La prudence
+  apparente fermait le seul canal qui pouvait le réparer.
 
-| signal | effet |
-|---|---|
-| **404** sur la route | le mécanisme n'est pas déployé, ou a été retiré ⇒ `main` |
-| `{"ref": null}` ou pas de `ref` | le cloud dit « aucune branche » ⇒ `main` |
-| branche dont `ls-remote` prouve l'absence | promotion : « branche supprimée au merge » ⇒ `main` |
+```
+panne de l'API · 5xx · 403 · DNS · TLS · certificat illisible
+corps illisible · nom de branche refusé · branche disparue       →  main, en WARNING
+404 sur la route · {"ref": null}                                 →  main, en INFO
+```
 
-Tout le reste — 5xx, délai dépassé, DNS, TLS, corps illisible, fetch qui échoue sans prouver
-l'absence, **certificat présent mais illisible**, et **ref fournie mais refusée** — **saute le
-tick**.
+⚖️ Et chaque cas vérifie **deux** choses dans le banc : la ref rendue **et** le niveau du journal.
+Un `main` silencieux serait aussi faux qu'un gel — ces situations ne sont pas normales.
 
-⚠️ **Une ref fournie mais refusée ne donne pas `main`**, et c'est la règle appliquée à elle-même :
-le cloud a donné une instruction, elle est inapplicable, mais elle **existe**. Un `H` majuscule
-dans « Hold », ou une espace en fin de valeur, livrerait sinon la release à un boîtier qu'on
-retenait — irréversible, pour une faute de frappe. Figer est **sûr** (rien n'est appliqué) et
-**bruyant** (un `WARNING` par tick), donc ça se corrige.
+#### ⓘ Une seule exception : le plan de la branche est inutilisable
 
-⚠️ **Et seul `FileNotFoundError` vaut « pas de certificat »**, pas `OSError` : celui-ci englobe
-`ssl.SSLError` **et** `PermissionError`. Un certificat **présent mais momentanément illisible** —
-la fenêtre de `ben_certd.basculer` pendant une rotation — ne doit pas faire prendre `main`, sinon
-le hasard d'une rotation de clé livre la release à un boîtier retenu.
+Si la branche **existe** mais que son `compatibility.yaml` est **illisible ou absent**, on saute le
+tick, **en `error`**. Et c'est l'argument de Xavier : **un plan mal formé est typiquement ce qu'une
+branche d'essai existe pour attraper**. Replier sur `main` ferait disparaître de l'écran le défaut
+qu'on cherchait à voir, et il ne se manifesterait qu'en atteignant tout le parc.
 
-🚨 **Et le nom de branche se compare en entier.** Le motif de `ls-remote` est apparié **sur la
-queue** du nom de ref : vérifié sur git 2.54.0, avec `canary` supprimée mais `foo/canary` encore
-présente, `ls-remote --heads origin -- canary` rend le code 0 et affiche `refs/heads/foo/canary`.
-Le boîtier aurait conclu « elle existe encore », sauté **chaque** tick sans fin, et ne serait
-jamais revenu sur `main` — perdu pour une homonymie en sous-dossier.
+C'est le **seul** endroit qui lève `TickASauter`, et le préflight ③ de l'`update.sh` le vérifie :
+une seule levée, et **jamais** dans `ref_demandee`. La règle est encodée dans le contrôle parce
+qu'elle a déjà été renversée deux fois.
 
-ⓘ Au passage, un **défaut latent** : `_rev_num()` avait été supprimée par accident alors que
-`find_next_transition` l'appelle encore dans son repli **par modèle** — un `NameError` à chaque
-tick. Rien ne le déclenche aujourd'hui (`compatibility.yaml` n'a plus de section `updates:`), mais
-un défaut qui dort dans l'agent d'OTA est celui qu'on ne veut pas laisser dormir. Rendue, et le
-banc emprunte désormais ce chemin mort exprès. Une **absence de réponse n'est pas une réponse** : sans
-instruction, on ne fait rien, et le timer repasse dans dix minutes. Une OTA n'est jamais urgente ;
-une release appliquée par erreur ne se retire pas.
+#### ⭐ La branche sans suite : on crie, puis on bascule
 
-⚠️ **Corollaire assumé** : couper le **serveur** fige l'OTA le temps de la panne. Débrayer le
-mécanisme se fait par un signal affirmatif — **retirer la route** (404), ou `ota_ref` à `NULL` —
-pas en éteignant l'API.
+Une branche fusionnée **en squash** qui survit avec son `ota_ref` encore posé : le boîtier atteint
+la dernière version qu'elle prévoyait, puis affiche paisiblement « Already up to date » **pour
+toujours**, en ratant toutes les releases suivantes de `main`.
 
-🚨 **Et un `compatibility.yaml` mal formé sur la branche saute le tick aussi**, pour la raison la
-plus forte du chantier : **c'est typiquement ce qu'une branche d'essai existe pour attraper**.
-Replier sur `main` ferait disparaître de l'écran le défaut qu'on cherchait à voir — le boîtier se
-mettrait à jour normalement, et le plan cassé ne se manifesterait qu'en atteignant tout le parc.
-
-ⓘ **Même logique, déjà acquise, pour un tag absent** : tout ce qui échoue *après* la lecture du
-plan — signature GPG d'un tag qui n'existe pas, SHA256 qui ne concorde pas, `update.sh` qui sort
-non nul — échoue **hors de toute portée de repli**, puisque `plan_de_mise_a_jour` s'arrête à la
-lecture du plan. L'échec nomme désormais la ref : sans ça, un défaut de branche se lit comme un
-échec ordinaire et on cherche la cause au mauvais endroit.
+La détection ne demande aucun état : la branche n'offre plus rien pour sa version, `main` offre une
+transition. Le boîtier le **crie**, puis **bascule** sur `main`. ⓘ C'est possible précisément parce
+qu'il n'existe pas de retenue délibérée à protéger — les deux décisions se tiennent.
 
 #### `{"ref": null}` se dit en `INFO`, pas en `WARNING`
 
@@ -180,13 +165,14 @@ boîtier. **La garde a été retirée**, et pour deux raisons qui disent la mêm
   ne sont donc **jamais** ancêtres de `main`, et le test répondait toujours « non ». La garde ne
   pouvait pas se déclencher. ⚠️ Et son banc la croyait bonne parce qu'il fusionnait en `--ff-only`,
   une forme qui **n'arrive jamais** sur ces dépôts : vert à tort ;
-- elle **passait outre un ordre légitime** : épingler un boîtier sur une branche tirée d'un vieux
-  commit pour le **retenir** avant une release risquée. Cette branche étant ancêtre de `main`, la
-  garde ramenait le boîtier sur `main` et lui appliquait la release.
+- un second argument avait été avancé — « elle passerait outre un ordre légitime de retenue » — et
+  il est **tombé depuis** : la retenue délibérée n'existe pas. Il ne reste que la première raison,
+  mais elle suffit : **une garde qui ne peut jamais se déclencher est pire qu'absente**, puisqu'on
+  la croit active.
 
-⭐ Le boîtier ne peut pas distinguer « branche morte, je suis coincé » de « on me retient exprès ».
-Il ne doit donc pas **décider** — c'est le cloud qui choisit la ref, et une seconde décision locale
-recréerait deux vérités. **Il obéit, et il crie.**
+⭐ Ce qui la remplace compare le **contenu** des deux plans — ce que la branche offre pour la
+version du boîtier, face à ce que `main` offre — donc résiste au squash. Voir « la branche sans
+suite » plus haut.
 
 #### 🚨 « Rien à faire » et « je ne peux plus rien faire » ne se disent pas pareil
 
@@ -206,7 +192,7 @@ repli attrape maintenant tout ce qui cloche **sur le chemin de la branche** — 
 
 #### Le banc, et ce qui a été vu tomber
 
-**27 cas.** **Dix** montent un **vrai dépôt git** jetable : seul moyen de prouver « lu depuis
+**31 cas.** **Treize** montent un **vrai dépôt git** jetable : seul moyen de prouver « lu depuis
 `origin/canary` », « une branche **rebasée** est relue à jour » et « une branche fusionnée **en
 squash** reste suivie ». Les autres couvrent la validation du nom, le signalement d'une version hors
 plan, et tout ce qui vaut `main` — dont un **5xx au corps valide**, seul cas qui vise la garde sur le
@@ -218,7 +204,7 @@ module, donc figée à l'**import** : le `LANGUAGE=fr` que les deux cas posent e
 plus `git`, et ils restaient verts même en retirant `LC_ALL=C`. L'environnement est maintenant
 construit **à chaque appel**, et la mutation a été vérifiée **rouge sur ben-0001**.
 
-⚖️ **30 mutations** vérifiées rouges, **7 sabotages** du préflight ③ aussi. ⚠️ **Une** est restée
+⚖️ **40 mutations** vérifiées rouges, **7 sabotages** du préflight ③ aussi. ⚠️ **Une** est restée
 verte — le `--` avant la refspec, puisque c'est le `+` qui fait barrière : le commentaire a été
 corrigé plutôt que de garder une garde invérifiable.
 

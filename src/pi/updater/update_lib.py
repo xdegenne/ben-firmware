@@ -57,26 +57,30 @@ def _env_git() -> dict:
 #    réponse, DNS, TLS, 404, 5xx, JSON illisible, champ absent, nom refusé — et le
 #    jour où la route est coupée, les boîtiers continuent de se mettre à jour comme
 #    avant. Aucune contrainte d'ordre de déploiement : ce code part SEUL.
-# 🚨 LA RÈGLE, ET ELLE TIENT EN UNE PHRASE : on ne suit `main` que sur un signal AFFIRMATIF —
-#    le cloud a dit « aucune branche », ou la branche demandée N'EXISTE DÉMONTRABLEMENT PLUS.
-#    Tout le reste — 5xx, délai dépassé, DNS, TLS, corps illisible, fetch qui échoue sans qu'on
-#    sache pourquoi — fait SAUTER LE TICK.
+# 🚨 LA RÈGLE, ET ELLE TIENT EN UNE PHRASE : au moindre doute, ON PREND `main`, et on le DIT
+#    en `warning`. Panne de l'API, 5xx, 403, DNS, TLS, certificat illisible, corps illisible, nom
+#    de branche refusé : tout cela donne `main`.
 #
-# ⚠️ C'EST UN RENVERSEMENT, et il faut savoir pourquoi. La première version repliait sur `main`
-#    « à la moindre erreur », au nom du débrayage. Mais `main` n'est le choix prudent QUE si le
-#    boîtier est sur une branche pour recevoir quelque chose EN AVANCE. Si on l'y a mis pour le
-#    RETENIR avant une release risquée, alors `main` est précisément le danger : un 503 d'un seul
-#    tick suffisait à lui livrer la release qu'on voulait éviter — et `device.json` étant bumpé,
-#    ce n'est PAS rattrapable.
-#    ⇒ Le boîtier ne peut pas distinguer les deux intentions. Mais il n'a pas à les distinguer :
-#      une ABSENCE DE RÉPONSE N'EST PAS UNE RÉPONSE. Sans instruction, on ne fait RIEN. Une OTA
-#      n'est jamais urgente — le timer repasse dans dix minutes — alors qu'une release appliquée
-#      par erreur ne se retire pas.
+# ⭐ POURQUOI, ET C'EST UNE DÉCISION PRISE AVEC XAVIER (notée dans PR #43) : `ota_ref` sert à
+#    recevoir une version EN AVANCE, et à rien d'autre. Il n'existe pas d'usage « retenir un
+#    boîtier en arrière » — ni dans `ben-docs#16`, ni dans `ben-api#29`.
+#    ⇒ Donc `main` est TOUJOURS le choix prudent : c'est ce que le reste du parc reçoit de toute
+#      façon. Une version d'avance manquée se rattrape au tick suivant ; un boîtier gelé, non.
 #
-# ⚠️ CE QUE ÇA COÛTE, ET IL FAUT L'ASSUMER : couper le SERVEUR fige l'OTA du parc le temps de la
-#    panne (le boîtier saute ses ticks). Débrayer le mécanisme ne se fait donc pas en éteignant
-#    l'API, mais par un signal affirmatif : RETIRER LA ROUTE (404 ⇒ `main`), ou mettre `ota_ref`
-#    à NULL. Les deux sont immédiats et explicites.
+# 🚨 ET C'EST L'ARGUMENT QUI TRANCHE : L'OTA EST LE SEUL CANAL DE RÉPARATION. Un certificat
+#    expiré, une CA renouvelée, et le boîtier ne peut plus joindre le cloud. S'il en concluait
+#    « je ne sais pas, donc je ne fais rien », il sortirait de l'OTA POUR TOUJOURS — et la seule
+#    issue serait d'aller le chercher en SSH. Prendre `main` dans ce cas lui laisse justement la
+#    chance de recevoir le correctif.
+#    ⚠️ Une version antérieure de cette PR faisait l'inverse, au nom d'un cas d'usage que
+#       personne n'avait demandé. C'est le défaut qu'il faut se rappeler ici : la prudence
+#       apparente — « ne rien faire quand on ne sait pas » — fermait le seul canal de réparation.
+#
+# ⓘ LA SEULE EXCEPTION, et elle vient de Xavier : si la branche EXISTE mais que son
+#   `compatibility.yaml` est ILLISIBLE ou ABSENT, on saute le tick. Un plan mal formé est
+#   typiquement ce qu'une branche d'essai existe pour ATTRAPER ; replier sur `main` ferait
+#   disparaître de l'écran le défaut qu'on cherchait à voir. C'est le seul cas qui lève
+#   `TickASauter`, et il le fait en `error`.
 REF_DEFAUT = "main"
 API_HOST = os.environ.get("BEN_API_HOST", "api.benpilote.fr")
 API_PORT = int(os.environ.get("BEN_API_PORT", "8443"))
@@ -97,11 +101,14 @@ _REF_ALPHABET = re.compile(r"^[a-z0-9][a-z0-9._/-]{0,99}$")
 
 
 class TickASauter(Exception):
-    """On ne sait pas quel plan suivre ⇒ on ne fait RIEN, et on réessaie au tick suivant.
+    """Le plan de la branche d'essai est INUTILISABLE ⇒ on ne fait rien, et ça doit se VOIR.
 
-    🚨 CE N'EST PAS UN ÉCHEC, et l'agent sort en 0 : rien n'a été tenté, `device.json` n'est pas
-       touché, et le timer repasse dans dix minutes. Un échec (code 1) voudrait dire qu'une
-       update a été tentée et a raté ; ici on s'est abstenu, ce qui est le résultat voulu.
+    🚨 UN SEUL CAS LA LÈVE : `compatibility.yaml` illisible ou absent sur une branche qui, elle,
+       existe. Tout le reste prend `main` (voir le commentaire de `REF_DEFAUT`). Si vous la voyez
+       levée ailleurs, c'est que la règle a été reperdue.
+
+    ⓘ L'agent sort en 0 : rien n'a été tenté, `device.json` n'est pas touché. Mais il le
+      journalise en `error`, pas en `info` — un gel silencieux est le défaut qu'on ferme ici.
     """
 
 
@@ -123,24 +130,22 @@ def ref_demandee(device_id: str) -> str:
 
     On ne rend `main` que sur un signal AFFIRMATIF :
 
-      · **404** — la route n'existe pas, donc le mécanisme n'est pas déployé ou a été retiré.
-        C'est l'état d'aujourd'hui, et c'est aussi le geste de débrayage ;
-      · **2xx sans `ref`** (absente ou `null`) — le cloud dit « ce boîtier n'est retenu sur
-        aucune branche ». ⚠️ EN `INFO`, PAS EN `WARNING` : `ota_ref` vaut `NULL` pour la quasi-
-        totalité du parc, donc ce sera la réponse NORMALE de 8 boîtiers toutes les 10 minutes.
-        Un avertissement permanent ne se lit plus, et il noierait celui de `hors_du_plan` — qui
-        signale, lui, un boîtier réellement bloqué ;
-    🚨 UNE REF FOURNIE MAIS REFUSÉE NE DONNE PAS `main` — elle fait SAUTER LE TICK, avec un
-       `WARNING`. Le cloud a donné une instruction ; elle est inapplicable, mais elle existe, et
-       prendre `main` reviendrait à livrer la release à un boîtier qu'on retenait — pour un `H`
-       majuscule dans « Hold », ou une espace en fin de valeur. Irréversible, pour une faute de
-       frappe. Figer est au contraire SÛR (rien n'est appliqué) et BRUYANT (un avertissement par
-       tick), donc ça se corrige. ⇒ Le `WARNING` reste : une intention qui ne s'applique pas doit
-       se voir, et sans cette ligne on y passerait une heure.
+      · **404** — la route n'existe pas : mécanisme non déployé, ou retiré. C'est l'état
+        d'aujourd'hui, et c'est aussi le geste de débrayage. En `info` ;
+      · **2xx sans `ref`** (absente ou `null`) — « aucune branche pour ce boîtier ».
+        ⚠️ EN `INFO`, PAS EN `WARNING` : `ota_ref` vaut `NULL` pour la quasi-totalité du parc,
+        donc ce sera la réponse NORMALE de 8 boîtiers toutes les 10 minutes. Un avertissement
+        permanent ne se lit plus, et il noierait celui de `hors_du_plan` — qui signale, lui, un
+        boîtier réellement bloqué ;
+      · **tout le reste** — 5xx, 403, délai dépassé, DNS, TLS, connexion refusée, corps
+        illisible, certificat présent mais illisible, ref fournie mais refusée — donne `main` en
+        **`warning`**. Ces cas ne sont pas normaux et doivent se voir, mais aucun ne justifie de
+        fermer le seul canal de réparation du boîtier.
 
-    🚨 TOUT LE RESTE LÈVE : 5xx, 403, délai dépassé, DNS, TLS, connexion refusée, corps
-       illisible. Voir le commentaire de `REF_DEFAUT` : un 503 d'un seul tick ne doit pas livrer
-       à un boîtier RETENU la release qu'on lui épargnait.
+    🚨 CETTE FONCTION NE LÈVE JAMAIS. C'est le point qui a été repris deux fois : une version
+       antérieure sautait le tick sur une panne, au nom d'une « retenue » que personne n'avait
+       demandée — et un certificat expiré suffisait alors à sortir un boîtier de l'OTA pour
+       toujours.
     """
     try:
         ctx = ssl.create_default_context(
@@ -150,19 +155,21 @@ def ref_demandee(device_id: str) -> str:
         #    moitié de l'authentification. Si le serveur est rejeté, on corrige le certificat.
     except FileNotFoundError as e:
         # ⓘ AUCUN certificat = boîtier non provisionné ou désappairé : il ne peut PAS parler au
-        #   cloud, donc il ne peut pas être retenu sur une branche. `main` est sans risque, et
-        #   sauter le tick figerait l'OTA d'un boîtier qui ne pourra jamais demander.
-        log.info("pas de certificat (%s) — ce boîtier ne peut être retenu sur aucune branche, "
-                 "on prend %s", e, REF_DEFAUT)
+        #   cloud, donc il ne peut recevoir AUCUN ordre de branche. `main` est le seul plan
+        #   qu'il puisse suivre, et c'est aussi celui dont il a besoin : l'OTA est ce qui pourrait
+        #   lui rendre un certificat.
+        log.info("pas de certificat (%s) — aucun ordre de branche possible, on prend %s",
+                 e, REF_DEFAUT)
         return REF_DEFAUT
     except OSError as e:
-        # 🚨 `FileNotFoundError` SEULEMENT, et pas `OSError` : celui-ci englobe `ssl.SSLError` ET
-        #    `PermissionError` (vérifié : les deux en héritent). Un certificat PRÉSENT mais
-        #    momentanément illisible — c'est la fenêtre de `ben_certd.basculer` pendant une
-        #    rotation — n'est pas « ce boîtier n'a pas de certificat » : on ne sait pas, donc on
-        #    ne fait rien. L'alternative livrerait la release de `main` à un boîtier RETENU, par
-        #    le hasard d'une rotation de clé.
-        raise TickASauter(f"certificat présent mais inutilisable ({e})") from e
+        # ⚠️ DISTINCT de `FileNotFoundError`, et pas pour rien : `OSError` englobe `ssl.SSLError`
+        #    ET `PermissionError` (les deux en héritent, vérifié). Un certificat PRÉSENT mais
+        #    momentanément illisible — la fenêtre de `ben_certd.basculer` pendant une rotation —
+        #    n'est pas « ce boîtier n'a pas de certificat » : c'est une anomalie, donc `warning`.
+        #    Mais on prend `main` quand même : un boîtier dont la clé est abîmée a BESOIN de
+        #    l'OTA.
+        log.warning("certificat présent mais inutilisable (%s) — on prend %s", e, REF_DEFAUT)
+        return REF_DEFAUT
     try:
         conn = http.client.HTTPSConnection(
             API_HOST, API_PORT, context=ctx, timeout=REF_TIMEOUT_S)
@@ -174,25 +181,31 @@ def ref_demandee(device_id: str) -> str:
         finally:
             conn.close()
     except Exception as e:  # noqa: BLE001
-        raise TickASauter(f"cloud injoignable pour la ref ({e})") from e
+        log.warning("cloud injoignable pour la ref (%s) — on prend %s", e, REF_DEFAUT)
+        return REF_DEFAUT
 
     if statut == 404:
         log.info("route de ref absente (404) — mécanisme non déployé, on prend %s", REF_DEFAUT)
         return REF_DEFAUT
     if not (200 <= statut < 300):
-        raise TickASauter(f"HTTP {statut} sur la ref — on ne sait pas quel plan suivre")
+        log.warning("HTTP %d sur la ref — on prend %s", statut, REF_DEFAUT)
+        return REF_DEFAUT
     try:
         ref = json.loads(corps).get("ref")
     except Exception as e:  # noqa: BLE001
-        raise TickASauter(f"réponse de ref illisible ({e})") from e
+        log.warning("réponse de ref illisible (%s) — on prend %s", e, REF_DEFAUT)
+        return REF_DEFAUT
 
     if ref is None:
         log.info("aucune branche pour ce boîtier — on suit %s", REF_DEFAUT)
         return REF_DEFAUT
     if not ref_valide(ref):
-        log.warning("ref OTA refusée (%r) — tick sauté, ce boîtier n'avancera pas tant que "
-                    "`ota_ref` porte cette valeur", ref)
-        raise TickASauter(f"ref refusée par la validation ({ref!r})")
+        # ⚠️ `warning` : quelqu'un a écrit une valeur que le boîtier ne peut pas employer, donc
+        #    une intention qui ne s'applique pas. Mais on prend `main` — figer le boîtier pour
+        #    une faute de frappe fermerait son canal de réparation.
+        log.warning("ref OTA refusée (%r) — on prend %s ; corriger `ota_ref` côté cloud",
+                    ref, REF_DEFAUT)
+        return REF_DEFAUT
     if ref != REF_DEFAUT:
         log.info("ref OTA : %s (dite par le cloud)", ref)
     return ref
@@ -272,14 +285,16 @@ def hors_du_plan(compat: dict, version: str) -> bool:
          branche ne sont donc JAMAIS des ancêtres de `main`, et le test répondait toujours
          « non ». La garde ne pouvait pas se déclencher. ⚠️ Et son banc la croyait bonne parce
          qu'il fusionnait en `--ff-only` — une forme qui n'arrive jamais ici ;
-       · elle PASSAIT OUTRE un ordre légitime : épingler un boîtier sur une branche tirée d'un
-         vieux commit pour le RETENIR avant une release risquée. Cette branche étant ancêtre de
-         `main`, la garde ramenait le boîtier sur `main` et lui appliquait la release.
+       · un second argument avait été avancé — « elle passerait outre un ordre légitime de
+         retenue » — et il est TOMBÉ depuis : la retenue délibérée n'existe pas (décision de
+         PR #43). Il ne reste donc que la première raison, mais elle suffit : une garde qui ne
+         peut jamais se déclencher est pire qu'absente, puisqu'on la croit active.
 
-    ⭐ LES DEUX DISENT LA MÊME CHOSE : le boîtier ne peut pas distinguer « branche morte, je
-       suis coincé » de « on me retient exprès ». Il ne doit donc pas DÉCIDER — c'est le cloud
-       qui choisit la ref, et une seconde décision locale recréerait deux vérités. Il obéit, et
-       il CRIE : un boîtier bruyant se répare, un boîtier silencieusement figé ne se voit pas.
+    ⭐ CE QUI REMPLACE LA GARDE est plus simple et se vérifie : on compare ce que la branche
+       OFFRE à ce que `main` offre, pour la version du boîtier (`plan_de_mise_a_jour`). Le
+       contenu, pas l'historique — donc immune au squash. Et quand la branche n'a plus rien,
+       le boîtier CRIE puis BASCULE : un boîtier bruyant se répare, un boîtier silencieusement
+       figé ne se voit pas.
 
     ⇒ Vrai quand la version installée n'est NI le `from` d'une transition, NI le `to` d'une :
       le plan n'a jamais entendu parler d'elle, donc ce boîtier n'avancera plus jamais.
@@ -296,47 +311,74 @@ def hors_du_plan(compat: dict, version: str) -> bool:
 
 
 def plan_de_mise_a_jour(repo_path: str = "/opt/ben/repo",
-                        ref: str = REF_DEFAUT) -> tuple:
-    """Rend `(compatibility, ref_employée)`, ou LÈVE `TickASauter`.
+                        ref: str = REF_DEFAUT,
+                        version: str = "") -> tuple:
+    """Rend `(compatibility, ref_employée)`. Lève `TickASauter` dans UN seul cas.
 
-    🚨 MÊME RÈGLE QUE `ref_demandee` : on ne rend la main à `main` que si la branche
-       **n'existe démontrablement plus** sur `origin` — le cas normal après une promotion,
-       puisque la règle du dépôt est « branche supprimée au merge ». Tout autre échec fait
-       sauter le tick : un réseau qui tombe pendant qu'on suit une branche de RETENUE ne doit
-       pas livrer la release de `main`.
+    🚨 TOUT ÉCHEC DE FETCH DONNE `main`, avec un `warning` qui en NOMME la cause — branche
+       disparue (le cas normal après une promotion, « branche supprimée au merge ») ou panne qu'on
+       n'a pas pu qualifier. `main` est toujours le choix prudent : c'est ce que le reste du parc
+       reçoit, et `ota_ref` ne sert qu'à recevoir EN AVANCE (décision notée dans PR #43).
 
-    🚨 UN `compatibility.yaml` ILLISIBLE SUR LA BRANCHE FAIT SAUTER LE TICK, et c'est la raison
-       la plus forte de tout ce raisonnement : **un plan mal formé est précisément ce que la
-       branche d'essai existe pour attraper.** Replier sur `main` ferait disparaître de l'écran
-       le défaut qu'on cherchait à voir — le boîtier se mettrait à jour normalement, et le plan
-       cassé ne se manifesterait qu'au moment où il atteindrait tout le parc. Sauter le tick le
-       laisse visible, sans rien appliquer : l'erreur se corrige en poussant sur la branche, et
-       le boîtier repart au tick suivant.
+    ⓘ `ref_existe_sur_origin` ne DÉCIDE donc plus rien : elle sert à écrire la bonne cause dans le
+      journal. C'est peu, et c'est assez — une cause fausse envoie chercher au mauvais endroit.
 
-    🚨 Il ne cherche PAS à deviner qu'une branche a été promue : le boîtier obéit à la ref que
-       le cloud lui donne, et `hors_du_plan` le fait crier s'il s'y trouve figé. Voir le
-       commentaire de `hors_du_plan` pour les deux raisons qui ont fait retirer la garde
-       d'ascendance.
+    🚨 LA SEULE EXCEPTION : la branche existe mais son `compatibility.yaml` est ILLISIBLE ou
+       ABSENT ⇒ `TickASauter`, en `error`. Un plan mal formé est typiquement ce qu'une branche
+       d'essai existe pour ATTRAPER ; replier sur `main` ferait disparaître de l'écran le défaut
+       qu'on cherchait à voir, et il ne se manifesterait qu'en atteignant tout le parc.
+
+    ⭐ ET LA BRANCHE SANS SUITE : si elle n'offre plus rien pour `version` alors que `main` offre
+       une transition, le boîtier BASCULE sur `main` après l'avoir crié. C'est le cas d'une
+       branche fusionnée EN SQUASH qui survit avec son `ota_ref` encore posé — la branche ne
+       bougera plus, et sans ça le boîtier raterait toutes les releases suivantes en affichant
+       paisiblement « Already up to date ». ⓘ Décision prise avec Xavier (PR #43) : comme il
+       n'existe pas de retenue délibérée à protéger, le boîtier peut se réparer lui-même.
     """
     if ref == REF_DEFAUT:
         fetch_origin(repo_path, REF_DEFAUT)
         return load_compatibility_from_remote(repo_path, REF_DEFAUT), REF_DEFAUT
+
+    def _main():
+        fetch_origin(repo_path, REF_DEFAUT)
+        return load_compatibility_from_remote(repo_path, REF_DEFAUT), REF_DEFAUT
+
     try:
         fetch_origin(repo_path, ref)
     except Exception as e:  # noqa: BLE001
         motif = (getattr(e, "stderr", None) or str(e)).strip()[:200]
         if ref_existe_sur_origin(repo_path, ref) is False:
-            log.warning("la branche %s n'existe plus sur origin (%s) — repli sur %s DANS CE "
-                        "TICK ; vérifier `ota_ref` côté cloud", ref, motif, REF_DEFAUT)
-            fetch_origin(repo_path, REF_DEFAUT)
-            return load_compatibility_from_remote(repo_path, REF_DEFAUT), REF_DEFAUT
-        raise TickASauter(f"fetch de {ref} impossible et la branche existe peut-être "
-                          f"encore ({motif})") from e
+            log.warning("la branche %s n'existe plus sur origin — on prend %s ; remettre "
+                        "`ota_ref` à NULL côté cloud", ref, REF_DEFAUT)
+        else:
+            log.warning("fetch de %s impossible (%s) — on prend %s", ref, motif, REF_DEFAUT)
+        return _main()
     try:
-        return load_compatibility_from_remote(repo_path, ref), ref
+        plan = load_compatibility_from_remote(repo_path, ref)
     except Exception as e:  # noqa: BLE001
-        raise TickASauter(f"plan de {ref} illisible ({e}) — on n'applique RIEN de {REF_DEFAUT} "
-                          f"à sa place") from e
+        # 🚨 `error`, et on NE PREND PAS `main`. Voir la docstring : c'est le seul cas.
+        log.error("le plan de la branche %s est inutilisable (%s) — tick sauté, et on n'applique "
+                  "RIEN de %s à sa place : c'est le défaut que cette branche sert à attraper",
+                  ref, e, REF_DEFAUT)
+        raise TickASauter(f"plan de {ref} inutilisable ({e})") from e
+
+    if version:
+        try:
+            plan_main = _main()[0]
+        except Exception as e:  # noqa: BLE001
+            # ⓘ On ne peut pas comparer : on suit la branche, qui est l'ordre du cloud.
+            log.warning("plan de %s illisible pour comparaison (%s) — on suit %s",
+                        REF_DEFAUT, e, ref)
+            return plan, ref
+        dev = {"softwareVersion": version}
+        if (find_next_transition(plan, dev) is None
+                and find_next_transition(plan_main, dev) is not None):
+            log.warning("la branche %s n'offre plus rien depuis %s alors que %s offre une "
+                        "transition — branche probablement fusionnée avec `ota_ref` resté posé "
+                        "⇒ ON BASCULE sur %s pour ne pas rater les releases suivantes",
+                        ref, version, REF_DEFAUT, REF_DEFAUT)
+            return plan_main, REF_DEFAUT
+    return plan, ref
 
 
 def _rev_num(rev: str) -> int:

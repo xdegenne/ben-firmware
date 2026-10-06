@@ -11,10 +11,8 @@
 #
 #     ① avant chaque tentative d'OTA : GET /api/devices/<id>/update, en mTLS
 #     ② le cloud répond { "ref": "canary" }
-#     ③ `main` sur un signal AFFIRMATIF SEULEMENT : 404 (route absente), « aucune branche »,
-#       ou branche dont l'absence est PROUVÉE. Tout le reste SAUTE LE TICK — y compris une ref
-#       FOURNIE mais refusée par la validation : « Hold » avec une majuscule ne doit pas livrer
-#       la release à un boîtier qu'on retenait
+#     ③ AU MOINDRE DOUTE, `main`, en `warning` : panne de l'API, 5xx, 403, DNS, TLS, certificat
+#       illisible, corps illisible, nom de branche refusé, branche disparue
 #     ④ l'agent fetch cette ref et y lit compatibility.yaml
 #     ⑤ le reste ne change pas : GPG du tag, SHA256 du script, UNE transition par tick
 #
@@ -28,19 +26,29 @@
 #      (`ben-api#29`) : le cloud rend 404, tout boîtier prend donc `main` et se comporte
 #      exactement comme avant. Ce volet part SEUL.
 #
-#   🚨 MAIS « ÇA NE RÉPOND PAS ⇒ main » A ÉTÉ RENVERSÉ EN REVUE, et il faut savoir pourquoi.
-#      `main` n'est le choix prudent QUE si le boîtier est sur une branche pour recevoir quelque
-#      chose EN AVANCE. Si on l'y a mis pour le RETENIR avant une release risquée, `main` est
-#      précisément le danger : un 503 d'un SEUL tick suffisait à lui livrer la release qu'on lui
-#      épargnait, et `device.json` étant bumpé, ce n'est PAS rattrapable.
-#      ⇒ Une ABSENCE DE RÉPONSE N'EST PAS UNE RÉPONSE. Sans instruction claire, on ne fait RIEN
-#        et on réessaie dans dix minutes. Une OTA n'est jamais urgente.
-#      ⇒ Corollaire assumé : couper le SERVEUR fige l'OTA le temps de la panne. Débrayer le
-#        mécanisme se fait par un signal affirmatif — RETIRER LA ROUTE (404), ou `ota_ref` à
-#        NULL — pas en éteignant l'API.
-#      ⇒ Et un `compatibility.yaml` MAL FORMÉ sur la branche saute le tick lui aussi : c'est
-#        typiquement ce qu'une branche d'essai existe pour ATTRAPER. Replier sur `main` ferait
-#        disparaître de l'écran le défaut qu'on cherchait à voir.
+#   🚨 ET « AU MOINDRE DOUTE, `main` » EST UNE DÉCISION PRISE AVEC XAVIER, notée dans PR #43.
+#      Elle a été renversée deux fois en revue avant d'être tranchée, et voici ce qui tranche :
+#
+#      · `ota_ref` sert à recevoir une version EN AVANCE, et à RIEN d'autre. L'usage « retenir un
+#        boîtier en arrière » n'existe pas — ni dans `ben-docs#16`, ni dans `ben-api#29` ;
+#      · donc `main` est TOUJOURS le choix prudent : c'est ce que le reste du parc reçoit de toute
+#        façon, et une version d'avance manquée se rattrape au tick suivant ;
+#      · 🚨 SURTOUT, L'OTA EST LE SEUL CANAL DE RÉPARATION. Un certificat expiré, une CA
+#        renouvelée, et le boîtier ne joint plus le cloud. S'il en concluait « je ne sais pas,
+#        donc je ne fais rien », il sortirait de l'OTA POUR TOUJOURS, et il faudrait aller le
+#        chercher en SSH. La prudence apparente fermait le seul canal de réparation.
+#
+#   ⓘ UNE SEULE EXCEPTION, et elle vient de Xavier : si la branche EXISTE mais que son
+#     `compatibility.yaml` est ILLISIBLE ou ABSENT, on saute le tick, en `error`. Un plan mal
+#     formé est TYPIQUEMENT ce qu'une branche d'essai existe pour ATTRAPER — replier sur `main`
+#     ferait disparaître de l'écran le défaut qu'on cherchait à voir, et il ne se manifesterait
+#     qu'en atteignant tout le parc.
+#
+#   ⭐ ET LA BRANCHE SANS SUITE : si la branche n'offre plus rien pour la version du boîtier alors
+#     que `main` offre une transition — c'est une branche fusionnée EN SQUASH qui survit avec son
+#     `ota_ref` encore posé — le boîtier CRIE puis BASCULE sur `main`. Sans ça il atteindrait la
+#     dernière version prévue par la branche, puis afficherait « Already up to date » pour
+#     toujours en ratant toutes les releases suivantes.
 #
 # ═══ 🚨 CE QU'IL FAUT ATTENDRE, ET QUI N'EST PAS UNE PANNE ════════════════════════════════════
 #
@@ -94,7 +102,7 @@ log "préflight ① OK (3 fichiers présents et compilables)"
 
 # ═══ PRÉFLIGHT ② — LE BANC LIVRÉ PAR LE TAG, SUR LE PYTHON ET LE GIT DU BOÎTIER ══════════════
 #
-#   27 cas, et ce banc-là a besoin du `git` de la cible : DIX de ses cas montent un VRAI dépôt
+#   31 cas, et ce banc-là a besoin du `git` de la cible : TREIZE de ses cas montent un VRAI dépôt
 #   jetable pour vérifier d'où le plan a été lu. C'est le seul moyen de prouver « lu depuis
 #   origin/canary », qu'une branche REBASÉE est relue à jour (refspec forcée), et qu'une branche
 #   FUSIONNÉE EN SQUASH reste suivie — le boîtier obéit au cloud, il ne devine pas. Et deux cas
@@ -111,14 +119,14 @@ log "préflight ① OK (3 fichiers présents et compilables)"
 #    correction, vert après.
 #
 # ⚖️ Les témoins vont dans les deux sens : une implémentation qui rendrait toujours `main`
-#    passerait tous les cas de repli. 30 mutations vérifiées ROUGES avant livraison — et UNE est
+#    passerait tous les cas de repli. 40 mutations vérifiées ROUGES avant livraison — et UNE est
 #    restée VERTE, ce qui a fait corriger le commentaire plutôt que garder une garde invérifiable
 #    (le `--` avant la refspec : c'est le `+` qui fait barrière).
 # ⚠️ `TMPDIR=/var/tmp` et pas /tmp : /tmp peut être un tmpfs étroit sur un Pi Zero, et ce banc y
 #    crée des dépôts git.
 TMPDIR=/var/tmp python3 "$UPD/test_ref_ota.py" \
     || fail "le banc de la ref OTA échoue — NE PAS déployer en l'état"
-log "préflight ② OK (banc livré : 27 cas, dont 10 sur un vrai dépôt git, et 2 sous LANGUAGE=fr)"
+log "préflight ② OK (banc livré : 31 cas, dont 13 sur un vrai dépôt git, et 2 sous LANGUAGE=fr)"
 
 # ═══ PRÉFLIGHT ③ — 🚨 LE CORRECTIF EST BRANCHÉ, PROUVÉ SUR L'ARBRE ════════════════════════════
 #
@@ -159,12 +167,23 @@ if "plan_de_mise_a_jour" not in aa:
 if "hors_du_plan" not in aa:
     ko.append("l'agent n'appelle pas hors_du_plan() — un boîtier figé resterait silencieux")
 # 🚨 LA RÈGLE DU SIGNAL AFFIRMATIF : sans `TickASauter` défini ET levé ET rattrapé par l'agent,
-#    on retombe sur « toute erreur ⇒ main » — qui livre à un boîtier RETENU la release qu'on lui
-#    épargnait, de façon irréversible.
+#    plus rien ne garantit que le seul cas qui doit geler — un plan de branche inutilisable — gèle
+#    effectivement, ni qu'il soit VU.
 if not any(isinstance(n, ast.ClassDef) and n.name == "TickASauter" for n in ast.walk(lib)):
     ko.append("TickASauter absente — plus de « on ne fait rien sans instruction »")
-if not any(isinstance(n, ast.Raise) and "TickASauter" in ast.dump(n) for n in ast.walk(lib)):
-    ko.append("TickASauter n'est JAMAIS levée — la règle du signal affirmatif est décorative")
+leves = [n for n in ast.walk(lib) if isinstance(n, ast.Raise) and "TickASauter" in ast.dump(n)]
+if not leves:
+    ko.append("TickASauter n'est JAMAIS levée — le plan de branche inutilisable ne gèlerait plus")
+# 🚨 ET UN SEUL ENDROIT DOIT LA LEVER. Si `ref_demandee` se remettait à lever, une panne de cloud
+#    sortirait un boîtier de l'OTA — alors que l'OTA est son seul canal de réparation. C'est la
+#    décision de PR #43, et elle est encodée ici parce qu'elle a déjà été renversée deux fois.
+if len(leves) != 1:
+    ko.append(f"TickASauter est levée {len(leves)} fois : un seul cas doit geler (plan de branche "
+              f"inutilisable), tout le reste prend main")
+for n in ast.walk(lib):
+    if isinstance(n, ast.FunctionDef) and n.name == "ref_demandee":
+        if any(isinstance(x, ast.Raise) and "TickASauter" in ast.dump(x) for x in ast.walk(n)):
+            ko.append("ref_demandee lève TickASauter — une panne de cloud gèlerait le boîtier")
 if "TickASauter" not in {h.type.attr for n in ast.walk(agent)
                          if isinstance(n, ast.Try) for h in n.handlers
                          if isinstance(h.type, ast.Attribute)}:

@@ -87,22 +87,24 @@ def main() -> None:
         # 3. La REF où chercher le plan — demandée au CLOUD, boîtier par boîtier
         #    (ben-docs#16). Tant que la route n'existe pas, le cloud rend 404 et ce
         #    boîtier prend `main` : il se comporte exactement comme avant.
-        #    🚨 Et elle peut lever `TickASauter` : sans réponse claire du cloud, on ne fait
-        #       RIEN. Voir `update_lib.REF_DEFAUT` — un 503 d'un seul tick ne doit pas livrer
-        #       à un boîtier RETENU la release qu'on lui épargnait.
+        #    ⓘ Elle NE LÈVE JAMAIS : au moindre doute elle rend `main`, en `warning`. L'OTA est
+        #      le seul canal de réparation d'un boîtier, on ne le ferme pas parce que le cloud
+        #      n'a pas répondu (décision notée dans PR #43).
         try:
             ref = update_lib.ref_demandee(device["deviceId"])
 
-            # 4. Fetch + plan de mise à jour. Repli sur `main` DANS CE TICK si la branche
-            #    n'existe DÉMONTRABLEMENT plus (cas normal après une promotion) ; sinon on
-            #    saute le tick.
+            # 4. Fetch + plan de mise à jour. Tout échec donne `main` avec un `warning` ; la
+            #    seule exception est un plan de branche inutilisable, qui saute le tick.
             log.info("Fetching origin (%s)...", ref)
-            compat, ref = update_lib.plan_de_mise_a_jour(REPO_PATH, ref)
+            compat, ref = update_lib.plan_de_mise_a_jour(
+                REPO_PATH, ref, device["softwareVersion"])
         except update_lib.TickASauter as e:
-            # ⓘ Sortie 0, et c'est délibéré : rien n'a été tenté, `device.json` n'est pas
-            #   touché, et le timer repasse dans dix minutes. Un code 1 dirait qu'une update a
-            #   échoué.
-            log.info("tick sauté — %s", e)
+            # 🚨 `error`, PAS `info` : un seul cas lève ceci — le plan de la branche d'essai est
+            #    inutilisable — et un gel silencieux est exactement le défaut qu'on ferme.
+            #    `update_lib` a déjà crié la cause ; cette ligne dit la conséquence.
+            # ⓘ Sortie 0 quand même : rien n'a été tenté, `device.json` n'est pas touché, et le
+            #   timer repasse dans dix minutes. Un code 1 dirait qu'une update a échoué.
+            log.error("tick sauté, AUCUNE mise à jour tentée — %s", e)
             sys.exit(0)
         if ref != update_lib.REF_DEFAUT:
             log.info("plan lu depuis origin/%s", ref)

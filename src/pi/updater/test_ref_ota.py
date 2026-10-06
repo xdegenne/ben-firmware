@@ -231,106 +231,111 @@ def aucune_branche_pour_ce_boitier_donne_main_EN_INFO_PAS_EN_WARNING():
             ul.log.removeHandler(h)
 
 
-@cas
-def une_ref_PRESENTE_mais_refusee_SAUTE_LE_TICK_avec_un_WARNING():
-    """🚨 ELLE NE DONNE PAS `main`, et c'est la règle de cette PR appliquée à elle-même : le
-    cloud a donné une instruction, elle est inapplicable, mais elle EXISTE. Prendre `main`
-    livrerait la release à un boîtier qu'on retenait — pour un `H` majuscule dans « Hold », ou
-    une espace en fin de valeur. Irréversible, pour une faute de frappe. Figer est SÛR (rien
-    n'est appliqué) et BRUYANT (un avertissement par tick), donc ça se corrige.
+# ── TOUT LE RESTE DONNE `main`, EN WARNING ──────────────────────────────────
+#
+# 🚨 DÉCISION PRISE AVEC XAVIER, NOTÉE DANS PR #43 : `ota_ref` sert à recevoir une version EN
+#    AVANCE, et à rien d'autre — il n'existe pas d'usage « retenir un boîtier en arrière », ni
+#    dans ben-docs#16 ni dans ben-api#29. Donc `main` est TOUJOURS le choix prudent, et surtout :
+#    L'OTA EST LE SEUL CANAL DE RÉPARATION. Un certificat expiré, une CA renouvelée, et un
+#    boîtier qui « ne fait rien quand il ne sait pas » sort de l'OTA POUR TOUJOURS.
+# ⚖️ Chaque cas vérifie DEUX choses : la ref rendue, ET le niveau du journal. Un `main` silencieux
+#    serait aussi faux qu'un gel : ces situations ne sont pas normales.
 
-    ⚖️ Le WARNING reste le contre-témoin du cas précédent : sans lui, un code qui ravalerait tout
-       en `info` passerait, et une intention qui ne s'applique pas resterait invisible."""
-    for mauvaise in ('{"ref": "--upload-pack=id"}', '{"ref": "Hold"}', '{"ref": "hold "}',
-                     '{"ref": "a..b"}'):
-        h = journal()
-        try:
-            _avec_cloud(200, mauvaise)
-        except ul.TickASauter:
-            assert any(n >= logging.WARNING for n, _ in h.lignes), (
-                f"une ref refusée doit s'annoncer en WARNING : {h.lignes}")
-            continue
-        finally:
-            ul.log.removeHandler(h)
-        raise AssertionError(f"{mauvaise} doit faire SAUTER le tick, pas prendre main")
+def _doit_donner_main_en_warning(nom, appel):
+    h = journal()
+    try:
+        assert appel() == ul.REF_DEFAUT, f"{nom} doit donner {ul.REF_DEFAUT}"
+        assert any(n >= logging.WARNING for n, _ in h.lignes), (
+            f"{nom} doit s'annoncer en WARNING, pas en silence : {h.lignes}")
+    finally:
+        ul.log.removeHandler(h)
 
-
-# ── TOUT LE RESTE FAIT SAUTER LE TICK ───────────────────────────────────────
 
 @cas
-def un_boitier_RETENU_ne_recoit_PAS_la_release_sur_un_503():
-    """🚨 LE CAS QUI A FAIT RENVERSER LA RÈGLE, et il n'est pas rattrapable. Un boîtier retenu
-    sur `hold` pendant que `main` publie 0.11.0 → 0.12.0 : un SEUL tick où `/update` répond 503
-    suffisait à lui faire lire le plan de `main` et appliquer la release qu'on lui épargnait.
-    `device.json` bumpé, donc irréversible.
-
-    ⭐ Une ABSENCE DE RÉPONSE N'EST PAS UNE RÉPONSE : sans instruction, on ne fait RIEN. Une OTA
-       n'est jamais urgente — le timer repasse dans dix minutes."""
+def une_panne_de_l_API_donne_main_car_l_OTA_EST_LE_SEUL_MOYEN_DE_REPARER():
+    """🚨 LE CAS QUI A FAIT RENVERSER LA RÈGLE — DANS CE SENS-CI, APRÈS L'AVOIR RENVERSÉE DANS
+    L'AUTRE. Une version antérieure sautait le tick sur une panne, au nom d'une « retenue » que
+    personne n'avait demandée. Or un certificat expiré ou une CA renouvelée empêchent le boîtier
+    de joindre le cloud : s'il en concluait « je ne sais pas, donc rien », il sortirait de l'OTA
+    pour toujours — et l'OTA est précisément ce qui aurait pu le réparer."""
     for statut in (500, 502, 503, 403, 429):
-        try:
-            r = _avec_cloud(statut, '{"ref": "hold"}')
-        except ul.TickASauter:
-            continue
-        raise AssertionError(f"HTTP {statut} a rendu {r!r} au lieu de sauter le tick")
+        _doit_donner_main_en_warning(f"HTTP {statut}",
+                                     lambda s=statut: _avec_cloud(s, '{"ref": "canary"}'))
 
 
 @cas
-def une_PANNE_RESEAU_fait_SAUTER_LE_TICK():
+def une_PANNE_RESEAU_donne_main():
     class _Casse(_Conn):
         def request(self, *a, **k):
             raise OSError("réseau injoignable")
 
-    try:
-        _avec_cloud(200, '{"ref": "canary"}', monkey=_Casse)
-    except ul.TickASauter:
-        return
-    raise AssertionError("une panne réseau doit faire sauter le tick, pas choisir un plan")
+    _doit_donner_main_en_warning(
+        "panne réseau", lambda: _avec_cloud(200, '{"ref": "canary"}', monkey=_Casse))
 
 
 @cas
-def un_corps_ILLISIBLE_fait_SAUTER_LE_TICK():
-    """⚠️ Un 200 au corps cassé veut dire que quelque chose s'est mis entre le boîtier et le
-    cloud — un portail, un proxy. On ne devine pas ce que le cloud voulait dire."""
-    try:
-        _avec_cloud(200, "pas du json")
-    except ul.TickASauter:
-        return
-    raise AssertionError("un corps illisible doit faire sauter le tick")
+def un_corps_ILLISIBLE_donne_main():
+    _doit_donner_main_en_warning("corps illisible", lambda: _avec_cloud(200, "pas du json"))
 
 
 @cas
-def un_certificat_PRESENT_MAIS_ILLISIBLE_fait_SAUTER_LE_TICK():
-    """🚨 `FileNotFoundError` SEULEMENT doit donner `main`, pas `OSError` : celui-ci englobe
-    `ssl.SSLError` ET `PermissionError` (les deux en héritent, vérifié). Un certificat PRÉSENT
-    mais momentanément illisible — la fenêtre de `ben_certd.basculer` pendant une rotation — n'est
-    pas « ce boîtier n'a pas de certificat ». Sinon le hasard d'une rotation de clé livrerait la
-    release de `main` à un boîtier RETENU."""
+def une_ref_PRESENTE_mais_refusee_donne_main_AVEC_un_WARNING():
+    """⚖️ Le WARNING est le contre-témoin du cas « aucune branche », qui doit rester en INFO :
+    sans lui, un code qui ravalerait tout en `info` passerait, et une valeur qu'un opérateur a
+    écrite mais que le boîtier refuse resterait invisible."""
+    for mauvaise in ('{"ref": "--upload-pack=id"}', '{"ref": "Hold"}', '{"ref": "hold "}',
+                     '{"ref": "a..b"}'):
+        _doit_donner_main_en_warning(mauvaise, lambda m=mauvaise: _avec_cloud(200, m))
+
+
+@cas
+def un_certificat_PRESENT_MAIS_ILLISIBLE_donne_main_AVEC_un_WARNING():
+    """🚨 `ssl.SSLError` et `PermissionError` héritent tous deux d'`OSError` : la fenêtre de
+    `ben_certd.basculer` pendant une rotation tombe donc ici. C'est une anomalie — d'où le
+    WARNING — mais un boîtier dont la clé est abîmée a BESOIN de l'OTA."""
     import ssl
     vrai = ssl.create_default_context
     for panne in (PermissionError("device.key"), ssl.SSLError("bad key")):
         ssl.create_default_context = lambda *a, **k: (_ for _ in ()).throw(panne)
         try:
-            ul.ref_demandee("ben-0001")
-        except ul.TickASauter:
-            continue
+            _doit_donner_main_en_warning(repr(panne), lambda: ul.ref_demandee("ben-0001"))
         finally:
             ssl.create_default_context = vrai
-        raise AssertionError(f"{panne!r} doit faire sauter le tick, pas prendre main")
 
 
 @cas
-def un_certificat_ABSENT_donne_main_et_ne_saute_PAS_le_tick():
-    """ⓘ Un boîtier sans certificat ne peut PAS parler au cloud, donc il ne peut pas être
-    retenu sur une branche : `main` est sans risque. Sauter le tick figerait l'OTA d'un boîtier
-    qui ne pourra jamais demander — exactement le contraire du but."""
+def un_certificat_ABSENT_donne_main_SANS_warning():
+    """⚖️ LE CONTRE-TÉMOIN : un boîtier non provisionné n'a RIEN d'anormal à signaler, et il ne
+    peut de toute façon pas être sur une branche. En INFO."""
     import ssl
     vrai = ssl.create_default_context
     ssl.create_default_context = lambda *a, **k: (_ for _ in ()).throw(
         FileNotFoundError("/etc/ben-firmware/certs/root-ca.crt"))
+    h = journal()
     try:
         assert ul.ref_demandee("ben-0001") == ul.REF_DEFAUT
+        assert h.lignes and max(n for n, _ in h.lignes) <= logging.INFO, h.lignes
     finally:
         ssl.create_default_context = vrai
+        ul.log.removeHandler(h)
+
+
+@cas
+def ref_demandee_NE_LEVE_JAMAIS():
+    """⚖️ LE TÉMOIN DE LA RÈGLE ELLE-MÊME. Si une seule branche de cette fonction se remettait à
+    lever, un boîtier pourrait de nouveau sortir de l'OTA sur une panne de cloud."""
+    import ssl
+    vrai = ssl.create_default_context
+    cas_limites = [(200, "{}"), (404, ""), (500, "x"), (200, "pas du json"),
+                   (200, '{"ref": "Hold"}'), (200, '{"ref": null}')]
+    for statut, corps in cas_limites:
+        assert isinstance(_avec_cloud(statut, corps), str)
+    for panne in (PermissionError("x"), ssl.SSLError("y"), FileNotFoundError("z")):
+        ssl.create_default_context = lambda *a, **k: (_ for _ in ()).throw(panne)
+        try:
+            assert isinstance(ul.ref_demandee("ben-0001"), str), panne
+        finally:
+            ssl.create_default_context = vrai
 
 
 # ── Le plan lui-même, sur un VRAI dépôt ──────────────────────────────────────
@@ -374,12 +379,14 @@ def une_branche_FUSIONNEE_EN_SQUASH_reste_SUIVIE_le_boitier_obeit():
       un commit NEUF, donc les commits de la branche ne sont JAMAIS ancêtres de `main` et le
       test répondait toujours « non » : la garde ne pouvait pas se déclencher. Le banc la
       croyait bonne parce qu'il fusionnait en `--ff-only`, forme qui n'arrive jamais ici ;
-    · elle PASSAIT OUTRE un ordre légitime — retenir un boîtier sur une vieille branche avant
-      une release risquée.
+    · un second argument avait été avancé — « elle passerait outre un ordre légitime de
+      retenue » — et il est TOMBÉ depuis : la retenue délibérée n'existe pas (décision de PR #43).
+      La première raison suffit : une garde qui ne peut jamais se déclencher est pire qu'absente.
 
-    ⭐ Le boîtier ne peut pas distinguer les deux situations : il OBÉIT, et c'est
-       `hors_du_plan` qui le fait crier. Ce cas fixe donc le comportement VOULU, et il tombe si
-       quelqu'un remet une garde d'ancêtre."""
+    ⭐ Ce qui la remplace compare le CONTENU des deux plans, donc résiste au squash — voir
+       `une_branche_SANS_SUITE_fait_BASCULER_sur_main_apres_l_avoir_crie`. Ce cas-ci fixe le
+       comportement voulu quand on ne donne PAS de version à comparer, et il tombe si quelqu'un
+       remet une garde d'ancêtre."""
     d = pathlib.Path(tempfile.mkdtemp()); _A_NETTOYER.append(d)
     git("init", "-q", "--bare", str(d / "origin.git"), cwd=d)
     w = d / "w"
@@ -402,7 +409,7 @@ def une_branche_FUSIONNEE_EN_SQUASH_reste_SUIVIE_le_boitier_obeit():
 
     compat, ref = ul.plan_de_mise_a_jour(str(w), "canary")
     assert ref == "canary", (
-        f"le boîtier doit OBÉIR au cloud, pas deviner la promotion : {ref}")
+        f"sans version à comparer, le boîtier suit la branche : {ref}")
     assert compat == {"plan": "canary"}, compat
     # ⚖️ Et la preuve que le test d'ancêtre ne POUVAIT pas marcher ici :
     r = subprocess.run(["git", "merge-base", "--is-ancestor", "origin/canary", "origin/main"],
@@ -413,6 +420,47 @@ def une_branche_FUSIONNEE_EN_SQUASH_reste_SUIVIE_le_boitier_obeit():
 
 
 # ── Le signalement qui remplace la garde ─────────────────────────────────────
+
+@cas
+def une_branche_SANS_SUITE_fait_BASCULER_sur_main_apres_l_avoir_crie():
+    """🚨 LE PIÈGE DE LA PROMOTION EN SQUASH, et il est silencieux. La branche fusionnée survit,
+    `ota_ref` reste posé : le boîtier atteint la dernière version que la branche prévoyait, puis
+    affiche paisiblement « Already up to date » pour TOUJOURS, en ratant toutes les releases
+    suivantes de `main`.
+
+    ⭐ Décision prise avec Xavier (PR #43) : WARNING **puis bascule**. Comme `ota_ref` ne sert qu'à
+       recevoir en avance — il n'existe pas de retenue délibérée à protéger — le boîtier peut se
+       réparer lui-même. La détection ne demande aucun état : la branche n'offre plus rien pour sa
+       version, `main` offre une transition."""
+    d, w = depot({
+        "main": ("updates_caps:\n"
+                 "  - {from: '0.11.0', to: '0.12.0', tag: 'pi-0.12.0', script: 'x'}\n"),
+        "canary": "updates_caps: []\n"})
+    h = journal()
+    try:
+        compat, ref = ul.plan_de_mise_a_jour(str(w), "canary", "0.11.0")
+        assert ref == ul.REF_DEFAUT, f"la branche n'a plus rien pour 0.11.0 : {ref}"
+        assert compat["updates_caps"][0]["to"] == "0.12.0", compat
+        assert any(n >= logging.WARNING for n, _ in h.lignes), (
+            f"la bascule doit être CRIÉE, sinon elle est aussi silencieuse que le piège : "
+            f"{h.lignes}")
+    finally:
+        ul.log.removeHandler(h)
+
+
+@cas
+def une_branche_QUI_A_ENCORE_QUELQUE_CHOSE_est_suivie():
+    """⚖️ LE CONTRE-TÉMOIN, et sans lui le chantier n'aurait plus d'objet : un code qui
+    basculerait TOUJOURS sur `main` passerait le cas précédent — et plus aucun boîtier ne
+    recevrait jamais une version en avance."""
+    d, w = depot({
+        "main": "updates_caps: []\n",
+        "canary": ("updates_caps:\n"
+                   "  - {from: '0.11.0', to: '0.12.0-rc1', tag: 'pi-0.12.0-rc1', script: 'x'}\n")})
+    compat, ref = ul.plan_de_mise_a_jour(str(w), "canary", "0.11.0")
+    assert ref == "canary", ref
+    assert compat["updates_caps"][0]["to"] == "0.12.0-rc1", compat
+
 
 @cas
 def un_boitier_dont_la_version_est_INCONNUE_DU_PLAN_est_signale():
@@ -457,27 +505,69 @@ def un_compatibility_yaml_ILLISIBLE_sur_la_branche_fait_SAUTER_LE_TICK():
     voir — le boîtier se mettrait à jour normalement et le plan cassé ne se manifesterait qu'en
     atteignant tout le parc. Sauter le tick le laisse visible, sans rien appliquer."""
     d, w = depot({"main": "plan: main\n", "canary": "plan: [ceci n'est pas\n  du yaml: :\n"})
+    h = journal()
     try:
         ul.plan_de_mise_a_jour(str(w), "canary")
     except ul.TickASauter:
+        # ⚖️ ET LE NIVEAU COMPTE : un tick sauté en `info` est un gel SILENCIEUX, qui peut durer
+        #    des semaines sans qu'on le voie. C'est le seul cas qui gèle, il doit crier.
+        assert any(n >= logging.ERROR for n, _ in h.lignes), (
+            f"un plan inutilisable doit se dire en ERROR : {h.lignes}")
         return
+    finally:
+        ul.log.removeHandler(h)
     raise AssertionError("un plan illisible doit faire sauter le tick, pas replier sur main")
 
 
 @cas
-def un_fetch_qui_echoue_SANS_PROUVER_l_absence_fait_SAUTER_LE_TICK():
-    """🚨 La frontière de ce chantier. « Je n'ai pas pu fetcher » ne veut PAS dire « la branche
-    n'existe plus » : ça peut être le réseau. On ne le devine pas, on le DEMANDE —
-    `ls-remote --exit-code` rend 2 pour une ref absente et 128 pour une panne, deux CODES
-    distincts. Ici `origin` est injoignable : on ne sait pas, donc on ne fait rien."""
+def un_compatibility_yaml_ABSENT_de_la_branche_fait_SAUTER_LE_TICK():
+    """Même famille, et c'est le cas le plus facile à produire : on pousse une branche d'essai
+    sans le fichier. `git show origin/<ref>:compatibility.yaml` échoue alors — et la branche, elle,
+    existe bel et bien, donc on ne replie pas."""
+    d, w = depot({"main": "plan: main\n"})
+    git("checkout", "-q", "-B", "sans-plan", "main", cwd=w)
+    (w / "compatibility.yaml").unlink()
+    git("commit", "-qam", "sans plan", cwd=w)
+    git("push", "-q", "origin", "sans-plan", cwd=w)
+    h = journal()
+    try:
+        ul.plan_de_mise_a_jour(str(w), "sans-plan")
+    except ul.TickASauter:
+        assert any(n >= logging.ERROR for n, _ in h.lignes), h.lignes
+        return
+    finally:
+        ul.log.removeHandler(h)
+    raise AssertionError("un plan ABSENT doit faire sauter le tick")
+
+
+@cas
+def un_fetch_qui_echoue_donne_main_et_NOMME_la_branche():
+    """« Je n'ai pas pu fetcher » ne veut pas dire « la branche n'existe plus » — mais les deux
+    donnent `main`. Ce que `ls-remote` apporte n'est plus une décision, c'est la bonne CAUSE dans
+    le journal : « la branche n'existe plus » (promotion) ou « fetch impossible » (panne). Une
+    cause fausse envoie chercher au mauvais endroit."""
     d, w = depot({"main": "plan: main\n", "canary": "plan: canary\n"})
+    # `main` est déjà connu localement ; seul `origin` devient injoignable.
     subprocess.run(["git", "remote", "set-url", "origin", str(d / "disparu.git")],
                    cwd=w, check=True, capture_output=True)
+    h = journal()
     try:
         ul.plan_de_mise_a_jour(str(w), "canary")
-    except ul.TickASauter:
-        return
-    raise AssertionError("un origin injoignable doit faire sauter le tick")
+    except Exception as e:  # noqa: BLE001
+        # ⓘ `main` étant injoignable aussi dans ce montage, la lecture finit par lever — ce qui
+        #   est le comportement voulu pour `main` (une panne de `main` est une panne réelle). Ce
+        #   que ce cas prouve est qu'on n'a PAS sauté le tick au motif de la branche.
+        assert not isinstance(e, ul.TickASauter), (
+            "un fetch impossible ne doit pas faire sauter le tick : on prend main")
+    # ⚠️ ASSERTION SPÉCIFIQUE, et la première ne l'était pas : `ref_existe_sur_origin` émet elle
+    #    aussi un WARNING contenant « canary », donc exiger « un WARNING qui nomme la branche »
+    #    était satisfait SANS la ligne du repli — vérifié par mutation, le cas restait vert quand
+    #    on faisait passer le repli en `info`. On exige donc la ligne du REPLI, qui est la seule à
+    #    dire « on prend ».
+    assert any(n >= logging.WARNING and "canary" in m and "on prend" in m
+               for n, m in h.lignes), (
+        f"le repli sur main doit se dire en WARNING et nommer la branche : {h.lignes}")
+    ul.log.removeHandler(h)
 
 
 @cas
