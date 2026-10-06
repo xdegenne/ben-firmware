@@ -15,6 +15,17 @@ par le cloud ; le boîtier doit pouvoir s'en passer entièrement.
    levé.
 
     python3 src/pi/updater/test_ref_ota.py
+
+🚨 ET À LANCER AUSSI AVEC LE GIT DU BOÎTIER, QUI N'A PAS LES MÊMES DÉFAUTS QUE CELUI DU MAC. Deux
+   différences ont déjà fait tomber ce banc, et l'une brûlait la version :
+
+     # la branche par défaut du Pi est `master`, celle du Mac `main`
+     GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=init.defaultBranch GIT_CONFIG_VALUE_0=master \
+       python3 src/pi/updater/test_ref_ota.py
+
+   ⚠️ La seconde — `git.mo` FRANÇAIS présent sur l'image du parc, absent du Mac — ne se reproduit
+      PAS ici : seule une cible peut la prouver. Les deux cas sous `LANGUAGE=fr` passent donc
+      trivialement sur un Mac, et ce n'est pas une preuve de l'épinglage `LC_ALL=C`.
 """
 import atexit
 import json
@@ -371,7 +382,7 @@ def une_branche_REBASEE_est_relue_a_jour():
 
 
 @cas
-def une_branche_FUSIONNEE_EN_SQUASH_reste_SUIVIE_le_boitier_obeit():
+def SANS_version_a_comparer_la_branche_est_suivie_meme_fusionnee_en_squash():
     """🚨 LE CAS QUI A FAIT RETIRER UNE GARDE. On avait ajouté un test d'ancêtre pour détecter
     une branche promue dont le boîtier n'aurait pas été détaché. Deux raisons l'ont tué :
 
@@ -568,6 +579,56 @@ def un_fetch_qui_echoue_donne_main_et_NOMME_la_branche():
                for n, m in h.lignes), (
         f"le repli sur main doit se dire en WARNING et nommer la branche : {h.lignes}")
     ul.log.removeHandler(h)
+
+
+@cas
+def un_TAG_ou_une_TETE_DE_PULL_REQUEST_ne_peut_pas_servir_de_plan():
+    """🚨 LA BARRIÈRE DU CÔTÉ SOURCE DE LA REFSPEC. Avec un simple `<ref>`, git résout le nom à SA
+    façon et ne cherche pas que dans les branches — vérifié sur git 2.54.0 : `+pi-0.11.0:…`
+    rapatrie le TAG, `+pull/43/head:…` la TÊTE D'UNE PULL REQUEST.
+
+    Or `ben-firmware` est PUBLIC : n'importe qui peut ouvrir une PR depuis un fork, donc un
+    `ota_ref = "pull/N/head"` ferait lire un plan ÉCRIT PAR UN INCONNU. La signature GPG protège
+    toujours le CODE — `update.sh` vient du tag — mais un plan étranger peut faire rejouer un vieux
+    `update.sh` signé sur une version qui n'est pas la sienne.
+
+    ⇒ `+refs/heads/<ref>:…` refuse les deux, et le boîtier retombe sur `main`."""
+    d, w = depot({"main": "plan: main\n"})
+    # un TAG, et une TÊTE DE PR : deux refs qui existent sur origin, mais pas comme branches
+    git("tag", "-a", "pi-0.11.0", "-m", "t", cwd=w)
+    git("push", "-q", "origin", "pi-0.11.0", cwd=w)
+    git("push", "-q", "origin", "HEAD:refs/pull/43/head", cwd=w)
+    presentes = subprocess.run(["git", "ls-remote", "origin"], cwd=w, check=True,
+                               capture_output=True, text=True).stdout
+    assert "refs/tags/pi-0.11.0" in presentes and "refs/pull/43/head" in presentes, (
+        f"le montage doit VRAIMENT porter ces refs, sinon le cas ne prouve rien : {presentes}")
+
+    for usurpatrice in ("pi-0.11.0", "pull/43/head"):
+        assert ul.ref_valide(usurpatrice), (
+            f"{usurpatrice} passe la validation d'alphabet — c'est pour ça que la refspec doit "
+            f"faire barrière")
+        assert ul.ref_existe_sur_origin(str(w), usurpatrice) is False, usurpatrice
+        compat, ref = ul.plan_de_mise_a_jour(str(w), usurpatrice)
+        assert ref == ul.REF_DEFAUT, f"{usurpatrice} ne doit pas servir de plan : {ref}"
+        assert compat == {"plan": "main"}, compat
+
+
+@cas
+def un_plan_VIDE_sur_la_branche_fait_SAUTER_LE_TICK():
+    """⚠️ `yaml.safe_load("")` rend `None`, pas une erreur : sans contrôle, `find_next_transition`
+    lèverait une `AttributeError` plus loin et le tick finirait en « Update failed », code 1 — le
+    défaut resterait visible, mais par un autre chemin que celui qu'on décrit. Un plan vide EST un
+    plan inutilisable."""
+    d, w = depot({"main": "plan: main\n", "vide": ""})
+    h = journal()
+    try:
+        ul.plan_de_mise_a_jour(str(w), "vide")
+    except ul.TickASauter:
+        assert any(n >= logging.ERROR for n, _ in h.lignes), h.lignes
+        return
+    finally:
+        ul.log.removeHandler(h)
+    raise AssertionError("un plan vide doit faire sauter le tick")
 
 
 @cas

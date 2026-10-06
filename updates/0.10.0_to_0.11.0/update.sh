@@ -102,12 +102,14 @@ log "préflight ① OK (3 fichiers présents et compilables)"
 
 # ═══ PRÉFLIGHT ② — LE BANC LIVRÉ PAR LE TAG, SUR LE PYTHON ET LE GIT DU BOÎTIER ══════════════
 #
-#   31 cas, et ce banc-là a besoin du `git` de la cible : TREIZE de ses cas montent un VRAI dépôt
+#   33 cas, et ce banc-là a besoin du `git` de la cible : QUINZE de ses cas montent un VRAI dépôt
 #   jetable pour vérifier d'où le plan a été lu. C'est le seul moyen de prouver « lu depuis
 #   origin/canary », qu'une branche REBASÉE est relue à jour (refspec forcée), et qu'une branche
-#   FUSIONNÉE EN SQUASH reste suivie — le boîtier obéit au cloud, il ne devine pas. Et deux cas
-#   éprouvent des NIVEAUX de journal, pas des valeurs : « aucune branche » doit se dire en INFO
-#   (ce sera la réponse de 8 boîtiers toutes les 10 min) et une ref refusée en WARNING.
+#   SANS SUITE fait BASCULER sur `main` après l'avoir crié. Deux cas éprouvent des NIVEAUX de
+#   journal et non des valeurs — « aucune branche » doit se dire en INFO (ce sera la réponse de 8
+#   boîtiers toutes les 10 min) et une ref refusée en WARNING. Et deux cas prouvent que NI un TAG
+#   NI une TÊTE DE PULL REQUEST ne peuvent servir de plan : le dépôt est PUBLIC, donc un
+#   `ota_ref = "pull/N/head"` ferait sinon lire un plan écrit par un inconnu.
 #
 # 🚨 ET IL NE LIT PLUS UN MESSAGE DE GIT TRADUISIBLE — c'est le défaut le plus grave trouvé en
 #    revue, et il brûlait cette version. Deux cas lisent le texte d'une erreur de git ; `git.mo`
@@ -119,14 +121,14 @@ log "préflight ① OK (3 fichiers présents et compilables)"
 #    correction, vert après.
 #
 # ⚖️ Les témoins vont dans les deux sens : une implémentation qui rendrait toujours `main`
-#    passerait tous les cas de repli. 40 mutations vérifiées ROUGES avant livraison — et UNE est
+#    passerait tous les cas de repli. 42 mutations vérifiées ROUGES avant livraison — et UNE est
 #    restée VERTE, ce qui a fait corriger le commentaire plutôt que garder une garde invérifiable
 #    (le `--` avant la refspec : c'est le `+` qui fait barrière).
 # ⚠️ `TMPDIR=/var/tmp` et pas /tmp : /tmp peut être un tmpfs étroit sur un Pi Zero, et ce banc y
 #    crée des dépôts git.
 TMPDIR=/var/tmp python3 "$UPD/test_ref_ota.py" \
     || fail "le banc de la ref OTA échoue — NE PAS déployer en l'état"
-log "préflight ② OK (banc livré : 31 cas, dont 13 sur un vrai dépôt git, et 2 sous LANGUAGE=fr)"
+log "préflight ② OK (banc livré : 33 cas, dont 15 sur un vrai dépôt git, et 2 sous LANGUAGE=fr)"
 
 # ═══ PRÉFLIGHT ③ — 🚨 LE CORRECTIF EST BRANCHÉ, PROUVÉ SUR L'ARBRE ════════════════════════════
 #
@@ -166,11 +168,11 @@ if "plan_de_mise_a_jour" not in aa:
 #    toujours — c'est l'état de ben-0005, invisible depuis des semaines.
 if "hors_du_plan" not in aa:
     ko.append("l'agent n'appelle pas hors_du_plan() — un boîtier figé resterait silencieux")
-# 🚨 LA RÈGLE DU SIGNAL AFFIRMATIF : sans `TickASauter` défini ET levé ET rattrapé par l'agent,
-#    plus rien ne garantit que le seul cas qui doit geler — un plan de branche inutilisable — gèle
-#    effectivement, ni qu'il soit VU.
+# 🚨 LE SEUL CAS QUI DOIT GELER. Sans `TickASauter` définie ET levée ET rattrapée par l'agent, un
+#    plan de branche inutilisable repasserait en silence sur `main` — et le défaut que la branche
+#    d'essai servait à attraper disparaîtrait de l'écran.
 if not any(isinstance(n, ast.ClassDef) and n.name == "TickASauter" for n in ast.walk(lib)):
-    ko.append("TickASauter absente — plus de « on ne fait rien sans instruction »")
+    ko.append("TickASauter absente — un plan de branche inutilisable ne gèlerait plus")
 leves = [n for n in ast.walk(lib) if isinstance(n, ast.Raise) and "TickASauter" in ast.dump(n)]
 if not leves:
     ko.append("TickASauter n'est JAMAIS levée — le plan de branche inutilisable ne gèlerait plus")

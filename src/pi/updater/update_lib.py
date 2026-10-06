@@ -126,9 +126,9 @@ def ref_valide(ref) -> bool:
 
 
 def ref_demandee(device_id: str) -> str:
-    """Demande au cloud où chercher le plan. Rend une ref, ou LÈVE `TickASauter`.
+    """Demande au cloud où chercher le plan. Rend TOUJOURS une ref — elle ne lève jamais.
 
-    On ne rend `main` que sur un signal AFFIRMATIF :
+    Au moindre doute, `main`. Ce qui change d'un cas à l'autre est le NIVEAU du journal :
 
       · **404** — la route n'existe pas : mécanisme non déployé, ou retiré. C'est l'état
         d'aujourd'hui, et c'est aussi le geste de débrayage. En `info` ;
@@ -355,6 +355,12 @@ def plan_de_mise_a_jour(repo_path: str = "/opt/ben/repo",
         return _main()
     try:
         plan = load_compatibility_from_remote(repo_path, ref)
+        # ⚠️ UN FICHIER VIDE N'EST PAS UNE ERREUR POUR `yaml.safe_load` : il rend `None`, et
+        #    `find_next_transition` lèverait alors une `AttributeError` plus loin — le défaut
+        #    resterait visible, mais en « Update failed » et code 1, pas par le chemin décrit.
+        #    Un plan vide EST un plan inutilisable : il appartient ici.
+        if not isinstance(plan, dict):
+            raise ValueError(f"plan vide ou non structuré ({type(plan).__name__})")
     except Exception as e:  # noqa: BLE001
         # 🚨 `error`, et on NE PREND PAS `main`. Voir la docstring : c'est le seul cas.
         log.error("le plan de la branche %s est inutilisable (%s) — tick sauté, et on n'applique "
@@ -437,6 +443,16 @@ def find_next_transition(compat: dict, device: dict) -> Optional[dict]:
 def fetch_origin(repo_path: str = "/opt/ben/repo", ref: str = REF_DEFAUT) -> None:
     """Rapatrie les tags et la ref demandée.
 
+    🚨 CÔTÉ SOURCE : `refs/heads/<ref>`, ET C'EST UNE BARRIÈRE, PAS UNE PRÉCISION. Avec un simple
+       `<ref>`, git résout le nom à SA façon et ne cherche pas que dans les branches — vérifié sur
+       git 2.54.0, `+pi-0.11.0:…` rapatrie le TAG, et `+pull/43/head:…` la TÊTE D'UNE PULL REQUEST.
+       Or ce dépôt est PUBLIC : n'importe qui peut ouvrir une PR depuis un fork, donc un
+       `ota_ref = "pull/N/head"` ferait lire un plan ÉCRIT PAR UN INCONNU. La signature GPG protège
+       toujours le CODE exécuté — `update.sh` vient du tag — mais un plan étranger peut faire
+       rejouer un vieux `update.sh` signé sur une version qui n'est pas la sienne.
+       ⓘ Et c'était incohérent avec `ref_existe_sur_origin`, qui ne regarde que `refs/heads/` : le
+         fetch pouvait réussir là où la vérification d'existence aurait dit non.
+
     🚨 REFSPEC EXPLICITE ET FORCÉE (`+`), et les deux moitiés comptent.
        · EXPLICITE : sans elle, la mise à jour de `refs/remotes/origin/<ref>` dépend
          du `remote.origin.fetch` du dépôt (`+refs/heads/*:…` sur les boîtiers du
@@ -458,7 +474,7 @@ def fetch_origin(repo_path: str = "/opt/ben/repo", ref: str = REF_DEFAUT) -> Non
     """
     subprocess.run(
         ["git", "-C", repo_path, "fetch", "--tags", "origin",
-         "--", f"+{ref}:refs/remotes/origin/{ref}"],
+         "--", f"+refs/heads/{ref}:refs/remotes/origin/{ref}"],
         check=True,
         capture_output=True,
         text=True,

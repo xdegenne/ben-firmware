@@ -52,6 +52,20 @@ La route n'existe pas encore (`ben-api#29`) : tout le parc prend donc `main` et 
 exactement comme avant. Ce volet part **seul**, et le jour où la route serait coupée, rien ne
 s'arrête. C'est l'inverse du champ `access` de `ben-docs#3`, qui exigeait l'API **avant** le tag.
 
+#### 🚨 Et la ref ne peut désigner qu'une BRANCHE
+
+Côté source de la refspec, `refs/heads/<ref>` — et c'est une **barrière**, pas une précision. Avec un
+simple `<ref>`, git résout le nom à sa façon et ne cherche pas que dans les branches : vérifié sur
+git 2.54.0, `+pi-0.11.0:…` rapatrie le **tag**, et `+pull/43/head:…` la **tête d'une pull request**.
+
+Or `ben-firmware` est **public** : n'importe qui peut ouvrir une PR depuis un fork, donc un
+`ota_ref = "pull/N/head"` ferait lire un plan **écrit par un inconnu**. La signature GPG protège
+toujours le **code** — `update.sh` vient du tag — mais un plan étranger pourrait faire rejouer un
+vieux `update.sh` signé sur une version qui n'est pas la sienne.
+
+ⓘ C'était aussi incohérent avec `ref_existe_sur_origin`, qui ne regarde que `refs/heads/` : le fetch
+pouvait réussir là où la vérification d'existence aurait dit non.
+
 #### 🚨 Le nom de branche vient du réseau et finit dans une ligne de commande `git`
 
 `ref_valide` impose un alphabet **fermé** : `[a-z0-9][a-z0-9._/-]{0,99}`. Le premier caractère
@@ -192,7 +206,7 @@ repli attrape maintenant tout ce qui cloche **sur le chemin de la branche** — 
 
 #### Le banc, et ce qui a été vu tomber
 
-**31 cas.** **Treize** montent un **vrai dépôt git** jetable : seul moyen de prouver « lu depuis
+**33 cas.** **Quinze** montent un **vrai dépôt git** jetable : seul moyen de prouver « lu depuis
 `origin/canary` », « une branche **rebasée** est relue à jour » et « une branche fusionnée **en
 squash** reste suivie ». Les autres couvrent la validation du nom, le signalement d'une version hors
 plan, et tout ce qui vaut `main` — dont un **5xx au corps valide**, seul cas qui vise la garde sur le
@@ -204,7 +218,7 @@ module, donc figée à l'**import** : le `LANGUAGE=fr` que les deux cas posent e
 plus `git`, et ils restaient verts même en retirant `LC_ALL=C`. L'environnement est maintenant
 construit **à chaque appel**, et la mutation a été vérifiée **rouge sur ben-0001**.
 
-⚖️ **40 mutations** vérifiées rouges, **7 sabotages** du préflight ③ aussi. ⚠️ **Une** est restée
+⚖️ **42 mutations** vérifiées rouges, **9 sabotages** du préflight ③ aussi. ⚠️ **Une** est restée
 verte — le `--` avant la refspec, puisque c'est le `+` qui fait barrière : le commentaire a été
 corrigé plutôt que de garder une garde invérifiable.
 

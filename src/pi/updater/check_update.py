@@ -198,7 +198,10 @@ def main() -> None:
         #    boîtier d'essai, pas se faire remplacer en silence par celui de `main`.
         #    ⇒ Mais sans la ref dans la ligne, un échec de branche se lit comme un échec
         #      ordinaire, et on cherche la cause au mauvais endroit.
-        log.exception("Update failed (plan lu depuis origin/%s) — device.json not modified, "
+        # ⚠️ « DEMANDÉE », pas « lue » : si c'est la lecture de `main` qui a échoué après un repli,
+        #    `ref` porte encore le nom de la branche, et dire « plan lu depuis origin/canary »
+        #    enverrait chercher la cause au mauvais endroit. « Demandée » est vrai dans tous les cas.
+        log.exception("Update failed (ref demandée : origin/%s) — device.json not modified, "
                       "will retry next tick", ref)
         sys.exit(1)
     finally:
