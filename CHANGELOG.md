@@ -18,7 +18,7 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
-### [0.11.2] — 2026-10-07
+### [0.12.0] — 2026-10-07
 
 **Le filet du réseau est enfin posé.** Chantier
 [`ben-docs#17`](https://github.com/xdegenne/ben-docs/issues/17), sous-tâche

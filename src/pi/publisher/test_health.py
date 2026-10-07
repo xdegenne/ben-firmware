@@ -561,7 +561,7 @@ def snapshot_fait_REMONTER_le_compteur_a_plat():
     (d / "nm-restarts").write_text("3\n")
     health._sh = lambda *a: ""          # aucune sonde externe ne doit être nécessaire
     try:
-        out = health.snapshot(None, {"model": "Filaire", "softwareVersion": "0.11.2"})
+        out = health.snapshot(None, {"model": "Filaire", "softwareVersion": "0.12.0"})
     finally:
         health.NM_RESTARTS, health._sh = vrai_nm, vrai_sh
     assert out.get("nm_restarts") == 3, out

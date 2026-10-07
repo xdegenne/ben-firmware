@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# update.sh — 0.11.1 → pi-0.11.2 : LE FILET DU RÉSEAU EST ENFIN POSÉ.
+# update.sh — 0.11.1 → pi-0.12.0 : LE FILET DU RÉSEAU EST ENFIN POSÉ.
 #
 # ═══ CE QUE LIVRE CETTE VERSION ═══════════════════════════════════════════════════════════════
 #
@@ -66,7 +66,7 @@
 #     ce qui est sans danger — ils étaient le but.
 
 set -euo pipefail
-TR="→ pi-0.11.2"
+TR="→ pi-0.12.0"
 log()  { echo "[update $TR] $*"; }
 warn() { echo "[update $TR] ⚠ $*" >&2; }
 fail() { echo "[update $TR] ✗ ERREUR : $*" >&2; exit 1; }
@@ -79,7 +79,7 @@ API="http://127.0.0.1:8087/health"
 # ═══ PRÉFLIGHT ① — les fichiers livrés sont là et se tiennent ═════════════════════════════════
 for f in "$WD" "$SRC/wifi-watchdog/test_wifi_watchdog.sh" "$SRC/publisher/health.py" \
          "$SRC/publisher/test_health.py"; do
-    [ -f "$f" ] || fail "absent du dépôt : $f (checkout pi-0.11.2 incomplet ?)"
+    [ -f "$f" ] || fail "absent du dépôt : $f (checkout pi-0.12.0 incomplet ?)"
 done
 # 🚨 GUILLEMETS SIMPLES DANS LE MESSAGE. En doubles, les backticks de « bash -n » sont une
 #    SUBSTITUTION DE COMMANDE : bash exécuterait `bash -n` sans argument sur la branche d'échec,
