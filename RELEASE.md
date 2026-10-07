@@ -107,10 +107,22 @@ par **égalité**) donc il ne rejoue rien. Si les `to` divergeaient, il se retro
 version que `main` n'a jamais entendue, et il serait **hors du parc OTA** — le cas de ben-0005,
 resté en `0.9.29`.
 
-ⓘ **Les deux tags livrent le même arbre.** Vérifié sur `0.11.1` : `pi-0.11.1-rc1` et `pi-0.11.1`
-pointent tous deux sur `b3bfeef`, et leur `update.sh` a la même empreinte à l'octet — le squash
-d'une branche sur un `main` qui n'a pas bougé produit le même arbre que la branche. Le parc reçoit
-donc exactement ce que le canary a éprouvé.
+ⓘ **Le parc reçoit ce que le canary a éprouvé — mais ça se VÉRIFIE, ça ne se suppose pas.** Sur
+`0.11.1` les deux tags pointaient sur le même arbre (`b3bfeef`), le squash d'une branche sur un
+`main` qui n'a pas bougé produisant le même arbre que la branche. Mais **la branche continue de
+vivre** pendant que le canary tourne : sur `0.12.0`, un commit de documentation l'a fait dépasser
+le tag d'essai. Donc avant de signer `pi-<B>`, comparer ce que le boîtier **consomme** :
+
+```bash
+for c in updates/<A>_to_<B> src/pi config/systemd compatibility.yaml install.sh; do
+    [ "$(git rev-parse pi-<B>-rc1:$c)" = "$(git rev-parse HEAD:$c)" ] \
+        && echo "✓ $c" || echo "✗ $c DIFFÈRE — le canary n'a pas éprouvé ÇA"
+done
+```
+
+⚠️ Un `✗` n'interdit pas de livrer : il dit que **le canary n'a pas éprouvé ce morceau-là**, et
+qu'il faut décider en le sachant. Un `RELEASE.md` qui change ne regarde pas le boîtier ; un
+`src/pi` qui change annule l'essai.
 
 ### Pourquoi un `-rc1`, et pas le numéro final tout de suite
 
