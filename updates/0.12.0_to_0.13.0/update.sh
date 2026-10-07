@@ -166,7 +166,15 @@ else
     RAISON="$(printf '%s' "$JOURNAL" | grep -m1 ':8088' || echo 'aucune ligne :8088 au journal')"
     warn ":8088 NON ouverte — $RAISON"
     warn "   ⓘ Ce n'est PAS un échec d'update : :8087 sert, et l'app s'y replie légitimement."
-    warn "   ⇒ Renouveler le certificat avec ben-certd, puis redémarrer ben-local-api."
+    # 🚨 ET EN ESSAI À BLANC, CETTE LIGNE EST NORMALE — constaté sur ben-0001 le 2026-10-07.
+    #    `ben-local-api.service` exécute le code de /opt/ben/repo, PAS de $REPO : avec un
+    #    REPO_PATH jetable, le service redémarré est l'ANCIEN code, donc il n'écrit aucune
+    #    ligne `:8088`. Pour mesurer le chemin TLS sans installer, appeler la fonction :
+    #      sudo python3 -c "import sys; sys.path[:0]=['$SRC','$SRC/store']; \
+    #                       import local_api as L; s=L._ecoute_tls(); print(s); s and s.server_close()"
+    #    Fait sur ben-0001 ET ben-0003 : « certificat conforme : 180 j, SAN [...] », bind réussi.
+    warn "   ⓘ En essai avec un REPO_PATH jetable, c'est ATTENDU (le service lit /opt/ben/repo)."
+    warn "   ⇒ Sinon : renouveler le certificat avec ben-certd, puis redémarrer ben-local-api."
 fi
 
 # ③ le ticket : le fichier et sa caractéristique GATT sont-ils en place côté provisioner ?
