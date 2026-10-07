@@ -429,6 +429,47 @@ def les_DEUX_compteurs_repartent_de_zero_apres_un_lot_reussi():
         "que c'est l'envoi qui prouve la lisibilité de la base")
 
 
+@cas
+def un_boitier_vierge_ne_tue_pas_le_publisher():
+    """🚨 LE DÉFAUT QUI A FAILLI COÛTER LE DÉBALLAGE, mesuré sur ben-0005 le 05/10.
+
+    `pending_approx()` est appelé à la deuxième ligne de `main()`. Sur un boîtier
+    qui sort du déballage, la table `measurements` n'existe pas encore : elle naît
+    à la première ouverture en ÉCRITURE par un lecteur, et le publisher ouvre en
+    lecture. Il mourait donc sur `no such table`, bien AVANT
+    `presenter_le_ticket()` — dont le commentaire dit pourtant « LE TICKET
+    D'ABORD, c'est ce qui fonde le propriétaire ».
+
+    systemd le relançait 30 s plus tard et tout rentrait dans l'ordre : le défaut
+    était donc INVISIBLE, sauf à lire le journal. Un plantage durable aurait fait
+    expirer la fenêtre de 900 s du ticket, et le boîtier serait arrivé en ligne
+    sans propriétaire possible.
+    """
+    import sqlite3 as _sq
+    vide = _sq.connect(":memory:")          # aucune table, comme un boîtier neuf
+    assert pub.pending_approx(vide) == 0, "un boîtier vierge doit annoncer 0, pas lever"
+
+
+@cas
+def une_vraie_panne_de_base_remonte_toujours():
+    """⭐ LE CONTRE-TÉMOIN du cas précédent, et il est indispensable.
+
+    Ravaler `OperationalError` en bloc rendrait « base vierge » indiscernable
+    d'une base VERROUILLÉE ou CORROMPUE — on publierait « 0 point en attente »
+    sur un boîtier en panne, et la cadence de rattrapage ne repartirait jamais.
+    """
+    class _Cassee:
+        def execute(self, *a, **k):
+            raise _Sq.OperationalError("database is locked")
+
+    import sqlite3 as _Sq
+    try:
+        pub.pending_approx(_Cassee())
+    except _Sq.OperationalError:
+        return
+    raise AssertionError("une base verrouillée doit LEVER, pas rendre 0")
+
+
 if __name__ == "__main__":
     ko = 0
     for fn in CAS:

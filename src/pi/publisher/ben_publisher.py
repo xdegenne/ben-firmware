@@ -72,6 +72,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # src/pi
 import capabilities as caps  # noqa: E402
 import health  # noqa: E402
+from store import access  # noqa: E402
+from store import claim_ticket  # noqa: E402
 from store import db  # noqa: E402
 
 # ── Réglages ──────────────────────────────────────────────────────────────────
@@ -543,18 +545,39 @@ def pending_approx(conn: sqlite3.Connection) -> int:
     (les lignes purgées laissent des trous) — c'est une ligne de journal, pas une
     comptabilité.
     """
-    row = conn.execute(
-        "SELECT (SELECT max(rowid) FROM measurements), "
-        # 🚨 LE MÊME FILTRE QUE `SELECT_BATCH`, et sans lui ce chiffre MENT.
-        #    Une seule ligne non publiable — compteur refusé par le cloud, ou mesure
-        #    orpheline dont le `pdl_index` n'est plus dans `pdl` — ÉPINGLE le
-        #    minimum : le retard affiché ne redescend plus JAMAIS. Conséquences
-        #    mesurées : la cadence reste verrouillée sur PERIOD_RETARD (10 s au lieu
-        #    de 60, en permanence), et le contrôle « le retard doit DÉCROÎTRE » que
-        #    l'update exige ne peut plus passer.
-        "       (SELECT min(m.rowid) FROM measurements m "
-        "          JOIN pdl p ON p.pdl_index = m.pdl_index "
-        "         WHERE m.sent = 0 AND p.ref IS NOT NULL AND p.ref <> '')").fetchone()
+    # 🚨 UN BOÎTIER VIERGE N'A PAS ENCORE CETTE TABLE, et le publisher y mourait.
+    #    Mesuré sur ben-0005 le 05/10, au premier démarrage après un déballage :
+    #    `sqlite3.OperationalError: no such table: measurements`. Or cet appel est
+    #    la DEUXIÈME ligne de `main()`, donc bien avant `presenter_le_ticket()` —
+    #    dont le commentaire dit pourtant « LE TICKET D'ABORD ». Le ticket n'était
+    #    présenté qu'au redémarrage de systemd, 30 s plus tard, et un plantage
+    #    durable aurait fait expirer sa fenêtre de 900 s.
+    #
+    # ⭐ La table naît à la première ouverture en ÉCRITURE par un LECTEUR
+    #    (`db.connect()` rejoue le schéma) ; le publisher, lui, ouvre en lecture.
+    #    Sur un boîtier neuf il peut donc démarrer AVANT que le premier lecteur
+    #    n'ait écrit — et « zéro point en attente » est alors la réponse VRAIE.
+    #
+    # ⚠️ On ne ravale que ce défaut-là : toute autre `OperationalError` (base
+    #    verrouillée, fichier corrompu) doit continuer de remonter.
+    try:
+        row = conn.execute(
+            "SELECT (SELECT max(rowid) FROM measurements), "
+            # 🚨 LE MÊME FILTRE QUE `SELECT_BATCH`, et sans lui ce chiffre MENT.
+            #    Une seule ligne non publiable — compteur refusé par le cloud, ou mesure
+            #    orpheline dont le `pdl_index` n'est plus dans `pdl` — ÉPINGLE le
+            #    minimum : le retard affiché ne redescend plus JAMAIS. Conséquences
+            #    mesurées : la cadence reste verrouillée sur PERIOD_RETARD (10 s au lieu
+            #    de 60, en permanence), et le contrôle « le retard doit DÉCROÎTRE » que
+            #    l'update exige ne peut plus passer.
+            "       (SELECT min(m.rowid) FROM measurements m "
+            "          JOIN pdl p ON p.pdl_index = m.pdl_index "
+            "         WHERE m.sent = 0 AND p.ref IS NOT NULL AND p.ref <> '')").fetchone()
+    except sqlite3.OperationalError as e:
+        if "no such table" not in str(e):
+            raise
+        log.info("base encore vide (%s) — 0 point en attente", e)
+        return 0
     if not row or row[0] is None or row[1] is None:
         return 0
     return max(0, row[0] - row[1] + 1)
@@ -810,9 +833,64 @@ def heartbeat(cli: Client, conn: sqlite3.Connection, dev: dict) -> None:
                                "std": None if r[4] is None else bool(r[4]),
                                "papp_max": r[5]})
 
+    # ── Les DROITS nés localement ────────────────────────────────────────────
+    #
+    # 🚨 DÉPLACÉS DU HELLO VERS LE BATTEMENT au rebase du 03/10, et le critère le
+    #    commande : /hello porte ce que le boîtier EST — identité, versions,
+    #    compteurs lus, et ça change par ÉVÉNEMENT. Des droits d'accès changent en
+    #    continu : quelqu'un revendique, quelqu'un est coupé. C'est donc ce qu'il
+    #    VIT, et ça voyage dans /ping.
+    #
+    # ⚠️ Et ce n'était pas qu'une question de rangement : depuis pi-0.9.27 le
+    #    serveur refuse les champs inconnus (`DisallowUnknownFields`), et le
+    #    `/hello` étroit ne déclare que sw·fw·model·pdl. Laissé dans le hello, ce
+    #    champ partait en 400 `bad_body` — le rebase aurait « réussi » et la
+    #    fonctionnalité serait morte EN SILENCE.
+    #
+    # ⭐ Le déplacement SERT leur intention d'origine. Elle était : « poussés en
+    #    entier à chaque hello, donc auto-réparateur — une ligne que le cloud aurait
+    #    perdue revient au hello suivant ». Or le hello est devenu RARE
+    #    (événementiel) et le battement est QUOTIDIEN : la réparation est plus
+    #    rapide dans le ping qu'elle ne l'était dans le hello.
+    #
+    # ⭐ Poussés EN ENTIER, sans boîte d'envoi : la table fait 1 à 5 lignes — un
+    #    foyer et ses habitants. Avec un `sent = 1`, une ligne perdue le serait
+    #    POUR TOUJOURS, et le boîtier se croirait à jour.
+    #
+    # 🚨 AJOUT SEULEMENT, le cloud ne retire rien sur cette base. La liste du
+    #    boîtier est un SOUS-ENSEMBLE de `device_access` : quelqu'un d'inscrit côté
+    #    cloud qui n'a jamais revendiqué n'apparaît pas ici. En déduire une
+    #    suppression effacerait des droits parfaitement valides.
+    #
+    # ⚠️ La RÉVOCATION ne passe donc pas par là : c'est l'app qui la fait des deux
+    #    côtés, elle seule étant à la fois sur le LAN et sur Internet
+    #    (cf. `access.revoke_person`). Rien ne descend du cloud vers le boîtier.
+    #
+    # ⚠️ L'import est au niveau du MODULE (voir en tête), pas ici. Écrit d'abord en
+    #    local sous `try`, il échouait en silence — `import access` ne résout pas
+    #    depuis ce répertoire, c'est `from store import access`. Le battement serait
+    #    parti sans les droits, avec un warning quotidien que personne ne lit. Un
+    #    import de module échoue AU DÉMARRAGE, et bruyamment.
+    #
+    # ⓘ `access.db` est une base SÉPARÉE (/var/lib/ben-firmware/access.db) avec sa
+    #    propre connexion sérialisée : aucune interférence avec `conn`.
+    acces = []
+    try:
+        with access.session() as ac:
+            # 🔒 La projection vit dans `access`, pas ici : c'est elle qui garantit
+            #    que le prénom local ne monte JAMAIS au cloud, et le banc la vérifie
+            #    nommément. Le cloud reçoit de quoi DÉCIDER — qui, quel rôle, coupé
+            #    ou non — et rien de plus.
+            acces = access.for_cloud(ac)
+    except Exception as e:  # noqa: BLE001
+        # La LECTURE peut légitimement échouer (base verrouillée) — et ne doit pas
+        # empêcher le battement de partir, ni les mesures.
+        log.warning("accès locaux illisibles (%s) — battement sans eux", e)
+
     payload = {"contract_epoch": key_by_ref(epochs),
                "tariff_labels": key_by_ref(labels),
-               "meter_profile": key_by_ref(profile)}
+               "meter_profile": key_by_ref(profile),
+               "access": acces}
 
     # ── L'instantané de santé (#16) ───────────────────────────────────────────
     #
@@ -855,6 +933,101 @@ def _on_signal(signum, _frame):
     global _stop
     _stop = True
     log.info("signal %d — arrêt après le lot en cours", signum)
+
+
+def presenter_le_ticket(cli) -> None:
+    """Présente le ticket reçu en BLE, UNE fois, à la première connexion au cloud.
+
+    🚨 C'EST LE CHEMIN QUI REND UN BOÎTIER NEUF REVENDICABLE. Sans lui, `grant()` n'est
+    appelé que depuis `mint()` et `consume_invitation()` : un boîtier envoyé à un
+    client est inrevendicable, et les 7 du parc ne marchent que parce que leurs lignes
+    ont été semées à la main — un rattrapage de migration, pas une procédure.
+
+    ⭐ TOUTE L'ASYMÉTRIE DU DÉBALLAGE TIENT ICI : le téléphone avait Internet, le
+    boîtier non. Le ticket a donc été frappé par l'app, passé en BLE, persisté sur le
+    disque — et c'est maintenant, au premier lien, qu'il se présente.
+
+    🚨 `fonder=True` NE PART QUE D'ICI, et l'existence du fichier en est la PREUVE.
+    Un `/claim` arrivé par le LAN envoie toujours `false` : le boîtier ne sait pas si
+    le cloud a déjà un owner, mais il sait par quel CANAL le ticket est arrivé — et
+    c'est la seule moitié de la garde qu'il soit en position de tenir.
+
+    ⚠️ ON NE FRAPPE AUCUN JETON LOCAL ICI, et ce n'est pas un oubli : la session BLE
+    est finie, il n'y a personne à qui le rendre. ⇒ Voie A (tranchée le 05/10) : l'app
+    refrappe un ticket et rejoue un `/claim` ordinaire sur le LAN. C'est ce qui a rendu
+    `CLAIM_TOKEN` inutile.
+
+    ⓘ Ne lève jamais : un déballage qui échoue ne doit pas empêcher la collecte.
+    """
+    ticket = claim_ticket.lire()
+    if not ticket:
+        return
+
+    try:
+        statut, brut = cli.post("/claim", claim_ticket.charge(ticket, fonder=True))
+    except Exception as e:  # noqa: BLE001
+        # ⭐ ON GARDE LE FICHIER. Le cloud peut être injoignable longtemps au premier
+        #    démarrage — WiFi qui se monte, DNS, ADSL. Effacer ici rendrait le boîtier
+        #    définitivement inrevendicable pour une panne passagère.
+        log.warning("ticket non présenté (%s) — conservé, on réessaiera", e)
+        return
+
+    v = claim_ticket.verdict(statut, brut.encode())
+
+    if isinstance(v, claim_ticket.CloudInjoignable):
+        log.warning("ticket : le cloud a répondu %d — conservé", statut)
+        return
+
+    if v is not None:
+        # 🚨 REFUS DÉFINITIF ⇒ ON EFFACE. Un ticket consommé, expiré ou frappé pour un
+        #    autre boîtier ne redeviendra jamais valable : le garder le ferait
+        #    présenter à CHAQUE démarrage, pour rien, et masquerait le vrai état du
+        #    boîtier dans les journaux.
+        log.error("ticket REFUSÉ (%s: %s) — effacé, un nouveau déballage est "
+                  "nécessaire", type(v).__name__, v)
+        claim_ticket.effacer()
+        return
+
+    try:
+        rep = json.loads(brut)
+        uid = str(rep.get("uid") or "").strip()
+        role = str(rep.get("role") or "").strip()
+    except Exception as e:  # noqa: BLE001
+        log.error("ticket : réponse illisible (%s) — conservé", e)
+        return
+
+    # 🚨 ON NE VALIDE QUE L'uid, PAS LE RÔLE — et la distinction s'est mesurée.
+    #
+    #    `access.grant` refuse DÉJÀ un rôle inconnu (`ValueError`), attrapé plus bas :
+    #    valider ici aussi ne changeait RIEN d'observable, donc aucune mutation ne
+    #    pouvait détecter la disparition de ce contrôle. Deux endroits où la liste des
+    #    rôles pouvait diverger, pour rien.
+    #
+    # ⚠️ L'uid, LUI, N'EST VALIDÉ NULLE PART AILLEURS : `grant` ne le regarde pas, et
+    #    un uid vide s'insérerait tel quel — posant un `owner` qui n'est personne, donc
+    #    un boîtier qui se croit revendiqué et ne l'est pas.
+    #
+    # ⓘ Conservé dans les deux cas : une réponse 200 mal formée est un défaut de
+    #    CONTRAT, pas un refus. L'effacer condamnerait le boîtier pour un bug de notre
+    #    côté.
+    if not uid:
+        log.error("ticket : réponse 200 sans uid (role=%r) — conservé", role)
+        return
+
+    try:
+        with access.session() as ac:
+            access.grant(ac, uid, role)
+    except Exception as e:  # noqa: BLE001
+        # ⚠️ Conservé AUSSI : le cloud a écrit sa ligne, mais pas nous. Réessayer
+        #    rejouera le `/claim`, qui trouvera la ligne EXISTANTE et la rendra — le
+        #    ticket étant consommé, il faudra toutefois un nouveau déballage.
+        log.error("ticket : droit local non écrit (%s) — conservé", e)
+        return
+
+    # 🔒 L'uid est journalisé, jamais le ticket : c'est un secret à usage unique, et
+    #    `journalctl` est lisible.
+    log.info("DÉBALLAGE : %s est désormais %s de ce boîtier", uid, role)
+    claim_ticket.effacer()
 
 
 def main() -> int:
@@ -973,6 +1146,12 @@ def main() -> int:
     #       mémoire existe et vaut la version installée, les deux conditions sont
     #       fausses et rien ne part.
     declare_if_needed()
+    # 🚨 LE TICKET D'ABORD, s'il y en a un. Avant le premier battement : c'est ce qui
+    #    fonde le propriétaire, et tout le reste du parcours en dépend.
+    # ⓘ Ne fait rien dans 99,99 % des démarrages — le fichier n'existe qu'entre le
+    #    déballage en BLE et la première connexion réussie.
+    presenter_le_ticket(cli)
+
     prochain_hello = hello()
     echecs = 0
     # ⚠️ `-inf` et non `0.0` : `time.monotonic()` part de l'uptime, pas de zéro. Avec `0.0`,
@@ -985,6 +1164,25 @@ def main() -> int:
     #    le serveur pendant neuf jours d'un disque abîmé.
     echecs_base = 0
     while not _stop:
+        # 🚨 **LE TICKET SE REPRÉSENTE TANT QU'IL EST LÀ.** Il n'était présenté qu'au
+        #    DÉMARRAGE — or quatre sorties de `presenter_le_ticket` journalisent
+        #    « conservé, on réessaiera » et rien ne réessayait : cloud injoignable,
+        #    DNS ou WiFi pas encore montés après le reboot, 5xx de ben-api, réponse
+        #    sans uid, octroi local en échec. Aucun de ces cas ne fait mourir le
+        #    publisher, donc systemd ne le relançait pas : au bout de 900 s le ticket
+        #    expirait et le boîtier restait SANS PROPRIÉTAIRE — exactement ce que le
+        #    ticket existe pour éviter, et il faut alors rouvrir une fenêtre BLE.
+        #
+        # ⭐ AUCUN COMPTEUR D'ESSAIS N'EST NÉCESSAIRE, et c'est ce qui rend la
+        #    reprise simple : passé 900 s le cloud répond `bad_ticket`, `verdict()`
+        #    en fait un refus DÉFINITIF, et le fichier est effacé. La boucle s'éteint
+        #    donc d'elle-même — par le succès, ou par la péremption.
+        #
+        # ⓘ Le recul est celui de la boucle (60 s), soit 15 tentatives au plus. Et
+        #    `lire()` ne coûte qu'un `open()` qui échoue, dans 99,99 % des tours.
+        if claim_ticket.lire():
+            presenter_le_ticket(cli)
+
         # 🚨 HORS DU `try`, ET C'EST TOUT L'INTÉRÊT. Dedans, le `raise` d'un lot
         #    refusé sautait la déclaration à chaque tour : un boîtier dont le cloud
         #    ne reconnaît plus une ref ne pouvait JAMAIS la renouveler, puisque
