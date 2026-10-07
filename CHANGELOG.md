@@ -18,6 +18,97 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.13.0] — 2026-10-07
+
+**L'accès local.** TLS sur l'écoute LAN, jetons porteurs de rôle, et `/claim` relayé au cloud
+**par ticket**. Chantier [`ben-docs#3`](https://github.com/xdegenne/ben-docs/issues/3), sous-tâche
+[#35](https://github.com/xdegenne/ben-firmware/issues/35).
+
+#### 🚨 La règle cardinale : `:8087` continue de servir, quoi qu'il arrive
+
+C'est lui que l'app du parc et Home Assistant utilisent, **en permanence**. Le code le garantit :
+tout chemin d'échec de `_ecoute_tls()` rend `None`, et l'écoute en clair vit dans le thread
+**principal**. ⓘ Le `bind` est **dans** le `try` — dehors, un port déjà pris tuait l'API entière
+en boucle de redémarrage, là où la docstring promettait l'inverse.
+
+⇒ **Le contrôle d'effet exige `:8087` et RAPPORTE `:8088` sans l'exiger.** Exiger `:8088`
+brûlerait la version sur tout boîtier dont le certificat n'a pas de SAN — et le SAN ne se lit
+**pas** depuis le cloud (`cert_task.cert` est vidée à la livraison). *Un garde-fou plus exigeant
+que le code qu'il garde est un garde-fou faux* (pi-0.9.12).
+
+#### Le partage des deux ports
+
+```
+:8087  en clair   GELÉ sur ses 14 routes historiques. Aucune exigence.
+:8088  chiffré    jeton EXIGÉ dès le premier jour. Une seule exemption : /claim.
+```
+
+La surface d'administration neuve (`/access`, `/invitations`, `/tokens/*`) n'existe **que** sur
+`:8088` et répond **404** sur le port clair — 404 et non 426, pour ne pas confirmer à qui balaie
+le port clair qu'il y a une administration ailleurs.
+
+⭐ **L'exigence naît AVEC le canal chiffré**, elle ne s'arme pas « plus tard, sur preuve que plus
+personne n'appelle sans jeton » : ce jour-là n'arrive jamais tout seul. Une app qui parle `:8088`
+a forcément revendiqué, donc il n'y a **aucune population à migrer**.
+
+#### 🚨 Le boîtier relaie un TICKET, jamais un jeton Firebase
+
+Un `ID token` est un **porteur** valable ~1 h auprès de tout le projet Firebase BEN, et
+l'attaquant réaliste n'est pas l'opérateur : c'est **l'owner d'un boîtier rooté contre ses propres
+invités**. Un en-tête `Authorization` sur `/claim` est donc un **refus franc**.
+
+⭐ **Et le même ticket, remis en BLE, fonde le premier propriétaire** — c'est ce qui débloquait la
+livraison d'un boîtier à un client. `grant()` n'était appelé que depuis `mint()` et
+`consume_invitation()` : un boîtier neuf était **inrevendiquable**, et les 7 du parc ne
+fonctionnaient que par des lignes semées à la main — *un rattrapage, pas une procédure*. La garde
+est **côté cloud** (`ben-api#26`) : il refuse la création d'un premier owner sans `fonder`. Le
+boîtier ordonne, le cloud exécute — seul partage possible, puisque le boîtier ne sait pas si le
+cloud a déjà un owner, mais que **lui seul sait par quel canal le ticket est arrivé**.
+
+#### ⚠️ Le champ d'accès voyage dans `/ping`, pas dans `/hello`
+
+Et c'est le piège **qu'aucun conflit git ne signale**. Le serveur refuse les champs inconnus
+(`DisallowUnknownFields`) : un `access` resté dans le hello partirait en **400 `bad_body`** à
+chaque déclaration, et la fonctionnalité serait **morte en silence**. Le préflight ④ le vérifie
+sur l'**arbre syntaxique**, jamais par `grep` — les commentaires nomment les deux routes. Les deux
+moitiés se livrent ensemble : `ben-api` l'accepte depuis `a0e0f42`, **déployée**.
+
+#### 🚨 Le sudoers est validé par `visudo -c` AVANT d'être posé
+
+Un `/etc/sudoers.d/` cassé casse `sudo` **pour tout le monde**, root compris, sur un boîtier qui
+est chez un client. C'est le seul préflight de cette update dont l'absence serait une panne
+**irrécupérable à distance**. Il est revalidé après la pose, et `sudo -n true` rejoué.
+
+`ben-local-api` rejoint `ben-publisher` dans ce fichier : un processus Python lit son certificat
+**une seule fois**, à la construction de son contexte SSL, donc `ben-certd` doit pouvoir le
+redémarrer après l'avoir remplacé.
+
+⚠️ **Et `install.sh` ne posait pas ce fichier.** Il avait été posé au parc par
+`updates/0.9.15_to_0.9.16/update.sh` : tout boîtier provisionné **depuis** en était dépourvu, et
+aurait servi un certificat périmé **en silence**. Corrigé ici — même classe de défaut que le
+watchdog de 0.12.0, un fichier du dépôt que la liste explicite d'`install.sh` avait oublié.
+
+#### Trois commentaires FAUX, corrigés
+
+- `local_api.py` portait **deux doctrines contradictoires** : un bloc disait « cette version ne
+  refuse rien, l'exigence s'armera plus tard », et `_exige_jeton`, trente lignes plus bas, disait
+  l'inverse en toutes lettres. *Deux doctrines dans un fichier : celle qu'on lit en premier est
+  celle qu'on croit.*
+- « quatre boîtiers du parc portent encore le certificat d'origine, 3650 jours » — **faux depuis la
+  bascule PKI** : mesuré côté cloud, les 8 portent un certificat de **180 jours** émis entre le
+  24/09 et le 05/10. Le contrôle n'en devient pas décoratif : c'est le **SAN** qui décide
+  désormais, et lui ne se lit pas depuis le cloud.
+- `access.py` disait dix fois que les lignes remontent « au hello ». Elles remontent dans le
+  **battement** (`/ping`) depuis le rebase du 03/10. ⓘ L'argument du « miroir en retard » tient
+  quand même : `HELLO_EVERY = 86400`, le battement est **quotidien**.
+
+#### Ce que ça ne fait pas
+
+Aucune migration de `measurements.db`. `access.db` est une base **séparée**
+(`/var/lib/ben-firmware/access.db`) créée à la première session, en écriture, par l'API locale
+elle-même. ⇒ **Retour arrière vers 0.12.0** : le sudoers et l'unité resteraient en place, sans
+danger — l'ancien code ne lit ni l'un ni l'autre, et il n'ouvre pas `:8088`.
+
 ### [0.12.0] — 2026-10-07
 
 **Le filet du réseau est enfin posé.** Chantier
