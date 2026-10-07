@@ -34,7 +34,16 @@ cas() {
         oui)  printf '#!/bin/sh\necho ben-provisioned\n'      > "$T/bin/nmcli" ;;
         non)  printf '#!/bin/sh\necho une-autre-connexion\n'  > "$T/bin/nmcli" ;;
     esac
-    [ "$fichier" = 1 ] && : > "$T/conn/ben-provisioned.nmconnection"
+    # ⭐ Sous son nom TEMPORAIRE, comme sur ben-0001 — c'est le CONTENU qui porte l'identité.
+    if [ "$fichier" = 1 ]; then
+        printf '[connection]\nid=ben-provisioned\n' \
+            > "$T/conn/ben-provisioned-tmp-1783764212.nmconnection"
+    elif [ "$fichier" = leurre ]; then
+        # ⚖️ Un keyfile dont le NOM commence par `ben-provisioned` mais qui pointe AILLEURS : un
+        #    glob sur le nom l'accepterait à tort.
+        printf '[connection]\nid=ben-provisioned-autre-chose\n' \
+            > "$T/conn/ben-provisioned-autre.nmconnection"
+    fi
     printf '#!/bin/sh\nexit %d\n' "$([ "$ping_ok" = 1 ] && echo 0 || echo 1)" > "$T/bin/ping"
     # ⭐ `systemctl` TRACE au lieu d'agir : c'est la trace qui est l'oracle du banc.
     printf '#!/bin/sh\necho "$@" >> %s/systemctl.trace\n' "$T" > "$T/bin/systemctl"
@@ -86,8 +95,12 @@ cas "neuf__ne_touche_a_rien"                     non 0 aucun 0 0 \
     "un boîtier neuf n'a PAS de réseau par construction : agir le ferait boucler"
 cas "neuf__meme_si_le_ping_passe"                non 0 aucun 1 0 \
     "la garde ① ne dépend pas du ping : on sort AVANT de tester"
-cas "deballe_par_le_FICHIER_de_connexion"        non 1 aucun 0 1 \
-    "⭐ le fichier est de l'état PERSISTANT : il suffit, même si nmcli ne cite pas la connexion"
+cas "deballe_par_le_FICHIER_sous_son_nom_TEMPORAIRE" non 1 aucun 0 1 \
+    "⭐ relevé sur ben-0001 : le keyfile s'appelle ben-provisioned-tmp-<ts>.nmconnection et porte
+     id=ben-provisioned. NM ne renomme pas le fichier, donc c'est le CONTENU qui fait foi"
+cas "un_keyfile_LEURRE_ne_compte_PAS"            non leurre aucun 0 0 \
+    "⚖️ un fichier nommé ben-provisioned-autre mais pointant AILLEURS : un glob sur le NOM
+     l'accepterait à tort, le test sur id= le refuse"
 
 # 🚨 LE CAS QUI ANNULAIT TOUT LE WATCHDOG
 cas "NM_MORT__AGIT_QUAND_MEME"                   mort 0 aucun 0 1 \
@@ -118,7 +131,7 @@ printf '#!/bin/sh\nexit 0\n'               > "$T/bin/logger"
 printf '#!/bin/sh\nexit 0\n'               > "$T/bin/sleep"
 chmod +x "$T/bin/"*
 echo 7 > "$T/nm-restarts"          # ⭐ un boîtier qui a DÉJÀ été rattrapé 7 fois
-mkdir -p "$T/conn"; : > "$T/conn/ben-provisioned.nmconnection"
+mkdir -p "$T/conn"; printf '[connection]\nid=ben-provisioned\n' > "$T/conn/c.nmconnection"
 PATH="$T/bin:$PATH" BEN_BLE_FLAG="$T/absent" BEN_NM_RESTARTS="$T/nm-restarts" \
     BEN_NM_CONN_DIR="$T/conn" bash "$SCRIPT" >/dev/null 2>&1
 n=$(cat "$T/nm-restarts" | tr -dc '0-9')
@@ -138,7 +151,7 @@ printf '#!/bin/sh\nexit 1\n' > "$T/bin/ping"
 for f in systemctl logger sleep; do printf '#!/bin/sh\nexit 0\n' > "$T/bin/$f"; done
 chmod +x "$T/bin/"*
 : > "$T/nm-restarts"               # fichier VIDE, comme après une coupure
-mkdir -p "$T/conn"; : > "$T/conn/ben-provisioned.nmconnection"
+mkdir -p "$T/conn"; printf '[connection]\nid=ben-provisioned\n' > "$T/conn/c.nmconnection"
 PATH="$T/bin:$PATH" BEN_BLE_FLAG="$T/absent" BEN_NM_RESTARTS="$T/nm-restarts" \
     BEN_NM_CONN_DIR="$T/conn" bash "$SCRIPT" >/dev/null 2>&1
 code=$?; n=$(cat "$T/nm-restarts" | tr -dc '0-9')
@@ -151,5 +164,5 @@ fi
 rm -rf "$T"
 
 echo
-if [ "$KO" = 0 ]; then echo "11/11"; else echo "$((11-KO))/11"; fi
+if [ "$KO" = 0 ]; then echo "12/12"; else echo "$((12-KO))/12"; fi
 exit $([ "$KO" = 0 ] && echo 0 || echo 1)

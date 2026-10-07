@@ -106,7 +106,7 @@ TMPDIR=/var/tmp bash "$SRC/wifi-watchdog/test_wifi_watchdog.sh" \
     || fail "le banc du watchdog échoue — NE PAS déployer en l'état"
 TMPDIR=/var/tmp python3 "$SRC/publisher/test_health.py" \
     || fail "le banc de health échoue — NE PAS déployer en l'état"
-log "préflight ② OK (banc watchdog : 11 cas · banc health : 35 cas, sur le Python du boîtier)"
+log "préflight ② OK (banc watchdog : 12 cas · banc health : 35 cas, sur le Python du boîtier)"
 
 # ═══ PRÉFLIGHT ③ — 🚨 LE CORRECTIF EST BRANCHÉ, PROUVÉ SUR L'ARBRE ════════════════════════════
 #

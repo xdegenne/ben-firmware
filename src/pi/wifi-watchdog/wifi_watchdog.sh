@@ -41,12 +41,16 @@
 #      d'agir, et on continue ;
 #    ③ sinon seulement, `nmcli` répond et ne cite pas la connexion ⇒ boîtier neuf, on s'abstient.
 #
-# ⓘ Le glob `ben-provisioned*` couvre les deux formes de keyfile : `.nmconnection` (NM ≥ 1.20,
-#   donc le parc) et le nom nu des versions antérieures.
+# 🚨 ON LIT LE CONTENU DU KEYFILE, PAS SON NOM — relevé sur ben-0001 le 2026-10-07 : le fichier
+#    s'appelle `ben-provisioned-tmp-1783764212.nmconnection` et porte `id=ben-provisioned`.
+#    NetworkManager ne renomme PAS le keyfile quand on renomme la connexion, et le provisioner crée
+#    sous un nom temporaire avant de renommer la connexion (`wifi_config`, étape 5). Un glob sur le
+#    NOM marcherait donc par accident, et accepterait en plus n'importe quel `ben-provisioned-autre`
+#    pointant vers une autre connexion. `id=` est exactement l'identité que `nmcli` rend.
 # ⓘ Sortie 0 et non 1 : ne pas être déballé n'est pas une panne, et un `wifi-watchdog.service` en
 #   échec toutes les 2 minutes polluerait le journal d'un boîtier neuf.
 CONN_DIR="${BEN_NM_CONN_DIR:-/etc/NetworkManager/system-connections}"
-if ! ls "$CONN_DIR"/ben-provisioned* >/dev/null 2>&1; then
+if ! grep -qsx "id=ben-provisioned" "$CONN_DIR"/* 2>/dev/null; then
     if NOMS="$(nmcli -t -f NAME connection show 2>/dev/null)"; then
         # `nmcli` a répondu : son verdict est fiable.
         printf '%s\n' "$NOMS" | grep -qx ben-provisioned || exit 0

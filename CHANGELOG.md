@@ -60,7 +60,7 @@ WiFi/BLE sur Pi Zero W — ce qui a déjà coûté un décrochage en déballage 
 
 ```bash
 # ① déballé ? le FICHIER d'abord — lisible même si NetworkManager est mort
-ls "$CONN_DIR"/ben-provisioned* || { nmcli … || « NM en panne ⇒ on agit » }
+grep -qsx "id=ben-provisioned" "$CONN_DIR"/* || { nmcli … || « NM en panne ⇒ on agit » }
 # ② session BLE ? avec sa PÉREMPTION de 900 s
 [ -f "$BLE_FLAG" ] && [ "$AGE" -lt 900 ] && exit 0
 ```
@@ -70,6 +70,12 @@ ls "$CONN_DIR"/ben-provisioned* || { nmcli … || « NM en panne ⇒ on agit » 
 NM était `failed` — donc elle sortait en 0 **à chaque tick**, exactement pendant la coupure qu'elle
 doit couvrir. Elle lit donc d'abord le **fichier** de connexion (état persistant), et traite une
 erreur `nmcli` comme « NM est en panne, donc on agit ».
+
+🚨 **Et elle lit le CONTENU du keyfile, pas son nom** — mesuré sur ben-0001 : le fichier s'appelle
+`ben-provisioned-tmp-1783764212.nmconnection` et porte `id=ben-provisioned`. Un `ls
+"$CONN_DIR"/ben-provisioned*` marchait donc **par accident**, sur un nom temporaire que rien ne
+garantit, et il aurait dit « déballé » pour n'importe quel keyfile *nommé* ainsi. La garde `grep -qsx
+"id=ben-provisioned"` interroge l'identité que NetworkManager, lui, utilise vraiment.
 
 🚨 **Et le drapeau BLE a une péremption** (900 s, comme `SESSION_MAX_SEC`). Le provisioner n'a **pas
 de gestionnaire SIGTERM** : le drapeau survit à son arrêt — `_watch_window` qui voit revenir le
@@ -120,14 +126,16 @@ sans watchdog, exactement l'oubli qui a produit celui-ci.
 
 #### Le banc, et ce qui a été vu tomber
 
-**11 cas** pour le watchdog, montant de faux `nmcli`/`ping`/`systemctl` dans un `PATH` temporaire —
+**12 cas** pour le watchdog, montant de faux `nmcli`/`ping`/`systemctl` dans un `PATH` temporaire —
 il tourne donc sans NetworkManager, sur un Mac comme sur un boîtier. Les deux gardes dans tous leurs
 états, dont **`nmcli` en erreur** (NM mort ⇒ il doit **agir**) et un **drapeau BLE périmé** (⇒ agir
-aussi), l'incrément du compteur, et un compteur **vide** qui vaut zéro sans faire échouer.
+aussi), l'incrément du compteur, et un compteur **vide** qui vaut zéro sans faire échouer. Et deux
+cas que le keyfile a imposés : le fichier sous son **nom temporaire réel**, et un **leurre** — un
+keyfile nommé `ben-provisioned*` mais portant un autre `id=` — qui ne doit **pas** compter.
 ⚖️ Le contre-témoin est la moitié du banc : un watchdog qui ne redémarrerait **jamais** passerait
 tous les cas de refus.
 
-**35 cas** pour `health`. **14 mutations rouges** au total. ⚠️ Dont une restée **verte**, qui a fait
+**35 cas** pour `health`. **16 mutations rouges** au total. ⚠️ Dont une restée **verte**, qui a fait
 ajouter le témoin du **branchement** de la sonde dans `snapshot()` : une sonde livrée mais jamais
 appelée est une mesure qu'on croit avoir.
 
