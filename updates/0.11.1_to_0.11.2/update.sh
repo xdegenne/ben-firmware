@@ -31,6 +31,15 @@
 #     même doctrine que la déclaration de version de pi-0.10.0 : une condition se re-vérifie, un
 #     geste s'oublie. Et elle vaut pour les boîtiers neufs comme pour les 8 existants.
 #
+#   🚨 ET LA GARDE ① NE DÉPEND PAS DE NETWORKMANAGER VIVANT. Une première version l'interrogeait
+#      par `nmcli` seul : si NM est `failed`, `nmcli` ne rend qu'une erreur, la garde concluait
+#      « pas déballé » et sortait en 0 À CHAQUE TICK — soit exactement la coupure que ce script
+#      existe pour éviter, au pire moment. Elle lit donc d'abord le FICHIER de connexion (état
+#      persistant), et traite une erreur `nmcli` comme « NM est en panne, donc on agit ».
+#   🚨 ET LE DRAPEAU BLE A UNE PÉREMPTION (900 s, comme `SESSION_MAX_SEC`). Le provisioner n'a pas
+#      de gestionnaire SIGTERM : le drapeau survit à son arrêt, et sans péremption il bloquait le
+#      watchdog JUSQU'AU REDÉMARRAGE.
+#
 # ═══ ET IL COMPTE, CE QUI EST AUSSI IMPORTANT QUE DE RATTRAPER ════════════════════════════════
 #
 #   Un filet qui rattrape en silence rend un boîtier malade INDISCERNABLE d'un boîtier sain :
@@ -72,7 +81,11 @@ for f in "$WD" "$SRC/wifi-watchdog/test_wifi_watchdog.sh" "$SRC/publisher/health
          "$SRC/publisher/test_health.py"; do
     [ -f "$f" ] || fail "absent du dépôt : $f (checkout pi-0.11.2 incomplet ?)"
 done
-bash -n "$WD" || fail "le watchdog livré ne passe pas `bash -n`"
+# 🚨 GUILLEMETS SIMPLES DANS LE MESSAGE. En doubles, les backticks de « bash -n » sont une
+#    SUBSTITUTION DE COMMANDE : bash exécuterait `bash -n` sans argument sur la branche d'échec,
+#    qui lit alors stdin et peut BLOQUER l'update. Vérifié.
+bash -n "$WD" || fail 'le watchdog livré ne passe pas la vérification de syntaxe bash'
+
 # ⚠️ `ast.parse`, JAMAIS `py_compile` : celui-ci écrit dans __pycache__, qui appartient à root sur
 #    les boîtiers du parc alors que l'OTA tourne en `ben`.
 python3 - "$SRC/publisher/health.py" <<'PYEOF' || fail "health.py ne compile pas"
@@ -84,15 +97,16 @@ log "préflight ① OK (4 fichiers présents, syntaxe bash et python vérifiées
 # ═══ PRÉFLIGHT ② — LES DEUX BANCS LIVRÉS, SUR LA CIBLE ════════════════════════════════════════
 #
 #   Celui du watchdog monte de faux `nmcli`/`ping`/`systemctl` dans un PATH temporaire : il tourne
-#   donc sans NetworkManager, et il éprouve les QUATRE combinaisons de ses deux gardes plus le
-#   compteur. ⚖️ Son contre-témoin est la moitié du banc — un watchdog qui ne redémarrerait JAMAIS
-#   passerait les trois cas de refus.
+#   donc sans NetworkManager, et il éprouve les DEUX gardes dans tous leurs états — dont les deux
+#   qui ont été trouvés en revue : `nmcli` EN ERREUR (NM mort ⇒ il doit AGIR) et un drapeau BLE
+#   PÉRIMÉ (⇒ il doit agir aussi). ⚖️ Son contre-témoin est la moitié du banc — un watchdog qui ne
+#   redémarrerait JAMAIS passerait tous les cas de refus.
 # ⚠️ `TMPDIR=/var/tmp` et pas /tmp : /tmp peut être un tmpfs étroit sur un Pi Zero.
 TMPDIR=/var/tmp bash "$SRC/wifi-watchdog/test_wifi_watchdog.sh" \
     || fail "le banc du watchdog échoue — NE PAS déployer en l'état"
 TMPDIR=/var/tmp python3 "$SRC/publisher/test_health.py" \
     || fail "le banc de health échoue — NE PAS déployer en l'état"
-log "préflight ② OK (banc watchdog : 7 cas · banc health : 35 cas, sur le Python du boîtier)"
+log "préflight ② OK (banc watchdog : 11 cas · banc health : 35 cas, sur le Python du boîtier)"
 
 # ═══ PRÉFLIGHT ③ — 🚨 LE CORRECTIF EST BRANCHÉ, PROUVÉ SUR L'ARBRE ════════════════════════════
 #

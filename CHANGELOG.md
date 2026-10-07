@@ -59,9 +59,22 @@ NetworkManager pendant que le téléphone écrit les identifiants toucherait à 
 WiFi/BLE sur Pi Zero W — ce qui a déjà coûté un décrochage en déballage Android.
 
 ```bash
-nmcli … | grep -qx ben-provisioned || exit 0      # pas déballé ⇒ on ne touche à rien
-[ -f /run/ben/ble-central-connected ] && exit 0   # session BLE ⇒ on ne touche pas à la radio
+# ① déballé ? le FICHIER d'abord — lisible même si NetworkManager est mort
+ls "$CONN_DIR"/ben-provisioned* || { nmcli … || « NM en panne ⇒ on agit » }
+# ② session BLE ? avec sa PÉREMPTION de 900 s
+[ -f "$BLE_FLAG" ] && [ "$AGE" -lt 900 ] && exit 0
 ```
+
+🚨 **La garde ① ne dépend pas de NetworkManager vivant**, et c'est un défaut trouvé en revue qui
+**annulait tout le watchdog** : interrogée par `nmcli` seul, elle concluait « pas déballé » dès que
+NM était `failed` — donc elle sortait en 0 **à chaque tick**, exactement pendant la coupure qu'elle
+doit couvrir. Elle lit donc d'abord le **fichier** de connexion (état persistant), et traite une
+erreur `nmcli` comme « NM est en panne, donc on agit ».
+
+🚨 **Et le drapeau BLE a une péremption** (900 s, comme `SESSION_MAX_SEC`). Le provisioner n'a **pas
+de gestionnaire SIGTERM** : le drapeau survit à son arrêt — `_watch_window` qui voit revenir le
+réseau, une session qui dépasse 15 min, le `Conflicts=` d'un lecteur — et sans péremption il
+bloquait le watchdog **jusqu'au redémarrage**.
 
 Les deux marqueurs existaient déjà (`check_network._has_been_provisioned`,
 `provisioning_state.ble_session_active`). ⭐ **Dans le script, et non dans un `enable` placé au bon
@@ -107,15 +120,20 @@ sans watchdog, exactement l'oubli qui a produit celui-ci.
 
 #### Le banc, et ce qui a été vu tomber
 
-**7 cas** pour le watchdog, montant de faux `nmcli`/`ping`/`systemctl` dans un `PATH` temporaire —
-il tourne donc sans NetworkManager, sur un Mac comme sur un boîtier. Les **quatre combinaisons** des
-deux gardes, l'incrément du compteur, et un compteur **vide** qui vaut zéro sans faire échouer.
+**11 cas** pour le watchdog, montant de faux `nmcli`/`ping`/`systemctl` dans un `PATH` temporaire —
+il tourne donc sans NetworkManager, sur un Mac comme sur un boîtier. Les deux gardes dans tous leurs
+états, dont **`nmcli` en erreur** (NM mort ⇒ il doit **agir**) et un **drapeau BLE périmé** (⇒ agir
+aussi), l'incrément du compteur, et un compteur **vide** qui vaut zéro sans faire échouer.
 ⚖️ Le contre-témoin est la moitié du banc : un watchdog qui ne redémarrerait **jamais** passerait
-les trois cas de refus.
+tous les cas de refus.
 
-**35 cas** pour `health`, et **9 mutations rouges**. ⚠️ Dont une restée **verte**, qui a fait ajouter
-le témoin du **branchement** de la sonde dans `snapshot()` : une sonde livrée mais jamais appelée
-est une mesure qu'on croit avoir.
+**35 cas** pour `health`. **14 mutations rouges** au total. ⚠️ Dont une restée **verte**, qui a fait
+ajouter le témoin du **branchement** de la sonde dans `snapshot()` : une sonde livrée mais jamais
+appelée est une mesure qu'on croit avoir.
+
+ⓘ Et un piège du script d'update lui-même, trouvé en revue : un message d'erreur contenant des
+**backticks** entre guillemets doubles est une **substitution de commande** — `bash -n` y serait
+lancé sans argument, lirait `stdin` et pourrait **bloquer l'update**. Guillemets simples.
 
 #### Ce que ça ne fait pas
 

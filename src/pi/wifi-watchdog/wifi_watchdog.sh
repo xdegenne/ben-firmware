@@ -28,12 +28,31 @@
 
 # ── GARDE ① : le boîtier est-il déballé ? ─────────────────────────────────────────────────────
 #
-# `ben-provisioned` est le nom de connexion que `check_network._has_been_provisioned()` interroge
-# déjà — on ne réinvente pas le critère, on emploie le même.
+# 🚨 ELLE NE DOIT PAS DÉPENDRE DE NETWORKMANAGER VIVANT, et c'est le défaut qui annulait tout le
+#    watchdog. Une première version demandait seulement `nmcli connection show | grep
+#    ben-provisioned`. Or si NetworkManager est `failed` — limite de redémarrages systemd
+#    atteinte, ou son propre restart en échec — `nmcli` ne rend qu'une erreur : la garde concluait
+#    « pas déballé » et sortait en 0, à CHAQUE tick. Soit exactement la coupure de 8 h 40 que ce
+#    script existe pour éviter, et au pire moment possible.
+#
+# ⇒ D'OÙ L'ORDRE DES TROIS QUESTIONS :
+#    ① le FICHIER de connexion existe-t-il ? C'est de l'état PERSISTANT, lisible même NM mort ;
+#    ② sinon, `nmcli` répond-il ? S'il échoue, NM est en panne — donc c'est précisément le moment
+#      d'agir, et on continue ;
+#    ③ sinon seulement, `nmcli` répond et ne cite pas la connexion ⇒ boîtier neuf, on s'abstient.
+#
+# ⓘ Le glob `ben-provisioned*` couvre les deux formes de keyfile : `.nmconnection` (NM ≥ 1.20,
+#   donc le parc) et le nom nu des versions antérieures.
 # ⓘ Sortie 0 et non 1 : ne pas être déballé n'est pas une panne, et un `wifi-watchdog.service` en
-#   échec toutes les 2 minutes polluerait le journal du boîtier neuf.
-if ! nmcli -t -f NAME connection show 2>/dev/null | grep -qx ben-provisioned; then
-    exit 0
+#   échec toutes les 2 minutes polluerait le journal d'un boîtier neuf.
+CONN_DIR="${BEN_NM_CONN_DIR:-/etc/NetworkManager/system-connections}"
+if ! ls "$CONN_DIR"/ben-provisioned* >/dev/null 2>&1; then
+    if NOMS="$(nmcli -t -f NAME connection show 2>/dev/null)"; then
+        # `nmcli` a répondu : son verdict est fiable.
+        printf '%s\n' "$NOMS" | grep -qx ben-provisioned || exit 0
+    else
+        logger -t wifi_watchdog "nmcli ne répond pas — NetworkManager est en panne, on agit"
+    fi
 fi
 
 # ── GARDE ② : une session BLE est-elle en cours ? ─────────────────────────────────────────────
@@ -44,9 +63,26 @@ fi
 # ⓘ Surchargeable pour que la garde soit ÉPROUVABLE — un banc ne peut pas écrire dans /run/ben.
 #   Même forme que les `BEN_*` du publisher : un défaut qui est la valeur de production.
 BLE_FLAG="${BEN_BLE_FLAG:-/run/ben/ble-central-connected}"
+#
+# 🚨 ET LA PÉREMPTION N'EST PAS DÉCORATIVE : `provisioning_state.ble_session_active()` applique une
+#    limite de 15 min (`SESSION_MAX_SEC`), et ce script l'ignorait — il ne testait que l'EXISTENCE
+#    du fichier. Or le provisioner n'a PAS de gestionnaire SIGTERM, donc le drapeau survit dès
+#    qu'on l'arrête pendant qu'un téléphone est connecté. Trois chemins y mènent, tous réels :
+#    `_watch_window` qui voit revenir le réseau et arrête le provisioner, une session qui dépasse
+#    15 min, et le `Conflicts=` d'un lecteur qui l'arrête. ⇒ Un drapeau oublié bloquait alors le
+#    watchdog JUSQU'AU REDÉMARRAGE — c'est-à-dire exactement le cas qu'il doit couvrir.
+#
+# ⓘ `date -r <fichier>` donne la date de modification, et la forme est portable GNU/BSD — donc le
+#   banc tourne sur un Mac comme sur le boîtier.
+BLE_MAX_S="${BEN_BLE_MAX_S:-900}"      # = SESSION_MAX_SEC de provisioning_state.py
 if [ -f "$BLE_FLAG" ]; then
-    logger -t wifi_watchdog "session BLE en cours — on ne touche pas à la radio"
-    exit 0
+    POSE="$(date -r "$BLE_FLAG" +%s 2>/dev/null || echo 0)"
+    AGE=$(( $(date +%s) - POSE ))
+    if [ "$POSE" -gt 0 ] && [ "$AGE" -lt "$BLE_MAX_S" ]; then
+        logger -t wifi_watchdog "session BLE en cours (${AGE}s) — on ne touche pas à la radio"
+        exit 0
+    fi
+    logger -t wifi_watchdog "drapeau BLE périmé (${AGE}s > ${BLE_MAX_S}s) — ignoré"
 fi
 
 # ── LE TEST, ET CE QU'IL NE COUVRE PAS ───────────────────────────────────────────────────────
