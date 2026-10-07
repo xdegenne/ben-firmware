@@ -88,6 +88,40 @@ moment** : le « quand » devient une **propriété** relue à chaque tour — m
 déclaration de version de `0.10.0`, *une condition se re-vérifie, un geste s'oublie* — et ça vaut
 pour les boîtiers neufs **comme** pour les 8 existants.
 
+#### 🚨 Une troisième garde : le drapeau ne voyait pas la fenêtre la plus exposée
+
+Le drapeau BLE ne dit qu'une chose — **un téléphone est CONNECTÉ**. Or il existe une fenêtre plus
+longue, et plus exposée, où personne n'est connecté et où la radio est prise quand même :
+
+> Coupure de courant, le boîtier revient **avant** la box. Il est **déjà déballé**, donc la garde ①
+> le laisse passer. `ben-network-check` démarre `ben-network-recovery`, qui **offre** le BLE pendant
+> **300 s** et se contente de **pinguer** pendant ce temps — exprès, pour ne pas toucher à la radio
+> partagée. Le watchdog, lui, part 60 s après le boot puis toutes les 2 min : **aucun téléphone
+> connecté donc aucun drapeau**, et il relancerait NetworkManager deux ou trois fois dans cette
+> fenêtre, avec un scan WiFi complet à chaque fois. Soit **le décrochage de déballage que ce script
+> prétend éviter**.
+
+Second chemin, lui aussi réel : un **re-provisioning avec un mauvais mot de passe**. Le provisioner
+sort (`os._exit(1)` + `Restart=on-failure`) et son `main()` **efface le drapeau à chaque
+démarrage** — entre deux reconnexions BLE, il n'y a donc pas de drapeau.
+
+⭐ **Une unité active est un meilleur témoin qu'un drapeau** : c'est un état que systemd tient, pas
+un fichier qu'un processus doit penser à poser **et** à retirer. Troisième application de la même
+doctrine. ⇒ Le watchdog s'abstient dès que `ben-ble-provisioner` ou `ben-network-recovery` est
+`active`, `activating` ou `deactivating`.
+
+ⓘ **C'est borné**, donc ça n'annule pas le filet : `network_recovery` sort au bout de sa fenêtre, et
+sur un boîtier déjà déballé le provisioner n'est lancé que par lui.
+
+#### ⚠️ Et l'unité portait une clé qui n'existe pas
+
+`AccuracyMin=30s` — depuis le premier commit. La clé s'écrit **`AccuracySec`**. systemd l'ignore
+**en silence**, sans une ligne de journal, et applique son défaut de **1 min** : mesuré sur
+ben-0001, `AccuracyUSec=1min`. Un timer de 2 min avec 1 min de battement, là où l'intention écrite
+était 30 s. L'update **pose donc aussi l'unité** et vérifie ce que systemd en a retenu — sinon le
+dépôt dirait une chose et les 8 boîtiers une autre, exactement la classe de défaut qui a produit ce
+chantier.
+
 #### 🚨 Et il compte, ce qui est aussi important que de rattraper
 
 Un filet qui rattrape **en silence** rend un boîtier malade **indiscernable** d'un boîtier sain :
@@ -126,16 +160,23 @@ sans watchdog, exactement l'oubli qui a produit celui-ci.
 
 #### Le banc, et ce qui a été vu tomber
 
-**12 cas** pour le watchdog, montant de faux `nmcli`/`ping`/`systemctl` dans un `PATH` temporaire —
+**15 cas** pour le watchdog, montant de faux `nmcli`/`ping`/`systemctl` dans un `PATH` temporaire —
 il tourne donc sans NetworkManager, sur un Mac comme sur un boîtier. Les deux gardes dans tous leurs
 états, dont **`nmcli` en erreur** (NM mort ⇒ il doit **agir**) et un **drapeau BLE périmé** (⇒ agir
-aussi), l'incrément du compteur, et un compteur **vide** qui vaut zéro sans faire échouer. Et deux
+aussi), l'incrément du compteur, et un compteur **vide** qui vaut zéro sans faire échouer. Deux
 cas que le keyfile a imposés : le fichier sous son **nom temporaire réel**, et un **leurre** — un
-keyfile nommé `ben-provisioned*` mais portant un autre `id=` — qui ne doit **pas** compter.
+keyfile nommé `ben-provisioned*` mais portant un autre `id=` — qui ne doit **pas** compter. Et trois
+pour la garde ③ : la fenêtre de `network_recovery` **sans téléphone**, le re-provisioning **entre
+deux reconnexions**, et une unité en `activating` qui compte déjà comme prise.
+
+🚨 **Un faux plus permissif que la réalité valide le défaut.** Le faux `systemctl` sortait en 0 pour
+n'importe quel état : une mutation qui testait le **code** de `is-active --quiet` au lieu du **mot**
+restait donc **verte**. Le vrai sort en 0 pour `active` **seulement** — `activating` sort en 3. Faux
+corrigé, mutation rouge.
 ⚖️ Le contre-témoin est la moitié du banc : un watchdog qui ne redémarrerait **jamais** passerait
 tous les cas de refus.
 
-**35 cas** pour `health`. **16 mutations rouges** au total. ⚠️ Dont une restée **verte**, qui a fait
+**35 cas** pour `health`. **19 mutations rouges** au total. ⚠️ Dont une restée **verte**, qui a fait
 ajouter le témoin du **branchement** de la sonde dans `snapshot()` : une sonde livrée mais jamais
 appelée est une mesure qu'on croit avoir.
 

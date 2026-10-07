@@ -4,7 +4,10 @@ Description=WiFi watchdog every 2 minutes
 [Timer]
 OnBootSec=60
 OnUnitActiveSec=2min
-AccuracyMin=30s
+# ⚠️ `AccuracySec`, PAS `AccuracyMin` : cette clé-là n'existe pas, systemd l'ignore en silence et
+#    applique son défaut de 1 min — mesuré sur ben-0001 (`AccuracyUSec=1min`), et aucune ligne de
+#    journal ne le signale. Le timer tirait donc avec 1 min de battement sur une cadence de 2 min.
+AccuracySec=30s
 
 [Install]
 WantedBy=timers.target

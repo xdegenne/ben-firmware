@@ -304,10 +304,14 @@ systemctl start  ben-local-api.service || true
 #    par un — et le watchdog n'y était pas. D'où une unité `loaded` sur les 8 boîtiers et un timer
 #    `disabled` sur les 8. Les deux faits avaient l'air de se contredire.
 #
-# ⓘ Le script ne fait RIEN tant que le boîtier n'est pas déballé : ses deux gardes sortent
-#   immédiatement s'il n'y a pas de connexion `ben-provisioned`, ou si une session BLE est en
-#   cours — la radio est partagée WiFi/BLE sur Pi Zero W. Il est donc sans danger de l'activer ici,
-#   avant même le provisioning.
+# ⓘ Le script ne fait RIEN tant que le boîtier n'est pas déballé : sa garde ① sort immédiatement
+#   s'il n'y a pas de connexion `ben-provisioned`. Il est donc sans danger de l'activer ici, avant
+#   même le provisioning.
+# ⚠️ Et ses deux autres gardes couvrent la radio sur un boîtier DÉJÀ déballé — la radio est partagée
+#    WiFi/BLE sur Pi Zero W. ⚠️ Un drapeau « téléphone connecté » n'y suffisait PAS : pendant les
+#    300 s où `ben-network-recovery` ne fait qu'OFFRIR le BLE, personne n'est connecté et il n'y a
+#    donc aucun drapeau. ⇒ la garde ③ s'abstient dès que `ben-ble-provisioner` ou
+#    `ben-network-recovery` est actif.
 install -m 755 "$REPO_PATH/src/pi/wifi-watchdog/wifi_watchdog.sh" /usr/local/bin/wifi_watchdog.sh
 systemctl enable wifi-watchdog.timer
 systemctl start  wifi-watchdog.timer || true

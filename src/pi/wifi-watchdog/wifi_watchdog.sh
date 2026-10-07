@@ -20,7 +20,7 @@
 #    téléphone écrit les identifiants toucherait à la radio — et sur un Pi Zero W **la radio est
 #    partagée** entre WiFi et BLE, ce qui a déjà coûté un décrochage en déballage Android.
 #
-# ⭐ D'OÙ LES DEUX GARDES CI-DESSOUS, ET LE FAIT QU'ELLES SOIENT DANS LE SCRIPT. On pourrait
+# ⭐ D'OÙ LES TROIS GARDES CI-DESSOUS, ET LE FAIT QU'ELLES SOIENT DANS LE SCRIPT. On pourrait
 #    n'activer le timer qu'à la fin du provisioning : ce serait un geste de plus à ne pas oublier,
 #    et les 8 boîtiers déjà déballés n'y passeraient jamais. Ici le « quand » est une PROPRIÉTÉ du
 #    script, relue à chaque tour — même doctrine que la déclaration de version de pi-0.10.0 : une
@@ -63,7 +63,8 @@ fi
 #
 # Le drapeau de `provisioning_state.ble_session_active()`. Il peut y avoir une session BLE sur un
 # boîtier DÉJÀ déballé — reconfiguration du WiFi, remise d'un ticket — donc la garde ① ne suffit
-# pas.
+# pas. ⚠️ Et elle ne couvre que le téléphone CONNECTÉ : la fenêtre où le BLE est seulement OFFERT
+# est l'affaire de la garde ③.
 # ⓘ Surchargeable pour que la garde soit ÉPROUVABLE — un banc ne peut pas écrire dans /run/ben.
 #   Même forme que les `BEN_*` du publisher : un défaut qui est la valeur de production.
 BLE_FLAG="${BEN_BLE_FLAG:-/run/ben/ble-central-connected}"
@@ -88,6 +89,44 @@ if [ -f "$BLE_FLAG" ]; then
     fi
     logger -t wifi_watchdog "drapeau BLE périmé (${AGE}s > ${BLE_MAX_S}s) — ignoré"
 fi
+
+# ── GARDE ③ : un agent de provisioning tient-il la radio ? ────────────────────────────────────
+#
+# 🚨 LE DRAPEAU BLE NE SUFFIT PAS — il ne dit que « un téléphone est CONNECTÉ ». Or il existe une
+#    fenêtre, bien plus longue, où personne n'est connecté et où la radio est prise quand même ;
+#    et c'est la plus exposée des deux.
+#
+#    Le cas est banal : coupure de courant, le boîtier revient AVANT la box. `ben-network-check`
+#    constate l'absence de réseau et démarre `ben-network-recovery`, qui OFFRE le BLE pendant
+#    300 s (`BLE_WINDOW_SEC`) et, pendant ce temps, se contente de PINGUER — exprès, pour ne pas
+#    inquiéter le lien BLE ni lancer de scan WiFi. Le watchdog, lui, part 60 s après le boot puis
+#    toutes les 2 min : sans téléphone connecté il n'y a aucun drapeau, donc il redémarrerait
+#    NetworkManager deux ou trois fois DANS cette fenêtre, avec un scan complet à chaque fois.
+#    Sur la radio partagée du Pi Zero W, c'est le décrochage de déballage que ce script prétend
+#    éviter — et il se produirait sur un boîtier DÉJÀ déballé, donc la garde ① ne le voit pas.
+#
+#    Second chemin, lui aussi réel : un re-provisioning avec un mauvais mot de passe. Le
+#    provisioner sort (`os._exit(1)` + `Restart=on-failure`) et son `main()` EFFACE le drapeau à
+#    chaque démarrage ⇒ entre deux reconnexions BLE, le drapeau n'existe pas.
+#
+# ⭐ L'UNITÉ ACTIVE EST UN MEILLEUR TÉMOIN QUE LE DRAPEAU : c'est un état que systemd tient, pas un
+#    fichier qu'un processus doit penser à poser ET à retirer. Même doctrine que les deux gardes
+#    précédentes — une condition se re-vérifie, un geste s'oublie.
+#
+# ⓘ C'est BORNÉ, donc ça n'annule pas le watchdog : `network_recovery` sort au bout de sa fenêtre
+#   (plus, au pire, l'attente de fin de session, elle-même plafonnée par `SESSION_MAX_SEC`), et sur
+#   un boîtier déjà déballé le provisioner n'est lancé que par lui. Un boîtier jamais déballé, lui,
+#   est déjà sorti à la garde ①.
+# ⓘ `activating` et `deactivating` comptent comme PRIS : une unité qui démarre tient déjà la radio,
+#   et deux minutes d'abstention de plus ne coûtent rien. En revanche si `systemctl` ne répond pas,
+#   on AGIT — même arbitrage que `nmcli` à la garde ①.
+for UNITE in ben-ble-provisioner.service ben-network-recovery.service; do
+    case "$(systemctl is-active "$UNITE" 2>/dev/null)" in
+        active|activating|deactivating|reloading)
+            logger -t wifi_watchdog "$UNITE actif — la radio est à lui, on ne touche à rien"
+            exit 0 ;;
+    esac
+done
 
 # ── LE TEST, ET CE QU'IL NE COUVRE PAS ───────────────────────────────────────────────────────
 #

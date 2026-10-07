@@ -74,11 +74,13 @@ REPO="${REPO_PATH:-/opt/ben/repo}"
 SRC="$REPO/src/pi"
 WD="$SRC/wifi-watchdog/wifi_watchdog.sh"
 CIBLE=/usr/local/bin/wifi_watchdog.sh
+UNITE_SRC="$REPO/config/systemd/wifi-watchdog.timer"
+UNITE_DST=/etc/systemd/system/wifi-watchdog.timer
 API="http://127.0.0.1:8087/health"
 
 # ═══ PRÉFLIGHT ① — les fichiers livrés sont là et se tiennent ═════════════════════════════════
 for f in "$WD" "$SRC/wifi-watchdog/test_wifi_watchdog.sh" "$SRC/publisher/health.py" \
-         "$SRC/publisher/test_health.py"; do
+         "$SRC/publisher/test_health.py" "$UNITE_SRC"; do
     [ -f "$f" ] || fail "absent du dépôt : $f (checkout pi-0.12.0 incomplet ?)"
 done
 # 🚨 GUILLEMETS SIMPLES DANS LE MESSAGE. En doubles, les backticks de « bash -n » sont une
@@ -92,21 +94,22 @@ python3 - "$SRC/publisher/health.py" <<'PYEOF' || fail "health.py ne compile pas
 import ast, pathlib, sys
 p = pathlib.Path(sys.argv[1]); ast.parse(p.read_text(encoding="utf-8"), filename=p.name)
 PYEOF
-log "préflight ① OK (4 fichiers présents, syntaxe bash et python vérifiées)"
+log "préflight ① OK (5 fichiers présents, syntaxe bash et python vérifiées)"
 
 # ═══ PRÉFLIGHT ② — LES DEUX BANCS LIVRÉS, SUR LA CIBLE ════════════════════════════════════════
 #
 #   Celui du watchdog monte de faux `nmcli`/`ping`/`systemctl` dans un PATH temporaire : il tourne
 #   donc sans NetworkManager, et il éprouve les DEUX gardes dans tous leurs états — dont les deux
 #   qui ont été trouvés en revue : `nmcli` EN ERREUR (NM mort ⇒ il doit AGIR) et un drapeau BLE
-#   PÉRIMÉ (⇒ il doit agir aussi). ⚖️ Son contre-témoin est la moitié du banc — un watchdog qui ne
+#   PÉRIMÉ (⇒ il doit agir aussi). Et la garde ③, trouvée à la revue suivante : une unité de
+#   provisioning ACTIVE tient la radio, même quand aucun téléphone n'est connecté. ⚖️ Son contre-témoin est la moitié du banc — un watchdog qui ne
 #   redémarrerait JAMAIS passerait tous les cas de refus.
 # ⚠️ `TMPDIR=/var/tmp` et pas /tmp : /tmp peut être un tmpfs étroit sur un Pi Zero.
 TMPDIR=/var/tmp bash "$SRC/wifi-watchdog/test_wifi_watchdog.sh" \
     || fail "le banc du watchdog échoue — NE PAS déployer en l'état"
 TMPDIR=/var/tmp python3 "$SRC/publisher/test_health.py" \
     || fail "le banc de health échoue — NE PAS déployer en l'état"
-log "préflight ② OK (banc watchdog : 12 cas · banc health : 35 cas, sur le Python du boîtier)"
+log "préflight ② OK (banc watchdog : 15 cas · banc health : 35 cas, sur le Python du boîtier)"
 
 # ═══ PRÉFLIGHT ③ — 🚨 LE CORRECTIF EST BRANCHÉ, PROUVÉ SUR L'ARBRE ════════════════════════════
 #
@@ -155,8 +158,21 @@ sudo install -m 755 "$WD" "$CIBLE" || fail "copie de $CIBLE impossible"
 [ -x "$CIBLE" ] || fail "$CIBLE n'est pas exécutable après la copie"
 log "✓ $CIBLE posé, exécutable"
 
+# 🚨 ET L'UNITÉ ELLE-MÊME EST CORRIGÉE, parce qu'elle portait une clé qui N'EXISTE PAS :
+#    `AccuracyMin=30s`. systemd l'ignore en silence — aucune ligne de journal — et applique son
+#    défaut de 1 min : mesuré sur ben-0001, `AccuracyUSec=1min`. Un timer de 2 min avec 1 min de
+#    battement, là où l'intention écrite était 30 s. ⇒ `AccuracySec`.
+# ⓘ Sans cette copie, le dépôt dirait une chose et les 8 boîtiers une autre — exactement la classe
+#   de défaut qui a produit tout ce chantier (une unité présente, et personne pour la relire).
+sudo install -m 644 "$UNITE_SRC" "$UNITE_DST" || fail "copie de $UNITE_DST impossible"
+sudo systemctl daemon-reload || fail "daemon-reload impossible après la pose de l'unité"
+PRECISION="$(systemctl show wifi-watchdog.timer -p AccuracyUSec --value 2>/dev/null || true)"
+[ "$PRECISION" = "30s" ] || fail "l'unité est posée mais systemd retient AccuracyUSec=$PRECISION, \
+attendu 30s — la clé est de nouveau mal orthographiée"
+log "✓ wifi-watchdog.timer posée et relue (AccuracyUSec=$PRECISION)"
+
 sudo systemctl enable wifi-watchdog.timer >/dev/null 2>&1 || fail "enable du timer impossible"
-sudo systemctl start  wifi-watchdog.timer >/dev/null 2>&1 || warn "start du timer refusé"
+sudo systemctl restart wifi-watchdog.timer >/dev/null 2>&1 || warn "restart du timer refusé"
 ETAT="$(systemctl is-enabled wifi-watchdog.timer 2>/dev/null || true)"
 [ "$ETAT" = "enabled" ] || fail "wifi-watchdog.timer est « $ETAT », attendu « enabled »"
 log "✓ wifi-watchdog.timer : enabled"

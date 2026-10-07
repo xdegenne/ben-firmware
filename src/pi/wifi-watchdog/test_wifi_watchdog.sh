@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Banc du watchdog réseau — les QUATRE combinaisons de ses deux gardes.
+# Banc du watchdog réseau — ses TROIS gardes, dans tous leurs états.
 #
 # 🚨 CE QUI SE JOUE ICI N'EST PAS LE CHEMIN HEUREUX, c'est le déballage. Un watchdog qui redémarre
 #    NetworkManager pendant la fenêtre BLE touche à une radio PARTAGÉE entre WiFi et BLE sur Pi
@@ -18,8 +18,12 @@ ICI="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$ICI/wifi_watchdog.sh"
 KO=0
 
-# cas <nom> <nmcli: oui|non|mort> <fichier conn 0|1> <ble: aucun|frais|perime> <ping 0|1> \
+# cas <nom> <nmcli: oui|non|mort> <fichier conn 0|1|leurre> <radio> <ping 0|1> \
 #     <attendu restart 0|1> <pourquoi>
+#
+# <radio> = QUI TIENT LA RADIO — c'est la même question pour les gardes ② et ③ :
+#   aucun · frais (téléphone connecté) · perime (drapeau abandonné)
+#   provisioner · recovery · recovery_qui_demarre (unité `activating`)
 cas() {
     local nom="$1" nm="$2" fichier="$3" ble="$4" ping_ok="$5" attendu="$6" pourquoi="$7"
     local T; T="$(mktemp -d)"
@@ -46,13 +50,41 @@ cas() {
     fi
     printf '#!/bin/sh\nexit %d\n' "$([ "$ping_ok" = 1 ] && echo 0 || echo 1)" > "$T/bin/ping"
     # ⭐ `systemctl` TRACE au lieu d'agir : c'est la trace qui est l'oracle du banc.
-    printf '#!/bin/sh\necho "$@" >> %s/systemctl.trace\n' "$T" > "$T/bin/systemctl"
+    # ⭐ `systemctl` TRACE au lieu d'agir — SAUF `is-active`, que la garde ③ interroge : le faux
+    #    doit lui répondre. `BEN_TEST_ACTIFS` est lu par le FAUX (il hérite de l'environnement),
+    #    jamais par le script éprouvé : celui-ci ne connaît que la commande `systemctl`.
+    cat > "$T/bin/systemctl" <<'FAUX'
+#!/bin/sh
+# 🚨 CE FAUX DOIT ÊTRE AUSSI SÉVÈRE QUE LE VRAI, et il ne l'était pas : il sortait en 0 pour
+#    N'IMPORTE QUEL état, donc une mutation qui testait le CODE de `is-active --quiet` au lieu du
+#    MOT restait VERTE. Le vrai `systemctl` sort en 0 pour `active` SEULEMENT — `activating` sort
+#    en 3 — et `--quiet` n'affiche RIEN. Un faux plus permissif que la réalité, c'est un banc qui
+#    valide le défaut.
+if [ "$1" = "is-active" ]; then
+    shift
+    q=0; [ "$1" = "--quiet" ] && { q=1; shift; }
+    etat=inactive
+    for u in $BEN_TEST_ACTIFS; do [ "$u" = "$1" ] && etat="$BEN_TEST_ETAT"; done
+    [ "$q" = 1 ] || echo "$etat"
+    [ "$etat" = active ] && exit 0
+    exit 3
+fi
+echo "$@" >> "$BEN_TEST_TRACE"
+FAUX
     printf '#!/bin/sh\necho "$@" >> %s/logger.trace\n' "$T" > "$T/bin/logger"
     printf '#!/bin/sh\nexit 0\n' > "$T/bin/sleep"
     chmod +x "$T/bin/"*
 
-    local flag="$T/pas-de-session-ble"
+    local flag="$T/pas-de-session-ble" actifs="" etat=active
     case "$ble" in
+        # ⭐ GARDE ③ — une UNITÉ active, et non un drapeau. Le drapeau ne dit que « téléphone
+        #    CONNECTÉ » ; pendant les 300 s où `ben-network-recovery` ne fait qu'OFFRIR le BLE,
+        #    personne n'est connecté et il n'y a AUCUN drapeau.
+        provisioner) actifs="ben-ble-provisioner.service" ;;
+        recovery)    actifs="ben-network-recovery.service" ;;
+        # ⚖️ Une unité qui DÉMARRE tient déjà la radio : `is-active` rend `activating`, sur quoi
+        #    `is-active --quiet` sortirait en ERREUR — d'où un test sur le MOT, pas sur le code.
+        recovery_qui_demarre) actifs="ben-network-recovery.service"; etat=activating ;;
         frais)  flag="$T/ble-connected"; : > "$flag" ;;
         # ⭐ Un drapeau de 2 h : le provisioner n'a pas de gestionnaire SIGTERM, donc le fichier
         #    survit à son arrêt. Sans péremption, il bloquait le watchdog JUSQU'AU REDÉMARRAGE.
@@ -62,7 +94,8 @@ cas() {
     esac
 
     PATH="$T/bin:$PATH" BEN_BLE_FLAG="$flag" BEN_NM_RESTARTS="$T/nm-restarts" \
-        BEN_NM_CONN_DIR="$T/conn" bash "$SCRIPT" >/dev/null 2>&1
+        BEN_NM_CONN_DIR="$T/conn" BEN_TEST_ACTIFS="$actifs" BEN_TEST_ETAT="$etat" \
+        BEN_TEST_TRACE="$T/systemctl.trace" bash "$SCRIPT" >/dev/null 2>&1
     local code=$?
 
     local restart=0
@@ -109,6 +142,23 @@ cas "NM_MORT__AGIT_QUAND_MEME"                   mort 0 aucun 0 1 \
 cas "NM_mort_avec_le_fichier__AGIT"              mort 1 aucun 0 1 \
     "le fichier tranche d'abord, et nmcli n'est même pas interrogé"
 
+# ── GARDE ③ : UN AGENT DE PROVISIONING TIENT-IL LA RADIO ? ────────────────────────────────────
+#
+# 🚨 LE CAS QUE LE DRAPEAU NE VOYAIT PAS, et c'est le plus exposé des deux : coupure de courant, le
+#    boîtier revient AVANT la box. Il est DÉJÀ déballé (la garde ① le laisse donc passer), personne
+#    n'est connecté en BLE (donc aucun drapeau), et `ben-network-recovery` offre pourtant le BLE
+#    pendant 300 s en se contentant de PINGUER — exprès, pour ne pas toucher à la radio partagée.
+#    Le watchdog part 60 s après le boot puis toutes les 2 min : il tirerait DEUX OU TROIS FOIS
+#    dans cette fenêtre, chaque fois avec un scan WiFi complet.
+cas "fenetre_RECOVERY_sans_telephone__ne_touche_pas_radio" oui 1 recovery 0 0 \
+    "network_recovery offre le BLE 300 s sans qu'aucun téléphone soit connecté : pas de drapeau,
+     et la radio est prise quand même"
+cas "RE-provisioning_entre_deux_reconnexions__s_abstient"  oui 1 provisioner 0 0 \
+    "le provisioner EFFACE le drapeau à chaque démarrage (os._exit(1) + Restart=on-failure) :
+     l'unité active est le seul témoin qui tienne dans cet intervalle"
+cas "unite_qui_DEMARRE_compte_comme_prise"                 oui 1 recovery_qui_demarre 0 0 \
+    "is-active rend « activating » : une unité qui démarre tient déjà la radio"
+
 # ── GARDE ② : LA SESSION BLE, ET SA PÉREMPTION ────────────────────────────────────────────────
 cas "session_BLE_FRAICHE__ne_touche_pas_radio"   oui 1 frais 0 0 \
     "la radio est PARTAGÉE WiFi/BLE sur Pi Zero W — redémarrer NM casserait le déballage"
@@ -126,7 +176,7 @@ cas "deballe_avec_reseau__ne_redemarre_PAS"      oui 1 aucun 1 0 \
 T="$(mktemp -d)"; mkdir -p "$T/bin"
 printf '#!/bin/sh\necho ben-provisioned\n' > "$T/bin/nmcli"
 printf '#!/bin/sh\nexit 1\n'               > "$T/bin/ping"
-printf '#!/bin/sh\nexit 0\n'               > "$T/bin/systemctl"
+printf '#!/bin/sh\n[ "$1" = is-active ] && { echo inactive; exit 3; }\nexit 0\n' > "$T/bin/systemctl"
 printf '#!/bin/sh\nexit 0\n'               > "$T/bin/logger"
 printf '#!/bin/sh\nexit 0\n'               > "$T/bin/sleep"
 chmod +x "$T/bin/"*
@@ -148,7 +198,8 @@ rm -rf "$T"
 T="$(mktemp -d)"; mkdir -p "$T/bin"
 printf '#!/bin/sh\necho ben-provisioned\n' > "$T/bin/nmcli"
 printf '#!/bin/sh\nexit 1\n' > "$T/bin/ping"
-for f in systemctl logger sleep; do printf '#!/bin/sh\nexit 0\n' > "$T/bin/$f"; done
+for f in logger sleep; do printf '#!/bin/sh\nexit 0\n' > "$T/bin/$f"; done
+printf '#!/bin/sh\n[ "$1" = is-active ] && { echo inactive; exit 3; }\nexit 0\n' > "$T/bin/systemctl"
 chmod +x "$T/bin/"*
 : > "$T/nm-restarts"               # fichier VIDE, comme après une coupure
 mkdir -p "$T/conn"; printf '[connection]\nid=ben-provisioned\n' > "$T/conn/c.nmconnection"
@@ -164,5 +215,5 @@ fi
 rm -rf "$T"
 
 echo
-if [ "$KO" = 0 ]; then echo "12/12"; else echo "$((12-KO))/12"; fi
+if [ "$KO" = 0 ]; then echo "15/15"; else echo "$((15-KO))/15"; fi
 exit $([ "$KO" = 0 ] && echo 0 || echo 1)
