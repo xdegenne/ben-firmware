@@ -78,6 +78,20 @@ UNITE_SRC="$REPO/config/systemd/wifi-watchdog.timer"
 UNITE_DST=/etc/systemd/system/wifi-watchdog.timer
 API="http://127.0.0.1:8087/health"
 
+# ═══ PRÉFLIGHT ⓞ — LE DROIT D'ÉCRIRE HORS DU DÉPÔT ═══════════════════════════════════════════
+#
+# 🚨 L'AGENT TOURNE EN `ben` (`User=ben` dans `ben-update.service`), et cette update est la
+#    première à écrire dans /usr/local/bin ET dans /etc/systemd/system. `install.sh` pose bien
+#    `ben ALL=(ALL) NOPASSWD: ALL` dans /etc/sudoers.d/ben-firmware depuis le commit de bootstrap,
+#    donc les 8 boîtiers l'ont par construction — vérifié sur ben-0001 (fichier daté du 31/05).
+# ⚠️ Mais s'il manquait, le premier `sudo install` échouerait SANS mot de passe possible, et on
+#    aurait une update qui retombe à chaque tick sur un message illisible. On le dit tout de suite,
+#    et au bon endroit : avant d'avoir touché à quoi que ce soit.
+sudo -n true 2>/dev/null \
+    || fail "l'agent (ben) n'a pas de sudo sans mot de passe — /etc/sudoers.d/ben-firmware manque \
+ou est illisible. Cette update doit écrire dans /usr/local/bin et /etc/systemd/system."
+log "préflight ⓞ OK (sudo sans mot de passe disponible pour $(id -un))"
+
 # ═══ PRÉFLIGHT ① — les fichiers livrés sont là et se tiennent ═════════════════════════════════
 for f in "$WD" "$SRC/wifi-watchdog/test_wifi_watchdog.sh" "$SRC/publisher/health.py" \
          "$SRC/publisher/test_health.py" "$UNITE_SRC"; do

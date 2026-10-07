@@ -224,6 +224,13 @@ tous les cas de refus.
 ajouter le témoin du **branchement** de la sonde dans `snapshot()` : une sonde livrée mais jamais
 appelée est une mesure qu'on croit avoir.
 
+ⓘ **Et l'update a été rejouée en tant que `ben`, pas en `root`** — c'est ainsi que l'agent la
+lance (`User=ben`), et c'est la première update qui écrit hors du dépôt : `/usr/local/bin` et
+`/etc/systemd/system`. `install.sh` pose `ben ALL=(ALL) NOPASSWD: ALL` depuis le commit de
+bootstrap, donc les 8 boîtiers l'ont par construction (fichier daté du 31/05 sur ben-0001), mais un
+**préflight ⓞ** le dit maintenant tout de suite, avant d'avoir touché à quoi que ce soit : sans lui,
+un sudoers manquant donnerait une update qui retombe à chaque tick sur un message illisible.
+
 ⓘ Et un piège du script d'update lui-même, trouvé en revue : un message d'erreur contenant des
 **backticks** entre guillemets doubles est une **substitution de commande** — `bash -n` y serait
 lancé sans argument, lirait `stdin` et pourrait **bloquer l'update**. Guillemets simples.
