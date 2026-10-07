@@ -46,6 +46,7 @@ perdue par le lecteur contre `ben-radio` a coûté 2 538 plantages en neuf heure
 """
 import json
 import os
+import pathlib
 import sqlite3
 import subprocess
 import time
@@ -66,8 +67,28 @@ import time
 UNITS = ("ben-radio", "ben-telemetry", "ben-tic-reader", "ben-publisher",
          "ben-local-api", "ben-certd", "wifi-watchdog")
 
+# 🚨 LES TIMERS, QUE CET INSTANTANÉ NE REGARDAIT PAS DU TOUT — relevé le 2026-10-07 :
+#    `units()` suffixait chaque nom par `.service`, donc AUCUN timer n'arrivait au cloud. Trois
+#    conséquences, et la deuxième est la plus grave :
+#
+#      · on ne pouvait pas voir si `wifi-watchdog.timer` était activé — et il est `disabled` sur
+#        les 8 boîtiers, ce qui a laissé un filet absent passer pour présent quinze versions ;
+#      · 🚨 on ne pouvait pas voir si `ben-update.timer` était activé, c'est-à-dire SI UN BOÎTIER
+#        PREND ENCORE SES OTA. Un boîtier dont ce timer serait désactivé serait invisible, et
+#        l'OTA est le seul canal de réparation à distance ;
+#      · un `.service` piloté par timer est `inactive/dead` ENTRE DEUX EXÉCUTIONS, par
+#        construction — son état n'apprend donc rien, c'est l'état du TIMER qui porte
+#        l'information. Le commentaire de `UNITS` le dit déjà pour les oneshots ; il manquait d'en
+#        tirer la conséquence.
+#
+# ⇒ Ce qu'on relève est `UnitFileState` (`enabled` / `disabled` / `masked`), qui est la question
+#   posée, et non `ActiveState` qui ne veut rien dire ici.
+TIMERS = ("ben-update.timer", "wifi-watchdog.timer", "ben-level-profiler.timer")
+
 VAR = "/var/lib/ben-firmware"
 DB_PATH = f"{VAR}/measurements.db"
+# Écrit par `wifi_watchdog.sh`, à chaque redémarrage de NetworkManager qu'il déclenche.
+NM_RESTARTS = f"{VAR}/nm-restarts"
 
 # ⚠️ Un délai PAR SONDE, et pas seulement un budget global : le coût de `journalctl` VARIE
 #    beaucoup — 1 151 ms au premier appel (journal froid), 117 ms ensuite. Sans garde
@@ -554,7 +575,8 @@ def units() -> list | None:
     raw = _sh("systemctl", "show", "--timestamp=unix", "--no-pager",
               "--property=Id,LoadState,ActiveState,SubState,NRestarts,"
               "ExecMainStartTimestamp",
-              *[u + ".service" for u in UNITS])
+              "--property=UnitFileState",
+              *[u + ".service" for u in UNITS], *TIMERS)
     if not raw:
         return None
     blocks, cur = [], {}
@@ -571,9 +593,21 @@ def units() -> list | None:
 
     out = []
     for b in blocks:
-        name = b.get("Id", "").removesuffix(".service")
-        if not name:
+        ident = b.get("Id", "")
+        if not ident:
             continue
+        # ⭐ UN TIMER NE SE LIT PAS COMME UN SERVICE : ce qui compte est `UnitFileState`, pas
+        #    `ActiveState`. Un timer `enabled` mais momentanément `inactive` est sain ; un timer
+        #    `disabled` est un filet débranché, même s'il paraît « active » nulle part.
+        if ident.endswith(".timer"):
+            etat = b.get("UnitFileState")
+            entry = {"n": ident, "f": etat}
+            load = b.get("LoadState")
+            if load and load != "loaded":
+                entry["load"] = load
+            out.append(entry)
+            continue
+        name = ident.removesuffix(".service")
         entry = {"n": name, "a": b.get("ActiveState"), "s": b.get("SubState")}
         # ⭐ `LoadState` seulement quand il n'est PAS « loaded », et c'est volontaire :
         #    `systemctl show` répond pour une unité qui n'existe pas, en la rendant
@@ -782,7 +816,40 @@ def versions(dev: dict) -> dict | None:
 # ── L'assemblage ─────────────────────────────────────────────────────────────
 
 # Les sondes versées À PLAT dans le résultat : leur contenu est le socle, pas un sous-objet.
-FLAT = ("host", "store")
+# ⭐ `reseau` est À PLAT, et c'est une leçon payée : `units` est un TABLEAU, et interroger
+#    `health->'units'->>'wifi-watchdog'` en SQL rend NULL — on ne peut pas indexer un tableau par
+#    nom. J'en ai conclu à tort que `health` ne rapportait rien, et bâti une priorité entière sur
+#    cette fausse mesure. Un SCALAIRE se range à plat : `health->>'nm_restarts'` répond du premier
+#    coup, et personne n'a à deviner la forme.
+FLAT = ("host", "store", "reseau")
+
+
+def reseau() -> dict | None:
+    """Combien de fois le watchdog a dû relancer NetworkManager.
+
+    🚨 C'EST L'INSTRUMENT QUI EMPÊCHE LE FILET DE MASQUER LA MALADIE. Un boîtier qui perd sa
+       radio toutes les deux heures et qu'on rattrape chaque fois publie normalement : sans ce
+       compteur, il est INDISCERNABLE d'un boîtier sain. Le watchdog remet le réseau debout, il
+       n'explique rien — `ben-docs#17`, point ③.
+
+    ⚠️ ET AUCUN CHAMP SYSTEMD NE LE DONNE. `NRestarts` compte les redémarrages AUTOMATIQUES de
+       systemd (politique `Restart=`), pas un `systemctl restart` lancé par un script. Et
+       `errors()` ne lit que la priorité 3 (`err`), donc la ligne `logger` du watchdog, en
+       `notice`, n'y remonterait pas. D'où un fichier, écrit par le watchdog lui-même.
+
+    ⓘ Fichier ABSENT = jamais rattrapé, et c'est bien zéro : le watchdog ne l'écrit qu'au premier
+      redémarrage. Mais on ne rend rien dans ce cas, pour tenir la règle de cet instantané — un
+      champ absent dit « je n'ai pas pu », pas « ça vaut zéro ». ⇒ C'est l'état du TIMER qui dit
+      si le filet est en place ; ce compteur dit seulement combien de fois il a servi.
+    """
+    try:
+        brut = pathlib.Path(NM_RESTARTS).read_text()
+    except OSError:
+        return None
+    chiffres = "".join(c for c in brut if c.isdigit())
+    if not chiffres:
+        return None
+    return {"nm_restarts": int(chiffres)}
 
 
 def snapshot(conn: sqlite3.Connection | None, dev: dict | None = None,
@@ -818,6 +885,7 @@ def snapshot(conn: sqlite3.Connection | None, dev: dict | None = None,
               ("radio", lambda: radio(conn, pdl_indexes) if conn is not None else None),
               ("repo", repo),
               ("units", units),
+              ("reseau", reseau),
               ("errors", errors),
               # ⚠️ EN DERNIER : la plus lente (~2,9 s), et celle dont l'absence coûte le
               #    moins — les autres champs disent déjà l'essentiel.

@@ -486,6 +486,90 @@ def un_NRestarts_absent_n_invente_pas_de_zero():
 
 
 @cas
+def un_TIMER_se_lit_par_UnitFileState_pas_par_ActiveState():
+    """🚨 UN TIMER NE SE LIT PAS COMME UN SERVICE, et c'est tout l'enjeu : `wifi-watchdog.timer`
+    est `disabled` sur les 8 boîtiers du parc, ce qui a laissé un filet absent passer pour
+    présent quinze versions. Et `ben-update.timer` désactivé voudrait dire qu'un boîtier ne
+    prend PLUS SES OTA — donc qu'il est hors de portée de toute réparation à distance.
+
+    ⚠️ `ActiveState` ne répond pas à la question : un timer sain est souvent `inactive` entre
+       deux déclenchements. C'est `UnitFileState` qui dit si le filet est branché."""
+    vrai = health._sh
+    health._sh = lambda *a: (
+        "Id=ben-publisher.service\nActiveState=active\nSubState=running\n"
+        "UnitFileState=static\n\n"
+        "Id=ben-update.timer\nActiveState=active\nSubState=waiting\n"
+        "UnitFileState=enabled\n\n"
+        "Id=wifi-watchdog.timer\nActiveState=inactive\nSubState=dead\n"
+        "UnitFileState=disabled\n")
+    try:
+        u = health.units()
+    finally:
+        health._sh = vrai
+    par_nom = {e["n"]: e for e in u}
+    # le service garde sa forme : a/s, et PAS de `f`
+    assert par_nom["ben-publisher"] == {"n": "ben-publisher", "a": "active", "s": "running"}, u
+    # les timers portent `f`, et rien d'autre — leur ActiveState est écarté exprès
+    assert par_nom["ben-update.timer"] == {"n": "ben-update.timer", "f": "enabled"}, u
+    assert par_nom["wifi-watchdog.timer"] == {"n": "wifi-watchdog.timer", "f": "disabled"}, u
+    # ⚖️ LE TÉMOIN : un timer `disabled` doit se DISTINGUER d'un timer `enabled`. Sans ça on ne
+    #    saurait pas si le déploiement du watchdog a pris sur les six boîtiers injoignables.
+    assert par_nom["wifi-watchdog.timer"]["f"] != par_nom["ben-update.timer"]["f"]
+
+
+@cas
+def le_compteur_de_redemarrages_de_NetworkManager_remonte():
+    """🚨 L'INSTRUMENT QUI EMPÊCHE LE FILET DE MASQUER LA MALADIE. Un boîtier qui perd sa radio
+    toutes les deux heures et qu'on rattrape chaque fois publie normalement : sans ce compteur il
+    est indiscernable d'un boîtier sain (`ben-docs#17`, point ③).
+
+    ⚠️ Aucun champ systemd ne le donne — `NRestarts` compte les redémarrages AUTOMATIQUES de
+       systemd, pas un `systemctl restart` lancé par un script. D'où un fichier, écrit par le
+       watchdog."""
+    import tempfile
+    d = pathlib.Path(tempfile.mkdtemp())
+    vrai = health.NM_RESTARTS
+    health.NM_RESTARTS = str(d / "nm-restarts")
+    try:
+        # ⚖️ FICHIER ABSENT ⇒ RIEN, et pas zéro : la règle de cet instantané est qu'un champ
+        #    absent dit « je n'ai pas pu », jamais « ça vaut zéro ». C'est l'état du TIMER qui
+        #    dit si le filet est en place.
+        assert health.reseau() is None
+        # ⚖️ Et un fichier VIDE — une coupure pendant l'écriture — ne doit pas rendre 0 non plus.
+        (d / "nm-restarts").write_text("")
+        assert health.reseau() is None
+        (d / "nm-restarts").write_text("12\n")
+        assert health.reseau() == {"nm_restarts": 12}, health.reseau()
+    finally:
+        health.NM_RESTARTS = vrai
+
+
+@cas
+def snapshot_fait_REMONTER_le_compteur_a_plat():
+    """🚨 LE TÉMOIN DU BRANCHEMENT, et il manquait : retirer `("reseau", reseau)` de la liste des
+    sondes laissait tous les autres cas verts. Une sonde livrée mais jamais appelée est une
+    mesure qu'on croit avoir.
+
+    ⭐ Et À PLAT, délibérément : `units` est un TABLEAU, donc
+       `health->'units'->>'wifi-watchdog'` rend NULL en SQL — on ne peut pas indexer un tableau
+       par nom. Cette forme m'a fait conclure à tort que `health` ne rapportait rien. Un scalaire
+       se range à plat : `health->>'nm_restarts'` répond du premier coup."""
+    import tempfile
+    d = pathlib.Path(tempfile.mkdtemp())
+    vrai_nm, vrai_sh = health.NM_RESTARTS, health._sh
+    health.NM_RESTARTS = str(d / "nm-restarts")
+    (d / "nm-restarts").write_text("3\n")
+    health._sh = lambda *a: ""          # aucune sonde externe ne doit être nécessaire
+    try:
+        out = health.snapshot(None, {"model": "Filaire", "softwareVersion": "0.12.0"})
+    finally:
+        health.NM_RESTARTS, health._sh = vrai_nm, vrai_sh
+    assert out.get("nm_restarts") == 3, out
+    # ⚖️ À PLAT, pas imbriqué sous `reseau` — sinon la requête SQL change de forme.
+    assert "reseau" not in out, out
+
+
+@cas
 def un_horodatage_systemd_NON_unix_est_ecarte():
     """⚠️ Sans `--timestamp=unix`, systemd rend « Mon 2026-09-28 17:23:48 CEST » — du texte
     localisé. Le laisser passer mettrait une chaîne illisible là où le serveur attend un

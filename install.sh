@@ -16,7 +16,7 @@ REPO_PATH="/opt/ben/repo"
 # == latest. §8 écrit un device.json CAPABILITIES-based (via caps_for_model) → un device neuf naît
 # directement en capabilities (+ watchdog durci pour un lora). Le parc EXISTANT migre par OTA
 # (0.5.0/0.6.0 → 0.6.1 → 0.7.0). Le chantier ben-ops (workflow opérateur) reste à part.
-INITIAL_TAG="pi-0.11.1"
+INITIAL_TAG="pi-0.12.0"
 # Version écrite dans device.json — DOIT correspondre au tag checkout, sinon
 # l'OTA re-grimpe depuis une version périmée. Dérivée de INITIAL_TAG pour
 # qu'elles ne puissent jamais diverger (ex. pi-0.0.28 → 0.0.28).
@@ -293,6 +293,29 @@ systemctl enable ben-local-api.service
 systemctl start  ben-local-api.service || true
 
 # Profileur du niveau de conso (percentiles PAPP → table level_profile), 1×/jour.
+# 🚨 LE WATCHDOG RÉSEAU — et l'ORDRE DES DEUX GESTES N'EST PAS INDIFFÉRENT.
+#
+#   `cp config/systemd/*` ci-dessus a déjà posé `wifi-watchdog.service` et son timer : l'unité est
+#   donc `loaded`, et son `ExecStart` pointe vers `/usr/local/bin/wifi_watchdog.sh`. Activer le
+#   timer AVANT de copier le script produirait un échec toutes les 2 minutes, indéfiniment.
+#
+# ⚠️ C'EST LA LIGNE QUI MANQUAIT, et elle a coûté 8 h 40 de cécité sur ben-0005 le 2026-10-06
+#    (`ben-docs#17`) : le `cp` ratissait les unités, mais la liste des `enable` est explicite — un
+#    par un — et le watchdog n'y était pas. D'où une unité `loaded` sur les 8 boîtiers et un timer
+#    `disabled` sur les 8. Les deux faits avaient l'air de se contredire.
+#
+# ⓘ Le script ne fait RIEN tant que le boîtier n'est pas déballé : sa garde ① sort immédiatement
+#   s'il n'y a pas de connexion `ben-provisioned`. Il est donc sans danger de l'activer ici, avant
+#   même le provisioning.
+# ⚠️ Et ses deux autres gardes couvrent la radio sur un boîtier DÉJÀ déballé — la radio est partagée
+#    WiFi/BLE sur Pi Zero W. ⚠️ Un drapeau « téléphone connecté » n'y suffisait PAS : pendant les
+#    300 s où `ben-network-recovery` ne fait qu'OFFRIR le BLE, personne n'est connecté et il n'y a
+#    donc aucun drapeau. ⇒ la garde ③ s'abstient dès que `ben-ble-provisioner` ou
+#    `ben-network-recovery` est actif.
+install -m 755 "$REPO_PATH/src/pi/wifi-watchdog/wifi_watchdog.sh" /usr/local/bin/wifi_watchdog.sh
+systemctl enable wifi-watchdog.timer
+systemctl start  wifi-watchdog.timer || true
+
 systemctl enable ben-level-profiler.timer
 systemctl start  ben-level-profiler.timer || true
 

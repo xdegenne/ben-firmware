@@ -2,9 +2,20 @@
 Description=WiFi watchdog every 2 minutes
 
 [Timer]
-OnBootSec=60
+# 🚨 300 s, PAS 60 : MESURÉ sur ben-0001 le 2026-10-07, en monotone depuis le boot —
+#    NetworkManager ne DÉMARRE qu'à 66,2 s et n'est actif qu'à 84,0 s, et `ben-network-check`
+#    tourne de 84,3 s à 104,4 s. À 60 s, le watchdog tirait donc AVANT que NetworkManager existe :
+#    il aurait compté un redémarrage et bousculé le démarrage en cours, à CHAQUE boot, en
+#    polluant le seul compteur sur lequel tout ce chantier repose.
+# ⭐ Et c'est le bon partage : le boot a DÉJÀ son filet (`ben-network-check` → `ben-network-recovery`).
+#    Ce watchdog-ci est celui du boîtier EN MARCHE ; il prend la main là où l'autre a fini.
+#    5 min au lieu d'1 ne coûtent rien à qui existe pour rattraper une cécité de 8 h 40.
+OnBootSec=300
 OnUnitActiveSec=2min
-AccuracyMin=30s
+# ⚠️ `AccuracySec`, PAS `AccuracyMin` : cette clé-là n'existe pas, systemd l'ignore en silence et
+#    applique son défaut de 1 min — mesuré sur ben-0001 (`AccuracyUSec=1min`), et aucune ligne de
+#    journal ne le signale. Le timer tirait donc avec 1 min de battement sur une cadence de 2 min.
+AccuracySec=30s
 
 [Install]
 WantedBy=timers.target

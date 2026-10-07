@@ -10,17 +10,20 @@ les ~10 min**. À chaque tick, **une seule** transition de version est appliqué
 (un device en retard de plusieurs versions rattrape tick par tick) :
 
 1. lit `device.json` (version courante)
-2. `git fetch` origin (tags + main)
-3. lit `compatibility.yaml` depuis `origin/main`, cherche la transition
-   `from == version courante`
-4. **vérifie la signature GPG** du tag cible (`git verify-tag`) — clé publique
+2. **demande au cloud sur quelle branche chercher** : `GET /api/devices/{id}/update` en mTLS
+   → `{"ref": "<branche>"}`. Pas de réponse, ou `{"ref": null}` → **`main`** (repli). Voir la
+   section « Livrer à quelques boîtiers d'abord » ci-dessous
+3. `git fetch` origin (tags + la branche demandée)
+4. lit `compatibility.yaml` depuis **`origin/<ref>`**, cherche la transition
+   `from == version courante`, par **ÉGALITÉ**
+5. **vérifie la signature GPG** du tag cible (`git verify-tag`) — clé publique
    embarquée sur le device
-5. `git checkout <tag>`
-6. **vérifie le SHA256** de l'`update.sh` (`update.sh.sha256` adjacent)
-7. exécute `update.sh`
-8. **seulement si tout réussit** : écrit la nouvelle version dans `device.json`
-9. redémarre **`ben-publisher`** — systématiquement, après **chaque** update, et
-   **sans que `update.sh` ait à le demander** (voir la section suivante)
+6. `git checkout <tag>`
+7. **vérifie le SHA256** de l'`update.sh` (`update.sh.sha256` adjacent)
+8. exécute `update.sh`
+9. **seulement si tout réussit** : écrit la nouvelle version dans `device.json`
+10. redémarre **`ben-publisher`** — systématiquement, après **chaque** update, et
+    **sans que `update.sh` ait à le demander** (voir la section suivante)
 
 Si une étape échoue → `device.json` **non modifié**, le device reste sur sa
 version et re-tente au prochain tick. Donc une release cassée **bloque** la
@@ -36,11 +39,11 @@ oublier un jour.
 
 | opération | qui s'en charge | depuis |
 |---|---|---|
-| redémarrer `ben-publisher` | `check_update.py`, étape 9 ci-dessus | 0.9.15 |
+| redémarrer `ben-publisher` | `check_update.py`, étape 10 ci-dessus | 0.9.15 |
 | faire connaître la version installée au cloud | `ben_publisher.py`, **à chaque battement** | 0.10.0 |
 
 **Le redémarrage du publisher.** Le service exécute le code de `/opt/ben/repo` : après le
-`git checkout` de l'étape 5, le processus vivant tourne encore sur l'**ancien** code. L'agent
+`git checkout` de l'étape 6, le processus vivant tourne encore sur l'**ancien** code. L'agent
 le redémarre donc lui-même, avec cet argument écrit dans son propre code — *« le laisser à la
 charge de chaque `update.sh` reviendrait à l'oublier un jour »*.
 
@@ -67,6 +70,129 @@ qui a été fait ce jour-là.
 ouvre en écriture sans rejouer le schéma, l'API locale est en lecture seule — aucun des deux ne
 peut créer une table), les **redémarrages de lecteurs** (eux seuls savent si leur correctif
 l'exige, et un restart coûte des mesures), les **préflights**, et le **contrôle d'effet**.
+
+## 🐤 Livrer à quelques boîtiers d'abord — le canary
+
+Depuis **pi-0.11.0**, chaque boîtier peut lire son plan sur une **autre branche que `main`**.
+C'est une colonne, `devices.ota_ref`, et une route : `GET /api/devices/{id}/update` sous
+`deviceAuth` (le `{id}` doit égaler le CN du certificat). **Débrayable par construction** : pas de
+réponse, un 404, un `{"ref": null}`, une branche absente ⇒ **`main`**. Couper l'API ne coupe pas
+l'OTA.
+
+```sql
+-- mettre un boîtier en canary, et l'en sortir
+UPDATE devices SET ota_ref = 'canary' WHERE device_id = 'ben-0003' AND NOT revoked;
+UPDATE devices SET ota_ref = NULL     WHERE device_id = 'ben-0003';
+SELECT device_id, sw_version, COALESCE(ota_ref,'main') FROM devices WHERE NOT revoked ORDER BY 1;
+```
+
+### Le flux, et il a été éprouvé deux fois (pi-0.11.1 puis pi-0.12.0)
+
+1. le travail sur sa **branche d'issue** : `update.sh` + `.sha256` + CHANGELOG + l'entrée
+   `updates_caps`, **dont le `tag:` porte le numéro FINAL** (`pi-<B>`) — cette branche est
+   exactement ce que `main` recevra, il n'y a rien à y réécrire à la promotion ;
+2. un **tag d'essai signé** sur la tête de cette branche : `pi-<B>-rc1` ;
+3. `canary` = **`main` plus UNE ligne** : la même entrée, mais `tag: "pi-<B>-rc1"` ;
+4. seuls les boîtiers dont `ota_ref` vaut `'canary'` prennent. Les autres lisent `main`, qui ne
+   porte pas encore la transition, et ne voient **rien** ;
+5. si c'est bon : **squash dans `main`**, tag signé **`pi-<B>`**, dans cet ordre ;
+6. 🚨 **et la ligne DISPARAÎT de `canary`** — sinon les boîtiers d'essai restent sur un plan
+   d'essai pour toujours.
+
+### 🚨 Le `to` est le même des deux côtés, seul le `tag` diffère
+
+C'est l'invariant qui fait tenir tout le mécanisme. Un boîtier d'essai monte en `<B>` par le
+`-rc1` ; quand `main` rattrape le parc, **aucune transition ne part de `<B>`** (`from` est comparé
+par **égalité**) donc il ne rejoue rien. Si les `to` divergeaient, il se retrouverait sur une
+version que `main` n'a jamais entendue, et il serait **hors du parc OTA** — le cas de ben-0005,
+resté en `0.9.29`.
+
+ⓘ **Le parc reçoit ce que le canary a éprouvé — mais ça se VÉRIFIE, ça ne se suppose pas.** Sur
+`0.11.1` les deux tags pointaient sur le même arbre (`b3bfeef`), le squash d'une branche sur un
+`main` qui n'a pas bougé produisant le même arbre que la branche. Mais **la branche continue de
+vivre** pendant que le canary tourne : sur `0.12.0`, un commit de documentation l'a fait dépasser
+le tag d'essai. Donc avant de signer `pi-<B>`, comparer ce que le boîtier **consomme** :
+
+```bash
+for c in updates/<A>_to_<B> src/pi config/systemd compatibility.yaml install.sh; do
+    [ "$(git rev-parse pi-<B>-rc1:$c)" = "$(git rev-parse HEAD:$c)" ] \
+        && echo "✓ $c" || echo "✗ $c DIFFÈRE — le canary n'a pas éprouvé ÇA"
+done
+```
+
+⚠️ Un `✗` n'interdit pas de livrer : il dit que **le canary n'a pas éprouvé ce morceau-là**, et
+qu'il faut décider en le sachant. Un `RELEASE.md` qui change ne regarde pas le boîtier ; un
+`src/pi` qui change annule l'essai.
+
+### Pourquoi un `-rc1`, et pas le numéro final tout de suite
+
+Parce qu'**un tag publié ne se réécrit jamais**. Si le canary révèle un défaut, le `-rc1` est brûlé
+et `pi-<B>` reste **libre** pour le parc ; on re-tague `-rc2` et les boîtiers d'essai retentent.
+ⓘ Un canary qui échoue les laisse sur leur **ancienne** version : l'agent ne bumpe `device.json`
+qu'après un `update.sh` sorti à 0.
+
+### ⭐ Le tag n'a pas besoin d'être « dans » `canary`
+
+Le boîtier lit `compatibility.yaml` depuis `origin/<ref>` et `update.sh` depuis **le tag**. Donc
+`canary` reste un **plan de contrôle pur** — une ligne, rien d'autre — le code ne vit qu'à un seul
+endroit, et un tag survit à la suppression de sa branche.
+
+### 🚨 La checklist obligatoire donne TROIS ❌ FAUX sur `canary`
+
+Mesuré le 2026-10-07, en la lançant telle quelle sur la branche :
+
+```
+❌ script absent : updates/0.11.1_to_0.12.0/update.sh   ← volontaire, il vient DU TAG
+❌ INITIAL_TAG=pi-0.11.1 != pi-0.12.0-rc1               ← INITIAL_TAG appartient au flux de main
+❌ CHANGELOG sans entrée [0.12.0]                        ← l'entrée est sur la branche d'issue
+```
+
+Les trois découlent du fait que `canary` est un plan de contrôle pur. ⇒ **La checklist se lance sur
+la branche d'issue** — celle qui deviendra `main` —, **jamais sur `canary`**. Le danger est double,
+et les deux moitiés sont graves : soit on « corrige » `canary` en y recopiant le script, le
+CHANGELOG et `INITIAL_TAG`, ce qui détruit exactement la propriété recherchée ; soit on prend
+l'habitude d'ignorer une checklist qui crie pour rien — et c'est elle qui a sauvé trois releases.
+
+### ⚠️ L'ordre : le tag AVANT le plan
+
+Pousser la ligne de `canary` avant le tag ouvre la même fenêtre que pousser `main` avant le tag :
+tout boîtier d'essai qui tique entre les deux échoue sur `tag not found`. Sans danger
+(`device.json` non bumpé), mais ça se lit comme une panne.
+
+### Observer un boîtier qu'on ne peut pas joindre en SSH
+
+Depuis **pi-0.12.0**, `health` remonte les **timers** (`UnitFileState`, pas `ActiveState` : un
+`.service` piloté par timer est `inactive` entre deux exécutions par construction) et le compteur
+`nm_restarts`, **à plat**. C'est ce qui permet de vérifier qu'une update a pris sur les boîtiers
+hors tailnet :
+
+```sql
+SELECT DISTINCT ON (device_id)
+       device_id, to_char(at,'DD/MM HH24:MI') AS vu, health->'dev'->>'sw' AS sw,
+       (SELECT string_agg(u->>'n' || '=' || (u->>'f'), '  ')
+        FROM jsonb_array_elements(health->'units') u WHERE u->>'n' LIKE '%timer') AS timers,
+       COALESCE(health->'reseau'->>'nm_restarts','-') AS nm
+FROM device_health ORDER BY device_id, at DESC;
+```
+
+🚨 **Pas de fenêtre temporelle dans cette requête, et c'est délibéré.** `device_health` n'est écrit
+**qu'au changement** — mesuré le 2026-10-07 : **2 à 4 lignes par boîtier et par 24 h**. Un
+`WHERE at > now() - interval '20 min'` rend donc **vide**, ce qui se lit comme « l'update n'a pas
+pris ». On lit **la dernière ligne de chaque boîtier**, quel que soit son âge : `DISTINCT ON`.
+
+Ce que ça donne juste après la promotion du canary de `pi-0.12.0` — et c'est le témoin
+lui-même :
+
+```
+ben-0001  07/10 09:43  0.12.0  ben-update.timer=enabled  wifi-watchdog.timer=enabled  …
+ben-0003  07/10 09:46  0.12.0  ben-update.timer=enabled  wifi-watchdog.timer=enabled  …
+ben-0002  06/10 17:11  0.11.1  (rien)        ← tourne encore le health d'avant
+ben-0010  06/10 17:15  0.11.1  (rien)
+```
+
+⚠️ `units` est un **tableau** : `health->'units'->>'<nom>'` rend `NULL` en SQL. Une sonde qui doit
+s'interroger facilement va **à plat**, comme `nm_restarts`. ⓘ Et `nm_restarts` **absent** vaut
+« jamais rattrapé » : le watchdog n'écrit son compteur qu'au premier redémarrage.
 
 ## Checklist de release (version N → N+1)
 
@@ -136,6 +262,10 @@ l'**histoire** — rien de neuf n'y va.
    échoue sur `tag not found`. Sans danger — `device.json` non bumpé, rejeu au tick suivant,
    et c'est arrivé le 2026-10-06 — mais ne pas s'en inquiéter en lisant le journal.
 
+ⓘ **Pour ne livrer qu'à quelques boîtiers d'abord**, cette étape 7 change : tag `pi-<B>-rc1`
+   d'abord, `canary` ensuite, et `main` seulement après validation. Voir « 🐤 Livrer à quelques
+   boîtiers d'abord » ci-dessus.
+
 8. **Les devices se mettent à jour seuls** au prochain tick (~10 min). Rien à
    faire à la main sur un device. Suivre : `journalctl -u ben-update.service -f`.
 
@@ -144,7 +274,8 @@ l'**histoire** — rien de neuf n'y va.
 🚨 **La commande obligatoire est dans `~/work/ben/CLAUDE.md`** (« Publier une release OTA —
 checklist OBLIGATOIRE ») : elle vérifie les sommes de **tous** les `update.sh`, la dernière
 transition de `updates_caps`, l'`INITIAL_TAG` d'`install.sh` et l'entrée de CHANGELOG. **Exiger
-`✅ TOUT OK` avant de proposer un tag.** Un tag publié ne se réécrit jamais : une release ratée
+`✅ TOUT OK` avant de proposer un tag.** ⚠️ **Sur la branche d'issue, jamais sur `canary`** : voir
+« La checklist obligatoire donne trois ❌ faux sur `canary` » ci-dessus. Un tag publié ne se réécrit jamais : une release ratée
 est une version **brûlée**.
 
 Et ce qu'elle ne peut pas vérifier :
