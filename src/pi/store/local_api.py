@@ -327,15 +327,19 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    # ── Accès : ACCEPTÉ, JAMAIS EXIGÉ (0.9.16) ──────────────────────────────
+    # ── Accès : le jeton est EXIGÉ sur :8088, IGNORÉ sur :8087 ──────────────
     #
-    # 🚨 Cette version ne REFUSE rien. Elle se contente de reconnaître un jeton
-    #    quand l'app en présente un. C'est ce qui rend la livraison invisible :
-    #    les apps du parc, qui n'en ont pas, continuent de fonctionner à
-    #    l'identique, et Home Assistant aussi.
+    # ⚠️ CE BLOC DISAIT LE CONTRAIRE jusqu'au 2026-10-07 : « cette version ne
+    #    refuse rien, l'exigence s'arme plus tard sur preuve que plus personne
+    #    n'appelle sans jeton ». C'était la doctrine d'avant le port chiffré, et
+    #    le bloc `_exige_jeton` trente lignes plus bas la contredisait déjà en
+    #    toutes lettres. Deux doctrines dans un même fichier : celle qu'on lit en
+    #    premier est celle qu'on croit.
     #
-    # L'exigence s'arme plus tard, sur PREUVE que plus personne n'appelle sans
-    # jeton — jamais sur une date (cf. chantier, vague 5).
+    # ⇒ Le partage réel, et il est structurel, pas transitoire :
+    #    `:8087` reste en clair et GELÉ — aucune exigence, rien ne casse ;
+    #    `:8088` naît avec l'exigence, donc il n'y a aucune population à migrer.
+    #    Le détail et le pourquoi sont dans `_exige_jeton`, pas ici.
     def _role(self) -> str | None:
         """Le rôle porté par l'en-tête `Authorization: Bearer`, ou None.
 
@@ -1530,10 +1534,18 @@ def _certificat_conforme(chemin: str, device_id: str) -> tuple[bool, str]:
     """Ce certificat est-il acceptable par un TÉLÉPHONE ? Renvoie (ok, raison).
 
     🚨 POURQUOI CE CONTRÔLE EXISTE, ET CE QU'IL ÉVITE.
-       Sans lui, `:8088` s'ouvrait avec n'importe quel certificat. Or quatre
-       boîtiers du parc portent encore le certificat d'origine — « CN seul,
-       zéro extension, 3650 jours ». Ils auraient donc ouvert une écoute que
+       Sans lui, `:8088` s'ouvrait avec n'importe quel certificat — y compris le
+       certificat d'origine, « CN seul, zéro extension, 3650 jours », que
        l'iPhone REFUSE.
+
+    ⚠️ CE PARAGRAPHE DISAIT « quatre boîtiers du parc le portent encore ». C'EST
+       FAUX DEPUIS LA BASCULE PKI : mesuré côté cloud le 2026-10-07, les 8
+       boîtiers portent un certificat de **180 jours** émis entre le 24/09 et le
+       05/10, et passent donc la règle de durée. Le contrôle ne devient pas
+       décoratif pour autant — il reste la seule chose qui empêche d'ouvrir une
+       écoute que le téléphone refusera, et c'est le SAN qui décide désormais.
+       ⓘ Le SAN, lui, ne se lit PAS depuis le cloud : `cert_task.cert` est vidée
+         à la livraison (`state = closed`). Il se vérifie sur un boîtier.
        Et depuis que l'app ne se replie plus en clair sur un échec de poignée
        de main (c'était nécessaire : sinon un tiers pouvait provoquer le
        repli), le boîtier serait devenu INJOIGNABLE. Un firmware qui casse une
@@ -1554,7 +1566,7 @@ def _certificat_conforme(chemin: str, device_id: str) -> tuple[bool, str]:
         # 🚨 NE PAS OUVRIR quand on ne sait pas. Le risque qu'on écarte est
         #    « un certificat que le téléphone refuse » ; l'ignorance n'est pas
         #    une raison de parier. Le pire cas devient le comportement d'avant
-        #    0.9.17 : l'app parle en clair.
+        #    l'existence de `:8088` : l'app parle en clair, sur `:8087`.
         return False, f"certificat illisible ({e})"
 
     try:

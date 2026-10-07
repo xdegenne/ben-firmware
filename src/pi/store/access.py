@@ -7,7 +7,7 @@ Base SÉPARÉE : /var/lib/ben-firmware/access.db
 Parce que DEUX PROCESSUS ÉCRIVENT :
 
     local_api.py      frappe un jeton à /claim, révoque depuis l'app
-    ben_publisher.py  remonte les lignes `sent=0` au hello, les marque `sent=1`
+    ben_publisher.py  remonte la liste ENTIÈRE dans le BATTEMENT (`/ping`)
 
 Avec un JSON c'est une course perdue : le publisher lit, l'API lit, l'API écrit,
 le publisher écrit — et la modification de l'API disparaît, en silence. Une
@@ -45,7 +45,9 @@ circule dans l'app et dans les journaux, et le hacher ruinerait tout diagnostic.
 ═══ LE FLUX EST ENTIÈREMENT MONTANT ══════════════════════════════════════════
 
 `device_access` (cloud) NE REDESCEND JAMAIS. Les lignes `access` d'ici naissent
-LOCALEMENT — unboxing BLE, invitation par QR — et remontent au hello. Le rôle
+LOCALEMENT — unboxing BLE, invitation par QR — et remontent dans le BATTEMENT
+(`/ping`, et non `/hello` : les droits changent en continu, c'est du battement).
+Le rôle
 d'un demandeur à /claim est lu chez `ben-api` À L'INSTANT où la question se pose ;
 il n'y a donc aucune raison de verser la table au boîtier à l'avance.
 
@@ -54,8 +56,12 @@ il n'y a donc aucune raison de verser la table au boîtier à l'avance.
 ═══ CE QUE CE MODULE N'EST PAS ═══════════════════════════════════════════════
 
 Un magasin. Il n'IMPOSE rien : c'est l'API locale qui décide d'exiger un jeton ou
-non. En 0.9.16 elle l'ACCEPTE sans l'exiger — un boîtier du parc doit continuer
-de répondre aux apps qui ne savent pas encore en présenter un.
+non, et elle le fait PAR PORT — exigé sur `:8088`, ignoré sur `:8087`, qui reste
+gelé pour les apps du parc et Home Assistant.
+
+⚠️ Ce paragraphe disait « en 0.9.16 elle l'ACCEPTE sans l'exiger, l'exigence
+s'armera plus tard ». Cette doctrine est abandonnée : un durcissement qui attend
+« la preuve que plus personne n'appelle sans » n'arrive jamais tout seul.
 """
 from __future__ import annotations
 
@@ -94,15 +100,15 @@ CREATE TABLE IF NOT EXISTS access (
     uid        TEXT PRIMARY KEY,
     role       TEXT    NOT NULL,
     updated_ts INTEGER NOT NULL,
-    sent       INTEGER NOT NULL DEFAULT 0,  -- plus lue : le hello pousse tout
+    sent       INTEGER NOT NULL DEFAULT 0,  -- plus lue : le battement pousse tout
     -- ⭐ RÉVOCATION = UN DRAPEAU, PAS UNE SUPPRESSION.
     --    Une ligne supprimée ne se propage pas : le boîtier ne peut plus rien en
     --    dire, et le cloud ne peut pas l'inférer (sa liste est un SUR-ensemble).
-    --    Marquée, elle part au hello comme le reste, et le hello suivant la
-    --    redit si le cloud l'a ratée. Auto-réparateur, sans double appel.
+    --    Marquée, elle part au battement comme le reste, et le battement
+    --    suivant la redit si le cloud l'a ratée. Auto-réparateur, sans double appel.
     revoked_ts INTEGER,
     -- ⭐ 🔒 STRICTEMENT LOCAL AU BOÎTIER. Un prénom pour que l'écran de partage
-    --    dise « Claire » au lieu de « Membre ». Il ne part PAS au hello : le
+    --    dise « Claire » au lieu de « Membre ». Il ne part PAS au battement : le
     --    cloud n'a besoin que de l'uid et du rôle pour décider, et un prénom
     --    est une donnée personnelle qui n'a aucune raison de voyager pour
     --    rendre une liste plus jolie. La personne le donne en entrant son code.
@@ -293,7 +299,7 @@ NOM_LONGUEUR_MAX = 32
 def nommer(conn: sqlite3.Connection, uid: str, nom: str | None,
            *, seulement_si_vide: bool = False) -> bool:
     """Donne (ou retire) le prénom affiché d'une personne. 🔒 NE SORT JAMAIS DU
-    BOÎTIER — ni au hello, ni nulle part ailleurs.
+    BOÎTIER — ni au battement, ni nulle part ailleurs.
 
     ⭐ Écrase ce qui existe, délibérément : le propriétaire doit pouvoir
        corriger « ffff » en « Claire ». Une valeur vide remet à NULL, donc
@@ -456,7 +462,7 @@ def mint(conn: sqlite3.Connection, *, uid: str = "", label: str = "",
 
 
 def grant(conn: sqlite3.Connection, uid: str, role: str) -> None:
-    """Pose le DROIT d'une personne, à remonter au prochain hello (`sent=0`).
+    """Pose le DROIT d'une personne, à remonter au prochain battement.
 
     L'owner est en ÉCRITURE UNIQUE : une fois posé, il ne se remplace pas. Il n'y
     a pas de chemin de secours, et c'est assumé — on ne construit pas une porte de
@@ -500,7 +506,8 @@ def est_revoquee(conn: sqlite3.Connection, uid: str) -> bool:
     """Cette personne a-t-elle été coupée ICI ?
 
     🚨 Le boîtier est L'AUTORITÉ pour ses propres révocations ; le cloud n'en est
-    que le miroir, et un miroir EN RETARD — le hello est quotidien. Sans cette
+    que le miroir, et un miroir EN RETARD — le battement est QUOTIDIEN
+    (`HELLO_EVERY = 86400`, vérifié). Sans cette
     lecture, quelqu'un de révoqué il y a dix minutes revendique, le cloud répond
     encore « member » (il l'ignore), et le boîtier le laisse revenir. Sans
     invitation, et sans que le propriétaire en sache rien.
@@ -673,7 +680,7 @@ def revoke_person(conn: sqlite3.Connection, uid: str) -> int:
     # laisserait des téléphones parfaitement vivants.
     n = conn.execute("DELETE FROM token WHERE uid = ?", (uid,)).rowcount
     # La LIGNE, elle, survit marquée — c'est elle qui portera la nouvelle au
-    # cloud, au prochain hello, et la redira tant qu'il ne l'aura pas prise.
+    # cloud, au prochain battement, et la redira tant qu'il ne l'aura pas prise.
     n += conn.execute(
         "UPDATE access SET revoked_ts = ?, updated_ts = ?, sent = 0 "
         " WHERE uid = ? AND revoked_ts IS NULL",
@@ -748,7 +755,7 @@ def list_access(conn: sqlite3.Connection) -> list[dict]:
 
 # ⭐ `pending()` / `mark_sent()` ONT ÉTÉ SUPPRIMÉES (24/09).
 #
-# Le hello pousse désormais la liste ENTIÈRE des accès, comme il pousse déjà les
+# Le battement pousse désormais la liste ENTIÈRE des accès, comme il pousse déjà les
 # contrats et les libellés. Sur une table de 1 à 5 lignes, une boîte d'envoi
 # n'économise rien et coûte une panne : une ligne marquée `sent = 1` que le
 # cloud aurait perdue n'est jamais renvoyée, et le boîtier se croit à jour.
