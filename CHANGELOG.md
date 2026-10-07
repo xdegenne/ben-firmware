@@ -18,6 +18,115 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.11.2] — 2026-10-07
+
+**Le filet du réseau est enfin posé.** Chantier
+[`ben-docs#17`](https://github.com/xdegenne/ben-docs/issues/17), sous-tâche
+[#46](https://github.com/xdegenne/ben-firmware/issues/46).
+
+ben-0005 a passé **8 h 40 sans réseau** le 06/10 : il mesurait, il ne publiait plus, et l'OTA
+échouait pour la même cause — donc **le seul canal de réparation à distance était fermé en même
+temps que la publication**. Il a fallu aller le redémarrer à la main.
+
+```
+wifi_watchdog.sh    deux GARDES, et le compteur de rattrapages
+install.sh          + install -m 755 du script  + enable du timer   ← la ligne qui manquait
+health.py           + les TIMERS (UnitFileState)  + nm_restarts, à plat
+```
+
+#### ⚠️ Le remède existait déjà et n'était installé nulle part
+
+`wifi_watchdog.sh` est dans le dépôt depuis le **premier commit réel** (`9cce372`, bootstrap du
+30/05) avec son unité et son timer. Mais `install.sh` copie les unités **en bloc**
+(`cp config/systemd/*`) alors que la liste des `enable` est **explicite, un par un** — et le
+watchdog n'y était pas. D'où une unité `loaded` sur les 8 boîtiers et un timer `disabled` sur les
+8 : deux faits qui avaient l'air de se contredire, et qui venaient d'**une ligne manquante**.
+
+ⓘ **L'historique git est net** : aucun commit ne l'a jamais activé, aucun ne l'a jamais désactivé.
+Il est arrivé au *bootstrap* — l'import d'une machine configurée à la main — donc il tournait
+probablement sur **cette** machine, enrôlé par un `systemctl enable` qui ne vivait que dans l'état
+de sa carte SD. Chaque boîtier reflashé depuis est reparti sans, en silence. Même classe de défaut
+que `ben-recognizer` et `ben-remote`, qui tournent sur le banc sans être dans le dépôt.
+
+⭐ **Et il aurait suffi** : la Freebox ne voyait **aucun équipement**, donc le boîtier n'était pas
+associé, donc `ping 1.1.1.1` aurait échoué et le watchdog aurait relancé NetworkManager toutes les
+2 minutes jusqu'à la reprise.
+
+#### 🚨 Deux gardes, et elles sont dans le SCRIPT
+
+Il y a un moment où l'absence de réseau est **voulue** : la fenêtre BLE du déballage. Toucher à
+NetworkManager pendant que le téléphone écrit les identifiants toucherait à une radio **partagée**
+WiFi/BLE sur Pi Zero W — ce qui a déjà coûté un décrochage en déballage Android.
+
+```bash
+nmcli … | grep -qx ben-provisioned || exit 0      # pas déballé ⇒ on ne touche à rien
+[ -f /run/ben/ble-central-connected ] && exit 0   # session BLE ⇒ on ne touche pas à la radio
+```
+
+Les deux marqueurs existaient déjà (`check_network._has_been_provisioned`,
+`provisioning_state.ble_session_active`). ⭐ **Dans le script, et non dans un `enable` placé au bon
+moment** : le « quand » devient une **propriété** relue à chaque tour — même doctrine que la
+déclaration de version de `0.10.0`, *une condition se re-vérifie, un geste s'oublie* — et ça vaut
+pour les boîtiers neufs **comme** pour les 8 existants.
+
+#### 🚨 Et il compte, ce qui est aussi important que de rattraper
+
+Un filet qui rattrape **en silence** rend un boîtier malade **indiscernable** d'un boîtier sain :
+celui qui perd sa radio toutes les deux heures publie normalement. Le watchdog incrémente donc
+`/var/lib/ben-firmware/nm-restarts` — écriture **atomique**, dans `/var/lib` et **pas** `/run` pour
+survivre aux redémarrages, puisqu'un boîtier malade reboote — et `health` le fait monter **à plat**
+(`nm_restarts`).
+
+⚠️ **Aucun champ systemd ne le donnait.** `NRestarts` compte les redémarrages **automatiques** de
+systemd (`Restart=`), pas un `systemctl restart` lancé par un script. Et `health.errors()` ne lit
+que la priorité 3 (`err`), donc la ligne `logger` du watchdog, en `notice`, n'y remonterait pas.
+
+#### ⭐ `health` remonte désormais les TIMERS — il ne le faisait pas du tout
+
+Il suffixait chaque nom par `.service`, donc **aucun timer** n'arrivait au cloud :
+
+- on ne pouvait pas voir si `wifi-watchdog.timer` était activé — et il est `disabled` sur les 8 ;
+- 🚨 on ne pouvait pas voir si **`ben-update.timer`** était activé, c'est-à-dire **si un boîtier
+  prend encore ses OTA**, alors que l'OTA est le seul canal de réparation à distance ;
+- un `.service` piloté par timer est `inactive/dead` entre deux exécutions **par construction** :
+  c'est l'état du **timer** qui porte l'information.
+
+On relève donc `UnitFileState` (`enabled`/`disabled`) et non `ActiveState`. ⇒ C'est ce qui dira si
+cette update a pris sur les **six** boîtiers qu'on ne peut pas joindre en SSH.
+
+ⓘ `nm_restarts` est **à plat**, et c'est une leçon payée : `units` est un **tableau**, donc
+`health->'units'->>'wifi-watchdog'` rend `NULL` en SQL. J'en avais conclu à tort que `health` ne
+rapportait rien — et bâti une priorité entière sur cette fausse mesure.
+
+#### L'ordre de pose n'est pas indifférent
+
+**Le script d'abord, le timer ensuite.** L'unité est déjà installée sur le parc, avec un `ExecStart`
+qui pointerait dans le vide : activer le timer avant produirait un échec toutes les 2 minutes,
+indéfiniment. `install.sh` reçoit les deux mêmes gestes — sinon le prochain déballage repartirait
+sans watchdog, exactement l'oubli qui a produit celui-ci.
+
+#### Le banc, et ce qui a été vu tomber
+
+**7 cas** pour le watchdog, montant de faux `nmcli`/`ping`/`systemctl` dans un `PATH` temporaire —
+il tourne donc sans NetworkManager, sur un Mac comme sur un boîtier. Les **quatre combinaisons** des
+deux gardes, l'incrément du compteur, et un compteur **vide** qui vaut zéro sans faire échouer.
+⚖️ Le contre-témoin est la moitié du banc : un watchdog qui ne redémarrerait **jamais** passerait
+les trois cas de refus.
+
+**35 cas** pour `health`, et **9 mutations rouges**. ⚠️ Dont une restée **verte**, qui a fait ajouter
+le témoin du **branchement** de la sonde dans `snapshot()` : une sonde livrée mais jamais appelée
+est une mesure qu'on croit avoir.
+
+#### Ce que ça ne fait pas
+
+Aucune migration, aucune table, aucun lecteur redémarré — le nouveau `health.py` est lu par
+`ben-publisher`, que l'agent redémarre à l'étape ⑩. Retour arrière vers 0.11.1 : **rien à
+restaurer**, le script et le timer resteraient en place — ils étaient le but.
+
+⚠️ **Et ce que cette version n'explique pas** : *pourquoi* la radio est tombée 181 fois en 4 heures
+alors qu'un boîtier sain n'en fait **aucune** en 43 heures. Le watchdog **masque** le symptôme. ⇒
+`ben-docs#17`, point ③ — ne pas fermer ce chantier sur un symptôme disparu.
+
 ### [0.11.1] — 2026-10-06
 
 **Une release qui ne change rien, exprès.** Chantier
