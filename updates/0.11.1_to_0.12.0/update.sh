@@ -102,14 +102,16 @@ log "préflight ① OK (5 fichiers présents, syntaxe bash et python vérifiées
 #   donc sans NetworkManager, et il éprouve les DEUX gardes dans tous leurs états — dont les deux
 #   qui ont été trouvés en revue : `nmcli` EN ERREUR (NM mort ⇒ il doit AGIR) et un drapeau BLE
 #   PÉRIMÉ (⇒ il doit agir aussi). Et la garde ③, trouvée à la revue suivante : une unité de
-#   provisioning ACTIVE tient la radio, même quand aucun téléphone n'est connecté. ⚖️ Son contre-témoin est la moitié du banc — un watchdog qui ne
+#   provisioning ACTIVE tient la radio, même quand aucun téléphone n'est connecté — y compris
+#   `ben-network-check`, le oneshot du boot. Et le discriminant LIAISON / LIGNE : une panne FAI
+#   avec une passerelle joignable ne doit RIEN redémarrer. ⚖️ Son contre-témoin est la moitié du banc — un watchdog qui ne
 #   redémarrerait JAMAIS passerait tous les cas de refus.
 # ⚠️ `TMPDIR=/var/tmp` et pas /tmp : /tmp peut être un tmpfs étroit sur un Pi Zero.
 TMPDIR=/var/tmp bash "$SRC/wifi-watchdog/test_wifi_watchdog.sh" \
     || fail "le banc du watchdog échoue — NE PAS déployer en l'état"
 TMPDIR=/var/tmp python3 "$SRC/publisher/test_health.py" \
     || fail "le banc de health échoue — NE PAS déployer en l'état"
-log "préflight ② OK (banc watchdog : 15 cas · banc health : 35 cas, sur le Python du boîtier)"
+log "préflight ② OK (banc watchdog : 18 cas · banc health : 35 cas, sur le Python du boîtier)"
 
 # ═══ PRÉFLIGHT ③ — 🚨 LE CORRECTIF EST BRANCHÉ, PROUVÉ SUR L'ARBRE ════════════════════════════
 #
@@ -169,7 +171,15 @@ sudo systemctl daemon-reload || fail "daemon-reload impossible après la pose de
 PRECISION="$(systemctl show wifi-watchdog.timer -p AccuracyUSec --value 2>/dev/null || true)"
 [ "$PRECISION" = "30s" ] || fail "l'unité est posée mais systemd retient AccuracyUSec=$PRECISION, \
 attendu 30s — la clé est de nouveau mal orthographiée"
-log "✓ wifi-watchdog.timer posée et relue (AccuracyUSec=$PRECISION)"
+# 🚨 ET LA CADENCE DE BOOT, pour la même raison : c'est ce que systemd a RETENU qui compte, pas ce
+#    que le fichier dit. MESURÉ sur ben-0001 — NetworkManager ne démarre qu'à 66,2 s et n'est actif
+#    qu'à 84,0 s ⇒ à 60 s le watchdog tirait avant qu'il existe, et comptait un redémarrage à
+#    chaque boot. `TimersMonotonic` porte les deux déclencheurs ; on exige le bon.
+systemctl show wifi-watchdog.timer -p TimersMonotonic --value 2>/dev/null \
+    | grep -q "OnBootUSec=5min" \
+    || fail "systemd ne retient pas OnBootSec=300 — le watchdog tirerait pendant le boot, \
+avant même que NetworkManager soit actif"
+log "✓ wifi-watchdog.timer posée et relue (AccuracyUSec=$PRECISION, OnBootUSec=5min)"
 
 sudo systemctl enable wifi-watchdog.timer >/dev/null 2>&1 || fail "enable du timer impossible"
 sudo systemctl restart wifi-watchdog.timer >/dev/null 2>&1 || warn "restart du timer refusé"

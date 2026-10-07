@@ -120,7 +120,13 @@ fi
 # ⓘ `activating` et `deactivating` comptent comme PRIS : une unité qui démarre tient déjà la radio,
 #   et deux minutes d'abstention de plus ne coûtent rien. En revanche si `systemctl` ne répond pas,
 #   on AGIT — même arbitrage que `nmcli` à la garde ①.
-for UNITE in ben-ble-provisioner.service ben-network-recovery.service; do
+#
+# ⚠️ ET `ben-network-check` EN FAIT PARTIE, c'est le troisième défaut de revue de cette garde. Ce
+#    ONESHOT du boot pinge jusqu'à 30 s (`TOTAL_TIMEOUT_SEC`) puis joue ~5 s d'animation LED, et
+#    c'est LUI qui décide si le boîtier part en collecte ou en récupération. Redémarrer
+#    NetworkManager au milieu de son attente le ferait conclure « hors ligne » et déclencher
+#    `ben-network-recovery` : 300 s de BLE, et AUCUNE collecte — pour une box simplement lente.
+for UNITE in ben-ble-provisioner.service ben-network-recovery.service ben-network-check.service; do
     case "$(systemctl is-active "$UNITE" 2>/dev/null)" in
         active|activating|deactivating|reloading)
             logger -t wifi_watchdog "$UNITE actif — la radio est à lui, on ne touche à rien"
@@ -128,7 +134,7 @@ for UNITE in ben-ble-provisioner.service ben-network-recovery.service; do
     esac
 done
 
-# ── LE TEST, ET CE QU'IL NE COUVRE PAS ───────────────────────────────────────────────────────
+# ── LE TEST : DEUX QUESTIONS, PAS UNE ────────────────────────────────────────────────────────
 #
 # `1.1.1.1` par ADRESSE, donc sans résolution de noms. C'est volontaire et c'est une limite connue :
 # les deux chemins qui comptent passent par un NOM (`api.benpilote.fr` pour publier, `github.com`
@@ -140,7 +146,34 @@ done
 #    par le MagicDNS de Tailscale (100.100.100.100), les autres par leur box, donc un test de
 #    résolution testerait deux choses différentes selon le boîtier. ⇒ `ben-docs#17`.
 if ! ping -c1 -W3 1.1.1.1 &>/dev/null; then
-    logger -t wifi_watchdog "pas de connectivité IP — redémarrage de NetworkManager"
+    # ── 🚨 LA LIAISON, PAS LA LIGNE ───────────────────────────────────────────────────────────
+    #
+    #   Un `ping 1.1.1.1` qui échoue ne dit PAS que la radio est en panne : il dit qu'internet est
+    #   injoignable. Les deux causes sont distinctes et la seconde est fréquente — une coupure de
+    #   ligne chez l'opérateur, box et WiFi parfaitement sains. Redémarrer NetworkManager toutes
+    #   les 2 min pendant une panne FAI serait faux sur trois plans :
+    #
+    #   1. 🚨 ça couperait l'API locale `:8087` à chaque fois — or c'est EXACTEMENT ce qui marche
+    #      encore pour l'app pendant une coupure internet, et donc ce qu'il ne faut pas casser ;
+    #   2. `nm-restarts` grimperait, et le cloud relirait une panne de LIGNE comme une radio
+    #      défaillante — le compteur ne vaut que s'il ne compte que ce qu'il prétend compter ;
+    #   3. ça ne répare rien : la ligne n'est pas de ce côté-ci du mur.
+    #
+    # ⇒ LE DISCRIMINANT EST LA PASSERELLE. Si on l'atteint, la liaison est bonne et le défaut est
+    #   en amont : on se tait. Si on ne l'atteint pas, ou s'il n'y a même pas de route par défaut,
+    #   la liaison est morte et c'est notre affaire.
+    #
+    # ⓘ Et le cas de ben-0005 reste couvert : la Freebox ne voyait AUCUN équipement, donc pas
+    #   d'association, donc pas de bail DHCP, donc pas de route par défaut ⇒ on agit.
+    PASSERELLE="$(ip route show default 2>/dev/null | awk '{print $3; exit}')"
+    if [ -n "$PASSERELLE" ] && ping -c1 -W3 "$PASSERELLE" >/dev/null 2>&1; then
+        logger -t wifi_watchdog "passerelle $PASSERELLE joignable mais pas 1.1.1.1 — la LIGNE est \
+coupée, pas la radio : on ne redémarre rien (l'API locale doit rester debout)"
+        exit 0
+    fi
+
+    logger -t wifi_watchdog "ni 1.1.1.1 ni la passerelle \
+(${PASSERELLE:-aucune route par défaut}) — redémarrage de NetworkManager"
 
     # 🚨 ON COMPTE, ET C'EST AUSSI IMPORTANT QUE LE REDÉMARRAGE LUI-MÊME. Un filet qui rattrape
     #    en silence rend un boîtier malade INDISCERNABLE d'un boîtier sain : celui qui perd sa

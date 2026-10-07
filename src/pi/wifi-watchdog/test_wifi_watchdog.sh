@@ -18,8 +18,14 @@ ICI="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$ICI/wifi_watchdog.sh"
 KO=0
 
-# cas <nom> <nmcli: oui|non|mort> <fichier conn 0|1|leurre> <radio> <ping 0|1> \
+# cas <nom> <nmcli: oui|non|mort> <fichier conn 0|1|leurre> <radio> <reseau> \
 #     <attendu restart 0|1> <pourquoi>
+#
+# <reseau> = CE QUE LES DEUX PINGS TROUVENT, et c'est tout le discriminant liaison/ligne :
+#   ok            1.1.1.1 répond — rien à faire
+#   ligne_coupee  1.1.1.1 muet mais LA PASSERELLE RÉPOND ⇒ panne FAI, ce n'est pas la radio
+#   liaison_morte ni l'un ni l'autre, et il y a une route ⇒ la liaison est à nous
+#   sans_route    1.1.1.1 muet et AUCUNE route par défaut ⇒ pas de bail : c'est ben-0005
 #
 # <radio> = QUI TIENT LA RADIO — c'est la même question pour les gardes ② et ③ :
 #   aucun · frais (téléphone connecté) · perime (drapeau abandonné)
@@ -48,7 +54,23 @@ cas() {
         printf '[connection]\nid=ben-provisioned-autre-chose\n' \
             > "$T/conn/ben-provisioned-autre.nmconnection"
     fi
-    printf '#!/bin/sh\nexit %d\n' "$([ "$ping_ok" = 1 ] && echo 0 || echo 1)" > "$T/bin/ping"
+    # ⭐ LE FAUX `ping` DISTINGUE SA CIBLE — sinon le discriminant passerelle/internet ne peut pas
+    #    être éprouvé du tout : un `ping` qui répond pareil aux deux rend les deux cas
+    #    indiscernables, et le banc approuverait un script qui ne discrimine rien.
+    case "$ping_ok" in
+        ok)            printf '#!/bin/sh\nexit 0\n' > "$T/bin/ping" ;;
+        ligne_coupee)  printf '#!/bin/sh\n[ "$(for a in "$@"; do echo "$a"; done | tail -1)" \
+= 1.1.1.1 ] && exit 1\nexit 0\n' > "$T/bin/ping" ;;
+        *)             printf '#!/bin/sh\nexit 1\n' > "$T/bin/ping"
+printf '#!/bin/sh\necho "default via 192.168.1.1 dev wlan0"\n' > "$T/bin/ip" ;;
+    esac
+    # La route par défaut : présente partout sauf dans `sans_route`.
+    if [ "$ping_ok" = sans_route ]; then
+        printf '#!/bin/sh\nexit 0\n' > "$T/bin/ip"
+    else
+        printf '#!/bin/sh\necho "default via 192.168.1.1 dev wlan0 proto dhcp metric 600"\n' \
+            > "$T/bin/ip"
+    fi
     # ⭐ `systemctl` TRACE au lieu d'agir : c'est la trace qui est l'oracle du banc.
     # ⭐ `systemctl` TRACE au lieu d'agir — SAUF `is-active`, que la garde ③ interroge : le faux
     #    doit lui répondre. `BEN_TEST_ACTIFS` est lu par le FAUX (il hérite de l'environnement),
@@ -82,6 +104,9 @@ FAUX
         #    personne n'est connecté et il n'y a AUCUN drapeau.
         provisioner) actifs="ben-ble-provisioner.service" ;;
         recovery)    actifs="ben-network-recovery.service" ;;
+        # ⚠️ Le ONESHOT du boot : il pinge jusqu'à 30 s puis joue ~5 s de LED, et c'est LUI qui
+        #    décide collecte ou récupération. Le bousculer le fait conclure « hors ligne ».
+        boot_check)  actifs="ben-network-check.service" ;;
         # ⚖️ Une unité qui DÉMARRE tient déjà la radio : `is-active` rend `activating`, sur quoi
         #    `is-active --quiet` sortirait en ERREUR — d'où un test sur le MOT, pas sur le code.
         recovery_qui_demarre) actifs="ben-network-recovery.service"; etat=activating ;;
@@ -124,22 +149,22 @@ FAUX
 }
 
 # ── GARDE ① : LE BOÎTIER EST-IL DÉBALLÉ ? ─────────────────────────────────────────────────────
-cas "neuf__ne_touche_a_rien"                     non 0 aucun 0 0 \
+cas "neuf__ne_touche_a_rien"                     non 0 aucun liaison_morte 0 \
     "un boîtier neuf n'a PAS de réseau par construction : agir le ferait boucler"
-cas "neuf__meme_si_le_ping_passe"                non 0 aucun 1 0 \
+cas "neuf__meme_si_le_ping_passe"                non 0 aucun ok 0 \
     "la garde ① ne dépend pas du ping : on sort AVANT de tester"
-cas "deballe_par_le_FICHIER_sous_son_nom_TEMPORAIRE" non 1 aucun 0 1 \
+cas "deballe_par_le_FICHIER_sous_son_nom_TEMPORAIRE" non 1 aucun liaison_morte 1 \
     "⭐ relevé sur ben-0001 : le keyfile s'appelle ben-provisioned-tmp-<ts>.nmconnection et porte
      id=ben-provisioned. NM ne renomme pas le fichier, donc c'est le CONTENU qui fait foi"
-cas "un_keyfile_LEURRE_ne_compte_PAS"            non leurre aucun 0 0 \
+cas "un_keyfile_LEURRE_ne_compte_PAS"            non leurre aucun liaison_morte 0 \
     "⚖️ un fichier nommé ben-provisioned-autre mais pointant AILLEURS : un glob sur le NOM
      l'accepterait à tort, le test sur id= le refuse"
 
 # 🚨 LE CAS QUI ANNULAIT TOUT LE WATCHDOG
-cas "NM_MORT__AGIT_QUAND_MEME"                   mort 0 aucun 0 1 \
+cas "NM_MORT__AGIT_QUAND_MEME"                   mort 0 aucun liaison_morte 1 \
     "🚨 nmcli en erreur ⇒ NM est en panne ⇒ c'est EXACTEMENT le moment d'agir. Conclure « pas
      déballé » reproduisait la coupure de 8 h 40 que ce script existe pour éviter"
-cas "NM_mort_avec_le_fichier__AGIT"              mort 1 aucun 0 1 \
+cas "NM_mort_avec_le_fichier__AGIT"              mort 1 aucun liaison_morte 1 \
     "le fichier tranche d'abord, et nmcli n'est même pas interrogé"
 
 # ── GARDE ③ : UN AGENT DE PROVISIONING TIENT-IL LA RADIO ? ────────────────────────────────────
@@ -150,32 +175,44 @@ cas "NM_mort_avec_le_fichier__AGIT"              mort 1 aucun 0 1 \
 #    pendant 300 s en se contentant de PINGUER — exprès, pour ne pas toucher à la radio partagée.
 #    Le watchdog part 60 s après le boot puis toutes les 2 min : il tirerait DEUX OU TROIS FOIS
 #    dans cette fenêtre, chaque fois avec un scan WiFi complet.
-cas "fenetre_RECOVERY_sans_telephone__ne_touche_pas_radio" oui 1 recovery 0 0 \
+cas "fenetre_RECOVERY_sans_telephone__ne_touche_pas_radio" oui 1 recovery liaison_morte 0 \
     "network_recovery offre le BLE 300 s sans qu'aucun téléphone soit connecté : pas de drapeau,
      et la radio est prise quand même"
-cas "RE-provisioning_entre_deux_reconnexions__s_abstient"  oui 1 provisioner 0 0 \
+cas "RE-provisioning_entre_deux_reconnexions__s_abstient"  oui 1 provisioner liaison_morte 0 \
     "le provisioner EFFACE le drapeau à chaque démarrage (os._exit(1) + Restart=on-failure) :
      l'unité active est le seul témoin qui tienne dans cet intervalle"
-cas "unite_qui_DEMARRE_compte_comme_prise"                 oui 1 recovery_qui_demarre 0 0 \
+cas "unite_qui_DEMARRE_compte_comme_prise"                 oui 1 recovery_qui_demarre liaison_morte 0 \
     "is-active rend « activating » : une unité qui démarre tient déjà la radio"
 
+cas "CONTROLE_DE_BOOT_en_cours__ne_le_bouscule_pas"        oui 1 boot_check liaison_morte 0 \
+    "ben-network-check pinge jusqu'à 30 s et décide collecte/récupération : le bousculer le fait
+     conclure « hors ligne » ⇒ 300 s de BLE et aucune collecte, pour une box simplement lente"
+
 # ── GARDE ② : LA SESSION BLE, ET SA PÉREMPTION ────────────────────────────────────────────────
-cas "session_BLE_FRAICHE__ne_touche_pas_radio"   oui 1 frais 0 0 \
+cas "session_BLE_FRAICHE__ne_touche_pas_radio"   oui 1 frais liaison_morte 0 \
     "la radio est PARTAGÉE WiFi/BLE sur Pi Zero W — redémarrer NM casserait le déballage"
-cas "drapeau_BLE_PERIME__agit_quand_meme"        oui 1 perime 0 1 \
+cas "drapeau_BLE_PERIME__agit_quand_meme"        oui 1 perime liaison_morte 1 \
     "⚠️ le provisioner n'a pas de SIGTERM : le drapeau survit à son arrêt. Sans péremption il
      bloquait le watchdog JUSQU'AU REDÉMARRAGE — le cas même qu'il doit couvrir"
 
+# ── 🚨 LA LIAISON N'EST PAS LA LIGNE ─────────────────────────────────────────────────────────
+cas "LIGNE_coupee_passerelle_OK__ne_redemarre_PAS"        oui 1 aucun ligne_coupee 0 \
+    "🚨 panne FAI, box et WiFi sains : redémarrer NM couperait l'API locale :8087 — or c'est ce
+     qui marche ENCORE pour l'app — et ferait relire une coupure de ligne comme une radio morte"
+cas "AUCUNE_route_par_defaut__REDEMARRE"                  oui 1 aucun sans_route 1 \
+    "⚖️ pas de bail DHCP : c'est le cas de ben-0005, la Freebox ne voyait aucun équipement"
+
 # ── LE TÉMOIN ET SON CONTRE-TÉMOIN ────────────────────────────────────────────────────────────
-cas "deballe_sans_reseau__REDEMARRE"             oui 1 aucun 0 1 \
+cas "deballe_sans_reseau__REDEMARRE"             oui 1 aucun liaison_morte 1 \
     "⚖️ LE TÉMOIN : c'est le cas de ben-0005, et sans lui le banc passerait sur un script inerte"
-cas "deballe_avec_reseau__ne_redemarre_PAS"      oui 1 aucun 1 0 \
+cas "deballe_avec_reseau__ne_redemarre_PAS"      oui 1 aucun ok 0 \
     "⚖️ LE CONTRE-TÉMOIN : sinon on relance NM toutes les 2 min sur les 8 boîtiers, pour rien"
 
 # ── LE COMPTEUR S'INCRÉMENTE, IL NE SE RÉÉCRIT PAS ───────────────────────────────────────────
 T="$(mktemp -d)"; mkdir -p "$T/bin"
 printf '#!/bin/sh\necho ben-provisioned\n' > "$T/bin/nmcli"
 printf '#!/bin/sh\nexit 1\n'               > "$T/bin/ping"
+printf '#!/bin/sh\necho "default via 192.168.1.1 dev wlan0"\n' > "$T/bin/ip"
 printf '#!/bin/sh\n[ "$1" = is-active ] && { echo inactive; exit 3; }\nexit 0\n' > "$T/bin/systemctl"
 printf '#!/bin/sh\nexit 0\n'               > "$T/bin/logger"
 printf '#!/bin/sh\nexit 0\n'               > "$T/bin/sleep"
@@ -215,5 +252,5 @@ fi
 rm -rf "$T"
 
 echo
-if [ "$KO" = 0 ]; then echo "15/15"; else echo "$((15-KO))/15"; fi
+if [ "$KO" = 0 ]; then echo "18/18"; else echo "$((18-KO))/18"; fi
 exit $([ "$KO" = 0 ] && echo 0 || echo 1)

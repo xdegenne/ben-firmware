@@ -122,6 +122,45 @@ ben-0001, `AccuracyUSec=1min`. Un timer de 2 min avec 1 min de battement, là o�
 dépôt dirait une chose et les 8 boîtiers une autre, exactement la classe de défaut qui a produit ce
 chantier.
 
+#### 🚨 La liaison n'est pas la ligne — et le confondre cassait ce qui marche encore
+
+Un `ping 1.1.1.1` qui échoue ne dit pas que la radio est en panne : il dit qu'**internet est
+injoignable**. Les deux causes sont distinctes, et la seconde est banale — une coupure de ligne chez
+l'opérateur, box et WiFi parfaitement sains. Redémarrer NetworkManager toutes les 2 min pendant une
+panne FAI était faux sur trois plans :
+
+1. 🚨 **ça coupait l'API locale `:8087` à chaque fois** — or c'est exactement ce qui marche **encore**
+   pour l'app pendant une coupure internet, donc ce qu'il ne faut surtout pas casser ;
+2. `nm-restarts` grimpait, et le cloud aurait relu une panne de **ligne** comme une **radio
+   défaillante** : un compteur ne vaut que s'il ne compte que ce qu'il prétend compter ;
+3. ça ne réparait rien — la ligne n'est pas de ce côté-ci du mur.
+
+⇒ **Le discriminant est la passerelle.** Si on l'atteint, la liaison est bonne et le défaut est en
+amont : on se tait. Si on ne l'atteint pas, ou s'il n'y a **aucune route par défaut**, la liaison
+est morte et c'est notre affaire. ⓘ Le cas de ben-0005 reste couvert : la Freebox ne voyait aucun
+équipement ⇒ pas d'association, pas de bail, pas de route par défaut ⇒ on agit.
+
+#### ⚠️ Le watchdog tirait avant que NetworkManager existe
+
+`OnBootSec=60`, depuis le premier commit. Mesuré sur ben-0001 en **monotone depuis le boot** :
+
+```
+NetworkManager       démarre à 66,2 s   actif à 84,0 s
+ben-network-check    de 84,3 s à 104,4 s
+wifi-watchdog        tirait à 60,0 s          ← avant les deux
+```
+
+Le premier passage tombait donc **avant** NetworkManager : il aurait compté un redémarrage et
+bousculé le démarrage en cours, **à chaque boot**, en polluant le seul compteur sur lequel tout ce
+chantier repose. ⇒ `OnBootSec=300`, et `ben-network-check.service` rejoint la garde ③ — ce oneshot
+pinge jusqu'à 30 s puis joue ~5 s de LED, et c'est **lui** qui décide collecte ou récupération : le
+bousculer le ferait conclure « hors ligne » et déclencher 300 s de BLE **sans aucune collecte**,
+pour une box simplement lente.
+
+⭐ **Et c'est le bon partage** : le boot a déjà son filet (`ben-network-check` →
+`ben-network-recovery`). Celui-ci est le filet du boîtier **en marche**, et il prend la main là où
+l'autre a fini.
+
 #### 🚨 Et il compte, ce qui est aussi important que de rattraper
 
 Un filet qui rattrape **en silence** rend un boîtier malade **indiscernable** d'un boîtier sain :
@@ -160,23 +199,28 @@ sans watchdog, exactement l'oubli qui a produit celui-ci.
 
 #### Le banc, et ce qui a été vu tomber
 
-**15 cas** pour le watchdog, montant de faux `nmcli`/`ping`/`systemctl` dans un `PATH` temporaire —
+**18 cas** pour le watchdog, montant de faux `nmcli`/`ping`/`systemctl` dans un `PATH` temporaire —
 il tourne donc sans NetworkManager, sur un Mac comme sur un boîtier. Les deux gardes dans tous leurs
 états, dont **`nmcli` en erreur** (NM mort ⇒ il doit **agir**) et un **drapeau BLE périmé** (⇒ agir
 aussi), l'incrément du compteur, et un compteur **vide** qui vaut zéro sans faire échouer. Deux
 cas que le keyfile a imposés : le fichier sous son **nom temporaire réel**, et un **leurre** — un
 keyfile nommé `ben-provisioned*` mais portant un autre `id=` — qui ne doit **pas** compter. Et trois
 pour la garde ③ : la fenêtre de `network_recovery` **sans téléphone**, le re-provisioning **entre
-deux reconnexions**, et une unité en `activating` qui compte déjà comme prise.
+deux reconnexions**, et une unité en `activating` qui compte déjà comme prise. Et trois
+de plus pour les deux derniers défauts : le **contrôle de boot en cours**, une **ligne coupée avec
+la passerelle joignable** (⇒ ne rien redémarrer), et **aucune route par défaut** (⇒ agir, c'est
+ben-0005).
 
 🚨 **Un faux plus permissif que la réalité valide le défaut.** Le faux `systemctl` sortait en 0 pour
 n'importe quel état : une mutation qui testait le **code** de `is-active --quiet` au lieu du **mot**
 restait donc **verte**. Le vrai sort en 0 pour `active` **seulement** — `activating` sort en 3. Faux
-corrigé, mutation rouge.
+corrigé, mutation rouge. Même classe pour le faux `ping` : s'il répond **pareil aux deux cibles**,
+la ligne coupée et la liaison morte deviennent indiscernables et le banc approuverait un script qui
+ne discrimine rien — muté, rouge.
 ⚖️ Le contre-témoin est la moitié du banc : un watchdog qui ne redémarrerait **jamais** passerait
 tous les cas de refus.
 
-**35 cas** pour `health`. **19 mutations rouges** au total. ⚠️ Dont une restée **verte**, qui a fait
+**35 cas** pour `health`. **23 mutations rouges** au total. ⚠️ Dont une restée **verte**, qui a fait
 ajouter le témoin du **branchement** de la sonde dans `snapshot()` : une sonde livrée mais jamais
 appelée est une mesure qu'on croit avoir.
 
