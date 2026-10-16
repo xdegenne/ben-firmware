@@ -97,7 +97,40 @@ SELECT device_id, sw_version, COALESCE(ota_ref,'main') FROM devices WHERE NOT re
    porte pas encore la transition, et ne voient **rien** ;
 5. si c'est bon : **squash dans `main`**, tag signé **`pi-<B>`**, dans cet ordre ;
 6. 🚨 **et la ligne DISPARAÎT de `canary`** — sinon les boîtiers d'essai restent sur un plan
-   d'essai pour toujours.
+   d'essai pour toujours ;
+7. **les boîtiers d'essai sont désarmés** : `ota_ref = NULL`.
+
+#### 🚨 La ligne se retire par une FUSION, pas par une remise à plat
+
+Au squash de l'étape 5, `main` reçoit un **commit neuf**. `canary` n'est donc plus « `main` plus une
+ligne » : les deux ont **divergé**, un commit de chaque côté. Un `reset --hard` suivi d'un
+force-push est le réflexe, et il est doublement mauvais — il réécrit une branche partagée, et il
+n'est même pas nécessaire :
+
+```bash
+git switch canary
+git merge origin/main --no-commit          # conflit attendu sur compatibility.yaml
+git checkout --theirs compatibility.yaml   # « theirs » = main, donc la ligne d'essai s'en va
+git add compatibility.yaml
+git diff --cached --stat origin/main       # 🚨 DOIT ÊTRE VIDE — l'arbre identique à main
+git commit -F <message> && git push origin canary
+```
+
+⭐ **Le contrôle est le `diff --cached` vide**, pas la relecture du YAML : il prouve que `canary`
+porte l'arbre de `main` **à l'octet**, sur tous les fichiers et pas seulement celui qu'on a résolu.
+Seul l'historique garde la trace de l'essai, ce qui est exactement ce qu'on veut.
+
+#### ⓘ Et pourquoi désarmer, alors qu'être armé est sans effet
+
+Une fois `canary` revenue sur `main`, un boîtier armé lit le même plan que le parc : l'armement
+**ne fait rien**. On désarme quand même, parce que la vue **Parc** affiche la colonne OTA — trois
+boîtiers marqués « 🐤 canary » alors qu'aucun essai n'est en cours, c'est **un tableau qui ment**,
+et un tableau qui ment est pire qu'une colonne vide. Le ré-armement fait partie du **prochain**
+canary ; ce n'est pas un état permanent.
+
+```sql
+UPDATE devices SET ota_ref = NULL WHERE device_id IN ('ben-0001','ben-0002','ben-0003');
+```
 
 ### 🚨 Le `to` est le même des deux côtés, seul le `tag` diffère
 
