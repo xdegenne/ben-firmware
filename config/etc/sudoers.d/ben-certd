@@ -1,8 +1,18 @@
-# ben-certd a besoin de redémarrer le publisher après avoir remplacé le
-# certificat — celui-ci tient une connexion TLS PERSISTANTE ouverte avec
-# l'ancien, et continuerait de l'utiliser sans redémarrage.
+# ben-certd doit redémarrer ce qui TIENT le certificat après l'avoir remplacé.
 #
-# 🚨 Un SEUL verbe, sur une SEULE unité. Pas `systemctl *`, pas `ALL`.
-#    Un droit plus large que le besoin est un droit qu'on finit par utiliser
-#    pour autre chose.
+# Un processus Python lit son certificat UNE SEULE FOIS, à la construction de son
+# contexte SSL. Remplacer le fichier sous lui ne l'atteint jamais :
+#
+#   ben-publisher   CLIENT mTLS du cloud, et connexion PERSISTANTE par-dessus
+#   ben-local-api   SERVEUR TLS de l'app sur :8088
+#
+# 🚨 Un SEUL verbe, et UNE LIGNE PAR UNITÉ. Pas `systemctl *`, pas `ALL`, pas de
+#    liste entre accolades. Un droit plus large que le besoin est un droit qu'on
+#    finit par utiliser pour autre chose — et ici « autre chose » se ferait en
+#    root sur un boîtier chez un client.
+#
+# ⚠️ Ajouter un consommateur du certificat demande donc DEUX gestes : la ligne
+#    ici, et l'unité dans `basculer()` de ben_certd.py. En oublier un échoue
+#    franchement au redémarrage suivant, ce qui est le comportement voulu.
 ben ALL=(root) NOPASSWD: /usr/bin/systemctl restart ben-publisher
+ben ALL=(root) NOPASSWD: /usr/bin/systemctl restart ben-local-api

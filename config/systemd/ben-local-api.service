@@ -6,6 +6,15 @@ After=basic.target
 Type=simple
 User=ben
 WorkingDirectory=/opt/ben/repo/src/pi/store
+
+# 🚨 Sans ça, ce service N'A JAMAIS RIEN JOURNALISÉ. Python met sa sortie en
+#    tampon dès qu'elle n'est pas un terminal : sous systemd, tous les `print()`
+#    restaient dans le tampon et ne sortaient jamais. Constaté le 24/09 en
+#    cherchant à lire si l'écoute chiffrée :8088 avait démarré — un service muet
+#    depuis des mois, et personne ne l'avait remarqué puisque rien ne manquait
+#    visiblement. Un journal vide ressemble à un service qui n'a rien à dire.
+Environment=PYTHONUNBUFFERED=1
+
 ExecStart=/usr/bin/python3 /opt/ben/repo/src/pi/store/local_api.py
 Restart=always
 RestartSec=10

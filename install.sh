@@ -16,7 +16,7 @@ REPO_PATH="/opt/ben/repo"
 # == latest. §8 écrit un device.json CAPABILITIES-based (via caps_for_model) → un device neuf naît
 # directement en capabilities (+ watchdog durci pour un lora). Le parc EXISTANT migre par OTA
 # (0.5.0/0.6.0 → 0.6.1 → 0.7.0). Le chantier ben-ops (workflow opérateur) reste à part.
-INITIAL_TAG="pi-0.12.0"
+INITIAL_TAG="pi-0.13.0"
 # Version écrite dans device.json — DOIT correspondre au tag checkout, sinon
 # l'OTA re-grimpe depuis une version périmée. Dérivée de INITIAL_TAG pour
 # qu'elles ne puissent jamais diverger (ex. pi-0.0.28 → 0.0.28).
@@ -289,6 +289,17 @@ systemctl enable ben-led-release.service
 systemctl enable ben-network-check.service
 
 # API locale read-only (:8087) lue par l'app — tous modèles.
+# ⚠️ CE FICHIER N'ÉTAIT POSÉ PAR PERSONNE ICI, et c'est un défaut latent trouvé le 2026-10-07 :
+#    il avait été posé au parc par `updates/0.9.15_to_0.9.16/update.sh`, donc tout boîtier
+#    provisionné DEPUIS en était dépourvu. Sans lui, `ben-certd` ne peut pas redémarrer ce qui
+#    tient le certificat après l'avoir remplacé — et le boîtier servirait un certificat périmé
+#    EN SILENCE. Même classe de défaut que le watchdog : un fichier dans le dépôt que la liste
+#    explicite d'`install.sh` avait oublié.
+# 🚨 `visudo -c` AVANT de poser : un /etc/sudoers.d/ cassé casse sudo pour tout le monde.
+visudo -c -f "$REPO_PATH/config/etc/sudoers.d/ben-certd" >/dev/null \
+  || { echo "sudoers ben-certd INVALIDE — non posé"; exit 1; }
+install -m 440 -o root -g root "$REPO_PATH/config/etc/sudoers.d/ben-certd" /etc/sudoers.d/ben-certd
+
 systemctl enable ben-local-api.service
 systemctl start  ben-local-api.service || true
 

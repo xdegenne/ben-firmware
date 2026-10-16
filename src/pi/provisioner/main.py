@@ -38,6 +38,7 @@ pour ne pas bloquer le callback GATT.
 import json
 import logging
 import os
+import pathlib
 import secrets
 import subprocess
 import sys
@@ -48,6 +49,12 @@ from bluezero import adapter, peripheral
 
 import led
 import provisioning_state
+
+# ⭐ Le ticket : le FICHIER et le CONTRAT, partagés avec le publisher et l'API locale.
+#    Trois appelants, une seule définition — sinon le chemin du fichier et la forme de
+#    la charge divergeraient sans que rien ne le signale.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))  # src/pi
+from store import claim_ticket  # noqa: E402
 from wifi_config import configure_wifi
 
 GRACE_PERIOD_AFTER_SUCCESS_SEC = 5  # LED verte fixe avant reboot, le temps de voir le signal
@@ -98,6 +105,19 @@ VERIFY_UUID         = "b3e7e511-0001-4bea-9b15-000000000005"
 VERIFY_STATUS_UUID  = "b3e7e511-0001-4bea-9b15-000000000006"
 PREVIEW_CMD_UUID    = "b3e7e511-0001-4bea-9b15-000000000007"
 PREVIEW_COLOR_UUID  = "b3e7e511-0001-4bea-9b15-000000000008"
+# 🚨 LE TICKET DE REVENDICATION — la caractéristique qui rend un boîtier NEUF
+#    revendicable. Sans elle, `grant()` n'est appelé que depuis `mint()` et
+#    `consume_invitation()` : un boîtier envoyé à un client est INREVENDICABLE, et les
+#    7 du parc ne marchent que parce que leurs lignes ont été semées à la main.
+#
+# ⭐ TOUTE L'ASYMÉTRIE DU DÉBALLAGE TIENT ICI : le téléphone a Internet, le boîtier
+#    ne l'a pas encore. Le ticket est donc frappé par l'app auprès de `ben-api`, passé
+#    en BLE, et présenté par le boîtier à sa première connexion.
+#
+# ⓘ `CLAIM_TOKEN` (…00A) était prévu pour rendre le jeton local en BLE. Il est devenu
+#    INUTILE le 05/10 : la voie A fait refaire un `/claim` ordinaire sur le LAN, ce qui
+#    n'exige pas que la session BLE survive au retour du cloud.
+CLAIM_TICKET_UUID   = "b3e7e511-0001-4bea-9b15-000000000009"
 
 # ---------------------------------------------------------------------------
 # State machine
@@ -413,6 +433,49 @@ def on_device_info_read() -> bytes:
     return json.dumps(compact, separators=(",", ":")).encode("utf-8")
 
 
+def on_claim_ticket_write(value, options):
+    """Reçoit `{"ticket": "<43 car.>"}` et le POSE sur le disque.
+
+    🚨 MÊME GARDE QUE `WIFI_CONFIG` : rien avant la vérification couleur. C'est elle
+    qui prouve la PRÉSENCE PHYSIQUE — il faut VOIR la LED du boîtier — et c'est la
+    seule chose qui distingue ce chemin du TOFU rejeté le 19/09.
+
+    ⚠️ Et c'est le boîtier qui doit la tenir, pas le cloud : le cloud ne voit pas par
+    quel canal le ticket est arrivé. Lui seul le sait. ⇒ `fonder: true` ne partira que
+    pour un ticket venu d'ICI, et l'existence du fichier en est la preuve.
+
+    ⭐ On ne VÉRIFIE pas le ticket, on le RANGE. Le vérifier demanderait le cloud, que
+    le boîtier n'a pas encore — c'est précisément pourquoi il est passé en BLE.
+    """
+    if not _verified:
+        log.warning("CLAIM_TICKET reçu avant vérification couleur — rejeté")
+        set_status("failed:not_verified")
+        return
+    try:
+        payload = bytes(value).decode("utf-8")
+        ticket = str(json.loads(payload).get("ticket") or "").strip()
+    except (UnicodeDecodeError, json.JSONDecodeError, AttributeError) as e:
+        log.error("CLAIM_TICKET illisible: %s", e)
+        set_status(f"failed:invalid_payload:{type(e).__name__}")
+        return
+    if not ticket:
+        log.error("CLAIM_TICKET sans ticket")
+        set_status("failed:invalid_payload:no_ticket")
+        return
+
+    try:
+        claim_ticket.poser(ticket)
+    except Exception as e:  # noqa: BLE001
+        log.error("CLAIM_TICKET non persisté: %s", e)
+        set_status(f"failed:ticket_not_stored:{type(e).__name__}")
+        return
+
+    # 🔒 On journalise la LONGUEUR, jamais le ticket. C'est un secret à usage unique :
+    #    dans le journal, il deviendrait relisable par qui lit `journalctl`.
+    log.info("ticket de revendication reçu et persisté (%d car.)", len(ticket))
+    set_status("claim_ticket:stored")
+
+
 def on_verify_status_read() -> bytes:
     return _verify_status.encode("utf-8")
 
@@ -593,6 +656,28 @@ def main() -> int:
         value=list(b"-"), notifying=False,
         flags=["read", "notify"],
         read_callback=on_preview_color_read,
+    )
+    # 🚨 LE TICKET — en ÉCRITURE seulement, et jamais relisible.
+    #
+    # ⭐ ET C'EST UNE ÉCRITURE, PAS UNE LECTURE : l'invariant « une lecture = un PDU »
+    #    — 184 octets sur iOS, `bluezero` ne fait pas de *Read Long* — ne s'applique
+    #    donc PAS. C'est lui qui avait limité `WIFI_SCAN` à 3 réseaux. Mesuré :
+    #    `{"ticket": "<43 car.>"}` fait 57 octets, là où le `{ssid, password}` de
+    #    `WIFI_CONFIG` en fait déjà ~64 et passe depuis le POC.
+    #
+    # ⚠️ Reste à ÉPROUVER SUR APPAREIL — un calcul n'est pas une mesure, et c'est la
+    #    troisième fois de ce chantier qu'un raisonnement juste masque un détail de
+    #    pile. ⇒ Le témoin est un déballage complet sur iPhone ET Android.
+    #
+    # ⓘ `flags=["write"]` et non `encrypt-write` : le flag est PAR CARACTÉRISTIQUE, et
+    #    l'armer ici n'affecterait aucune app ancienne — mais il exige le pairing, que
+    #    l'app Flutter doit gérer. ⇒ Le ticket voyage donc EN CLAIR sur l'air, et c'est
+    #    le point ouvert n°6 de specs/003, que ces 900 s de validité aggravent.
+    ben.add_characteristic(
+        srv_id=1, chr_id=9, uuid=CLAIM_TICKET_UUID,
+        value=[], notifying=False,
+        flags=["write"],
+        write_callback=on_claim_ticket_write,
     )
 
     # Gestion de la déconnexion BLE :
