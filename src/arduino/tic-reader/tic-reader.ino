@@ -106,10 +106,48 @@
 //   concatenation est resolue a la compilation.
 #define FW_MAJOR 0
 #define FW_MINOR 1
-#define FW_PATCH 11
+#define FW_PATCH 12
 #define FW_STR_(x) #x
 #define FW_STR(x)  FW_STR_(x)
 #define FW_VERSION FW_STR(FW_MAJOR) "." FW_STR(FW_MINOR) "." FW_STR(FW_PATCH)
+// 0.1.12 : LE TRIPHASE — issue #51. IINST = IINST1 + IINST2 + IINST3, et un bit
+//          CF_TRIPHASE (bit 3 de l octet flags, LIBRE) dans la trame courbe. Un
+//          triphase n emet JAMAIS « IINST » : l emetteur n en voyait donc aucun et
+//          envoyait des trames SANS courant — il survivait par accident, la garde
+//          histo n exigeant que PAPP et l index actif. AGREGATION PAR PREFIXE :
+//          « IINST » et « IINST1/2/3 » partagent 5 caracteres, donc un strncmp
+//          n ajoute AUCUN litteral — decisif sur une carte a 98 %. LA SOMME ET PAS
+//          LE MAX : IINST ne sert qu a l estimation 230xI quand PAPP vaut 0, et en
+//          triphase chaque phase est a 230 V vers le neutre, donc 230x(I1+I2+I3) EST
+//          la puissance totale ; le max la sous-estimerait d un FACTEUR 3. Meme regle
+//          que le lecteur filaire (#50) — une seule agregation pour tout le parc.
+//          ON EXIGE LES TROIS PHASES : une somme partielle est un nombre PLAUSIBLE et
+//          FAUX la ou une phase manquante est une donnee PERDUE. Le bitmap ph_vues
+//          sert a deux choses — exiger les trois, et ne pas recompter une phase si
+//          une trame corrompue repete un groupe ; il repart de zero a CHAQUE trame,
+//          readAndParseTIC faisant son memset avant meme d attendre le STX.
+//          DEUX DEFAUTS TROUVES EN REVUE, et le premier est ANTERIEUR au triphase :
+//          `required` n a JAMAIS contenu TIC_SEEN_IINST, donc une ligne IINST perdue
+//          au checksum laissait v.iinst a 0 et curveAdd encodait ce 0 comme un POINT
+//          REEL — « 30, 30, 0, 30 » sur un compteur qui tire 30 A, et les SEPT
+//          boitiers monophases du parc le font deja. On perd desormais l echantillon
+//          entier, PAPP compris : la 2e courbe est POSITIONNELLE, on ne peut pas
+//          sauter le courant d un point sans decaler la serie, et le lecteur filaire
+//          fait ce meme choix. Second defaut : le bit etait lu dans curveStart SEUL,
+//          donc une trame ayant perdu une phase faisait partir ~55 s et jusqu a 130
+//          points marques « monophase » ; il s accumule maintenant sur tout le batch
+//          (curveTriphase) et l octet est rectifie au flush. ⚠️ CARTE DES BITS en
+//          tete de fichier CORRIGEE : elle decrivait un ANCIEN format (DEMAIN/ADPS/
+//          PEJP) et j ai failli croire le bit 3 occupe. 30 244 → 30 414 o, soit +170 o
+//          et le passage de 98 % a 99 % — 306 octets libres, RAM +1. A SAVOIR AVANT
+//          LE PROCHAIN AJOUT. Eprouve par le PREMIER banc du sketch qui EXECUTE quoi
+//          que ce soit : un harnais hote qui COMPILE LE TEXTE REEL du .ino (18 cas),
+//          plus 14 cas d inspection et 13 sur le codec dont la NON-REGRESSION A L
+//          OCTET — le risque n est pas de rater le triphase, personne n en a, c est
+//          de casser le monophase en le reparant. Sept mutations vues ROUGES.
+//          ⚠️ Le recepteur DECODE le bit et le JETTE : ecrire level_profile.phases
+//          pour corriger la jauge est l objet de #56. Sans lui, le courant est juste
+//          et la jauge reste fausse d un facteur 3.
 // 0.1.11 : UNE TRAME DE BOOT N ECRASE PLUS LE LOT EN COURS — issue #30. sendBootFrame et
 //          curveStart ecrivent TOUS DEUX dans curveBuf des l offset 0, et font TOUS DEUX
 //          msg_count++. Or l en-tete ecrit a l offset 0 EST LE NONCE ChaCha20 : un boot emis
