@@ -1263,7 +1263,15 @@ class Handler(BaseHTTPRequestHandler):
                 pref = db.get_pref(conn, row["pdl_index"])
                 row["isousc"] = isousc
                 row["pref"] = pref
-                from_isousc = isousc * 230 if isousc else None
+                # 🚨 ISOUSC est PAR PHASE (#50). Un abonnement 20 A sur un triphasé
+                #    autorise 3×20×230 = 13 800 VA, et `maxVa` borne un PAPP qui est
+                #    un TOTAL : sans ce facteur la jauge saturerait au tiers de
+                #    l'abonnement réel. `get_phases` rend 1 par défaut, donc les
+                #    boîtiers monophasés du parc sont strictement inchangés.
+                #    ⓘ PREF n'est PAS concerné : il est déjà un total (kVA).
+                phases = db.get_phases(conn, row["pdl_index"])
+                row["phases"] = phases
+                from_isousc = isousc * 230 * phases if isousc else None
                 from_pref = pref * 1000 if pref else None
                 if mode == "standard":
                     row["maxVa"] = from_pref or from_isousc
