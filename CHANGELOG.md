@@ -18,6 +18,55 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.15.0] — 2026-10-17
+
+**Le récepteur consomme le bit TRIPHASÉ** — la moitié manquante de
+[`#51`](https://github.com/xdegenne/ben-firmware/issues/51). Chantier
+[`ben-docs#19`](https://github.com/xdegenne/ben-docs/issues/19), sous-tâche
+[`#56`](https://github.com/xdegenne/ben-firmware/issues/56).
+
+#### 🚨 Le courant était juste et la jauge fausse
+
+L'émetteur publie depuis `0.1.12` le **total des trois phases** et lève `CF_TRIPHASE` (bit 3 de
+l'octet `flags`). Le récepteur décodait ce bit et le **jetait**. Or `ISOUSC` est exprimé **par
+phase** alors que `maxVa` borne un `PAPP` qui est un **total** :
+
+```
+foyer triphasé 3×20 A tirant 5 000 VA — parfaitement normal
+    avant :  5000 / (20 × 230)     = 109 %   🔴 rouge en permanence
+    après :  5000 / (20 × 230 × 3) =  36 %
+```
+
+⭐ **Aucune migration** : `level_profile.phases` existe depuis `pi-0.14.0` (#50) et
+`db.record_phases` aussi. La colonne n'était nourrie que par le lecteur **filaire**. Cette
+version branche un consommateur sur une colonne déjà là.
+
+#### 🚨 On n'écrit que 3, jamais 1
+
+Le monophasé est l'**absence de déclaration**, pas une déclaration d'absence : une trame ayant
+perdu une phase au checksum arrive sans le bit et ressemble trait pour trait à un monophasé.
+Retenir ce « 1 » ferait retomber un triphasé sur **une seule trame abîmée**.
+
+⭐ **Et l'invariant tient sur DEUX barrières indépendantes, mesuré par mutation** : faire écrire
+`1` au récepteur ne casse rien — `record_phases` refuse seul. Il faut se tromper **deux fois**.
+
+#### ⚠️ Personne n'est exposé, et rien ne s'active
+
+**Aucun triphasé dans le parc**, et **aucun émetteur n'émet encore le bit** — le reflash est
+**physique**, carte par carte : deux faites le 17/10 (ben-0011 et ben-0001), deux hors de
+portée. `get_phases` rend 1 par défaut ⇒ les 8 boîtiers monophasés ne voient rien changer.
+
+#### Éprouvé
+
+7 cas, dont le contre-témoin qui protège le parc (une trame sans le bit n'écrit **rien**) et la
+non-contamination d'un autre PDL. **Trois mutations rouges.** ⚠️ Une quatrième n'a pas tombé —
+c'était la mutation qui était vide, pas le banc.
+
+⚠️ **Et le banc tenait par accident d'ordre** (relevé en revue) : toutes les trames réutilisaient
+`batch_seq=1`, donc les suivantes étaient marquées en doublon. La couverture tenait — le bloc
+triphasé passe avant ce contrôle — mais *le banc serait devenu vide sans le dire* si cet ordre
+changeait. Corrigé.
+
 ### [0.14.0] — 2026-10-17
 
 **Deux correctifs sans rapport, groupés dans une même OTA.**
