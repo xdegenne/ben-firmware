@@ -54,9 +54,21 @@ CLE = bytes(range(32))
 PDL = 0
 
 
+_seq = [0]
+
+
 def courbe(triphase):
-    """Une trame COURBE décodée, comme `on_recv_curve` la reçoit."""
-    brut = fc.encode_curve(CLE, boot_count=1, msg_count=1, batch_seq=1,
+    """Une trame COURBE décodée, comme `on_recv_curve` la reçoit.
+
+    ⚠️ `batch_seq` INCRÉMENTÉ À CHAQUE APPEL — relevé en revue de la PR #58.
+       Avec un seq constant, `on_recv_curve` marque les trames suivantes comme
+       DOUBLONS. Le bloc triphasé s'exécute avant ce contrôle, donc la couverture
+       tenait quand même — mais par ACCIDENT D'ORDRE, pas par conception. Si cet
+       ordre changeait, ce banc deviendrait vide SANS LE DIRE, ce qui est la
+       pire des façons de perdre un banc.
+    """
+    _seq[0] += 1
+    brut = fc.encode_curve(CLE, boot_count=1, msg_count=_seq[0], batch_seq=_seq[0],
                            index_id=1, index_value=1000, papp=[1500, 1520],
                            period_ds=20, triphase=triphase)
     return fc.decode(brut, CLE)
