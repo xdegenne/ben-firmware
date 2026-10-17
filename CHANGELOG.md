@@ -18,6 +18,75 @@ Deux pistes indépendantes :
 
 ## Pi (récepteur / façade radio)
 
+### [0.14.0] — 2026-10-17
+
+**Deux correctifs sans rapport, groupés dans une même OTA.**
+
+#### ① Le triphasé — le courant publié est le TOTAL des trois phases ([#50](https://github.com/xdegenne/ben-firmware/issues/50))
+
+```
+IINST = IINST1 + IINST2 + IINST3     (historique)
+IINST = IRMS1  + IRMS2  + IRMS3      (standard)
+maxVa = ISOUSC × 230 × phases
+```
+
+🚨 **Le pire des deux défauts était le silencieux.** En historique, `IINST` n'est jamais émis par
+un triphasé (c'est `IINST1/2/3`) ⇒ la trame était jetée, le compteur ne produisait **rien** ; ça
+se voyait. En standard, `IRMS1` existe et était mappé vers `IINST` ⇒ le boîtier publiait **le
+courant d'une phase sur trois**. Aucune alerte, une courbe plausible, une donnée fausse — et
+d'autant plus discret que `PAPP` était juste (`SINSTS` est un total).
+
+⭐ **La somme, et pas le max.** `IINST` n'alimente pas la jauge : son seul usage calculatoire est
+`230 × IINST` quand `PAPP` vaut 0. En triphasé chaque phase est à 230 V vers le neutre, donc
+`S = 230 × (I1+I2+I3)` — la somme rend ce secours **exact**, le max le sous-estimerait d'un
+facteur 3. ⓘ Et l'app refait le même calcul, donc l'erreur aurait été dupliquée hors de portée
+d'une OTA.
+
+⭐ **Le critère est la SIMULTANÉITÉ** : `IINST1/2/3` viennent de la même trame. `IMAX1/2/3` sont
+des extrêmes datés séparément (`Σ max ≠ max Σ`) ⇒ hors périmètre, par décision.
+
+🚨 **`ISOUSC` est par phase.** 20 A par phase autorisent `3 × 20 × 230 = 13 800 VA`, mais `maxVa`
+borne un `PAPP` **total** : la jauge saturait au **tiers** de l'abonnement. Nouvelle colonne
+`level_profile.phases` (NULL = 1). ⓘ `PREF` n'est pas concerné, il est déjà un total.
+
+⚠️ **On n'enregistre que 3, jamais 1** : le monophasé est l'absence de déclaration, pas une
+déclaration d'absence — une trame tronquée dirait la même chose. Et « triphasé » ne se conclut
+jamais sur `IRMS1`, qu'un monophasé standard émet.
+
+🚨 **Une somme incomplète est une donnée FAUSSE** : si `IINST2` tombe au checksum, `I1 + I3`
+serait écrit, là où le monophasé perdant son `IINST` voyait sa trame rejetée. Deux gardes — le
+décodeur retire la clé, et la trame est rejetée si le raccordement **su** triphasé n'apporte pas
+ses trois phases.
+
+#### ② Le BLE n'est plus coupé sous l'utilisateur ([#49](https://github.com/xdegenne/ben-firmware/issues/49))
+
+`_wait_for_ble_session_end()` vivait dans la branche `else` de `network_recovery.main()` — donc
+consultée uniquement quand la fenêtre s'écoule **sans** réseau, c'est-à-dire quand personne ne
+configure rien. Sur le chemin nominal du déballage, le provisioner était tué **en pleine
+session** et le service GATT disparaissait sous l'app (`primary service not found`).
+
+⚠️ **Course de 0 à 30 s** (`POLL_INTERVAL_SEC`), d'où l'intermittence qui l'a caché : trois
+déballages ont réussi le 05/10, un a échoué le 17/10, un autre a réussi le même jour sans le
+correctif. Une radio WiFi/BLE **partagée** rendait « le Bluetooth est capricieux » plausible.
+
+ⓘ Actif au **prochain démarrage** : `ben-network-recovery` est un oneshot de boot.
+
+#### Éprouvé
+
+`test_triphase.py` (34 cas, trames forgées) et `test_network_recovery.py` (+2 cas). **Neuf
+mutations vérifiées rouges.** Contre-témoins monophasés verts avant comme après : les 7 boîtiers
+du parc sont monophasés et ne voient rien changer.
+
+⚠️ Le préflight ③ de l'update contrôle les gardes sur l'**arbre syntaxique**, docstrings
+retirées — et son contrôle du volet BLE est **structurel**, pas positionnel : une comparaison
+d'indices ne distingue pas « dans le `else` » de « après le `else` », et la mutation passait au
+vert.
+
+#### Reste ouvert
+
+`ben-app#4` (l'app affiche ce total comme un courant) · `ben-api#33` (le cloud ignore `phases`)
+· `ben-firmware#51` (la passe émetteur radio) · `ben-firmware#53` (trames courtes en dépassement).
+
 ### [0.13.0] — 2026-10-07
 
 **L'accès local.** TLS sur l'écoute LAN, jetons porteurs de rôle, et `/claim` relayé au cloud
