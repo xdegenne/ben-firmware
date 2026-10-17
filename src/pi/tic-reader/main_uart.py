@@ -338,6 +338,18 @@ def _courant_de_phase(phase: str, brut: str, out: dict) -> None:
     #    sur `IRMS1` mettrait les 7 boîtiers monophasés du parc en ISOUSC×3.
     if phase in ("2", "3"):
         out["PHASES"] = 3
+    # 🚨 UNE SOMME INCOMPLÈTE EST UNE DONNÉE FAUSSE, PAS UNE DONNÉE PARTIELLE.
+    #    Si `IINST2` tombe au checksum, `I1 + I3` est un nombre plausible et faux —
+    #    et il serait ÉCRIT, là où le monophasé perdant son `IINST` voyait sa trame
+    #    REJETÉE. C'est exactement l'inversion que ce projet combat : *une donnée
+    #    fausse là où on voulait une donnée perdue*. ⇒ dès qu'on sait qu'il y a
+    #    trois phases, on les exige toutes les trois ; sinon on RETIRE la clé, ce
+    #    qui fait tomber la trame dans la garde `IINST absent` déjà en place.
+    # ⓘ On retire la clé au lieu de poser None : l'état obtenu est alors
+    #    STRICTEMENT celui du monophasé sans IINST, donc aucune nouvelle forme à
+    #    gérer en aval (`_inject_va`, `record_measurement`, la garde elle-même).
+    if out.get("PHASES") == 3 and len(phases) < 3:
+        out.pop("IINST", None)
 
 
 def _parse_label(line: str, out: dict) -> None:
@@ -1325,7 +1337,9 @@ if __name__ == "__main__":
     last_flush = time.time()
     last_heartbeat = 0.0
     last_isousc: int | None = None  # garde RAM : record_isousc seulement sur changement
-    last_phases: int | None = None  # idem pour le raccordement triphasé (#50)
+    # Raccordement triphasé (#50). Relu depuis la base dès que le PDL est connu —
+    # voir le préchargement plus bas, qui n'est PAS une optimisation.
+    last_phases: int | None = None
     last_src_std: int | None = None  # garde RAM : record_tic_mode seulement sur changement
 
 
@@ -1421,6 +1435,22 @@ if __name__ == "__main__":
                                         log.info(f"pdl_index : {PDL_INDEX} → {pdl} (ADCO={adco})")
                                     PDL_INDEX = pdl
                                     _pdl_source_adco = adco
+                                    # 🚨 LE RACCORDEMENT SE RELIT ICI, ET PAS AU
+                                    #    DÉMARRAGE : `PDL_INDEX` vaut None tant
+                                    #    qu'une trame n'a pas livré son ADCO, donc
+                                    #    un préchargement en tête de `main()` ne
+                                    #    rendrait jamais rien.
+                                    # ⭐ Et ce n'est pas une optimisation : c'est la
+                                    #    SEULE chose qui permette de rejeter une
+                                    #    trame ayant perdu `IINST2` ET `IINST3` —
+                                    #    elle ressemble alors trait pour trait à un
+                                    #    monophasé, et le décodeur ne peut pas les
+                                    #    distinguer. Il faut la mémoire du
+                                    #    raccordement, et elle doit survivre à un
+                                    #    redémarrage du lecteur.
+                                    if last_phases is None:
+                                        su = db.get_phases(measurements_db, pdl)
+                                        last_phases = 3 if su == 3 else None
                             except Exception as e:
                                 log.warning(f"store: resolve_pdl échoué: {e}")
 
@@ -1498,6 +1528,13 @@ if __name__ == "__main__":
                             log.warning(f"{active_name} absent de la trame TIC{_cause_rejets(active_name)} — trame ignorée")
                         elif iinst is None:
                             log.warning(f"IINST absent de la trame TIC{_cause_rejets('IINST')} — trame ignorée")
+                        elif last_phases == 3 and len(labels.get("_phases") or {}) < 3:
+                            # 🚨 Ce boîtier est SU triphasé : une trame qui n'apporte
+                            #    qu'une ou deux phases donne une somme fausse, et elle
+                            #    est indiscernable d'un monophasé sans cette mémoire.
+                            log.warning(
+                                f"trame triphasée INCOMPLÈTE "
+                                f"({len(labels.get('_phases') or {})}/3 phases) — trame ignorée")
                         elif papp is None:
                             log.warning(f"PAPP absent de la trame TIC{_cause_rejets('PAPP')} — trame ignorée")
                         else:
@@ -1539,6 +1576,16 @@ if __name__ == "__main__":
                             log.warning(f"SINSTS absent de la trame standard{_cause_rejets('SINSTS')} — trame ignorée")
                         elif iinst is None:
                             log.warning(f"IRMS1 absent de la trame standard{_cause_rejets('IRMS1')} — trame ignorée")
+                        elif last_phases == 3 and len(labels.get("_phases") or {}) < 3:
+                            # 🚨 Même garde qu'en historique, et elle est AUSSI
+                            #    nécessaire ici : en standard un monophasé émet
+                            #    `IRMS1` seul, donc une trame triphasée qui aurait
+                            #    perdu IRMS2 ET IRMS3 est indiscernable d'un
+                            #    monophasé sain. Seule la mémoire du raccordement
+                            #    les sépare.
+                            log.warning(
+                                f"trame standard triphasée INCOMPLÈTE "
+                                f"({len(labels.get('_phases') or {})}/3 phases) — trame ignorée")
                         else:
                             # _src_standard TOUJOURS posé (c'est le mode → tic_mode/lecture papp).
                             # index_id/index_value seulement si l'index actif a été vu (sinon NULL

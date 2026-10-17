@@ -131,6 +131,55 @@ print("── cohérence puissance ───────────────
 #    Avec le max au lieu de la somme, ce secours sous-estimerait d'un facteur 3.
 verifie("230 × IINST ≈ PAPP (23×230=5290)", 230 * (tri.get("IINST") or 0), 5290)
 
+print("── trame INCOMPLÈTE : une somme partielle est une donnée FAUSSE ──")
+# 🚨 LE DÉFAUT QUE CES CAS GARDENT : si `IINST2` tombe au checksum, `I1 + I3` est
+#    un nombre PLAUSIBLE et FAUX, et il serait écrit — là où le monophasé perdant
+#    son `IINST` voyait sa trame REJETÉE. Une donnée fausse à la place d'une
+#    donnée perdue, c'est l'inversion exacte que ce projet combat.
+sans_phase2 = [g for g in TRI_HISTO if g[0] != "IINST2"]
+inc = lire_histo(sans_phase2)
+verifie("histo, IINST2 perdu → IINST ABSENT (⚖️ et pas 12+7=19)",
+        inc.get("IINST"), None)
+verifie("   la trame reste reconnue triphasée", inc.get("PHASES"), 3)
+verifie("   deux phases vues sur trois", len(inc.get("_phases") or {}), 2)
+
+sans_phase3 = [g for g in TRI_HISTO if g[0] != "IINST3"]
+verifie("histo, IINST3 perdu → IINST ABSENT",
+        lire_histo(sans_phase3).get("IINST"), None)
+
+sans_irms2 = [g for g in TRI_STD if g[0] != "IRMS2"]
+verifie("standard, IRMS2 perdu → IINST ABSENT",
+        lire_std(sans_irms2).get("IINST"), None)
+
+verifie("⚖️ CONTRE-TÉMOIN : les trois présentes → la somme revient",
+        lire_histo(TRI_HISTO).get("IINST"), 23)
+verifie("⚖️ CONTRE-TÉMOIN : mono standard (IRMS1 SEUL) n'est PAS amputé",
+        lire_std(MONO_STD).get("IINST"), 9)
+
+print("── le cas 1-phase-sur-3, que seule la MÉMOIRE sépare ───────")
+# ⚠️ Une trame qui perd IINST2 ET IINST3 est indiscernable d'un monophasé au
+#    décodage : `PHASES` n'est pas posé, `IINST` vaut I1. C'est la garde de trame
+#    (`last_phases == 3`, rechargée depuis la base) qui la rejette, pas le
+#    décodeur. On vérifie donc ici ce que le décodeur EXPOSE pour la rendre
+#    possible — le compteur de phases vues.
+seule1 = [g for g in TRI_HISTO if g[0] not in ("IINST2", "IINST3")]
+s1 = lire_histo(seule1)
+verifie("décodeur seul : indiscernable d'un mono (IINST = 12)", s1.get("IINST"), 12)
+verifie("   et PHASES n'est PAS posé", s1.get("PHASES"), None)
+verifie("⭐ mais `_phases` expose 1/3 — c'est ce qui rend la garde possible",
+        len(s1.get("_phases") or {}), 1)
+
+print("── inspection : les deux gardes de trame existent ──────────")
+import io as _io, os as _os, pathlib as _pl, tokenize as _tk  # noqa: E402
+_src = _pl.Path(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                              "main_uart.py")).read_text()
+_code = " ".join(tok.string for tok in _tk.generate_tokens(_io.StringIO(_src).readline)
+                 if tok.type not in (_tk.COMMENT, _tk.STRING))
+verifie("main_uart garde les trames triphasées incomplètes (×2 : histo + std)",
+        _code.count("last_phases == 3 and len"), 2)
+verifie("le raccordement est relu depuis la base (get_phases)",
+        "db . get_phases ( measurements_db , pdl )" in _code, True)
+
 print("── stockage : record_phases / get_phases ───────────────────")
 import io, os, pathlib, tempfile, tokenize  # noqa: E402
 
