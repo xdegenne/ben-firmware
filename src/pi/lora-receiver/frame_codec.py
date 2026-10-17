@@ -27,6 +27,14 @@ FLAG_ENC = 0x80                 # bit7 = corps chiffré
 CF_SRC_STANDARD = 0x01
 CF_TS_VALID = 0x02
 CF_HAS_IINST = 0x04   # bit2 : 2e courbe IINST (histo) — restaure IINST perdu au passage delta
+CF_TRIPHASE  = 0x08   # bit3 : raccordement TRIPHASÉ (#51) — l'émetteur a vu IINST1/2/3.
+#   🚨 SANS LUI, LE COURANT EST JUSTE ET LA JAUGE FAUSSE : `ISOUSC` est PAR PHASE,
+#      or `maxVa` borne un PAPP qui est un TOTAL ⇒ la jauge saturerait au TIERS de
+#      l'abonnement réel (5 000 VA sur un 3×20 A afficherait 109 %).
+#   ⭐ Bit LIBRE, donc rétro-compatible DANS LES DEUX SENS : un émetteur qui ne
+#      l'émet pas est lu « monophasé » (absent = 1 phase, jamais 0), et un
+#      récepteur qui l'ignorerait se comporte exactement comme avant. Un parc
+#      mixte fonctionne — c'est ce qui autorisait à livrer en deux temps.
 
 # --- Tags TLV (cf. §7 du doc) ---
 T_ADCO = 0x01
@@ -197,15 +205,21 @@ def _seal(ftype, boot_count, msg_count, body, k_enc, k_mac, encrypt):
 def encode_curve(key: bytes, *, boot_count: int, msg_count: int, batch_seq: int,
                  index_id: int, index_value: int, papp: list, period_ds: int,
                  src_standard: bool = False, ts_valid: bool = False,
+                 triphase: bool = False,
                  ts: bytes = b"\x00" * 7, dt_s=None, tlvs=None, encrypt: bool = False) -> bytes:
     """Encode une trame COURBE. `papp` = liste des PAPP (papp[0]=keyframe). `dt_s` = dt par
     point en s (dt_s[0] ignoré) ; None → 2 s uniformes. `tlvs` = liste de (tag, value_bytes).
-    `encrypt=True` → corps ChaCha20 + bit7."""
+    `encrypt=True` → corps ChaCha20 + bit7.
+
+    ⓘ `triphase` (#51) a un DÉFAUT à False, et c'est ce qui rend le bit
+      rétro-compatible : tout appelant existant produit exactement les mêmes
+      octets qu'avant. Un banc le vérifie à l'octet."""
     k_enc, k_mac = derive_keys(key)
     n = len(papp)
     if dt_s is None:
         dt_s = [0] + [2] * (n - 1)
-    flags = (CF_SRC_STANDARD if src_standard else 0) | (CF_TS_VALID if ts_valid else 0)
+    flags = ((CF_SRC_STANDARD if src_standard else 0) | (CF_TS_VALID if ts_valid else 0)
+             | (CF_TRIPHASE if triphase else 0))
 
     core = bytearray()
     core.append(flags)
@@ -298,6 +312,7 @@ def _parse_body(ftype: int, encrypted: bool, boot_count: int, msg_count: int, bo
         flags = body[pos]; pos += 1
         src_standard = bool(flags & CF_SRC_STANDARD)
         ts_valid = bool(flags & CF_TS_VALID)
+        triphase = bool(flags & CF_TRIPHASE)
         batch_seq = struct.unpack_from("<H", body, pos)[0]; pos += 2
         index_id = body[pos]; pos += 1
         index_value = struct.unpack_from("<I", body, pos)[0]; pos += 4
@@ -330,6 +345,7 @@ def _parse_body(ftype: int, encrypted: bool, boot_count: int, msg_count: int, bo
         tlvs = _decode_tlvs(body, pos, len(body))
         out.update({
             "flags": flags, "src_standard": src_standard, "ts_valid": ts_valid,
+            "triphase": triphase,
             "batch_seq": batch_seq, "index_id": index_id, "index_value": index_value,
             "papp_ref": papp_ref, "n": n, "period_ds": period_ds, "ts": ts,
             "ts_season": ts_season, "ts_raw": ts_raw,

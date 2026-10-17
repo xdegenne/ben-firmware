@@ -12,8 +12,11 @@
   (plus besoin de v0x02). Spec complète : rasperry/LORA_PROTOCOL.md §17.
 
     0       version      uint8  = 0x05
-    1       flags        bit0-1 DEMAIN, bit2 ADPS, bit3 PEJP, bit4 ts_valid,
-                         bit5 src_standard, bit6 has_ext  (bits 0-3 = 0 en standard)
+    1       flags        bit0 src_standard, bit1 ts_valid, bit2 has_iinst (histo),
+                         bit3 triphase (#51) ; bits 4-7 LIBRES.
+                         ⚠️ Cette carte décrivait un ANCIEN format (DEMAIN/ADPS/PEJP),
+                            corrigée le 2026-10-17 : le prochain qui cherche un bit
+                            libre se fierait sinon à une carte périmée.
     2-3     batch_seq    uint16 LE — RAM, reset au boot, +1/batch
     4       index_id     uint8  histo: PTEC 0x00..0x0A ; standard: NTARF 1..10
     5-8     index_value  uint32 LE — index absolu au 1er échantillon (Wh ; EASF[NTARF] en std)
@@ -103,10 +106,48 @@
 //   concatenation est resolue a la compilation.
 #define FW_MAJOR 0
 #define FW_MINOR 1
-#define FW_PATCH 11
+#define FW_PATCH 12
 #define FW_STR_(x) #x
 #define FW_STR(x)  FW_STR_(x)
 #define FW_VERSION FW_STR(FW_MAJOR) "." FW_STR(FW_MINOR) "." FW_STR(FW_PATCH)
+// 0.1.12 : LE TRIPHASE — issue #51. IINST = IINST1 + IINST2 + IINST3, et un bit
+//          CF_TRIPHASE (bit 3 de l octet flags, LIBRE) dans la trame courbe. Un
+//          triphase n emet JAMAIS « IINST » : l emetteur n en voyait donc aucun et
+//          envoyait des trames SANS courant — il survivait par accident, la garde
+//          histo n exigeant que PAPP et l index actif. AGREGATION PAR PREFIXE :
+//          « IINST » et « IINST1/2/3 » partagent 5 caracteres, donc un strncmp
+//          n ajoute AUCUN litteral — decisif sur une carte a 98 %. LA SOMME ET PAS
+//          LE MAX : IINST ne sert qu a l estimation 230xI quand PAPP vaut 0, et en
+//          triphase chaque phase est a 230 V vers le neutre, donc 230x(I1+I2+I3) EST
+//          la puissance totale ; le max la sous-estimerait d un FACTEUR 3. Meme regle
+//          que le lecteur filaire (#50) — une seule agregation pour tout le parc.
+//          ON EXIGE LES TROIS PHASES : une somme partielle est un nombre PLAUSIBLE et
+//          FAUX la ou une phase manquante est une donnee PERDUE. Le bitmap ph_vues
+//          sert a deux choses — exiger les trois, et ne pas recompter une phase si
+//          une trame corrompue repete un groupe ; il repart de zero a CHAQUE trame,
+//          readAndParseTIC faisant son memset avant meme d attendre le STX.
+//          DEUX DEFAUTS TROUVES EN REVUE, et le premier est ANTERIEUR au triphase :
+//          `required` n a JAMAIS contenu TIC_SEEN_IINST, donc une ligne IINST perdue
+//          au checksum laissait v.iinst a 0 et curveAdd encodait ce 0 comme un POINT
+//          REEL — « 30, 30, 0, 30 » sur un compteur qui tire 30 A, et les SEPT
+//          boitiers monophases du parc le font deja. On perd desormais l echantillon
+//          entier, PAPP compris : la 2e courbe est POSITIONNELLE, on ne peut pas
+//          sauter le courant d un point sans decaler la serie, et le lecteur filaire
+//          fait ce meme choix. Second defaut : le bit etait lu dans curveStart SEUL,
+//          donc une trame ayant perdu une phase faisait partir ~55 s et jusqu a 130
+//          points marques « monophase » ; il s accumule maintenant sur tout le batch
+//          (curveTriphase) et l octet est rectifie au flush. ⚠️ CARTE DES BITS en
+//          tete de fichier CORRIGEE : elle decrivait un ANCIEN format (DEMAIN/ADPS/
+//          PEJP) et j ai failli croire le bit 3 occupe. 30 244 → 30 414 o, soit +170 o
+//          et le passage de 98 % a 99 % — 306 octets libres, RAM +1. A SAVOIR AVANT
+//          LE PROCHAIN AJOUT. Eprouve par le PREMIER banc du sketch qui EXECUTE quoi
+//          que ce soit : un harnais hote qui COMPILE LE TEXTE REEL du .ino (18 cas),
+//          plus 14 cas d inspection et 13 sur le codec dont la NON-REGRESSION A L
+//          OCTET — le risque n est pas de rater le triphase, personne n en a, c est
+//          de casser le monophase en le reparant. Sept mutations vues ROUGES.
+//          ⚠️ Le recepteur DECODE le bit et le JETTE : ecrire level_profile.phases
+//          pour corriger la jauge est l objet de #56. Sans lui, le courant est juste
+//          et la jauge reste fausse d un facteur 3.
 // 0.1.11 : UNE TRAME DE BOOT N ECRASE PLUS LE LOT EN COURS — issue #30. sendBootFrame et
 //          curveStart ecrivent TOUS DEUX dans curveBuf des l offset 0, et font TOUS DEUX
 //          msg_count++. Or l en-tete ecrit a l offset 0 EST LE NONCE ChaCha20 : un boot emis
@@ -149,6 +190,13 @@
 #define CF_SRC_STANDARD  0x01   // octet flags du core courbe : bit0
 #define CF_TS_VALID      0x02   // bit1
 #define CF_HAS_IINST     0x04   // bit2 : 2e courbe IINST (histo) présente
+#define CF_TRIPHASE      0x08   // bit3 : raccordement TRIPHASÉ (IINST1/2/3 vus) — #51.
+                                //   🚨 SANS LUI, LE COURANT EST JUSTE ET LA JAUGE FAUSSE :
+                                //   ISOUSC est PAR PHASE, or `maxVa` borne un PAPP qui est
+                                //   un TOTAL ⇒ la jauge saturerait au TIERS de l'abonnement.
+                                //   ⭐ Un bit LIBRE, donc rétro-compatible dans les deux sens :
+                                //   un récepteur qui l'ignore lit « monophasé », un émetteur
+                                //   qui ne l'émet pas est lu « monophasé ». Parc mixte OK.
 #define T_ADCO    0x01
 #define T_ISOUSC  0x02
 #define T_PREF    0x03
@@ -272,6 +320,13 @@ static uint16_t curvePos     = 0;     // curseur d'écriture
 static int32_t  papp_prev    = 0;     // dernière PAPP encodée (signée : net en standard)
 static int32_t  iinst_prev   = 0;     // histo : dernier IINST encodé (2e courbe)
 static uint8_t  curveN       = 0;     // échantillons dans le batch courant
+// 🚨 LE BIT TRIPHASÉ EST UNE PROPRIÉTÉ DU BATCH, PAS DE SON PREMIER ÉCHANTILLON.
+//    Défaut trouvé en revue de la PR #57 : il était lu dans `curveStart`, donc si
+//    CETTE trame-là avait perdu une phase, les ~55 s et jusqu'à 130 points du batch
+//    partaient marqués « monophasé ». On accumule, et on rectifie l'octet au flush.
+// ⓘ `curveBuf[7]` : `writeHeader` rend 7 de façon constante, l'octet de drapeaux est
+//   donc à une position connue et se corrige sans réécrire la trame.
+static bool     curveTriphase = false;
 static bool     curveActive  = false;
 static bool     curveFlushPending = false;  // deferred flush : flush exécuté HORS du bloc v (pile dégagée)
 static uint8_t  curveIndexId = IDX_UNKNOWN;  // index_id du batch courant (homogène)
@@ -337,6 +392,8 @@ struct TICValues {
   bool adps_present;
   bool pejp_present;
   uint16_t iinst;
+  uint8_t  ph_vues;       // TRIPHASÉ (#51) : bitmap des phases vues dans CETTE trame
+  uint16_t ph_somme;      // somme des courants de phase, publiée quand ph_vues == 0x07
   uint16_t papp;
   uint8_t  isousc;        // intensité souscrite (A) — abonnement HISTO (statique)
   uint8_t  pref;          // puiss. de réf. (kVA) — abonnement STANDARD (statique, chantier ISOUSC)
@@ -654,7 +711,36 @@ static void parseTICLine(char* line, uint8_t len, TICValues& v) {
   else if (!strcmp(name, "BBRHPJW")) { v.bbr[3] = strtoul(val, 0, 10);           v.fields_seen |= TIC_SEEN_BBR3;   }
   else if (!strcmp(name, "BBRHCJR")) { v.bbr[4] = strtoul(val, 0, 10);           v.fields_seen |= TIC_SEEN_BBR4;   }
   else if (!strcmp(name, "BBRHPJR")) { v.bbr[5] = strtoul(val, 0, 10);           v.fields_seen |= TIC_SEEN_BBR5;   }
-  else if (!strcmp(name, "IINST"))   { v.iinst  = (uint16_t)strtoul(val, 0, 10); v.fields_seen |= TIC_SEEN_IINST;  }
+  else if (!strncmp(name, "IINST", 5)) {
+    // 🚨 TRIPHASÉ (#51). Mono = « IINST », triphasé = « IINST1/2/3 » : MÊME PRÉFIXE,
+    //    donc AUCUN littéral supplémentaire en flash — elle est à 98 %. Trois
+    //    `strcmp` complets auraient coûté bien plus que ce `strncmp`.
+    //
+    // ⭐ ON PUBLIE LE TOTAL DES TROIS PHASES, et ce n'est pas une préférence.
+    //    `IINST` ne sert qu'à l'estimation `230 × I` quand PAPP vaut 0, et en
+    //    triphasé résidentiel chaque phase est à 230 V vers le neutre : donc
+    //    230 × (I1+I2+I3) EST la puissance totale. Le max, plus « physique » en
+    //    apparence, la sous-estimerait d'un FACTEUR 3. Même règle que le lecteur
+    //    filaire (#50) — une seule agrégation pour tout le parc, sinon deux
+    //    grandeurs différentes circuleraient sous le même nom.
+    //
+    // 🚨 ON EXIGE LES TROIS. Une somme partielle est un nombre PLAUSIBLE et FAUX,
+    //    là où une phase manquante est au moins une donnée PERDUE. C'est
+    //    l'inversion que ce projet combat depuis l'alphabet TIC (0.1.9).
+    //
+    // ⓘ Le bitmap sert à DEUX choses : exiger les trois, et ne pas compter deux
+    //   fois la même phase si une trame corrompue répète un groupe. Et il repart
+    //   de zéro à CHAQUE trame — `readAndParseTIC` fait son `memset` avant même
+    //   d'attendre le STX, donc aucune phase ne peut franchir une frontière de
+    //   trame. Les deux garanties sont vérifiées par `test_triphase_emetteur`.
+    uint16_t a = (uint16_t)strtoul(val, 0, 10);
+    if (name[5] == 0) { v.iinst = a; v.fields_seen |= TIC_SEEN_IINST; }
+    else if (name[5] >= '1' && name[5] <= '3' && name[6] == 0) {
+      uint8_t b = (uint8_t)(1 << (name[5] - '1'));
+      if (!(v.ph_vues & b)) { v.ph_vues |= b; v.ph_somme += a; }
+      if (v.ph_vues == 0x07) { v.iinst = v.ph_somme; v.fields_seen |= TIC_SEEN_IINST; }
+    }
+  }
   else if (!strcmp(name, "PAPP"))    { v.papp   = (uint16_t)strtoul(val, 0, 10); v.fields_seen |= TIC_SEEN_PAPP;   }
   else if (!strcmp(name, "ISOUSC"))  v.isousc = (uint8_t)strtoul(val, 0, 10);   // abonnement (A)
   else if (!strcmp(name, "ADPS"))    v.adps_present = true;
@@ -975,7 +1061,9 @@ void curveStart(const TICValues& v, uint8_t id, uint32_t value) {
                  (v.ts[0] == 'E' || v.ts[0] == 'H');  // saison MAJUSCULE = horloge fiable
   uint8_t flags = (ticMode == MODE_STANDARD ? CF_SRC_STANDARD : 0)
                 | (tsValid ? CF_TS_VALID : 0)
-                | (ticMode == MODE_HISTO ? CF_HAS_IINST : 0);
+                | (ticMode == MODE_HISTO ? CF_HAS_IINST : 0)
+                | (v.ph_vues == 0x07 ? CF_TRIPHASE : 0);
+  curveTriphase = (v.ph_vues == 0x07);   // ① du batch — les suivants peuvent le lever
   curveBuf[pos++] = flags;                            // [7]  flags
   memcpy(curveBuf + pos, &batch_seq, 2); pos += 2;    // [8-9] batch_seq
   curveBuf[pos++] = id;                               // [10] index_id
@@ -1053,6 +1141,7 @@ void curveAdd(int32_t papp, const TICValues& v) {
   while (zz >= 0x80) { curveBuf[curvePos++] = (zz & 0x7F) | 0x80; zz >>= 7; }
   curveBuf[curvePos++] = (uint8_t)zz;
   papp_prev = papp;
+  if (v.ph_vues == 0x07) curveTriphase = true;   // ⭐ UNE seule trame complète suffit
   if (ticMode == MODE_HISTO) {                              // 2e courbe : delta IINST (zigzag)
     int32_t  di  = (int32_t)v.iinst - iinst_prev;
     uint32_t zzi = ((uint32_t)di << 1) ^ (uint32_t)(di >> 31);
@@ -1072,6 +1161,9 @@ void curveAdd(int32_t papp, const TICValues& v) {
 // trame (§17.3), aucun delta inter-batch.
 void curveFlush() {
   if (!curveActive || curveN == 0) { curveActive = false; return; }
+  // Rectifie l'octet de drapeaux : le batch est triphasé si N'IMPORTE LAQUELLE de
+  // ses trames a montré les trois phases. Cf. `curveTriphase`.
+  if (curveTriphase) curveBuf[7] |= CF_TRIPHASE;
   curveBuf[18] = curveN;                              // N (offset fixe du core)
   // period_ds = période RÉELLE mesurée (millis), en 1/10 s : (durée batch)/(N-1). Borné 1..255.
   {
@@ -1348,7 +1440,24 @@ void loop() {
     if (!v.valid) return;                                         // histo : trame invalide
     selectActiveIndex(v, id, value);
     if (id == IDX_UNKNOWN) return;                                // histo : PTEC inconnu (souvent = glitch)
-    uint16_t required = TIC_SEEN_PAPP;                            // garde histo : PAPP + index actif
+    // 🚨 IINST EST EXIGÉ, ET IL NE L'ÉTAIT PAS — défaut trouvé en revue de la PR #57,
+    //    et il est ANTÉRIEUR au triphasé : `required` n'a JAMAIS contenu
+    //    TIC_SEEN_IINST, donc une ligne `IINST` perdue au checksum laissait
+    //    `v.iinst` à 0 et `curveAdd` encodait ce 0 comme un POINT RÉEL. Un
+    //    compteur tirant 30 A rendait « 30, 30, 0, 30 ».
+    //
+    // ⭐ C'est la MÊME inversion que partout ailleurs — une donnée FAUSSE là où on
+    //    voulait une donnée PERDUE — et le triphasé la rend trois fois plus
+    //    probable : trois lignes peuvent se corrompre au lieu d'une.
+    //
+    // ⚠️ ON PERD AUSSI LE PAPP DE CET ÉCHANTILLON, et c'est assumé : la 2e courbe
+    //    est POSITIONNELLE, chaque point DOIT porter son IINST. On ne peut pas
+    //    « sauter » le courant d'un point sans décaler toute la série. Le lecteur
+    //    filaire fait exactement ce choix (`IINST absent … trame ignorée`), et
+    //    l'uniformité vaut mieux que deux doctrines. Coût mesuré sur un vrai
+    //    compteur : 0,17 % de groupes en erreur, donc un point perdu de temps en
+    //    temps — là où un 0 inventé se promène dans la courbe pour toujours.
+    uint16_t required = TIC_SEEN_PAPP | TIC_SEEN_IINST;           // garde histo : PAPP + IINST + index actif
     if (id < sizeof(INDEX_ID_TO_SEEN) / sizeof(INDEX_ID_TO_SEEN[0]))
       required |= INDEX_ID_TO_SEEN[id];
     if ((v.fields_seen & required) != required) return;          // trame partielle
