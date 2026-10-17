@@ -13,7 +13,11 @@
 import pathlib
 import sys
 
-INO = pathlib.Path(__file__).with_name("tic-reader.ino")
+# 🚨 LE .ino EST DANS LE RÉPERTOIRE PARENT, et ce n'est pas une préférence de
+#    rangement : `arduino-cli` COMPILE TOUT .cpp posé à côté du sketch. Le harnais
+#    hôte y a cassé la compilation AVR (`fatal error: cstdint`) — donc tout flash.
+#    Arduino ne compile PAS les sous-répertoires autres que `src/`, d'où `banc/`.
+INO = pathlib.Path(__file__).resolve().parent.parent / "tic-reader.ino"
 
 
 def bloc(src: str, debut: str) -> str:

@@ -82,6 +82,17 @@ verifie("   … levé par N'IMPORTE QUELLE trame complète, dans curveAdd",
 verifie("   … et l'octet de drapeaux est rectifié au flush",
         re.search(r"curveBuf\s*\[\s*7\s*\]\s*\|=\s*CF_TRIPHASE", nu) is not None)
 
+print("── ⚖️ le harnais hôte ne doit PAS casser la compilation AVR ─")
+# 🚨 DÉFAUT RÉEL, découvert en tentant un flash : `arduino-cli` compile TOUT
+#    fichier .cpp/.c posé à côté du `.ino`. Le harnais hôte y était, et le
+#    compilateur AVR échouait sur `<cstdint>` — donc AUCUN flash n'était possible.
+#    Les bancs passaient tous : seul un flash révélait le défaut.
+# ⭐ Arduino ne compile pas les sous-répertoires autres que `src/`, d'où `banc/`.
+rep = INO.parent
+intrus = sorted(p.name for p in rep.glob("*") if p.suffix in (".cpp", ".c", ".S"))
+verifie(f"aucun .cpp/.c/.S à côté du sketch (trouvés : {intrus or 'aucun'})", not intrus)
+verifie("le harnais vit bien dans banc/", (rep / "banc" / "test_triphase_emetteur.cpp").exists())
+
 print()
 if echecs:
     print(f"❌ {len(echecs)} cas en échec : " + ", ".join(echecs))
