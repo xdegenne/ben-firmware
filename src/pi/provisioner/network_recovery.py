@@ -186,10 +186,40 @@ def main() -> int:
     _start_provisioning()
 
     if _watch_window():
-        log.info("réseau revenu pendant la fenêtre BLE (sans rien couper)")
+        log.info("réseau revenu pendant la fenêtre BLE")
     else:
         log.info("fenêtre écoulée sans réseau — la mesure passe devant l'attente")
-        _wait_for_ble_session_end()
+
+    # 🚨 L'ATTENTE EST DANS LES DEUX CAS, ET ELLE NE L'ÉTAIT PAS.
+    #
+    #    `_wait_for_ble_session_end()` vivait dans la branche `else` — c'est-à-dire
+    #    uniquement quand la fenêtre s'écoule SANS réseau, donc précisément dans le
+    #    cas où PERSONNE n'est en train de configurer quoi que ce soit. Sa propre
+    #    docstring dit pourtant : « Ne JAMAIS couper la radio sous un utilisateur en
+    #    pleine configuration. » La garde existait, elle portait le bon commentaire,
+    #    elle était du mauvais côté du `if`.
+    #
+    # ⭐ Et c'est le chemin NOMINAL qui passait dessous : l'utilisateur donne le WiFi
+    #    en BLE → le boîtier s'associe → `_ping_once()` réussit → `_watch_window()`
+    #    rend True → `_stop_provisioning()` tuait le provisioner EN PLEINE SESSION,
+    #    et le service GATT disparaissait sous l'app. Déballage et changement de
+    #    réseau passent tous les deux par là.
+    #
+    # ⚠️ C'ÉTAIT UNE COURSE, d'où l'intermittence : `POLL_INTERVAL_SEC = 30`, donc
+    #    l'association est vue entre 0 et 30 s plus tard. Si l'app finissait son test
+    #    de connexion dans ce qui restait du tic, ça marchait. Sinon le service
+    #    s'évaporait — et une radio WiFi/BLE PARTAGÉE sur Pi Zero W rendait
+    #    l'explication « le Bluetooth est capricieux » parfaitement plausible, ce qui
+    #    ferme l'enquête sur une fausse cause.
+    #
+    # ⓘ Sans danger quand le réseau est revenu tout seul : sans central connecté, le
+    #   drapeau est absent et la fonction rend la main immédiatement. Et une session
+    #   oubliée ne peut pas retenir la collecte — le drapeau EXPIRE (SESSION_MAX_SEC).
+    #
+    # Mesuré le 2026-10-17 : fenêtre refermée à 08:58:23, revendication réussie à
+    # 08:58:28, puis `PlatformException(setNotifyValue, primary service not found
+    # 'b3e7e511-0001-…')` sur les reprises de 08:59:58 et 09:00:01.
+    _wait_for_ble_session_end()
 
     _stop_provisioning()          # libère LED/GPIO AVANT que les readers les prennent
     _last_chance_wifi()

@@ -57,8 +57,14 @@ import network_recovery as nr                                # noqa: E402
 provisioning_state.FLAG_DIR = tempfile.mkdtemp()
 provisioning_state.FLAG_PATH = os.path.join(provisioning_state.FLAG_DIR, "flag")
 
-nr.BLE_WINDOW_SEC = 2           # raccourci pour le banc (300 s en production)
-nr.POLL_INTERVAL_SEC = 1
+# ⚠️ LE BANC DOIT RESTER INSTANTANÉ. Depuis que `_wait_for_ble_session_end()` est
+#    consultée dans LES DEUX branches (#49), trois cas la traversent ; à 1 s par tour
+#    et 30 tours de garde, le banc passait de l'instantané à ~90 s. Or il tourne en
+#    PRÉFLIGHT D'OTA, sur un Pi Zero — et un banc lent est un banc qu'on cesse de
+#    lancer. La fenêtre reste réelle (c'est elle qui borne `_watch_window`), mais le
+#    pas d'attente tombe à zéro.
+nr.BLE_WINDOW_SEC = 0.2         # 300 s en production
+nr.POLL_INTERVAL_SEC = 0        # 30 s en production
 
 
 def run(ping_results, ble_session=False, session_ends_after=None, readers_active=()):
@@ -120,10 +126,43 @@ def case(title, check, **kw):
     CASES.append((title, check, kw))
 
 
-case("la box revient pendant la fenêtre BLE — on écourte sans rien couper",
+# ⚠️ CE CAS S'APPELAIT « on écourte SANS RIEN COUPER » et attendait pourtant `stop-BLE`.
+#    Le titre parlait du WiFi, la lecture rapide comprenait « sans couper le BLE » — et
+#    c'est exactement sous ce malentendu que le défaut #49 a vécu : personne n'a cherché
+#    le cas « réseau revenu ET session active », puisque celui-ci semblait déjà le couvrir.
+#    ⭐ Il reste utile tel quel : c'est le CONTRE-TÉMOIN du correctif — sans utilisateur
+#      connecté, l'arrêt doit rester IMMÉDIAT, sinon on échange un défaut contre une
+#      collecte retardée à chaque boot.
+case("réseau revenu SANS session BLE — l'arrêt est immédiat (⚖️ contre-témoin de #49)",
      lambda j, o: j == ["start-BLE", "stop-BLE", "relance-WiFi", "START-READERS"]
-                  and o == "rc=0",
+                  and "attente-session" not in j and o == "rc=0",
      ping_results=[False, True])
+
+# ═══ 🚨 LE CAS QUI MANQUAIT, ET C'EST LE CHEMIN NOMINAL DU DÉBALLAGE ════════════
+#
+# L'utilisateur donne le WiFi en BLE → le boîtier s'associe → `_ping_once` réussit →
+# `_watch_window()` rend True. La garde `_wait_for_ble_session_end()` n'était appelée
+# que dans la branche `else`, donc le provisioner était tué EN PLEINE SESSION et le
+# service GATT disparaissait sous l'app.
+#
+# ⭐ Et ce banc passait au VERT sur ce défaut : le cas « la box revient » ci-dessus
+#    n'a PAS de session BLE active, donc `stop-BLE` y est légitime. Le défaut ne vit
+#    que dans la COMBINAISON des deux — réseau qui revient ET utilisateur connecté —
+#    et personne ne l'avait écrite. *Un banc vert sur chaque moitié d'un défaut
+#    n'en couvre aucune.*
+#
+# Mesuré sur un boîtier le 2026-10-17 : fenêtre refermée à 08:58:23, revendication
+# réussie à 08:58:28, puis `PlatformException(setNotifyValue, primary service not
+# found)` sur les reprises de 08:59:58 et 09:00:01.
+case("🚨 le réseau revient PENDANT une session BLE — la radio n'est pas coupée",
+     lambda j, o: "stop-BLE" not in j and o == "ATTENTE-INFINIE",
+     ping_results=[False, True] + [True] * 60, ble_session=True)
+
+case("réseau revenu pendant la session, puis session terminée — la collecte reprend",
+     lambda j, o: "attente-session" in j
+                  and j.index("attente-session") < j.index("stop-BLE")
+                  and j[-1] == "START-READERS" and o == "rc=0",
+     ping_results=[False, True] + [True] * 60, ble_session=True, session_ends_after=2)
 
 case("hors ligne — fenêtre écoulée, puis COLLECTE quand même",
      lambda j, o: j == ["start-BLE", "stop-BLE", "relance-WiFi", "START-READERS"]
