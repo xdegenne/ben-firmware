@@ -139,6 +139,19 @@ _pdl_par_emetteur: dict = {}
 # jamais une lecture SQLite par trame reçue.
 _mode_par_pdl: dict = {}
 
+# Garde RAM du raccordement TRIPHASÉ par PDL (#56). Même doctrine que le mode :
+# la trame courbe arrive toutes les ~60 s, on ne matraque pas la SD.
+#
+# 🚨 ELLE NE MÉMORISE QUE LE PASSAGE À 3, jamais le retour à 1 — et ce n'est pas
+#    une économie, c'est la règle. Le monophasé est l'ABSENCE de déclaration, pas
+#    une déclaration d'absence : une trame qui aurait perdu une phase au checksum
+#    arrive sans le bit et ressemble trait pour trait à un monophasé. Retenir ce
+#    « 1 » ferait retomber un triphasé sur UNE seule trame abîmée, et la jauge
+#    repartirait au tiers de l'abonnement.
+# ⓘ `db.record_phases` refuse déjà toute valeur ≠ 3 — c'est une seconde barrière,
+#   pas une raison de relâcher celle-ci.
+_triphase_par_pdl: dict = {}
+
 def get_pdl_index(lora_address_int: int) -> int | None:
     """PDL du COMPTEUR branché au bout de cet émetteur.
 
@@ -520,6 +533,30 @@ def on_recv_curve(decoded, rssi, snr, pdl_index, now, time_since_prev) -> None:
             _mode_par_pdl[pdl_index] = _std
         except Exception as e:
             log.warning(f"store: record_tic_mode échoué: {e}")
+
+    # ═══ RACCORDEMENT TRIPHASÉ (#56) ═══════════════════════════════════════
+    #
+    # 🚨 SANS ÇA, LE COURANT EST JUSTE ET LA JAUGE FAUSSE. L'émetteur publie
+    #    depuis 0.1.12 le TOTAL des trois phases et lève CF_TRIPHASE — mais
+    #    `ISOUSC` reste exprimé PAR PHASE, alors que `maxVa` borne un PAPP qui
+    #    est un TOTAL. Un foyer triphasé tirant 5 000 VA — parfaitement normal
+    #    sur un 3×20 A — afficherait 109 %, rouge en permanence.
+    #
+    # ⭐ C'est la MÊME colonne que le lecteur filaire alimente depuis pi-0.14.0
+    #   (#50) : `level_profile.phases`. Elle existait, elle n'était nourrie que
+    #   d'un seul côté.
+    #
+    # ⚠️ On n'écrit QUE 3. Voir `_triphase_par_pdl` : l'absence du bit n'est pas
+    #    une preuve de monophasé, c'est une absence de preuve.
+    if decoded.get("triphase") and not _triphase_par_pdl.get(pdl_index) \
+            and measurements_db is not None:
+        try:
+            if db.record_phases(measurements_db, pdl_index, 3):
+                log.info(f"RACCORDEMENT TRIPHASÉ pdl_index={pdl_index} — "
+                         f"la jauge passe à 3 × ISOUSC × 230")
+            _triphase_par_pdl[pdl_index] = True
+        except Exception as e:
+            log.warning(f"store: record_phases échoué: {e}")
 
     # Index actif : histo → nom canonique (INDEX_NAMES) écrit dans base/hchc/hchp ;
     # standard → index_id = NTARF (1..10), OPAQUE (nom = LTARF fournisseur, pas de table
