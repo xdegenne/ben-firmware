@@ -12,8 +12,11 @@
   (plus besoin de v0x02). Spec complète : rasperry/LORA_PROTOCOL.md §17.
 
     0       version      uint8  = 0x05
-    1       flags        bit0-1 DEMAIN, bit2 ADPS, bit3 PEJP, bit4 ts_valid,
-                         bit5 src_standard, bit6 has_ext  (bits 0-3 = 0 en standard)
+    1       flags        bit0 src_standard, bit1 ts_valid, bit2 has_iinst (histo),
+                         bit3 triphase (#51) ; bits 4-7 LIBRES.
+                         ⚠️ Cette carte décrivait un ANCIEN format (DEMAIN/ADPS/PEJP),
+                            corrigée le 2026-10-17 : le prochain qui cherche un bit
+                            libre se fierait sinon à une carte périmée.
     2-3     batch_seq    uint16 LE — RAM, reset au boot, +1/batch
     4       index_id     uint8  histo: PTEC 0x00..0x0A ; standard: NTARF 1..10
     5-8     index_value  uint32 LE — index absolu au 1er échantillon (Wh ; EASF[NTARF] en std)
@@ -149,6 +152,13 @@
 #define CF_SRC_STANDARD  0x01   // octet flags du core courbe : bit0
 #define CF_TS_VALID      0x02   // bit1
 #define CF_HAS_IINST     0x04   // bit2 : 2e courbe IINST (histo) présente
+#define CF_TRIPHASE      0x08   // bit3 : raccordement TRIPHASÉ (IINST1/2/3 vus) — #51.
+                                //   🚨 SANS LUI, LE COURANT EST JUSTE ET LA JAUGE FAUSSE :
+                                //   ISOUSC est PAR PHASE, or `maxVa` borne un PAPP qui est
+                                //   un TOTAL ⇒ la jauge saturerait au TIERS de l'abonnement.
+                                //   ⭐ Un bit LIBRE, donc rétro-compatible dans les deux sens :
+                                //   un récepteur qui l'ignore lit « monophasé », un émetteur
+                                //   qui ne l'émet pas est lu « monophasé ». Parc mixte OK.
 #define T_ADCO    0x01
 #define T_ISOUSC  0x02
 #define T_PREF    0x03
@@ -337,6 +347,8 @@ struct TICValues {
   bool adps_present;
   bool pejp_present;
   uint16_t iinst;
+  uint8_t  ph_vues;       // TRIPHASÉ (#51) : bitmap des phases vues dans CETTE trame
+  uint16_t ph_somme;      // somme des courants de phase, publiée quand ph_vues == 0x07
   uint16_t papp;
   uint8_t  isousc;        // intensité souscrite (A) — abonnement HISTO (statique)
   uint8_t  pref;          // puiss. de réf. (kVA) — abonnement STANDARD (statique, chantier ISOUSC)
@@ -654,7 +666,36 @@ static void parseTICLine(char* line, uint8_t len, TICValues& v) {
   else if (!strcmp(name, "BBRHPJW")) { v.bbr[3] = strtoul(val, 0, 10);           v.fields_seen |= TIC_SEEN_BBR3;   }
   else if (!strcmp(name, "BBRHCJR")) { v.bbr[4] = strtoul(val, 0, 10);           v.fields_seen |= TIC_SEEN_BBR4;   }
   else if (!strcmp(name, "BBRHPJR")) { v.bbr[5] = strtoul(val, 0, 10);           v.fields_seen |= TIC_SEEN_BBR5;   }
-  else if (!strcmp(name, "IINST"))   { v.iinst  = (uint16_t)strtoul(val, 0, 10); v.fields_seen |= TIC_SEEN_IINST;  }
+  else if (!strncmp(name, "IINST", 5)) {
+    // 🚨 TRIPHASÉ (#51). Mono = « IINST », triphasé = « IINST1/2/3 » : MÊME PRÉFIXE,
+    //    donc AUCUN littéral supplémentaire en flash — elle est à 98 %. Trois
+    //    `strcmp` complets auraient coûté bien plus que ce `strncmp`.
+    //
+    // ⭐ ON PUBLIE LE TOTAL DES TROIS PHASES, et ce n'est pas une préférence.
+    //    `IINST` ne sert qu'à l'estimation `230 × I` quand PAPP vaut 0, et en
+    //    triphasé résidentiel chaque phase est à 230 V vers le neutre : donc
+    //    230 × (I1+I2+I3) EST la puissance totale. Le max, plus « physique » en
+    //    apparence, la sous-estimerait d'un FACTEUR 3. Même règle que le lecteur
+    //    filaire (#50) — une seule agrégation pour tout le parc, sinon deux
+    //    grandeurs différentes circuleraient sous le même nom.
+    //
+    // 🚨 ON EXIGE LES TROIS. Une somme partielle est un nombre PLAUSIBLE et FAUX,
+    //    là où une phase manquante est au moins une donnée PERDUE. C'est
+    //    l'inversion que ce projet combat depuis l'alphabet TIC (0.1.9).
+    //
+    // ⓘ Le bitmap sert à DEUX choses : exiger les trois, et ne pas compter deux
+    //   fois la même phase si une trame corrompue répète un groupe. Et il repart
+    //   de zéro à CHAQUE trame — `readAndParseTIC` fait son `memset` avant même
+    //   d'attendre le STX, donc aucune phase ne peut franchir une frontière de
+    //   trame. Les deux garanties sont vérifiées par `test_triphase_emetteur`.
+    uint16_t a = (uint16_t)strtoul(val, 0, 10);
+    if (name[5] == 0) { v.iinst = a; v.fields_seen |= TIC_SEEN_IINST; }
+    else if (name[5] >= '1' && name[5] <= '3' && name[6] == 0) {
+      uint8_t b = (uint8_t)(1 << (name[5] - '1'));
+      if (!(v.ph_vues & b)) { v.ph_vues |= b; v.ph_somme += a; }
+      if (v.ph_vues == 0x07) { v.iinst = v.ph_somme; v.fields_seen |= TIC_SEEN_IINST; }
+    }
+  }
   else if (!strcmp(name, "PAPP"))    { v.papp   = (uint16_t)strtoul(val, 0, 10); v.fields_seen |= TIC_SEEN_PAPP;   }
   else if (!strcmp(name, "ISOUSC"))  v.isousc = (uint8_t)strtoul(val, 0, 10);   // abonnement (A)
   else if (!strcmp(name, "ADPS"))    v.adps_present = true;
@@ -975,7 +1016,8 @@ void curveStart(const TICValues& v, uint8_t id, uint32_t value) {
                  (v.ts[0] == 'E' || v.ts[0] == 'H');  // saison MAJUSCULE = horloge fiable
   uint8_t flags = (ticMode == MODE_STANDARD ? CF_SRC_STANDARD : 0)
                 | (tsValid ? CF_TS_VALID : 0)
-                | (ticMode == MODE_HISTO ? CF_HAS_IINST : 0);
+                | (ticMode == MODE_HISTO ? CF_HAS_IINST : 0)
+                | (v.ph_vues == 0x07 ? CF_TRIPHASE : 0);
   curveBuf[pos++] = flags;                            // [7]  flags
   memcpy(curveBuf + pos, &batch_seq, 2); pos += 2;    // [8-9] batch_seq
   curveBuf[pos++] = id;                               // [10] index_id
