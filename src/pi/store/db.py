@@ -325,6 +325,16 @@ def connect(path: str = DB_PATH, *, read_only: bool = False) -> sqlite3.Connecti
         # Le standard ne fournit pas ISOUSC (A) mais PREF (kVA) ; on stocke brut, /live arbitre.
         if "pref" not in lvl_cols:
             conn.execute("ALTER TABLE level_profile ADD COLUMN pref INTEGER")
+        # Chantier TRIPHASÉ (#50) : nombre de phases du raccordement, 1 ou 3.
+        # 🚨 IL NE SERT QU'À ISOUSC, et c'est pour ça qu'il doit exister : ISOUSC est
+        #    exprimé PAR PHASE, alors que tout le reste du modèle est en TOTAUX (PAPP
+        #    est un total, les index sont des totaux). Un abonnement de 20 A par phase
+        #    autorise 3×20×230 = 13 800 VA ; sans ce champ la jauge saturerait au TIERS
+        #    de l'abonnement réel. ⓘ PREF, lui, est DÉJÀ un total (kVA) → pas concerné.
+        # NULL = inconnu, traité comme 1 : les 7 boîtiers du parc sont monophasés et
+        # ne doivent rien voir changer tant qu'aucune trame ne déclare 3 phases.
+        if "phases" not in lvl_cols:
+            conn.execute("ALTER TABLE level_profile ADD COLUMN phases INTEGER")
         # Chantier labels+index : NGTF (nom du calendrier tarifaire fournisseur, standard)
         # par PDL, write-on-change → sert à keyer/segmenter les registres au changement de
         # fournisseur (cf. CHANTIERS.md « Unification labels + index »).
@@ -692,6 +702,59 @@ def record_isousc(
     )
     conn.commit()
     return True
+
+
+def record_phases(
+    conn: sqlite3.Connection,
+    pdl_index: int,
+    phases: int | None,
+) -> bool:
+    """Enregistre le nombre de phases (1 ou 3) d'un PDL. Même doctrine que
+    `record_isousc` : donnée STATIQUE, écriture SUR CHANGEMENT uniquement.
+
+    🚨 ON N'ÉCRIT QUE 3, JAMAIS 1. Le monophasé est l'absence de déclaration, pas
+       une déclaration d'absence : `IINST`/`IRMS1` seuls ne PROUVENT pas qu'il n'y
+       a qu'une phase — une trame tronquée en perdant `IINST2`/`IINST3` dirait
+       exactement la même chose. Écrire 1 sur cette base ferait retomber un
+       triphasé en monophasé sur une seule trame abîmée, et la jauge repartirait
+       au tiers. ⇒ NULL reste « inconnu, donc 1 par défaut », et seule la présence
+       effective d'une 2e ou 3e phase fait basculer, définitivement.
+
+    ⚠️ Corollaire assumé : un boîtier déplacé d'un triphasé vers un monophasé
+       garderait `phases=3`. C'est un changement de compteur, qui exige déjà un
+       redémarrage et un désappairage (invariants du parc) — pas un cas que cette
+       fonction doit deviner."""
+    if phases != 3:  # on n'enregistre que la bascule vers le triphasé
+        return False
+    row = conn.execute(
+        "SELECT phases FROM level_profile WHERE pdl_index=?", (pdl_index,)
+    ).fetchone()
+    if row is not None and row["phases"] == phases:
+        return False  # inchangé → aucune écriture
+    conn.execute(
+        "INSERT INTO level_profile (pdl_index, computed_ts, phases) "
+        "VALUES (?, 0, ?) "
+        "ON CONFLICT(pdl_index) DO UPDATE SET phases = excluded.phases",
+        (pdl_index, phases),
+    )
+    conn.commit()
+    return True
+
+
+def get_phases(conn: sqlite3.Connection, pdl_index: int) -> int:
+    """Nombre de phases d'un PDL : 3 si déclaré, **1 sinon**.
+
+    ⭐ Rend un ENTIER, jamais None : l'appelant multiplie par ce nombre, et un
+       None l'obligerait à un `or 1` qu'il peut oublier — exactement la classe
+       d'oubli qui a produit ce chantier. Même garde défensive que `get_isousc`
+       (colonne absente juste après l'upgrade → 1, pas de crash)."""
+    try:
+        row = conn.execute(
+            "SELECT phases FROM level_profile WHERE pdl_index=?", (pdl_index,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return 1
+    return 3 if row and row["phases"] == 3 else 1
 
 
 def record_pref(
