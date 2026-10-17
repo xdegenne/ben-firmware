@@ -59,6 +59,30 @@ verifie("… et ne décrit plus l'ancien format (DEMAIN/ADPS en bits 0-3)",
         "bit0-1 DEMAIN" not in src)
 
 print()
+print("── ⚠️ défauts trouvés en revue de la PR #57 ───────────────")
+
+# ① 🚨 UNE TRAME SANS IINST COMPLET DOIT ÊTRE PERDUE, PAS PUBLIÉE À 0.
+#    `required` n'a JAMAIS contenu TIC_SEEN_IINST : une ligne perdue au checksum
+#    laissait `v.iinst` à 0, et `curveAdd` encodait ce 0 comme un POINT RÉEL —
+#    « 30, 30, 0, 30 » sur un compteur qui tire 30 A. Antérieur au triphasé, mais
+#    le triphasé le rend TROIS fois plus probable.
+m = re.search(r"uint16_t\s+required\s*=([^;]*);", nu)
+verifie("la garde histo est assemblée dans le CODE", bool(m))
+verifie("① … et elle EXIGE TIC_SEEN_IINST (sinon un 0 inventé entre dans la courbe)",
+        bool(m) and "TIC_SEEN_IINST" in m.group(1))
+verifie("   … toujours avec TIC_SEEN_PAPP", bool(m) and "TIC_SEEN_PAPP" in m.group(1))
+
+# ② 🚨 LE BIT TRIPHASÉ EST UNE PROPRIÉTÉ DU BATCH, PAS DE SON 1er ÉCHANTILLON.
+#    Lu dans `curveStart` seul, une trame qui perdait une phase faisait partir
+#    ~55 s et jusqu'à 130 points marqués « monophasé ».
+verifie("② un accumulateur de batch existe", "curveTriphase" in nu)
+verifie("   … levé par N'IMPORTE QUELLE trame complète, dans curveAdd",
+        re.search(r"if\s*\(\s*v\.ph_vues\s*==\s*0x07\s*\)\s*curveTriphase\s*=\s*true", nu)
+        is not None)
+verifie("   … et l'octet de drapeaux est rectifié au flush",
+        re.search(r"curveBuf\s*\[\s*7\s*\]\s*\|=\s*CF_TRIPHASE", nu) is not None)
+
+print()
 if echecs:
     print(f"❌ {len(echecs)} cas en échec : " + ", ".join(echecs))
     sys.exit(1)

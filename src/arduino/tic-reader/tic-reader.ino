@@ -282,6 +282,13 @@ static uint16_t curvePos     = 0;     // curseur d'écriture
 static int32_t  papp_prev    = 0;     // dernière PAPP encodée (signée : net en standard)
 static int32_t  iinst_prev   = 0;     // histo : dernier IINST encodé (2e courbe)
 static uint8_t  curveN       = 0;     // échantillons dans le batch courant
+// 🚨 LE BIT TRIPHASÉ EST UNE PROPRIÉTÉ DU BATCH, PAS DE SON PREMIER ÉCHANTILLON.
+//    Défaut trouvé en revue de la PR #57 : il était lu dans `curveStart`, donc si
+//    CETTE trame-là avait perdu une phase, les ~55 s et jusqu'à 130 points du batch
+//    partaient marqués « monophasé ». On accumule, et on rectifie l'octet au flush.
+// ⓘ `curveBuf[7]` : `writeHeader` rend 7 de façon constante, l'octet de drapeaux est
+//   donc à une position connue et se corrige sans réécrire la trame.
+static bool     curveTriphase = false;
 static bool     curveActive  = false;
 static bool     curveFlushPending = false;  // deferred flush : flush exécuté HORS du bloc v (pile dégagée)
 static uint8_t  curveIndexId = IDX_UNKNOWN;  // index_id du batch courant (homogène)
@@ -1018,6 +1025,7 @@ void curveStart(const TICValues& v, uint8_t id, uint32_t value) {
                 | (tsValid ? CF_TS_VALID : 0)
                 | (ticMode == MODE_HISTO ? CF_HAS_IINST : 0)
                 | (v.ph_vues == 0x07 ? CF_TRIPHASE : 0);
+  curveTriphase = (v.ph_vues == 0x07);   // ① du batch — les suivants peuvent le lever
   curveBuf[pos++] = flags;                            // [7]  flags
   memcpy(curveBuf + pos, &batch_seq, 2); pos += 2;    // [8-9] batch_seq
   curveBuf[pos++] = id;                               // [10] index_id
@@ -1095,6 +1103,7 @@ void curveAdd(int32_t papp, const TICValues& v) {
   while (zz >= 0x80) { curveBuf[curvePos++] = (zz & 0x7F) | 0x80; zz >>= 7; }
   curveBuf[curvePos++] = (uint8_t)zz;
   papp_prev = papp;
+  if (v.ph_vues == 0x07) curveTriphase = true;   // ⭐ UNE seule trame complète suffit
   if (ticMode == MODE_HISTO) {                              // 2e courbe : delta IINST (zigzag)
     int32_t  di  = (int32_t)v.iinst - iinst_prev;
     uint32_t zzi = ((uint32_t)di << 1) ^ (uint32_t)(di >> 31);
@@ -1114,6 +1123,9 @@ void curveAdd(int32_t papp, const TICValues& v) {
 // trame (§17.3), aucun delta inter-batch.
 void curveFlush() {
   if (!curveActive || curveN == 0) { curveActive = false; return; }
+  // Rectifie l'octet de drapeaux : le batch est triphasé si N'IMPORTE LAQUELLE de
+  // ses trames a montré les trois phases. Cf. `curveTriphase`.
+  if (curveTriphase) curveBuf[7] |= CF_TRIPHASE;
   curveBuf[18] = curveN;                              // N (offset fixe du core)
   // period_ds = période RÉELLE mesurée (millis), en 1/10 s : (durée batch)/(N-1). Borné 1..255.
   {
@@ -1390,7 +1402,24 @@ void loop() {
     if (!v.valid) return;                                         // histo : trame invalide
     selectActiveIndex(v, id, value);
     if (id == IDX_UNKNOWN) return;                                // histo : PTEC inconnu (souvent = glitch)
-    uint16_t required = TIC_SEEN_PAPP;                            // garde histo : PAPP + index actif
+    // 🚨 IINST EST EXIGÉ, ET IL NE L'ÉTAIT PAS — défaut trouvé en revue de la PR #57,
+    //    et il est ANTÉRIEUR au triphasé : `required` n'a JAMAIS contenu
+    //    TIC_SEEN_IINST, donc une ligne `IINST` perdue au checksum laissait
+    //    `v.iinst` à 0 et `curveAdd` encodait ce 0 comme un POINT RÉEL. Un
+    //    compteur tirant 30 A rendait « 30, 30, 0, 30 ».
+    //
+    // ⭐ C'est la MÊME inversion que partout ailleurs — une donnée FAUSSE là où on
+    //    voulait une donnée PERDUE — et le triphasé la rend trois fois plus
+    //    probable : trois lignes peuvent se corrompre au lieu d'une.
+    //
+    // ⚠️ ON PERD AUSSI LE PAPP DE CET ÉCHANTILLON, et c'est assumé : la 2e courbe
+    //    est POSITIONNELLE, chaque point DOIT porter son IINST. On ne peut pas
+    //    « sauter » le courant d'un point sans décaler toute la série. Le lecteur
+    //    filaire fait exactement ce choix (`IINST absent … trame ignorée`), et
+    //    l'uniformité vaut mieux que deux doctrines. Coût mesuré sur un vrai
+    //    compteur : 0,17 % de groupes en erreur, donc un point perdu de temps en
+    //    temps — là où un 0 inventé se promène dans la courbe pour toujours.
+    uint16_t required = TIC_SEEN_PAPP | TIC_SEEN_IINST;           // garde histo : PAPP + IINST + index actif
     if (id < sizeof(INDEX_ID_TO_SEEN) / sizeof(INDEX_ID_TO_SEEN[0]))
       required |= INDEX_ID_TO_SEEN[id];
     if ((v.fields_seen & required) != required) return;          // trame partielle
